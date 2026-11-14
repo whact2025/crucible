@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Explicit Claude/Fable 5.1 route for SWE-bench backend-convergence runs.
+#
+# This profile is separate from the historical E12 Arm B route in
+# ``backends_claude_opus5_org.yaml``, which remains frozen on Opus 5. Every
+# SWE-bench role is pinned to the authenticated NVIDIA organization session.
+# The profile configures no base URL, API key, or model fallback.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: claude
+  model: claude-fable-5-1
+  effort: high
+  feature_admission: enforce
+  extra:
+    credential_source: claude_session
+    expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+    expected_org_name: NVIDIA Corporation - Power Users
+
+roles:
+  architect_planner:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  architect_critic:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  architect_judge:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  implementer:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  breach_defender:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  swebench_impl_breaker:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  breach_judge:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  diff_scope:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  tier_completeness:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users
+
+  review_conflict_authority:
+    backend: claude
+    model: claude-fable-5-1
+    effort: high
+    feature_admission: enforce
+    extra:
+      credential_source: claude_session
+      expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+      expected_org_name: NVIDIA Corporation - Power Users

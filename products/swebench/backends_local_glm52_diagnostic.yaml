@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Diagnostic local-alias route for an operator-served exact GLM-5.2 model.
+#
+# This file invents neither an endpoint nor a price. The operator must set
+# CRUCIBLE_LOCAL_URL to the OpenAI-compatible loopback/private endpoint that
+# truthfully serves the exact model below. GLM-5.2 already has an explicit
+# reviewed zero-rate pricing entry. The served-model pin fails closed if that
+# endpoint returns another identity. The generic local feature profile remains
+# diagnostic and cannot produce promotion evidence.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: local
+  model: nvidia/zai-org/glm-5.2
+  base_url: ${CRUCIBLE_LOCAL_URL}
+  feature_admission: diagnostic
+  extra:
+    expected_served_model: nvidia/zai-org/glm-5.2
+    max_tokens: 16384
+
+roles:
+  architect_planner:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  architect_critic:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  architect_judge:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  implementer:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  breach_defender:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  swebench_impl_breaker:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  breach_judge:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  diff_scope:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  tier_completeness:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384
+  review_conflict_authority:
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    base_url: ${CRUCIBLE_LOCAL_URL}
+    feature_admission: diagnostic
+    extra:
+      max_tokens: 16384

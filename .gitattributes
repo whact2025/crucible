@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# These helpers are executed by Bash, including from Windows checkouts in WSL.
+*.sh text eol=lf

@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# SWE-bench diagnostic control — Kimi K2.6 over OpenAI-compatible HTTP.
+#
+# This is KIM-01 transport qualification only. It remains labelled
+# `openai_compat` and MUST NOT be reported as A/B/C Arm C. Source the private
+# operator environment before loading the profile. The expected served-model
+# pin rejects any response identity other than the exact K2.6 route:
+#
+#   source ~/.config/crucible/env
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: openai_compat
+  base_url: ${INFER_BASE_URL}
+  api_key: ${INFER_AUTH_TOKEN}
+  model: nvidia/moonshotai/kimi-k2.6
+  effort: high
+  feature_admission: diagnostic
+  extra:
+    expected_served_model: nvidia/moonshotai/kimi-k2.6
+
+roles:
+  architect_planner:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  architect_critic:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  architect_judge:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  implementer:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  breach_defender:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  swebench_impl_breaker:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  breach_judge:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  diff_scope:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  tier_completeness:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic
+  review_conflict_authority:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/moonshotai/kimi-k2.6
+    effort: high
+    feature_admission: diagnostic

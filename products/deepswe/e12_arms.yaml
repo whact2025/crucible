@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Immutable provider-lane definitions for the E12 DeepSWE comparison.
+#
+# Route qualification is supplied separately at cohort preflight, so secrets
+# and mutable provider observations never enter this checked-in descriptor.
+# Version 2 resets Arm A to blocked because retained Ultra evidence cannot
+# qualify the new Max route identity. Arm C remains diagnostic-only until
+# KIM-03 closes and Moonshot exposes an immutable deployment revision.
+
+schema_version: crucible.e12.arms.v2
+workflow: deepswe
+
+roles:
+  - architect_planner
+  - architect_critic
+  - architect_judge
+  - implementer
+  - breach_defender
+  - impl_breaker
+  - breach_judge
+  - diff_scope
+  - tier_completeness
+  - api_contract_fidelity
+  - review_conflict_authority
+
+arms:
+  A:
+    backend: codex
+    model: gpt-5.6-sol
+    effort: max
+    role_efforts:
+      architect_planner: high
+      architect_critic: high
+      architect_judge: high
+    quality_setting: max
+    routing: backends_codex_only.yaml
+    promotion_gate: blocked
+    gate_ticket: CDX-01-MAX
+
+  B:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+    role_efforts:
+      architect_planner: medium
+      architect_critic: medium
+      architect_judge: medium
+    quality_setting: high
+    routing: backends_claude_opus5_org.yaml
+    promotion_gate: qualified
+    gate_ticket: CLD-02
+
+  C:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    effort: null
+    quality_setting: high
+    routing: backends_kimi_sdk.yaml
+    promotion_gate: blocked
+    gate_ticket: KIM-03

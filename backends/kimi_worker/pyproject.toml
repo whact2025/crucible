@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "crucible-kimi-worker"
+version = "0.1.0"
+description = "Locked, process-isolated Kimi Agent SDK runtime for Crucible."
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "kimi-agent-sdk==0.0.5",
+    "kimi-cli==1.12.0",
+    # kimi-cli/kosong requires openai>=2.14,<2.15. Keep that incompatible
+    # transport entirely outside Crucible's openai>=2.37 root environment.
+    "openai==2.14.0",
+    # Independently compatible security floor. Kimi CLI's remaining exact
+    # pins stay visible in the isolated promotion audit until upstream moves.
+    "cryptography==50.0.0",
+]
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crucible_kimi_worker"]

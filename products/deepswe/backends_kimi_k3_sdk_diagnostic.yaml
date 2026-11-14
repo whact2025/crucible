@@ -1,0 +1,148 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# DeepSWE all-K3 diagnostic Moonshot Kimi Agent SDK route.
+#
+# Explicit opt-in for a new diagnostic run, not a replacement for K2.7 routes,
+# frozen E12 Arm C, or any existing cohort. This grants no promotion authority.
+# Source ~/.config/crucible/env before loading; bind the exact worker runtime
+# and fresh run/route identity before any separately authorized provider call.
+# Only implementer and breach_defender opt in to confined diagnostic writes.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: kimi
+  model: kimi-k3
+  effort: max
+  base_url: ${KIMI_BASE_URL}
+  api_key: ${MOONSHOT_API_KEY}
+  feature_admission: diagnostic
+  extra:
+    worker_source: project_locked
+    max_response_tokens: 32768
+
+roles:
+  plan_planner:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  architect_planner:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  architect_critic:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  architect_judge:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  implementer:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+      diagnostic_workspace_write: true
+      timeout_seconds: 1200
+  breach_defender:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+      diagnostic_workspace_write: true
+  impl_breaker:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  breach_judge:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  diff_scope:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  tier_completeness:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  api_contract_fidelity:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768
+  review_conflict_authority:
+    backend: kimi
+    model: kimi-k3
+    effort: max
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 32768

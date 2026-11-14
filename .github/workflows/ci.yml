@@ -1,0 +1,301 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_live:
+        description: Run Docker isolation probes
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Incubator static and package checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: crucible
+    env:
+      ANTHROPIC_API_KEY: ""
+      ANTHROPIC_AUTH_TOKEN: ""
+      ANTHROPIC_BASE_URL: ""
+      CRUCIBLE_BACKEND_CONFIG: ${{ github.workspace }}/crucible/.github/backends-hermetic.yaml
+      CRUCIBLE_PRICING_CONFIG: ${{ github.workspace }}/crucible/.github/pricing-hermetic.yaml
+      CRUCIBLE_LOCAL_API_KEY: ""
+      CRUCIBLE_LOCAL_MODEL: ""
+      CRUCIBLE_LOCAL_URL: ""
+      CRUCIBLE_SWEBENCH_SKIP_DISK_CHECK: "1"
+      CRUCIBLE_DEEPSWE_SKIP_DISK_CHECK: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - name: Check out Crucible
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: crucible
+          persist-credentials: false
+      - name: Check out Assay sibling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: whact2025/assay
+          ref: cdd2f4886333c541d6edb31954563e8332548f8d
+          path: assay
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.11.11"
+          enable-cache: true
+          cache-dependency-glob: |
+            crucible/uv.lock
+            crucible/backends/*_worker/uv.lock
+      - name: Install locked dependencies
+        run: uv sync --frozen --group dev
+      - name: Ruff baseline and source correctness checks
+        run: |
+          uv run --frozen ruff check .
+          uv run --frozen ruff check --select F541,F841,B007,B009,B010,B023,B904,B905 backends common products rubrics tools workflows
+      - name: Type-check execution contracts
+        run: >-
+          uv run --frozen mypy --follow-imports=skip --ignore-missing-imports
+          --check-untyped-defs
+          backends/config.py backends/limits.py backends/roles.py
+          backends/evidence.py backends/tool_authority.py
+          backends/codex_official.py backends/codex_official_worker.py
+          backends/deepseek.py
+          common/benchmark_runtime.py common/docker_engine_control_plane.py
+          common/docker_settlement.py common/docker_workflow_settlement.py
+          common/process_settlement.py common/process_supervisor_contract.py
+          workflows/_outcome.py workflows/_mutation_journal.py
+          workflows/_durable_state.py
+          workflows/_conversation.py workflows/_process_supervisor.py
+          workflows/_process_supervisor_contract.py
+          workflows/_provider_settlement.py workflows/_writer_epoch.py
+          workflows/_control.py workflows/_planner_session.py
+          workflows/_run_policy.py workflows/_readonly_scheduler.py
+          workflows/_writer_scheduler.py workflows/_backends.py workflows/reconcile.py
+      - name: Check published workflow discovery
+        run: |
+          uv run --frozen crucible --list
+          uv run --frozen crucible swebench --help
+          uv run --frozen crucible deepswe --help
+      - name: Audit root dependencies
+        run: |
+          uv export --frozen --group dev --no-emit-project --no-emit-package assay --no-hashes --output-file "${RUNNER_TEMP}/requirements.txt"
+          uv run --frozen pip-audit --strict --requirement "${RUNNER_TEMP}/requirements.txt"
+      - name: Audit isolated Codex and DeepSeek workers
+        run: |
+          for worker in codex deepseek; do
+            uv export --frozen --project "backends/${worker}_worker" --no-emit-project --no-hashes --output-file "${RUNNER_TEMP}/${worker}-requirements.txt"
+            uv run --frozen pip-audit --strict --requirement "${RUNNER_TEMP}/${worker}-requirements.txt"
+          done
+      - name: Audit isolated Kimi worker
+        continue-on-error: true
+        run: |
+          uv export --frozen --project backends/kimi_worker --no-emit-project --no-hashes --output-file "${RUNNER_TEMP}/kimi-requirements.txt"
+          uv run --frozen pip-audit --strict --requirement "${RUNNER_TEMP}/kimi-requirements.txt"
+      - name: Build and verify reproducible root wheel
+        run: |
+          uv build --wheel --out-dir "${RUNNER_TEMP}/wheel-a"
+          uv build --wheel --out-dir "${RUNNER_TEMP}/wheel-b"
+          uv run --frozen python scripts/verify_root_wheel.py --first-directory "${RUNNER_TEMP}/wheel-a" --second-directory "${RUNNER_TEMP}/wheel-b" --source-root . --smoke-runtime
+      - name: Generate environment SBOM
+        run: uv run --frozen cyclonedx-py environment --output-reproducible --output-format JSON --output-file sbom.cdx.json .venv
+      - name: Upload static evidence and SBOM
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: incubator-static-evidence
+          path: |
+            crucible/sbom.cdx.json
+          if-no-files-found: ignore
+
+
+  tests:
+    name: Incubator tests (shard ${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    defaults:
+      run:
+        working-directory: crucible
+    env:
+      ANTHROPIC_API_KEY: ""
+      ANTHROPIC_AUTH_TOKEN: ""
+      ANTHROPIC_BASE_URL: ""
+      CRUCIBLE_BACKEND_CONFIG: ${{ github.workspace }}/crucible/.github/backends-hermetic.yaml
+      CRUCIBLE_PRICING_CONFIG: ${{ github.workspace }}/crucible/.github/pricing-hermetic.yaml
+      CRUCIBLE_LOCAL_API_KEY: ""
+      CRUCIBLE_LOCAL_MODEL: ""
+      CRUCIBLE_LOCAL_URL: ""
+      CRUCIBLE_SWEBENCH_SKIP_DISK_CHECK: "1"
+      CRUCIBLE_DEEPSWE_SKIP_DISK_CHECK: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      COVERAGE_FILE: .coverage.shard-${{ matrix.shard }}
+    steps:
+      - name: Check out Crucible
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: crucible
+          persist-credentials: false
+      - name: Check out Assay sibling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: whact2025/assay
+          ref: cdd2f4886333c541d6edb31954563e8332548f8d
+          path: assay
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.11.11"
+          enable-cache: true
+          cache-dependency-glob: crucible/uv.lock
+      - name: Install locked dependencies
+        run: uv sync --frozen --group dev
+      - name: Enable hosted-runner user namespaces for descriptor tests
+        run: |
+          test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          test "$(unshare -Ur id -u)" = 0
+      - name: Run the complete assigned test modules
+        run: >-
+          uv run --frozen python scripts/test_shard.py --index ${{ matrix.shard }}
+          --plan-out test-shard-plan-${{ matrix.shard }}.json
+      - name: Upload shard coverage and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: incubator-test-shard-${{ matrix.shard }}
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            crucible/.coverage.shard-${{ matrix.shard }}
+            crucible/test-results-${{ matrix.shard }}.xml
+            crucible/test-shard-plan-${{ matrix.shard }}.json
+
+  coverage:
+    name: Incubator test coverage
+    if: always()
+    needs: [tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: crucible
+    steps:
+      - name: Require every test shard
+        working-directory: ${{ github.workspace }}
+        env:
+          TESTS_RESULT: ${{ needs.tests.result }}
+        run: test "${TESTS_RESULT}" = success
+      - name: Check out Crucible
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: crucible
+          persist-credentials: false
+      - name: Check out Assay sibling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: whact2025/assay
+          ref: cdd2f4886333c541d6edb31954563e8332548f8d
+          path: assay
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.11.11"
+          enable-cache: true
+          cache-dependency-glob: crucible/uv.lock
+      - name: Install locked coverage tooling
+        run: uv sync --frozen --group dev
+      - name: Download every shard's evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: incubator-test-shard-*
+          path: crucible
+          merge-multiple: true
+      - name: Require complete current shard evidence
+        run: >-
+          uv run --frozen python -c
+          "from pathlib import Path; from scripts.test_shard import verify_shard_evidence; verify_shard_evidence(Path('.'))"
+      - name: Combine complete coverage and enforce the floor
+        run: |
+          uv run --frozen python -m coverage combine --keep
+          uv run --frozen python -m coverage xml -o coverage.xml
+          uv run --frozen python -m coverage report --fail-under=55
+      - name: Upload combined coverage evidence
+        if: ${{ always() && hashFiles('crucible/coverage.xml') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: incubator-combined-coverage
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            crucible/.coverage
+            crucible/coverage.xml
+
+  gate:
+    name: Incubator quality gate
+    if: always()
+    needs: [quality, tests, coverage]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require static checks, every test shard, and combined coverage
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+        run: |
+          test "${QUALITY_RESULT}" = success
+          test "${TESTS_RESULT}" = success
+          test "${COVERAGE_RESULT}" = success
+
+  live-docker:
+    name: Live Docker isolation probes
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out Crucible
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: crucible
+          persist-credentials: false
+      - name: Check out Assay sibling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: whact2025/assay
+          ref: cdd2f4886333c541d6edb31954563e8332548f8d
+          path: assay
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.11.11"
+      - name: Install locked dependencies
+        working-directory: crucible
+        run: uv sync --frozen --group dev
+      - name: Exercise real container boundaries
+        working-directory: crucible
+        run: uv run --frozen python -m pytest -q -m live_docker --maxfail=1 tests/test_swebench_instance_container_live.py tests/test_workflows_deepswe.py

@@ -1,0 +1,130 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# DeepSWE diagnostic-only Moonshot Kimi workspace-write route.
+#
+# This explicit escape exercises the process-isolated mutation boundary for
+# bounded frontier qualification. It is not E12 Arm C, cannot produce
+# promotion evidence, and does not relax the default KIM-03 writer gate.
+# Source ~/.config/crucible/env before loading it.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: kimi
+  model: kimi-k2.7-code-highspeed
+  base_url: ${KIMI_BASE_URL}
+  api_key: ${MOONSHOT_API_KEY}
+  feature_admission: diagnostic
+  extra:
+    diagnostic_workspace_write: true
+    worker_source: project_locked
+
+roles:
+  # Keep the diagnostic writer's planning and implementation bounds identical
+  # to the dedicated DeepSWE route. Diagnostic admission changes promotion
+  # authority; it must not silently change the role execution envelope.
+  plan_planner:
+    extra:
+      max_response_tokens: 16384
+  architect_planner:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+      max_response_tokens: 16384
+  implementer:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+      timeout_seconds: 1200
+  architect_critic:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  architect_judge:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  breach_defender:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  impl_breaker:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  breach_judge:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  diff_scope:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  tier_completeness:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  api_contract_fidelity:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked
+  review_conflict_authority:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      worker_source: project_locked

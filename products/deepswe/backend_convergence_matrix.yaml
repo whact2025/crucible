@@ -1,0 +1,193 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Provider-free planning authority for the bounded DeepSWE quality pilot.
+#
+# This file does not authorize transport, spend, ranking, promotion, formal
+# E12 execution, or reuse of the proposed argv below. A future source-owned
+# launcher must independently authenticate successful successor canaries,
+# frozen execution routes/runtimes, process containment, and explicit spend.
+
+schema_version: crucible.deepswe-backend-convergence-matrix.v1
+workflow: deepswe
+cohort_id: deepswe-astra-mythos51-kimi-quality-pilot-20260914-v1
+
+authority:
+  provider_calls: false
+  live_dispatch: false
+  spend_authorized: false
+  diagnostic_only: true
+  ranking_admission: false
+  promotion_admission: false
+  formal_e12_execution_admission: false
+  adaptive_feedback: false
+
+corpus:
+  id: deep-swe-1-1-frontier-abc-20260802-v19
+  git_commit: e016041a6ccf8da29906afc9a3f5a8df940a1f78
+  git_tree: da6af978736343573c9f9560648c7a7f5e527a73
+  clean_status_sha256: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  manifest: tasks/manifest.json
+  manifest_schema: "1.0"
+  manifest_sha256: sha256:f987b656fe75e20eeb7a050ec1b3c5d692cc8f102dfe7caca45906616b5ae879
+  task_count: 113
+
+selection:
+  algorithm: exact-audited-list-sha256-counterbalanced-v1
+  seed: deepswe-astra-mythos51-kimi-quality-pilot-20260914-v1
+  languages: [go, javascript, python, rust, typescript]
+  per_language: 2
+  exclusions:
+    task_ids:
+      - adaptix-name-mapping-aliases
+      - ts-pattern-match-each
+    repos:
+      - prometheus/prometheus
+  tasks:
+    - task_id: participle-grammar-conflict-analysis
+      repo: alecthomas/participle
+      language: go
+      category: feature_request
+      replicate_orders: [ABC, BCA, CAB]
+    - task_id: kea-atomic-signal-selectors
+      repo: keajs/kea
+      language: typescript
+      category: feature_request
+      replicate_orders: [BCA, CAB, ABC]
+    - task_id: abs-stepped-slices
+      repo: abs-lang/abs
+      language: go
+      category: feature_request
+      replicate_orders: [CAB, ABC, BCA]
+    - task_id: obsidian-linter-scoped-ignore-markers
+      repo: platers/obsidian-linter
+      language: typescript
+      category: feature_request
+      replicate_orders: [ABC, BCA, CAB]
+    - task_id: bandit-interprocedural-taint-checks
+      repo: PyCQA/bandit
+      language: python
+      category: feature_request
+      replicate_orders: [BCA, CAB, ABC]
+    - task_id: yjs-map-conflict-detection
+      repo: yjs/yjs
+      language: javascript
+      category: feature_request
+      replicate_orders: [CAB, ABC, BCA]
+    - task_id: boa-hierarchical-evaluation-cancellation
+      repo: boa-dev/boa
+      language: rust
+      category: feature_request
+      replicate_orders: [ABC, BCA, CAB]
+    - task_id: vulture-persistent-analysis-cache
+      repo: jendrikseipp/vulture
+      language: python
+      category: feature_request
+      replicate_orders: [BCA, CAB, ABC]
+    - task_id: testem-bail-on-test-failure
+      repo: testem/testem
+      language: javascript
+      category: feature_request
+      replicate_orders: [CAB, ABC, BCA]
+    - task_id: fd-deterministic-multi-key-sorting
+      repo: sharkdp/fd
+      language: rust
+      category: feature_request
+      replicate_orders: [ABC, BCA, CAB]
+
+roles:
+  - architect_planner
+  - architect_critic
+  - architect_judge
+  - implementer
+  - breach_defender
+  - impl_breaker
+  - breach_judge
+  - diff_scope
+  - tier_completeness
+  - api_contract_fidelity
+  - review_conflict_authority
+
+arms:
+  A:
+    id: codex-astra
+    backend: codex
+    runtime_backend: codex
+    transport: legacy_app_server
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    evidence_status: diagnostic
+    routing: backends_codex_astra.yaml
+    routing_sha256: sha256:3380b297a17c987f24a99de58fb7bb8cc6324d1df035cbbb18893bda50cf66e3
+    static_routing_fingerprint: sha256:1ca6960f903777f41f19252fbe2204b4a0b85dd9c92623f5bbb59e33b26c300b
+  B:
+    id: claude-mythos51
+    backend: claude
+    runtime_backend: claude
+    transport: claude_agent_sdk
+    model: claude-mythos-5-1
+    effort: high
+    feature_admission: enforce
+    evidence_status: diagnostic
+    routing: backends_claude_mythos51_org.yaml
+    routing_sha256: sha256:cd0f24b34a8fd8ada2a4feb7b5e8489986b3f641711e815ffd71dc14f0f02d74
+    static_routing_fingerprint: sha256:7182ce19381b6660b75f0c36f6fe309650c2d97f3aa20a2d7813a4fc8c4fab32
+  C:
+    id: kimi-k2.7-highspeed-diagnostic
+    backend: kimi
+    runtime_backend: kimi
+    transport: kimi_agent_sdk_worker
+    model: kimi-k2.7-code-highspeed
+    effort: null
+    feature_admission: diagnostic
+    evidence_status: diagnostic
+    routing: backends_kimi_sdk_diagnostic.yaml
+    routing_sha256: sha256:0e772e66620c898592eb6ea48cbaf976a6de561363cfca8f370db01bf81a2c4b
+    static_routing_fingerprint: sha256:1f8d11259eceefe784a77ac87a1b7287dc474c92bc1c3a861c248170f40914b4
+
+execution:
+  phase: quality_pilot
+  tasks: 10
+  replicates_per_task: 3
+  arms_per_block: 3
+  scheduled_blocks: 30
+  scheduled_cells: 90
+  max_parallel_cells: 3
+  max_parallel_per_backend: 1
+  first_block_serial: true
+  first_block_task_id: participle-grammar-conflict-analysis
+  first_block_replicate: 1
+  first_block_gate: all-three-terminal-settled-before-other-blocks
+  dependency_condition: predecessor-any-terminal-and-settled
+  ready_queue_policy: matrix-task-order-then-replicate-then-order-index
+  max_turns: 90
+  planner_count: 3
+  backend_limit_mode: diagnostic
+  backend_limit_deadline_seconds: 1200
+  planner_tool_call_limit: 32
+  planner_tool_result_bytes: 262144
+  max_patch_bytes: 67108864
+  task_timeout_seconds: 5400
+  outer_timeout_seconds: 5700
+  storage_limit_bytes: 21474836480
+  budget:
+    per_cell_soft_usd: "12"
+    nominal_usd: "1080"
+    usd_enforcement: request-bound-post-hoc-lockout
+    hard_provider_spend_cap: false
+    spend_authorized: false
+
+analysis:
+  implementation:
+    schema: crucible.deepswe-backend-convergence-analysis.v1
+    path: backend_convergence_analysis.py
+    sha256: sha256:1629b326ada7c7f375b148a9254ae979636a4eacc1264bc6f191a2bd503feeef
+  purpose: descriptive-diagnostic-only
+  result_set_policy: exact-scheduled-cell-and-closed-terminal-status-bijection
+  publication_rule: complete-valid-evidence-only
+  ranking_admission: false
+  promotion_admission: false
+  complete_cost_evidence_required: true
+  complete_trace_evidence_required: true
+  complete_settlement_evidence_required: true

@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Run-local-binding SWE-bench diagnostic profile for native DeepSeek Responses.
+#
+# The adapter is fixed to DeepSeek V4 Flash, the first-party Responses host,
+# high reasoning, one physical attempt, and the project-owned locked worker.
+# A bound run-local copy is usable for diagnostic workflow routing. Only the
+# explicitly opted-in implementer and breach_defender roles admit confined
+# diagnostic workspace writes. Prompt-only structured output with deterministic
+# Crucible validation is admitted; provider-native constrained output is not.
+# DSK-00b/DSK-02 still block promotion and formal comparison. The installed
+# worker fingerprint contains host paths, so a real diagnostic must derive a
+# run-local copy of this file and add
+# ``expected_worker_runtime_fingerprint`` from the provider-free capture API.
+# This checked-in profile reads no credential and authorizes no provider call.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: deepseek
+  model: deepseek-v4-flash
+  feature_admission: diagnostic
+  extra:
+    max_response_tokens: 32000
+    timeout_seconds: 600
+
+roles:
+  architect_planner:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  architect_critic:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  architect_judge:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  implementer:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  breach_defender:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      diagnostic_workspace_write: true
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  swebench_impl_breaker:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  breach_judge:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  diff_scope:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  tier_completeness:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600
+
+  review_conflict_authority:
+    backend: deepseek
+    model: deepseek-v4-flash
+    feature_admission: diagnostic
+    extra:
+      max_response_tokens: 32000
+      timeout_seconds: 600

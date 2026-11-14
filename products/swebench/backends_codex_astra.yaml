@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Explicit Codex/Astra route for SWE-bench backend-convergence runs.
+#
+# This profile is separate from the historical E12 Arm A route in
+# ``backends_codex_only.yaml``, which remains frozen on GPT-5.6 Sol. Every
+# SWE-bench role is pinned here so a comparison cannot acquire a different
+# backend, model, effort, admission mode, or credential authority through
+# default fall-through. There is no provider, model, endpoint, or credential
+# fallback.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: codex
+  model: gpt-6-astra
+  effort: max
+  feature_admission: enforce
+  extra:
+    credential_source: chatgpt_session
+
+roles:
+  architect_planner:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  architect_critic:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  architect_judge:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  implementer:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  breach_defender:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  swebench_impl_breaker:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  breach_judge:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  diff_scope:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  tier_completeness:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session
+
+  review_conflict_authority:
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    feature_admission: enforce
+    extra:
+      credential_source: chatgpt_session

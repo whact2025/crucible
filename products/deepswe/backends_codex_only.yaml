@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Explicit DeepSWE frontier Arm A route.
+#
+# The built-in route now selects GPT-6 Astra. This frozen GPT-5.6 Sol route
+# remains a distinct, hashed Arm A artifact with private ChatGPT-session
+# credential authority.
+# ``CodexBackend.attach_toolset`` adds Crucible's role-scoped tools through
+# streamable HTTP MCP while capability checks constrain each role.
+#
+# DeepSWE-specific deltas vs products/swebench/backends_codex_only.yaml:
+# - Breaker rubric is ``impl_breaker`` (generic LLM Breaker), NOT
+#   ``swebench_impl_breaker``. DeepSWE has no FAIL_TO_PASS table; the rubric
+#   attacks
+#   alternative interpretations of the instruction.md enumerated
+#   behaviors. See products/deepswe/spec_synthesis.py::
+#   DEEPSWE_BREACH_POLICY.
+# - Planning/review roles use ``high`` reasoning to bound the cost of the
+#   non-mutating convergence loop. Implementation and Breaker roles retain the
+#   lane's ``max`` provider-quality setting.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: codex
+  model: gpt-5.6-sol
+  effort: max
+  extra:
+    credential_source: chatgpt_session
+
+roles:
+  # Planner — source inspection is provided only by build_source_tools(ctx).
+  architect_planner:
+    backend: codex
+    model: gpt-5.6-sol
+    effort: high
+
+  architect_critic:
+    backend: codex
+    model: gpt-5.6-sol
+    effort: high
+
+  architect_judge:
+    backend: codex
+    model: gpt-5.6-sol
+    effort: high
+
+  # Implementer — uses Crucible's scoped source/write ToolSet; workflow-owned
+  # code performs project execution in the authoring container.
+  implementer:
+    backend: codex
+    model: gpt-5.6-sol
+
+  # Breach Defender — same scoped edit surface as implementer.
+  breach_defender:
+    backend: codex
+    model: gpt-5.6-sol
+
+  # Breach Breaker (impl_breaker.yaml) — generic LLM Breaker.
+  # DeepSWE-shaped: attacks alternative interpretations of the
+  # instruction.md's enumerated expected behaviors rather than
+  # FAIL_TO_PASS test ids (which DeepSWE doesn't carry).
+  impl_breaker:
+    backend: codex
+    model: gpt-5.6-sol
+
+  # Breach Judge — single-shot verdict (no tools by design).
+  breach_judge:
+    backend: codex
+    model: gpt-5.6-sol

@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+_traces/
+*.tracy
+*.log
+# Operator-local state under .crucible/ — keep untracked except the vLLM example.
+.crucible/*
+!.crucible/local_vllm.example.yaml
+tmp*.yaml
+pytest-of-*/
+crucible-regression
+.coverage

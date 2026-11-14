@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+[run]
+branch = True
+source = .
+omit =
+    .venv/*
+    .claude/*
+    tests/*
+
+[report]
+show_missing = True
+skip_covered = True
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:

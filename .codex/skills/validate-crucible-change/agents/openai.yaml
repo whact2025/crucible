@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Validate Crucible Change"
+  short_description: "Run scope-aware Crucible release validation"
+  default_prompt: "Use $validate-crucible-change to validate this change against Crucible contracts."

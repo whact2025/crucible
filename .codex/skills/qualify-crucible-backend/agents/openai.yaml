@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Qualify Crucible Backend"
+  short_description: "Qualify an exact fail-closed backend route"
+  default_prompt: "Use $qualify-crucible-backend to qualify this exact provider route for Crucible."

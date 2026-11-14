@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+hermetic-no-network:
+  input_per_mtok: 0.0
+  output_per_mtok: 0.0
+  cache_write_per_mtok: 0.0
+  cache_read_per_mtok: 0.0

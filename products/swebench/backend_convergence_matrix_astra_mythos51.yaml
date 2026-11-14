@@ -1,0 +1,228 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Provider-free definition of the Astra/Mythos 5.1 SWE-bench convergence matrix.
+# Loading this file makes no provider call. Every v2 phase is permanently
+# diagnostic and non-promotional. Any future promotion experiment requires a
+# separately versioned launcher, evaluator, qualification, and result contract.
+
+schema_version: crucible.swebench-backend-convergence-matrix.v2
+workflow: swebench
+
+dataset:
+  id: princeton-nlp/SWE-bench_Verified:test
+  split: test
+  revision: c104f840cc67f8b6eec6f759ebc8b2693d585d4a
+  source_file: data/test-00000-of-00001.parquet
+  source_sha256: sha256:a45b1fe4e2f0c8390b2b2938ac83e92ed5979000856808f3679c07812e9e6dcd
+  export_algorithm: pyarrow-read-table-to-pylist-json-dumps-indent2-v1
+  row_count: 500
+  sha256: sha256:1001dcfee9f23df1c084b17ec5f2440d4608fb6972c60303ed1d0c60e3c9493a
+
+selection:
+  algorithm: sha256-ranked-and-block-interleaved-by-stratum-v1
+  seed: swebench-astra-mythos51-convergence-20260914-v2
+  strata:
+    astropy: astropy/astropy
+    django: django/django
+    matplotlib: matplotlib/matplotlib
+    requests: psf/requests
+    xarray: pydata/xarray
+    pylint: pylint-dev/pylint
+    pytest: pytest-dev/pytest
+    sklearn: scikit-learn/scikit-learn
+    sphinx: sphinx-doc/sphinx
+    sympy: sympy/sympy
+
+# Every paid workflow role stays on one backend/model within an arm.  The
+# route-file loader also covers future roles through the exact default route.
+roles:
+  - architect_planner
+  - architect_critic
+  - architect_judge
+  - implementer
+  - breach_defender
+  - swebench_impl_breaker
+  - breach_judge
+  - diff_scope
+  - tier_completeness
+  - review_conflict_authority
+
+arms:
+  A:
+    id: codex-astra
+    backend: codex
+    model: gpt-6-astra
+    effort: max
+    routing: backends_codex_astra.yaml
+    routing_sha256: sha256:a37943e368ce3681b38e5e13311fc7dc04c21acec53868b3819515b44ea98ff7
+    routing_fingerprint: sha256:7a4c68690f7eb06fa707e6f48182cefa2318c267e95880f1f838048ac2b1384c
+  B:
+    id: claude-mythos51
+    backend: claude
+    model: claude-mythos-5-1
+    effort: high
+    routing: backends_claude_mythos51_org.yaml
+    routing_sha256: sha256:5a19919c4d7cdd8ce90bbb060d31165026032780654daae5e1e579e85354c877
+    routing_fingerprint: sha256:ee99b26f50ba7d9a7d5f155d3ccf2e7d35f0968226e11eda31306f4c20a48c12
+
+phases:
+  # Previously exercised tasks are intentionally calibration-only.  Their
+  # outcomes can guide workflow fixes but cannot support a promotion claim.
+  calibration:
+    purpose: historical-broad10-workflow-and-transport-calibration
+    prerequisite_phase: null
+    task_ids:
+      - astropy__astropy-12907
+      - astropy__astropy-13033
+      - django__django-10097
+      - django__django-10554
+      - pytest-dev__pytest-10051
+      - pytest-dev__pytest-10081
+      - scikit-learn__scikit-learn-10297
+      - scikit-learn__scikit-learn-10844
+      - sympy__sympy-11618
+      - sympy__sympy-12096
+    per_stratum: {}
+    replicates: 1
+    stability_replicates: null
+    stability_per_stratum: 0
+    adaptive_feedback: allowed
+    promotion_evidence: false
+    evaluate_inline: true
+
+  # Twenty matrix-disjoint tasks, two from each primary repository stratum.
+  # Three separately rooted paired attempts expose observed run-to-run
+  # variation; the provider transports do not offer seeded replay.
+  pilot:
+    purpose: matrix-disjoint-stratified-workflow-convergence-pilot
+    prerequisite_phase: calibration
+    task_ids: []
+    per_stratum:
+      astropy: 2
+      django: 2
+      matplotlib: 2
+      requests: 2
+      xarray: 2
+      pylint: 2
+      pytest: 2
+      sklearn: 2
+      sphinx: 2
+      sympy: 2
+    replicates: 3
+    stability_replicates: null
+    stability_per_stratum: 0
+    # Results remain sealed until every pilot cell terminates. Findings may
+    # inform a newly versioned later matrix, never mutate this pilot in place.
+    adaptive_feedback: forbidden
+    promotion_evidence: false
+    evaluate_inline: true
+
+  # One hundred tasks disjoint from earlier phases in this matrix. They are
+  # not claimed to be globally unexposed: prior full-dataset runs exist. Two
+  # per stratum are selected in advance for three attempts; all others run
+  # once. Feedback is forbidden until the phase is complete. This v2 phase can
+  # never become promotional retroactively.
+  heldout:
+    purpose: disjoint-stratified-backend-convergence-validation
+    prerequisite_phase: pilot
+    task_ids: []
+    per_stratum:
+      astropy: 11
+      django: 11
+      matplotlib: 11
+      requests: 6
+      xarray: 11
+      pylint: 8
+      pytest: 11
+      sklearn: 11
+      sphinx: 10
+      sympy: 10
+    replicates: 1
+    stability_replicates: 3
+    stability_per_stratum: 2
+    adaptive_feedback: forbidden
+    promotion_evidence: false
+    evaluate_inline: true
+
+execution:
+  # Cross-backend parallelism halves serial wall time while avoiding
+  # same-backend session/rate-limit contention in v2.
+  # This exact v2-only namespace prevents cell-root reuse if a caller supplies
+  # the same output-root argument to both matrix generations.
+  output_namespace: swebench-astra-mythos51-v2
+  max_parallel_cells: 2
+  max_parallel_per_backend: 1
+  # Keep the ambient fallback absent so every future dispatch remains bound to
+  # its explicit cell route even if argument plumbing is omitted or regresses.
+  forbidden_environment_variables:
+    - CRUCIBLE_BACKEND_CONFIG
+  dependency_condition: any-terminal
+  ready_queue_policy: paired-successor-first
+  pair_order_algorithm: within-stratum-alternating-balanced-v1
+  max_turns: 90
+  planner_count: 3
+  budget_usd_per_instance: 12
+  eval_timeout_seconds: 7200
+  include_breach: true
+  include_review: true
+  build_verify: true
+
+# Task selection is deterministic. Provider sampling reproducibility is
+# uncontrolled because the current first-party session transports expose no
+# seed. Separately rooted attempts measure observed run-to-run variation; they
+# are neither seeded replays nor guaranteed independent draws.
+analysis:
+  implementation:
+    schema: crucible.swebench-backend-convergence-analysis.v2
+    path: backend_convergence_analysis_astra_mythos51.py
+    sha256: sha256:4209cee86a7676014e6ad5e0a05cfef23364edabd7cce71c202ccdd80427bd70
+  comparison_unit: paired-task-at-primary-replicate
+  provider_sampling_seed: unavailable
+  primary_endpoint: paired-intention-to-treat-resolved-pass-at-1-arm-a-minus-arm-b
+  primary_success_predicate: eval-status-exactly-resolved
+  primary_delta_direction: arm-a-minus-arm-b
+  primary_publication_rule: complete-valid-phase-only
+  primary_replicate: 1
+  primary_task_weighting: equal-per-selected-task
+  primary_stratum_aggregation: selected-task-count-weighted
+  primary_cell_denominator: all-replicate-1-cells
+  secondary_attempt_denominator: all-scheduled-cells
+  result_set_policy: exact-scheduled-cell-id-bijection
+  duplicate_result_treatment: phase-invalid-primary-suppressed
+  unplanned_result_treatment: phase-invalid-primary-suppressed
+  unknown_terminal_status_treatment: phase-invalid-primary-suppressed
+  failure_funnel_policy: exact-one-category-per-terminal-eval-status-v1
+  stability_estimand: equal-task-mean-within-task-all-replicate-pair-binary-resolution-agreement
+  interval_method: sha256-task-within-stratum-paired-percentile-bootstrap-v1
+  interval_quantile_method: nearest-rank-one-based
+  bootstrap_task_order: selected-task-order-filtered-by-stratum
+  bootstrap_index_derivation: sha256-utf8-seed-nul-zero-based-sample-nul-stratum-nul-zero-based-draw-big-endian-modulo-stratum-size-v1
+  bootstrap_stratum_sample_size: original-selected-task-count
+  bootstrap_stratum_weighting: original-selected-task-count
+  analysis_seed: swebench-astra-mythos51-analysis-20260914-v2
+  bootstrap_resamples: 10000
+  confidence_level: "0.95"
+  terminal_cell_requirement: exactly-one-per-scheduled-cell
+  infrastructure_failure_treatment: accepted-terminal-status-scores-zero-unless-resolved
+  cost_or_trace_incomplete_treatment: phase-incomplete-primary-suppressed
+  missing_result_treatment: phase-incomplete-primary-suppressed
+  identity_drift_treatment: phase-invalid-primary-suppressed
+  safety_violation_treatment: phase-invalid-primary-suppressed
+  phase_completion_requirement: all-cells-terminal-identity-valid-cost-trace-complete
+  complete_cost_evidence_required: true
+  complete_trace_evidence_required: true
+  safety_gate: zero-authority-or-unsettled-writer-violations
+  latency_interpretation: diagnostic-under-concurrency
+  metrics:
+    - primary_resolved_pass_at_1_by_arm
+    - primary_paired_resolution_delta
+    - primary_paired_both_resolve_rate
+    - primary_paired_either_resolves_rate
+    - primary_paired_disagreement_rate
+    - all_attempt_failure_funnel_by_arm
+    - all_attempt_submitted_patch_rate_by_arm
+    - all_attempt_safety_gate_block_rate_by_arm
+    - all_attempt_cost_usd_by_arm
+    - all_attempt_wall_time_seconds_by_arm
+    - within_task_replicate_agreement_by_arm

@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# SWE-bench A/B/C Arm C — dedicated Moonshot Kimi Agent SDK backend.
+#
+# `backend: kimi` resolves only to KimiBackend. It never aliases the
+# NVIDIA OpenAI-compatible diagnostic adapter. The optional Kimi dependency,
+# Moonshot endpoint/token, and exact K2.7 Code model are preflight
+# requirements; failure makes the arm unavailable rather than selecting
+# another backend/model.
+#
+#   source ~/.config/crucible/env
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: kimi
+  base_url: ${KIMI_BASE_URL}
+  api_key: ${MOONSHOT_API_KEY}
+  model: kimi-k2.7-code-highspeed
+  feature_admission: enforce
+  extra:
+    worker_source: project_locked
+
+roles:
+  # K2.7 counts private reasoning inside max_tokens. Keep a cautious 16K
+  # planner allowance while leaving non-planner routes at the qualified 32K
+  # adapter default.
+  plan_planner:
+    extra:
+      max_response_tokens: 16384
+  architect_planner:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+      max_response_tokens: 16384
+  architect_critic:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  architect_judge:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  implementer:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  breach_defender:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  swebench_impl_breaker:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  breach_judge:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  diff_scope:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  tier_completeness:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked
+  review_conflict_authority:
+    backend: kimi
+    base_url: ${KIMI_BASE_URL}
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.7-code-highspeed
+    feature_admission: enforce
+    extra:
+      worker_source: project_locked

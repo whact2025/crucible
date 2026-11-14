@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Immutable provider-lane definitions for the E12 SWE-bench comparison.
+#
+# This file contains no credential and does not authorize a live call.
+# ``workflows._abc_evaluation.preflight_e12`` additionally requires fresh,
+# exact-route qualification evidence for every arm. The version-2 Codex Max
+# lane remains blocked until fresh route-fingerprint-bound evidence closes
+# CDX-01-MAX. Kimi remains blocked until KIM-03's dependency gate closes and
+# Moonshot supplies an immutable deployment revision for a comparable cohort.
+
+schema_version: crucible.e12.arms.v2
+workflow: swebench
+
+roles:
+  - architect_planner
+  - architect_critic
+  - architect_judge
+  - implementer
+  - breach_defender
+  - swebench_impl_breaker
+  - breach_judge
+  - diff_scope
+  - tier_completeness
+  - review_conflict_authority
+
+arms:
+  A:
+    backend: codex
+    model: gpt-5.6-sol
+    effort: max
+    quality_setting: max
+    routing: backends_codex_only.yaml
+    promotion_gate: blocked
+    gate_ticket: CDX-01-MAX
+
+  B:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+    quality_setting: high
+    routing: backends_claude_opus5_org.yaml
+    promotion_gate: qualified
+    gate_ticket: CLD-02
+
+  C:
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    effort: null
+    quality_setting: high
+    routing: backends_kimi_sdk.yaml
+    promotion_gate: blocked
+    gate_ticket: KIM-03

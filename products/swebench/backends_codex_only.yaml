@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Explicit SWE-bench frontier Arm A route.
+#
+# The built-in route now selects GPT-6 Astra. This frozen GPT-5.6 Sol route
+# remains a distinct, hashed Arm A artifact with private ChatGPT-session
+# credential authority.
+#
+# Codex authenticates through ``codex login``. Crucible attaches role-scoped
+# tools through a streamable-HTTP MCP server and disables Codex's native shell
+# for benchmark-container authoring roles.
+# Token usage comes from Codex SDK events and is priced by Crucible's model
+# table for budget enforcement and post-run attribution.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: codex
+  model: gpt-5.6-sol
+  effort: max
+  extra:
+    credential_source: chatgpt_session
+
+roles:
+  # Planner — source inspection is provided only by build_source_tools(ctx).
+  architect_planner:
+    backend: codex
+    model: gpt-5.6-sol
+
+  architect_critic:
+    backend: codex
+    model: gpt-5.6-sol
+
+  architect_judge:
+    backend: codex
+    model: gpt-5.6-sol
+
+  # Implementer — uses Crucible's scoped source/write ToolSet; workflow-owned
+  # code performs project execution in the authoring container.
+  implementer:
+    backend: codex
+    model: gpt-5.6-sol
+
+  # Breach Defender — same scoped edit surface as implementer.
+  breach_defender:
+    backend: codex
+    model: gpt-5.6-sol
+
+  # Breach Breaker (swebench_impl_breaker.yaml) — single-shot
+  # adversarial test author. No tools needed by design.
+  swebench_impl_breaker:
+    backend: codex
+    model: gpt-5.6-sol
+
+  # Breach Judge — single-shot verdict.
+  breach_judge:
+    backend: codex
+    model: gpt-5.6-sol

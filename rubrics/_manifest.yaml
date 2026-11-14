@@ -1,0 +1,817 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Executable contracts for every bundled Crucible reviewer.
+# Criterion/category pairing, output rules, target closure, and judge outcomes
+# are runtime-validated; rubric YAML contains only role-specific instructions.
+
+schema_version: crucible.rubric-manifest.v2
+rubrics:
+  plan_selection:
+    family: planning
+    role: judge
+    status: active
+    artifact_kind: hash_bound_competing_plans
+    required_context: []
+    allowed_decisions:
+    - pass
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    criterion_results: required
+    criterion_categories:
+      plan_choice:
+      - selected
+      - synthesized
+      - no_selection
+    output:
+      proposal: exactly_one
+      attack_spec: forbidden
+      replacement_default: required
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: exactly_one
+      cases:
+      - decision: pass
+        category: selected
+        finding_id: plan_selection
+        severity: Low
+        disposition: addressed
+      - decision: pass
+        category: synthesized
+        finding_id: plan_selection
+        severity: Low
+        disposition: addressed
+      - decision: inconclusive
+        category: no_selection
+        finding_id: plan_selection
+        severity: Low
+        disposition: addressed
+    consumers:
+    - workflows/_plan_selection.py
+  api_contract_fidelity:
+    family: core_review
+    role: reviewer
+    status: active
+    artifact_kind: implementation_diff
+    required_context:
+    - spec_intent
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - spec_intent
+    criterion_categories:
+      api_name:
+      - api_deviation
+      api_shape:
+      - api_deviation
+      api_signature:
+      - api_deviation
+      api_type:
+      - api_deviation
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: required
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/tier.py
+  breach_attack_authority:
+    family: breach
+    role: reviewer
+    status: active
+    artifact_kind: hash_bound_attack_authority_bundle
+    coverage_completeness: artifact_attested
+    artifact_finding_id_closure:
+      schema_version: crucible.breach-authority-admission.v1
+      collection_path:
+      - generated_attacks
+      id_field: attack_id
+    required_context: []
+    allowed_decisions:
+    - pass
+    - inconclusive
+    severity_floor: Low
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    criterion_categories:
+      attack_authority:
+      - compatible
+      - additive
+      - directive_conflict
+      - unsupported
+      - inconclusive
+    output:
+      proposal: forbidden
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/breach.py
+  breach_attack_entailment:
+    family: breach
+    role: reviewer
+    status: active
+    artifact_kind: hash_bound_attack_entailment_bundle
+    coverage_completeness: artifact_attested
+    semantic_inconclusive_requires_response_repair: true
+    artifact_finding_id_closure:
+      schema_version: crucible.breach-attack-entailment.v1
+      collection_path:
+      - attacks
+      id_field: attack_id
+    required_context: []
+    allowed_decisions:
+    - pass
+    - inconclusive
+    severity_floor: Low
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    criterion_categories:
+      attack_entailment:
+      - entailed
+      - not_entailed
+      - inconclusive
+    output:
+      proposal: forbidden
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/breach.py
+  review_conflict_authority:
+    family: core_review
+    role: reviewer
+    status: active
+    artifact_kind: hash_bound_review_conflict_bundle
+    required_context: []
+    allowed_decisions:
+    - pass
+    - inconclusive
+    severity_floor: Low
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    criterion_categories:
+      review_conflict_authority:
+      - actionable
+      - verification_conflict
+      - inconclusive
+    output:
+      proposal: forbidden
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/tier.py
+  breach_judge:
+    family: breach
+    role: judge
+    status: active
+    artifact_kind: attack_execution_bundle
+    required_context: []
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - prior_output
+    criterion_categories:
+      attack_execution:
+      - confirmed_attack
+      - dismissed_attack
+      - surviving_test
+      implementation_correctness:
+      - confirmed_attack
+      - dismissed_attack
+      - fundamental_flaw
+      attack_validity:
+      - confirmed_attack
+      - dismissed_attack
+      approach_viability:
+      - fundamental_flaw
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: all_material
+    target_closure_severity_floor: Medium
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/breach.py
+  deepswe_plan_critic:
+    family: planning
+    role: critic
+    status: active
+    artifact_kind: tier_dag
+    required_context:
+    - spec_intent
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: Medium
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - spec_intent
+    finding_required_source_sets:
+    - - artifact
+      - spec_intent
+    criterion_categories:
+      intent_coverage:
+      - ungrounded_intent
+      - incomplete_increment
+      - other
+      responsibility_size:
+      - under_decomposed
+      - scope_too_broad
+      - incomplete_increment
+      sequencing:
+      - missing_sequencing
+      - parallel_conflict
+      path_grounding:
+      - hallucinated_path
+      - edits_test_files
+      eval_contract:
+      - incomplete_increment
+      - other
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    reject_proof:
+      scope: deepswe_directive
+      authority_label: DeepSWE directive
+    consumers:
+    - workflows/deepswe.py
+  diff_scope:
+    family: core_review
+    role: reviewer
+    status: active
+    artifact_kind: implementation_diff_with_scope
+    required_context:
+    - files_in_scope
+    - creates_paths
+    - dependency_provided_files
+    - directive_intent
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: Medium
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - files_in_scope
+    - creates_paths
+    - dependency_provided_files
+    - directive_intent
+    criterion_categories:
+      declared_scope:
+      - out_of_scope
+      - incidental_change
+      creates_paths:
+      - missing_create
+      forbidden_files:
+      - forbidden_file
+      incidental_changes:
+      - incidental_change
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/review.py
+    - workflows/tier.py
+    - workflows/handoff.py
+  goal_blue:
+    family: goal
+    role: blue
+    status: active
+    artifact_kind: goal_with_red_findings
+    required_context: []
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: Medium
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - prior_output
+    criterion_categories:
+      red_coverage:
+      - canonical_revision
+      - address_ambiguity
+      - add_constraint
+      - replace_citation
+      - add_criterion
+      - split_spec
+      - surface_infeasibility
+      scope_preservation:
+      - canonical_revision
+      - split_spec
+      citation_grounding:
+      - replace_citation
+      criterion_testability:
+      - add_criterion
+      feasibility:
+      - surface_infeasibility
+    output:
+      proposal: exactly_one
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules:
+      - when:
+          category: canonical_revision
+        requirement: required
+    target_closure: all_material
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/goal.py
+  goal_judge:
+    family: goal
+    role: judge
+    status: active
+    artifact_kind: revised_goal_debate
+    required_context: []
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - prior_output
+    criterion_categories:
+      intent_clarity:
+      - ready
+      - watered_down
+      constraint_completeness:
+      - ready
+      - unaddressed_red
+      - watered_down
+      done_criteria:
+      - ready
+      - unaddressed_red
+      - watered_down
+      red_disposition:
+      - ready
+      - unaddressed_red
+      feasibility:
+      - ready
+      - infeasible
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: all_material
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/goal.py
+  goal_red:
+    family: goal
+    role: red
+    status: active
+    artifact_kind: goal_document
+    required_context: []
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    criterion_categories:
+      intent_clarity:
+      - ambiguity
+      - other
+      constraint_completeness:
+      - missing_constraint
+      - other
+      citation_grounding:
+      - phantom_citation
+      done_criteria:
+      - done_criteria_gap
+      scope:
+      - scope_creep
+      feasibility:
+      - feasibility
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/goal.py
+  impl_breaker:
+    family: breach
+    role: breaker
+    status: active
+    artifact_kind: implementation_diff
+    required_context:
+    - spec_intent
+    allowed_decisions:
+    - pass
+    - revise
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - spec_intent
+    criterion_categories:
+      intent_boundary:
+      - edge_case
+      - correctness
+      concurrency:
+      - concurrency
+      edge_case:
+      - edge_case
+      memory:
+      - memory
+      performance:
+      - performance_cliff
+      correctness:
+      - correctness
+      rollback:
+      - rollback_safety
+    output:
+      proposal: forbidden
+      attack_spec: required_each
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    inconclusive_requires_incomplete_coverage: true
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/breach.py
+  plan_critic:
+    family: planning
+    role: critic
+    status: active
+    artifact_kind: tier_dag
+    required_context:
+    - spec_intent
+    - spec_constraints
+    - spec_done_criteria
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - spec_intent
+    - spec_constraints
+    - spec_done_criteria
+    criterion_results: required
+    criterion_source_requirements:
+      intent_coverage:
+        all_of:
+        - artifact
+        any_of:
+        - spec_intent
+        - spec_constraints
+        - spec_done_criteria
+      done_criteria_coverage:
+        all_of:
+        - artifact
+        - spec_done_criteria
+        any_of: []
+    criterion_categories:
+      intent_coverage:
+      - intent_gap
+      - ungrounded_intent
+      - other
+      done_criteria_coverage:
+      - done_criteria_gap
+      - other
+      slice_cohesion:
+      - scope_too_broad
+      prerequisites:
+      - missing_prereq
+      verification:
+      - verify_mode_mismatch
+      dependency_semantics:
+      - parallel_conflict
+      - dependency_mismatch
+      path_grounding:
+      - ungrounded_intent
+      - other
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/plan.py
+    - workflows/architect.py
+  plan_judge:
+    family: planning
+    role: judge
+    status: active
+    artifact_kind: tier_dag_with_critic_history
+    required_context:
+    - spec_intent
+    - spec_constraints
+    - spec_done_criteria
+    - prior_critic_findings
+    - prior_judge_findings
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - spec_intent
+    - spec_constraints
+    - spec_done_criteria
+    - prior_critic_findings
+    - prior_judge_findings
+    criterion_categories:
+      intent_coverage:
+      - intent_gap
+      - other
+      executability:
+      - cycle
+      - parallel_conflict
+      - deletion_violation
+      - other
+      critic_disposition:
+      - unresolved_critic
+      contradiction:
+      - contradiction
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: all_material
+    outcome:
+      cardinality: any
+      cases: []
+    reject_proof:
+      scope: original_intent
+      authority_label: original intent
+    consumers:
+    - workflows/plan.py
+    - workflows/architect.py
+  spec_clarity:
+    family: core_review
+    role: reviewer
+    status: active
+    artifact_kind: spec_or_plan
+    required_context: []
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    criterion_categories:
+      intent_clarity:
+      - ambiguity
+      field_completeness:
+      - missing_field
+      consistency:
+      - contradiction
+      testability:
+      - untestable
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/review.py
+    - workflows/tier.py
+    - workflows/architect.py
+  swebench_impl_breaker:
+    family: breach
+    role: breaker
+    status: active
+    artifact_kind: issue_and_implementation_diff
+    required_context:
+    - spec_intent
+    allowed_decisions:
+    - pass
+    - revise
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - spec_intent
+    criterion_categories:
+      boundary:
+      - unstated_boundary
+      parameter_semantics:
+      - parameter_ambiguity
+      meaning:
+      - broken_meaning
+      invariant:
+      - invariant_drift
+      named_contract:
+      - test_contract_drift
+      recurrence:
+      - incomplete_scope
+    output:
+      proposal: forbidden
+      attack_spec: required_each
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    inconclusive_requires_incomplete_coverage: true
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/breach.py
+  swebench_plan_critic:
+    family: planning
+    role: critic
+    status: active
+    artifact_kind: tier_dag
+    required_context:
+    - spec_intent
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: High
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    - spec_intent
+    criterion_categories:
+      issue_coverage:
+      - under_decomposed
+      - ungrounded_intent
+      - other
+      decomposition:
+      - over_decomposed
+      - under_decomposed
+      sequencing:
+      - over_tiered
+      - parallel_conflict
+      path_grounding:
+      - hallucinated_path
+      - edits_test_files
+      eval_contract:
+      - other
+      named_symbol:
+      - ungrounded_intent
+      - other
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    reject_proof:
+      scope: issue
+      authority_label: issue
+    consumers:
+    - workflows/swebench.py
+  tier_completeness:
+    family: core_review
+    role: reviewer
+    status: active
+    artifact_kind: tier_directives_and_union_diff
+    required_context: []
+    allowed_decisions:
+    - pass
+    - revise
+    - reject
+    - inconclusive
+    severity_floor: Medium
+    completeness: full_required
+    tools: none
+    evidence_sources:
+    - artifact
+    criterion_categories:
+      slice_delivery:
+      - missing_delivery
+      - partial_delivery
+      creates_paths:
+      - missing_create
+      scope_edits:
+      - partial_delivery
+      partial_delivery:
+      - partial_delivery
+      stub_detection:
+      - stub_only
+    output:
+      proposal: required_each
+      attack_spec: forbidden
+      replacement_default: forbidden
+      replacement_rules: []
+    target_closure: none
+    outcome:
+      cardinality: any
+      cases: []
+    consumers:
+    - workflows/tier.py
+    - workflows/architect.py
+    - workflows/review.py

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "crucible-deepseek-worker"
+version = "0.1.0"
+description = "Isolated native DeepSeek Responses transport worker for Crucible"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    # DSK-00a exact-bound package. Update only with a renewed provider,
+    # dependency, runtime, and streamed-wire qualification.
+    "openai==2.53.0",
+]
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crucible_deepseek_worker"]

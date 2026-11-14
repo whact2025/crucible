@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Provider-free inventory of the backend profiles available to DeepSWE.
+#
+# This catalog is metadata, not routing or launch authority. In particular,
+# ``promotion_evidence: false`` applies to every entry. A live experiment must
+# separately bind qualification evidence, resolved credentials/endpoints, and
+# the exact profile bytes in its own versioned execution contract.
+
+schema_version: crucible.backend-profile-catalog.v1
+product: deepswe
+
+roles:
+  - architect_planner
+  - architect_critic
+  - architect_judge
+  - implementer
+  - breach_defender
+  - impl_breaker
+  - breach_judge
+  - diff_scope
+  - tier_completeness
+  - api_contract_fidelity
+  - review_conflict_authority
+
+profiles:
+  codex_astra:
+    routing: backends_codex_astra.yaml
+    backend: codex
+    model: gpt-6-astra
+    transport: legacy_app_server
+    feature_admission: enforce
+    availability: runtime_required
+    runtime_binding: chatgpt_session
+    promotion_evidence: false
+
+  codex_official_sdk_diagnostic:
+    routing: backends_codex_official_sdk_diagnostic.yaml
+    backend: codex
+    model: gpt-5.6-sol
+    transport: official_sdk
+    feature_admission: diagnostic
+    availability: diagnostic
+    runtime_binding: project_locked
+    promotion_evidence: false
+
+  claude_fable51:
+    routing: backends_claude_fable51_org.yaml
+    backend: claude
+    model: claude-fable-5-1
+    transport: claude_agent_sdk
+    feature_admission: enforce
+    availability: runtime_required
+    runtime_binding: claude_session
+    promotion_evidence: false
+
+  claude_mythos51:
+    routing: backends_claude_mythos51_org.yaml
+    backend: claude
+    model: claude-mythos-5-1
+    transport: claude_agent_sdk
+    feature_admission: enforce
+    availability: runtime_required
+    runtime_binding: claude_session
+    promotion_evidence: false
+
+  deepseek_responses_diagnostic:
+    routing: backends_deepseek_diagnostic.yaml
+    backend: deepseek
+    model: deepseek-v4-flash
+    transport: native_responses
+    feature_admission: diagnostic
+    availability: diagnostic
+    runtime_binding: run_local_required
+    promotion_evidence: false
+
+  kimi_sdk:
+    routing: backends_kimi_sdk.yaml
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    transport: kimi_agent_sdk
+    feature_admission: enforce
+    availability: blocked
+    runtime_binding: project_locked
+    promotion_evidence: false
+
+  kimi_sdk_diagnostic:
+    routing: backends_kimi_sdk_diagnostic.yaml
+    backend: kimi
+    model: kimi-k2.7-code-highspeed
+    transport: kimi_agent_sdk
+    feature_admission: diagnostic
+    availability: diagnostic
+    runtime_binding: project_locked
+    promotion_evidence: false
+
+  kimi_k3_sdk_diagnostic:
+    routing: backends_kimi_k3_sdk_diagnostic.yaml
+    backend: kimi
+    model: kimi-k3
+    transport: kimi_agent_sdk
+    feature_admission: diagnostic
+    availability: diagnostic
+    runtime_binding: project_locked
+    promotion_evidence: false
+
+  openai_glm52_diagnostic:
+    routing: backends_inference_hub.yaml
+    backend: openai_compat
+    model: nvidia/zai-org/glm-5.2
+    transport: openai_chat_completions
+    feature_admission: diagnostic
+    availability: diagnostic
+    runtime_binding: configured_endpoint
+    promotion_evidence: false
+
+  openai_kimi26_diagnostic:
+    routing: backends_kimi_inference.yaml
+    backend: openai_compat
+    model: nvidia/moonshotai/kimi-k2.6
+    transport: openai_chat_completions
+    feature_admission: diagnostic
+    availability: diagnostic
+    runtime_binding: configured_endpoint
+    promotion_evidence: false
+
+  local_glm52_diagnostic:
+    routing: backends_local_glm52_diagnostic.yaml
+    backend: local
+    model: nvidia/zai-org/glm-5.2
+    transport: openai_chat_completions
+    feature_admission: diagnostic
+    availability: diagnostic
+    runtime_binding: configured_endpoint
+    promotion_evidence: false

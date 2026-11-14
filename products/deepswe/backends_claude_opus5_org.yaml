@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# DeepSWE A/B/C Arm B — first-party organization Claude Opus 5.
+#
+# Keep every role on this exact Claude Code session route. ClaudeBackend
+# disables model fallback and automatic SDK title/prompt-suggestion calls; a
+# failed Opus 5 preflight makes the arm unavailable. No configured-inference
+# endpoint or credential is admissible. The transport admits only the reviewed
+# Opus CLI compatibility set (Claude Code 2.1.220 or 2.1.261) and pins the
+# resolved executable identity for each invocation.
+#
+# The organization-session transport supports effort but does not expose a
+# qualified hard response-token stop. The three planning/review roles therefore
+# use an explicit medium effort while their output-token ceilings remain the
+# shared DevelopmentBudgetLedger's truthful post-hoc lockout. Do not add a
+# max_tokens/max_response_tokens field here unless that transport capability is
+# qualified and its BackendFeatureSet is upgraded.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: claude
+  model: claude-opus-5
+  effort: high
+  extra:
+    credential_source: claude_session
+    expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+    expected_org_name: NVIDIA Corporation - Power Users
+
+roles:
+  architect_planner:
+    effort: medium
+  architect_critic:
+    effort: medium
+  architect_judge:
+    effort: medium

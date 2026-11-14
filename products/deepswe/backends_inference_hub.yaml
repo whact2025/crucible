@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# DeepSWE routing — NVIDIA Inference Hub through the OpenAI-compatible
+# transport.  This is an explicit opt-in profile; omitting --backend-config
+# retains Crucible's built-in Codex default.
+#
+# Every DeepSWE comparison role explicitly pins the same GLM-5.2 route, and
+# `expected_served_model` rejects response-identity drift. The model's pricing
+# entry is intentionally zero-rate, while token/call telemetry is still
+# recorded. Keep the secret outside the repository:
+#
+#   export INFER_AUTH_TOKEN=...
+#   crucible deepswe --backend-config \
+#     products/deepswe/backends_inference_hub.yaml ...
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: openai_compat
+  base_url: ${INFER_BASE_URL}
+  api_key: ${INFER_AUTH_TOKEN}
+  model: nvidia/zai-org/glm-5.2
+  feature_admission: diagnostic
+  extra:
+    expected_served_model: nvidia/zai-org/glm-5.2
+
+roles:
+  architect_planner:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  architect_critic:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  architect_judge:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  implementer:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  breach_defender:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  impl_breaker:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  breach_judge:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  diff_scope:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  tier_completeness:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  api_contract_fidelity:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic
+  review_conflict_authority:
+    backend: openai_compat
+    base_url: ${INFER_BASE_URL}
+    api_key: ${INFER_AUTH_TOKEN}
+    model: nvidia/zai-org/glm-5.2
+    feature_admission: diagnostic

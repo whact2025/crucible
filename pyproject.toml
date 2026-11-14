@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "crucible"
+version = "0.4.0"
+description = "An adversarial solution-building incubator with SWE-bench and DeepSWE evaluation, built on Assay."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+
+dependencies = [
+    "anthropic>=0.85.0",
+    # Shared async transport security floor: TLS hostname identity, process
+    # supplementary groups, and process-pool stderr deadlock fixes.
+    "anyio>=4.14.2",
+    # Claude is an opt-in backend. The organization-session credential
+    # boundary subclasses the reviewed 0.2.110 subprocess transport, so an
+    # SDK upgrade must be deliberate and accompanied by a transport audit.
+    # Installing from sdist (configured below) avoids bundling another CLI.
+    "claude-agent-sdk==0.2.110",
+    "pyyaml>=6.0",
+    # assay (sibling submodule) — typed-primitives toolkit consumed
+    # by crucible/rules/ and crucible/workflows/.
+    # See assay/docs/ASSAY_ARCHITECTURE.md for the public surface.
+    "assay",
+    "openai>=2.37.0",
+    # evaluator_compat.py guards a reviewed generated-script shape. Keep this
+    # exact until a newer upstream harness is audited against that guard.
+    "swebench==4.1.0",
+    # Security floors for SWE-bench transitives. Keep these direct so a
+    # frozen lock refresh cannot reintroduce the audited vulnerable releases.
+    "datasets>=5.0.1",
+    "gitpython>=3.1.62",
+    "h2>=4.4.1",
+    "soupsieve>=2.9.0",
+    # Directly imported by products/swebench/evaluator_compat.py when it
+    # separates base-existing test files from newly added ones.
+    "unidiff>=0.7.5",
+    # Internal agent tool transport shared by the backend adapters.
+    "mcp==1.28.1",
+    "uvicorn>=0.52.4",
+    "websockets>=16.0,<17.0",
+    # Codex is Crucible's built-in backend, so its transport SDK is part of
+    # the base runtime. A system ``codex`` CLI and ``codex login`` state are
+    # still operational prerequisites.
+    # Exact-bound to the reviewed app-server transport. A lock refresh must
+    # not silently substitute an unqualified implementation.
+    "codex-app-server-sdk==0.3.2",
+]
+
+[project.optional-dependencies]
+# Named install extra for the OpenAI-compatible adapter used with vLLM,
+# llama.cpp, Ollama, TGI, lm-studio, and hosted gateways. ``openai`` is also a
+# base dependency because that adapter is part of the supported core surface.
+local = ["openai>=1.0"]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.16.7",
+    "mypy>=2.3.1",
+    "pip-audit>=2.10.1",
+    "cyclonedx-bom>=7.3.1",
+    "psutil>=5.9",
+]
+
+[project.scripts]
+# `crucible <name> [args]` dispatches to
+# `crucible.workflows.<name>:main` by filesystem convention.
+crucible = "crucible.workflows.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.16.7",
+    "mypy>=2.3.1",
+    "pip-audit>=2.10.1",
+    "cyclonedx-bom>=7.3.1",
+    "psutil>=5.9",
+    "httpx>=0.28.1",
+]
+
+[tool.uv]
+# Install the Claude SDK's Python transport from sdist and use the separately
+# installed system CLI selected by ``backends.claude``.
+no-binary-package = ["claude-agent-sdk"]
+
+[tool.uv.sources]
+assay = { path = "../assay", editable = true }
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+dev-mode-dirs = [".."]
+
+[tool.hatch.build.targets.wheel]
+# Hatch excludes build directories by default; this is an importable tool domain.
+force-include = { "tools/build" = "tools/build" }
+only-include = [
+    ".python-version",
+    "__init__.py",
+    "__main__.py",
+    "constraints.py",
+    "orchestration.py",
+    "pyproject.toml",
+    "uv.lock",
+    "backends",
+    "common",
+    "products",
+    "rubrics",
+    "rules",
+    "scripts",
+    "tools",
+    "workflows",
+]
+sources = { "" = "crucible" }
+exclude = [
+    "**/AGENTS.md",
+    "**/CLAUDE.md",
+    "**/README.md",
+    "**/__pycache__/**",
+    "products/**/tests/**",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".venv", "__pycache__"]
+addopts = "-m 'not live_docker and not llm_live'"
+timeout = 120
+markers = [
+    "e2e: end-to-end tests; may require optional deps or running services",
+    "llm_live: hits a live Anthropic API (cost + key required); skipped when ANTHROPIC_API_KEY is unset — opt in with -m llm_live",
+    "live_docker: hits the local docker daemon + (potentially) pulls multi-GB harness images; skipped when docker is unavailable — opt in with -m live_docker",
+]
+filterwarnings = [
+    "ignore:cannot collect test class:pytest.PytestCollectionWarning",
+]
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [".crucible"]
+
+[tool.ruff.lint]
+# Package-wide catastrophic-error baseline. CI adds a source-only bugbear and
+# unused-value/closure/exception-chain gate without forcing formatting churn
+# through historical tests and archived scripts.
+select = ["E9", "F63", "F7", "F82"]

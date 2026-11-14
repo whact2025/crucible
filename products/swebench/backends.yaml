@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Explicit organization-governed direct Claude Opus 5 profile for SWE-bench.
+#
+# Drop this at <swebench-spec-dir>/.crucible/backends.yaml to apply,
+# or pass `--backend-config /path/to/this/file` to `crucible swebench`.
+# This file is NOT Crucible's default. With no routing file, all roles use
+# Codex + GPT-6 Astra + Max. Selecting this profile intentionally opts the
+# complete cascade into Claude Opus 5. Organization policy forbids any
+# implicit model substitution.
+#
+# Profile rationale:
+#
+# - Every role stays on the same backend/model arm so comparison results do
+#   not confound model quality with role-specific substitution.
+# - ClaudeBackend uses the authenticated organization Claude session, sends
+#   high effort, and never configures endpoint, credential, or model fallback.
+
+schema_version: crucible.backend-routing.v1
+
+default:
+  backend: claude
+  model: claude-opus-5
+  effort: high
+  extra:
+    credential_source: claude_session
+    expected_org_id: 76f2dd92-7d56-4550-afaf-abd363e3235c
+    expected_org_name: NVIDIA Corporation - Power Users
+
+roles:
+  # Explicit role entries make the governed no-fallback policy auditable.
+  architect_planner:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+
+  # Critic and judge are independent invocations and are routed
+  # explicitly so model/cost attribution cannot collapse into planner.
+  architect_critic:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+
+  architect_judge:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+
+  # Implementer: iterates against the planner's directive in a known
+  # workspace using the same frozen Opus 5 arm.
+  implementer:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+
+  # Breach breaker (swebench_impl_breaker.yaml): emits declarative attack
+  # specifications probing alternative interpretations of the issue.
+  # Routes through ``pool.get(args.breaker_rubric)`` in workflows/
+  # breach.py — operators can override this rubric name with
+  # ``crucible breach --breaker-rubric ...`` and the pool will
+  # resolve THIS entry.
+  swebench_impl_breaker:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+
+  # Breach defender: implements the refinement that makes the
+  # breaker's adversarial test pass.
+  breach_defender:
+    backend: claude
+    model: claude-opus-5
+    effort: high
+
+  # Breach judge: arbitrates between breaker's attack and defender's
+  # refinement. Final-arbiter decision-making — Opus.
+  breach_judge:
+    backend: claude
+    model: claude-opus-5
+    effort: high
