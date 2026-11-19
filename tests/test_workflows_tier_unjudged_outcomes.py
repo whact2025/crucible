@@ -396,6 +396,21 @@ def test_smoke_gate_that_could_not_run_ends_slice_inconclusive(
     assert row["smoke_passed"] is False
     assert row["smoke_infrastructure_failure"] is True
     assert row["build_verify"] is None
+    # The Phase 1 event of the slice carries the flag as the summary row does.
+    run_dir = sorted((corpus.spec_dir / "runs").glob("*tier*"))[-1]
+    slice_events = [
+        event
+        for event in map(
+            json.loads,
+            (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines(),
+        )
+        if event.get("phase") == 1
+        and event.get("slice_id") == "s0"
+        and "classification" in event
+    ]
+    assert len(slice_events) == 1
+    assert slice_events[0]["classification"] == "smoke_unavailable"
+    assert slice_events[0]["smoke_infrastructure_failure"] is True
     # No retry of any kind is keyed on the flag.
     assert smoke_calls == ["s0"]
     assert gate_calls == []

@@ -29,8 +29,9 @@ tools; deterministic workflow code owns the verification commands.
 
 A gate that could not run judged nothing. When a round's pre-fix or post-fix
 gate, or the final shipping gate, reports that it produced no evidence (the
-`dev_verify` runner's unavailable flag, or an exact-observation failure of
-kind `infrastructure`), the loop ends `inconclusive_gate_unavailable`: no
+`dev_verify` runner's unavailable flag; round gates also: an
+exact-observation failure of kind `infrastructure`), the loop ends
+`inconclusive_gate_unavailable`: no
 Test Author repair turn, Defender recovery turn, or Judge call follows, and
 the workspace is restored as for every non-accepted end. The kind is the
 runner's own statement, with one exception: a gate command that timed out is

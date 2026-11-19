@@ -476,6 +476,31 @@ def test_run_plan_forwards_cwd_as_assay_project_root(monkeypatch, tmp_path):
     assert captured["project_root"] is None
 
 
+def test_run_plan_cwd_that_is_no_directory_raises_before_any_planner_call(
+    tmp_path,
+):
+    """A ``cwd`` that is not an existing directory raises from Assay.
+
+    The raise comes before the first Planner call.
+    """
+
+    planner = _Backend(json.dumps(_candidate_payload()))
+
+    with pytest.raises(ValueError, match="not an existing directory"):
+        plan_workflow.run_plan(
+            _spec(),
+            corpus=Corpus(tmp_path / "corpus"),
+            cwd=str(tmp_path / "missing"),
+            planner_backend=planner,
+            critic_backend=_Backend(),
+            judge_backend=_Backend(),
+            critic_rubric=load_rubric("spec_clarity"),
+            judge_rubric=load_rubric("spec_clarity"),
+        )
+
+    assert planner.invocations == []
+
+
 def _plan_same_named_project(monkeypatch, tmp_path, *scopes, repairs=0):
     """Plan project ``demo`` whose root holds a real ``demo`` directory.
 

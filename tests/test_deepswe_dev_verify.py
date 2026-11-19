@@ -32,6 +32,7 @@ from typing import Any
 
 import pytest
 
+from crucible.common.runners.observations import PYTEST_OBSERVER_PASSED
 from crucible.common.runners.pytest_policy import PYTEST_DEV_VERIFY_MAXFAIL_ARG
 from crucible.products.deepswe.runners import deepswe_dev_verify as dv
 
@@ -1363,11 +1364,25 @@ def test_malformed_stdin_exit_2():
     assert payload["values"]["dev_verify_runner_protocol_unavailable"] == 1.0
 
 
-def test_declared_probe_runner_error_is_explicitly_unavailable(monkeypatch):
+@pytest.mark.parametrize(
+    ("gate", "expected_rc"),
+    [
+        pytest.param((0, _passing_output("python"), ""), 2, id="gate-passes"),
+        pytest.param(
+            (124, "", "dev_verify timed out"), 124, id="gate-times-out",
+        ),
+    ],
+)
+def test_declared_probe_runner_error_is_explicitly_unavailable(
+    monkeypatch,
+    gate,
+    expected_rc,
+):
+    gate_rc, gate_stdout, gate_stderr = gate
     monkeypatch.setattr(
         subprocess,
         "run",
-        _fake_exec(rc=0, stdout=_passing_output("python")),
+        _fake_exec(rc=gate_rc, stdout=gate_stdout, stderr=gate_stderr),
     )
     monkeypatch.setattr(
         dv,
@@ -1381,9 +1396,13 @@ def test_declared_probe_runner_error_is_explicitly_unavailable(monkeypatch):
 
     rc, payload = _run(params)
 
-    assert rc == 2
-    assert payload["values"]["dev_verify_infrastructure_unavailable"] == 1.0
-    assert payload["values"]["dev_verify_declared_probe_unavailable"] == 1.0
+    # After a gate command that timed out only a later command that never
+    # started is exempt; any other probe error still sets the flag.
+    assert rc == expected_rc
+    values = payload["values"]
+    assert values["dev_verify_candidate_process_returncode"] == float(gate_rc)
+    assert values["dev_verify_infrastructure_unavailable"] == 1.0
+    assert values["dev_verify_declared_probe_unavailable"] == 1.0
 
 
 @pytest.mark.parametrize(
@@ -1749,8 +1768,10 @@ class _ScriptedContainer:
     """Answer the runner's contained commands and keep them in order.
 
     The presence probe and the removal are recognized by the exact script
-    the runner renders for the recorded paths; anything else is the gate.
-    An exception given as an answer is raised, as a host error would be.
+    the runner renders for the recorded paths, and an exact pytest
+    observation, which passes, by its observer module; anything else is the
+    gate.  An exception given as an answer is raised, as a host error would
+    be.
     """
 
     def __init__(
@@ -1793,6 +1814,9 @@ class _ScriptedContainer:
             if self.removal is not None:
                 return self.removal
             return 0, "removed\n" * self._removals[command], ""
+        if "_crucible_exact_pytest_observer" in command:
+            self.calls.append(("observation", container_id, command))
+            return PYTEST_OBSERVER_PASSED, "", ""
         self.calls.append(("gate", container_id, command))
         if isinstance(self.gate, BaseException):
             raise self.gate
@@ -1852,25 +1876,43 @@ def test_gate_created_paths_evidence_is_exact_and_bounded():
         None,
         7,
     ):
-        # Never an exception: the caller continues with an unbound record.
+        # Never an exception: the caller reads ``None`` as nothing it can bind.
         assert dv.gate_created_paths_evidence(unbindable) is None, unbindable
 
 
+@pytest.mark.parametrize(
+    ("breach_round", "kinds"),
+    [
+        pytest.param(False, ["probe", "gate", "removal"], id="tier-gate"),
+        # The observer commands of a breach round are candidate commands too:
+        # the removal is issued after them.
+        pytest.param(
+            True,
+            ["probe", "gate", "observation", "removal"],
+            id="breach-gate",
+        ),
+    ],
+)
 def test_recorded_gate_created_paths_are_removed_after_the_gate_run(
     monkeypatch,
+    breach_round,
+    kinds,
 ):
     container = _ScriptedContainer()
     monkeypatch.setattr(dv, "_run_docker_exec", container)
+    parameters = _gate_created_params()
+    if breach_round:
+        parameters.update(_BREACH_GATE_PARAMETERS)
 
-    rc, payload = _run(_gate_created_params())
+    rc, payload = _run(parameters)
 
     assert rc == 0
-    assert container.kinds() == ["probe", "gate", "removal"]
+    assert container.kinds() == kinds
     assert {candidate for _kind, candidate, _command in container.calls} == {
         "auth123"
     }
     assert container.calls[1][2] == dv._LANG_TO_COMMAND["python"]
-    assert container.calls[2][2] == dv._gate_created_removal_script(
+    assert container.calls[-1][2] == dv._gate_created_removal_script(
         _GATE_CREATED
     )
     values = payload["values"]
@@ -1935,6 +1977,14 @@ def test_gate_created_paths_are_removed_after_a_failing_gate_run(monkeypatch):
             {"removal": (44, "", "")},
             ["probe", "gate", "removal"],
             id="removal-refused",
+        ),
+        # Current behaviour; whether a gate whose tests failed should keep
+        # its own status after a failed removal is an open decision
+        # (deepswe-gate/OI-9/corr-3).
+        pytest.param(
+            {"gate": (1, _PYTEST_FAILING_OUTPUT, ""), "removal": (44, "", "")},
+            ["probe", "gate", "removal"],
+            id="failing-gate-removal-refused",
         ),
         pytest.param(
             {"removal": (0, "removed\nkept\n", "")},

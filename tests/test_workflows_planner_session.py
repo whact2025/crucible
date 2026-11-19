@@ -678,6 +678,78 @@ def test_turn_limit_terminal_after_earlier_turns_charges_the_remaining_ceiling(
     assert handle.turns_used == 5
 
 
+def test_turn_limit_terminal_below_the_session_ceiling_admits_a_further_call(
+    tmp_path: Path,
+) -> None:
+    """An invocation limit below the session's remainder is what is charged.
+
+    Session limit 10, invocation limit 5: the provider reports 6 turns at the
+    turn limit, 5 are charged, and the next call is admitted with the 5
+    turns that remain.
+    """
+
+    backend = _Backend("turn_limit:6", "active")
+    wrapper = planner_session.PlannerBoundaryBackend(
+        backend,
+        conversation=_config(
+            tmp_path,
+            limits=_conversation.ConversationLimits(
+                max_turns=10,
+                max_cost_usd=2.0,
+            ),
+        ),
+    )
+
+    first = wrapper.invoke(_invocation("first"))
+
+    assert isinstance(first.error, MaxTurnsExceeded)
+    assert first.error.turns_used == 6
+    handle = wrapper._controller(_invocation("first")).load()  # noqa: SLF001
+    assert handle is not None
+    assert handle.turns_used == 5
+
+    second = wrapper.invoke(_invocation("second"))
+
+    assert second.error is None
+    assert [item.max_turns for item in backend.invocations] == [5, 5]
+    handle = wrapper._controller(_invocation("second")).load()  # noqa: SLF001
+    assert handle is not None
+    assert handle.turns_used == 6
+
+
+def test_turn_limit_terminal_on_the_fresh_attempt_after_a_stale_reuse(
+    tmp_path: Path,
+) -> None:
+    """The fresh attempt after a stale reuse is charged at its own ceiling.
+
+    One turn is used, the reuse is rejected as stale, and the fresh attempt
+    is admitted with the 4 turns that remain. Its turn-limit terminal reports
+    5; the ledger ends at 1 + 4.
+    """
+
+    backend = _Backend("active", "stale", "turn_limit:5")
+    wrapper = planner_session.PlannerBoundaryBackend(
+        backend,
+        conversation=_config(tmp_path),
+    )
+
+    wrapper.invoke(_invocation("first"))
+    result = wrapper.invoke(_invocation("second"))
+
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.turns_used == 5
+    assert [
+        invocation.conversation.action
+        for invocation in backend.invocations
+        if invocation.conversation is not None
+    ] == ["fresh", "reuse", "fresh"]
+    assert [item.max_turns for item in backend.invocations] == [5, 4, 4]
+    handle = wrapper._controller(_invocation("second")).load()  # noqa: SLF001
+    assert handle is not None
+    assert handle.pending_operation is None
+    assert handle.turns_used == 5
+
+
 def test_turn_limit_terminal_leaves_no_turn_for_a_further_call(
     tmp_path: Path,
 ) -> None:

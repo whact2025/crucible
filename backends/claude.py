@@ -1467,7 +1467,9 @@ def _classify_max_turns(stop_reason: str | None, turns_used: int, turns_limit: i
     exhaust most of its turn budget — misclassifying a legitimate
     completion as a max-turns failure. The SDK's own counter is the
     source of truth; if it didn't say ``max_turns``, the invocation
-    wasn't a max-turns event.
+    wasn't a max-turns event. The provider's turn-limit terminal
+    subtype (``error_max_turns``) is normalised to the canonical stop
+    reason before this check.
     """
     return stop_reason in ("max_turns", "max-turns")
 

@@ -1036,7 +1036,17 @@ def _test_inventory_from_open_tests_tree(
             object_pairs_hook=_reject_duplicate_tests_config_key,
             parse_constant=_reject_nonfinite_tests_config_constant,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+    except DeepSWEInstanceError:
+        # Raised by the two hooks above, each with its own message.
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        # ``json.loads`` raises a plain ``ValueError`` for an integer literal
+        # with more digits than Python converts.
+        ValueError,
+    ) as exc:
         raise DeepSWEInstanceError(
             "tests/config.json is not strict JSON"
         ) from exc

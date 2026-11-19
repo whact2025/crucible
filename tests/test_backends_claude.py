@@ -5267,10 +5267,32 @@ def test_agent_max_turns_terminal_result_prose_is_not_the_typed_reply(
     ] == [("assistant", _TURN_LIMIT_PARTIAL_TEXT)]
 
 
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        pytest.param(
+            lambda: _max_turns_terminal(output_tokens=0),
+            id="provider-subtype",
+        ),
+        pytest.param(
+            lambda: _result_message(
+                stop_reason="max_turns",
+                output_tokens=0,
+                num_turns=5,
+            ),
+            id="canonical-stop-reason",
+        ),
+    ],
+)
 def test_agent_text_free_max_turns_terminal_is_not_an_empty_completion(
     monkeypatch,
+    terminal,
 ):
-    """A tool-only session at its limit is not the retriable stall shape."""
+    """A tool-only session at its limit is not the retriable stall shape.
+
+    That holds for the provider's turn-limit subtype and for a terminal that
+    reports the canonical ``max_turns`` stop reason itself.
+    """
     from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
 
     result, observed = _invoke_turn_limit_streams(
@@ -5286,7 +5308,7 @@ def test_agent_text_free_max_turns_terminal_is_not_an_empty_completion(
                 ],
                 model="claude-opus-5",
             ),
-            _max_turns_terminal(output_tokens=0),
+            terminal(),
         ]],
         on_max_turns="continue_with_warning",
     )
@@ -5299,9 +5321,23 @@ def test_agent_text_free_max_turns_terminal_is_not_an_empty_completion(
     assert _limit_event_names(result) == ["max_turns"]
 
 
+@pytest.mark.parametrize(
+    ("on_max_turns", "error_kind"),
+    [
+        ("raise", "max_turns"),
+        ("continue_with_warning", "transport"),
+    ],
+)
 def test_agent_max_turns_malformed_terminal_is_typed_and_incomplete(
     monkeypatch,
+    on_max_turns,
+    error_kind,
 ):
+    """A malformed turn-limit terminal is incomplete under either policy.
+
+    ``raise`` types it as the turn limit. ``continue_with_warning`` keeps the
+    malformed field's own transport error, which is not retriable.
+    """
     from assay import MaxTurnsExceeded
 
     result, observed = _invoke_turn_limit_streams(
@@ -5310,10 +5346,15 @@ def test_agent_max_turns_malformed_terminal_is_typed_and_incomplete(
             _turn_limit_text_turn(),
             _max_turns_terminal(errors="malformed-terminal-field"),
         ]],
+        on_max_turns=on_max_turns,
     )
 
     assert observed.query_max_turns == [5]
-    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error is not None
+    assert result.error.kind == error_kind
+    assert isinstance(result.error, MaxTurnsExceeded) is (
+        on_max_turns == "raise"
+    )
     assert result.error.retriable is False
     assert result.stop_reason == "max_turns"
     assert result.completeness.terminal_complete is False
@@ -5335,6 +5376,9 @@ def test_agent_max_turns_terminal_requires_served_model_identity(
                 is_error=is_error,
                 model_usage=None,
                 result="unproven content must not be admitted",
+                # ``result`` is never admitted on a turn-limit terminal;
+                # ``structured_output`` is the content the gate withholds.
+                structured_output={"unproven": True},
             ),
         ]],
         on_max_turns=on_max_turns,

@@ -32,6 +32,7 @@ import pytest
 from assay import (
     BackendExecutionEvent,
     BackendExecutionTrace,
+    BudgetExhausted,
     ContentHash,
     Evidence,
     ExecutionCompleteness,
@@ -1247,6 +1248,24 @@ class _LostReviewerBackend(_FailThenPassBackend):
         return super().invoke(invocation)
 
 
+class _BudgetStoppedReviewerBackend(_FailThenPassBackend):
+    """Every reviewer call ends on its budget, with complete evidence."""
+
+    def invoke(self, invocation) -> InvocationResult:
+        if self._is_review(invocation):
+            self.review_calls += 1
+            return replace(
+                _lost_reviewer_result(),
+                stop_reason="budget_exhausted",
+                error=BudgetExhausted(
+                    spent_usd=0.0,
+                    limit_usd=0.5,
+                    message="review budget exhausted",
+                ),
+            )
+        return super().invoke(invocation)
+
+
 class _LostReviewerUnknownUsageBackend(_LostReviewerBackend):
     """The lost reviewer call also reports no usable accounting."""
 
@@ -1972,25 +1991,40 @@ def test_response_contract_exhaustion_never_reimplements_domain_work(
     assert len(retry_manifest["attempts"]) == 9
 
 
-def test_lost_gating_reviewer_ends_review_inconclusive(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("backend_type", "domain"),
+    [
+        pytest.param(_LostReviewerBackend, "infrastructure", id="lost"),
+        # The reviewer backend returns a budget terminal: the summary names
+        # the budget, not an outage.
+        pytest.param(_BudgetStoppedReviewerBackend, "budget", id="budget"),
+    ],
+)
+def test_lost_gating_reviewer_ends_review_inconclusive(
+    tmp_path,
+    monkeypatch,
+    backend_type,
+    domain: str,
+):
     """A reviewer backend that is lost returns no verdict on the candidate.
 
-    The failed call carries complete accounting evidence; with unknown usage
-    the tier ends ``incomplete_accounting`` before it reports the review.
+    The same holds for a reviewer call that ends on its budget. The failed
+    call carries complete accounting evidence; with unknown usage the tier
+    ends ``incomplete_accounting`` before it reports the review.
     """
 
     rc, summary, backend = _run(
         tmp_path,
         monkeypatch,
         retry_budget=2,
-        backend_type=_LostReviewerBackend,
+        backend_type=backend_type,
     )
 
     assert rc == 3
     assert summary["status"] == "review_inconclusive"
     assert summary["phase_4_review_inconclusive"] == {
         "rubric": "tier_completeness",
-        "domain": "infrastructure",
+        "domain": domain,
     }
     outcome = _tier_outcome(tmp_path)
     assert outcome["detail_status"] == "review_inconclusive"
@@ -2010,7 +2044,12 @@ def test_lost_gating_reviewer_with_unknown_usage_ends_incomplete_accounting(
     tmp_path,
     monkeypatch,
 ):
-    """Accounting debt keeps its precedence over ``review_inconclusive``."""
+    """Accounting debt keeps its precedence over ``review_inconclusive``.
+
+    The assertion on ``phase_4_review_inconclusive`` pins today's behaviour:
+    the key stays in the summary under ``incomplete_accounting``. Dropping
+    the key at that return is an open decision (outcome-taxonomy/A-corr-5).
+    """
 
     rc, summary, backend = _run(
         tmp_path,
@@ -2022,6 +2061,10 @@ def test_lost_gating_reviewer_with_unknown_usage_ends_incomplete_accounting(
     assert rc == 1
     assert summary["status"] == "incomplete_accounting"
     assert _tier_outcome(tmp_path)["detail_status"] == "incomplete_accounting"
+    assert summary["phase_4_review_inconclusive"] == {
+        "rubric": "tier_completeness",
+        "domain": "infrastructure",
+    }
     assert summary["costs"]["accounting_debt"] is True
     assert backend.review_calls == 1
     assert backend.implement_calls == 1

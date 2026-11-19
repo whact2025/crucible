@@ -762,6 +762,7 @@ def test_docker_failure_before_the_command_starts_reports_not_started(
     monkeypatch, tmp_path, failure,
 ):
     docker_calls: list[list[str]] = []
+    marker_armed_at_staging: list[bool] = []
     cache_directory = tmp_path / "helper-cache"
     if failure == "inspect_fails":
         monkeypatch.setenv(
@@ -780,15 +781,16 @@ def test_docker_failure_before_the_command_starts_reports_not_started(
         monkeypatch.setenv(
             "CRUCIBLE_DEEPSWE_HELPER_DIR", str(cache_directory),
         )
+        inspected = json.loads(_inspect_payload())
+        inspected[0]["State"]["Running"] = False
 
-        def not_running(*_args, **_kwargs):
-            raise containment.ExecContainmentError(
-                "source container is not running"
+        def not_running(args, **_kwargs):
+            docker_calls.append(list(args[1:]))
+            return subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps(inspected), stderr="",
             )
 
-        monkeypatch.setattr(
-            containment, "_validate_source_container", not_running,
-        )
+        monkeypatch.setattr(containment.subprocess, "run", not_running)
         expected = "source container is not running"
     else:
         docker_calls, _stage_calls = _mock_contained_invocation(
@@ -796,6 +798,11 @@ def test_docker_failure_before_the_command_starts_reports_not_started(
         )
 
         def staging_fails(*_args, **_kwargs):
+            marker_armed_at_staging.append(
+                containment._poison_path(
+                    cache_directory, _CANONICAL_ID,
+                ).is_file()
+            )
             raise containment.ExecContainmentError(
                 "static exec-supervisor staging failed rc=1: no space left"
             )
@@ -820,11 +827,13 @@ def test_docker_failure_before_the_command_starts_reports_not_started(
     assert not any(
         containment._TRUSTED_BINARY in call for call in docker_calls
     )
-    if failure == "inspect_fails":
+    if failure in {"inspect_fails", "not_running"}:
         assert docker_calls == [["inspect", "--", "candidate"]]
     if failure == "staging_fails":
-        # The in-flight marker is withdrawn: nothing ran, so the source stays
-        # usable for the next command.
+        # The in-flight marker was armed when staging ran and is withdrawn
+        # after its failure: nothing ran, so the source stays usable for the
+        # next command.
+        assert marker_armed_at_staging == [True]
         assert not containment._poison_path(
             cache_directory, _CANONICAL_ID,
         ).exists()

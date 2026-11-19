@@ -251,8 +251,10 @@ def _turns_used(result: InvocationResult, *, admitted_turns: int) -> int:
     if isinstance(error, MaxTurnsExceeded):
         # A turn-limit terminal may count the turn the provider refused to
         # start (Claude CLI: num_turns == limit + 1 after ``limit`` requests).
-        # That one unit was neither admitted nor run. Any larger count is a
-        # real overrun and is charged in full.
+        # That one unit was neither admitted nor run. The discount is applied
+        # to a count of ``admitted_turns + 1`` from every adapter, not only
+        # on the route it was observed on. Any larger count is a real overrun
+        # and is charged in full.
         if error.turns_used == admitted_turns + 1:
             return admitted_turns
         return error.turns_used

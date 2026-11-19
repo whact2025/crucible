@@ -4399,6 +4399,21 @@ def test_run_task_cascade_reports_v11_reward_counts(
     assert raw["schema_version"] == 3
     assert raw["verifier"]["reward_counts"] == counts
     assert raw["checkpoint"]["reward_counts"] == counts
+    # A later run resumes this task from the checkpoint committed with the
+    # hidden evidence; the counts it sums per run come back with it.
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(tmp_path / "tasks" / "manifest.json"),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    inst = wf._load_and_filter(ns)[0]
+    assert inst.task_id == summary["task_id"]
+    checkpoint = wf._load_hidden_oracle_checkpoint(ns.spec, inst)
+    assert checkpoint["reward_counts"] == counts
 
 
 def test_run_task_cascade_reports_unresolved_counts(
@@ -4518,6 +4533,8 @@ def test_run_task_cascade_rejects_malformed_tests_config_before_any_spend(
     assert "tests/config.json p2p_node_ids" in summary["error"]
     assert summary["cost_usd"] == 0.0
     assert summary["hidden_invocation_measurement_ref"] is None
+    # The image pull precedes this check: "before any spend" means before
+    # workspace population, any container, Architect and any model cost.
     # Nothing was populated or started for a task that cannot be graded.
     assert "populate" not in calls
     assert "authoring" not in calls
@@ -6726,6 +6743,10 @@ def test_unjudged_task_projection_accepts_only_unjudged_failures(override):
             id="preflight-baseline-red",
         ),
         pytest.param(
+            {"failure_kind": "gate_created_paths_unbindable", "rc": 2},
+            id="preflight-gate-created-paths-unbindable",
+        ),
+        pytest.param(
             {
                 "failure_phase": "container_setup",
                 "failure_kind": "InstanceContainerSetupError",
@@ -6801,12 +6822,16 @@ def test_setup_stop_only_run_ends_inconclusive_tasks_failed(
         pytest.param({"cleanup_status": "failed"}, id="cleanup-failed"),
     ],
 )
-def test_setup_stop_after_architect_started_keeps_its_run_status(
+def test_setup_stop_unsettled_or_after_architect_start_keeps_its_run_status(
     tmp_path: Path,
     monkeypatch,
     override,
 ):
-    """The setup arm needs positive proof that Architect never started."""
+    """The setup arm needs positive proof that Architect never started.
+
+    It also needs the exact settlement of cost and cleanup: the last two
+    rows are stops before Architect that lack it.
+    """
 
     rc, result, _outcome_json = _run_status_for_task_summaries(
         tmp_path,
@@ -6929,11 +6954,23 @@ def test_implement_reports_tasks_not_started_after_budget_halt(
     assert summary["tasks_ungraded"] == 0
 
 
+@pytest.mark.parametrize(
+    ("failure", "halt_reason"),
+    [
+        pytest.param("checkpoint", "lifecycle_output_failed", id="checkpoint"),
+        pytest.param("lease", "task_lease_error", id="task-lease"),
+    ],
+)
 def test_implement_counts_a_task_without_summary_apart_from_not_started(
     tmp_path: Path,
     monkeypatch,
+    failure: str,
+    halt_reason: str,
 ):
-    """A task that ran but could not be checkpointed is not 'not started'."""
+    """A task handed to execution that left no summary is not 'not started'.
+
+    It ran but could not be checkpointed, or its lease could not be taken.
+    """
 
     manifest = _build_corpus(tmp_path)
     ns = wf._parse_args(
@@ -6957,18 +6994,27 @@ def test_implement_counts_a_task_without_summary_apart_from_not_started(
     def _append(*, out_path, summary):
         raise OSError("lifecycle volume is read-only")
 
+    def _lease(spec_dir, task_id):
+        raise OSError("task lease directory is read-only")
+
     monkeypatch.setattr(wf, "_run_task_cascade", _task)
-    monkeypatch.setattr(wf, "_append_lifecycle_record", _append)
+    if failure == "checkpoint":
+        monkeypatch.setattr(wf, "_append_lifecycle_record", _append)
+    else:
+        monkeypatch.setattr(wf, "_task_execution_lease", _lease)
 
     assert wf._implement_serial(filtered, args=ns) == 1
 
-    # The cascade of the first task ran to a resolved grade.
-    assert executed == [filtered[0].task_id]
+    # The cascade of the first task ran to a resolved grade, unless the
+    # lease it runs under could not be taken.
+    assert executed == (
+        [filtered[0].task_id] if failure == "checkpoint" else []
+    )
     run_dir = next((tmp_path / "s" / "runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text())
     result = json.loads((run_dir / "result.json").read_text())
-    assert result["status"] == "lifecycle_output_failed"
-    assert summary["halt_reason"] == "lifecycle_output_failed"
+    assert result["status"] == halt_reason
+    assert summary["halt_reason"] == halt_reason
     assert summary["tasks"] == []
     assert summary["tasks_selected"] == 4
     assert summary["tasks_total"] == 0
@@ -8248,6 +8294,11 @@ def test_completed_single_track_checkpoint_cannot_be_relabelled_as_competition(
     run_dir = next((tmp_path / "s" / "runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text())
     assert summary["halt_reason"] == "lifecycle_identity_conflict"
+    # The task was handed to execution and ended without a task summary.
+    assert summary["tasks_selected"] == 1
+    assert summary["tasks_total"] == 0
+    assert summary["tasks_unrecorded"] == 1
+    assert summary["tasks_not_started"] == 0
     assert lifecycle.read_bytes() == original_record
 
 

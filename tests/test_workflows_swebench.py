@@ -2717,10 +2717,12 @@ def _run_worker_with_stopped_architect_child(
     status: str,
     submit_any_nonempty_best_effort: bool,
     rollup_incomplete: bool = False,
+    architect_rc: int = 1,
 ):
-    """Run one worker whose Architect child kept one slice and returned 1.
+    """Run one worker whose Architect child kept one slice and returned.
 
-    Returns the worker outcome and the patches offered to inline evaluation.
+    The child's return value is ``architect_rc``.  Returns the worker outcome
+    and the patches offered to inline evaluation.
     """
     import contextlib as _contextlib
     import subprocess
@@ -2744,6 +2746,7 @@ def _run_worker_with_stopped_architect_child(
     def stopped_architect(**kwargs) -> int:
         # The real Architect returns 1 for a stopped cascade; it does not
         # raise. Its typed terminal is published under the worker's saga.
+        # ``architect_rc`` stands for a status it returns with another code.
         workspace = Path(kwargs["cwd"])
         instance_corpus = Corpus(kwargs["spec"])
         (workspace / "seed.py").write_text("def f(): return 99\n")
@@ -2778,7 +2781,7 @@ def _run_worker_with_stopped_architect_child(
                 },
             })
             handle.finalize(RunResult(status=status, cost_usd=1.0))
-        return 1
+        return architect_rc
 
     evaluated_patches: list[str] = []
 
@@ -2861,14 +2864,20 @@ def test_budget_stopped_cascade_is_partial_and_not_evaluated_inline(
 
 
 @pytest.mark.parametrize(
-    ("status", "architect_class", "submit_any_nonempty_best_effort"),
+    (
+        "status",
+        "architect_class",
+        "architect_rc",
+        "submit_any_nonempty_best_effort",
+    ),
     [
-        (status, architect_class, best_effort)
-        for status, architect_class in (
-            ("inconclusive_tier_failure", "inconclusive"),
-            ("retryable_tier_failure", "retryable_failure"),
-            ("cancelled", "cancelled"),
-            ("planner_infrastructure_failure", "inconclusive"),
+        (status, architect_class, architect_rc, best_effort)
+        for status, architect_class, architect_rc in (
+            ("inconclusive_tier_failure", "inconclusive", 1),
+            ("retryable_tier_failure", "retryable_failure", 1),
+            ("cancelled", "cancelled", 1),
+            # The real Architect returns this planning status with exit 2.
+            ("planner_infrastructure_failure", "inconclusive", 2),
         )
         for best_effort in (True, False)
     ],
@@ -2878,6 +2887,7 @@ def test_unjudged_cascade_is_partial_and_not_evaluated_inline(
     monkeypatch,
     status: str,
     architect_class: str,
+    architect_rc: int,
     submit_any_nonempty_best_effort: bool,
 ):
     """A cascade that returned without a ruling on its work is truncated work.
@@ -2891,13 +2901,14 @@ def test_unjudged_cascade_is_partial_and_not_evaluated_inline(
         monkeypatch,
         status=status,
         submit_any_nonempty_best_effort=submit_any_nonempty_best_effort,
+        architect_rc=architect_rc,
     )
 
     assert evaluated_patches == []
     assert outcome.eval_status == "cascade_aborted_partial"
     # The Architect's own return value still classifies the instance, and
     # its typed terminal is the instance label.
-    assert outcome.classification == "architect_rc_1"
+    assert outcome.classification == f"architect_rc_{architect_rc}"
     assert outcome.architect_detail_status == status
     assert outcome.architect_terminal_class == architect_class
     assert outcome.cost_incomplete is False
@@ -2946,7 +2957,6 @@ def test_non_budget_architect_failure_keeps_best_effort_inline_evaluation(
     assert len(evaluated_patches) == 1
     assert "return 99" in evaluated_patches[0]
     assert outcome.eval_status == "unresolved"
-    assert outcome.eval_status != "cascade_aborted_partial"
     assert outcome.classification == "architect_rc_1"
     assert outcome.architect_detail_status == status
     assert outcome.architect_terminal_class == architect_class

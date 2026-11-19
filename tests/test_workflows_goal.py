@@ -543,6 +543,62 @@ def test_goal_red_inconclusive_stops_before_blue_and_cannot_promote(
     assert summary["rounds"][0]["judge_decision"] is None
 
 
+def test_goal_red_inconclusive_in_a_later_round_leaves_the_staged_revision(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A staged ``revise`` candidate is not published by a later lost Red.
+
+    Round 0 stages a revision. In round 1 Red returns no review of it: Blue
+    and Judge are not consulted again, nothing is promoted, and the Spec
+    records an abandoned refinement.
+    """
+    from assay import LifecycleEvent
+
+    corpus = _setup_corpus(tmp_path)
+    scripted = ScriptedBackend([
+        # Round 0: Red high, Blue revises, Judge withholds.
+        _red_with_high("p0"),
+        _blue_revises("p0", intent="first staged revision"),
+        _judge_revise("needs another round", "p0"),
+        # Round 1: Red does not review the staged candidate.
+        _red_inconclusive(with_finding=False),
+        # Neither call may happen.
+        _blue_revises(
+            "p0",
+            intent="second staged revision",
+            excerpt="first staged revision",
+        ),
+        _judge_proceed("p0"),
+    ])
+    _patch_backend(monkeypatch, scripted)
+
+    from crucible.workflows.goal import main
+
+    rc = main([
+        "--spec", str(corpus.spec_dir),
+        "--max-rounds", "2",
+    ])
+    assert rc == 3
+    assert len(scripted.calls) == 4
+    # The round-1 Red received the staged round-0 candidate.
+    assert "first staged revision" in scripted.calls[3].user
+    spec = corpus.latest_spec()
+    assert spec is not None
+    assert spec.intent == "make the renderer faster"
+    (event_ref,) = spec.lifecycle_event_refs
+    event = corpus.get_record(event_ref, as_type=LifecycleEvent)
+    assert event.kind == "abandoned"
+    run_dir = max((corpus.spec_dir / "runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["status"] == "inconclusive"
+    assert summary["staged_revisions"] == 1
+    assert summary["promotions"] == 0
+    assert summary["rounds"][1]["red_decision"] == "inconclusive"
+    assert summary["rounds"][1]["blue_decision"] is None
+    assert summary["rounds"][1]["judge_decision"] is None
+
+
 def test_goal_red_harness_failure_stops_before_blue(
     tmp_path: Path,
     monkeypatch,
