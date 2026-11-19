@@ -248,6 +248,144 @@ def test_incomplete_accounting_projects_to_inconclusive_outcome(
     assert persisted["terminal_class"] == "inconclusive"
 
 
+def test_unjudged_work_statuses_are_typed_and_not_permanent() -> None:
+    """Work that nothing judged is never filed under a permanent class."""
+
+    for status in (
+        # Tier: a slice, the breach loop, or a gating review without a verdict.
+        "slice_inconclusive",
+        "breach_inconclusive",
+        "review_inconclusive",
+        # Breach: a gate that could not run.
+        "inconclusive_gate_unavailable",
+        # Parents that carry an unjudged child upward.
+        "inconclusive_tier_failure",
+        "inconclusive_tasks_failed",
+        # Planner backend lost; delta of a slice not capturable.
+        "planner_infrastructure_failure",
+        "hard_fail_capture",
+        # Breach's own inconclusive terminals. Four are loops that reached no
+        # ruling; ``post_strip_verify`` and ``workspace_mismatch`` record a
+        # deterministic refusal, which the tier files as ``breach_failed``.
+        "inconclusive_authority",
+        "inconclusive_breaker",
+        "inconclusive_judge",
+        "inconclusive_post_strip_verify",
+        "inconclusive_transport_failed",
+        "inconclusive_workspace_mismatch",
+    ):
+        assert classify_terminal_status(status) is TerminalClass.INCONCLUSIVE, status
+    for status in ("cancelled", "hard_fail_cancellation"):
+        assert classify_terminal_status(status) is TerminalClass.CANCELLED, status
+
+
+def test_tier_breach_failure_statuses_are_permanent() -> None:
+    """The tier's two judged breach terminals are registered, not unknown."""
+
+    for status in ("breach_failed", "breach_reject"):
+        assert (
+            classify_terminal_status(status) is TerminalClass.PERMANENT_FAILURE
+        ), status
+
+
+def test_judged_statuses_stay_permanent() -> None:
+    """Typing the unjudged cases must not move a judged failure."""
+
+    for status in (
+        "slice_failed",
+        "review_failed",
+        "incomplete",
+        "partial_failed",
+        "tasks_failed",
+        "hard_fail_smoke",
+        "hard_fail_max_turns",
+        "hard_fail_mutation_scope",
+        "hard_fail_gate_mutation",
+        "rounds_exhausted",
+        "no_candidate",
+    ):
+        assert (
+            classify_terminal_status(status) is TerminalClass.PERMANENT_FAILURE
+        ), status
+    for status in ("hard_fail_timeout", "all_slices_transport_failed"):
+        assert (
+            classify_terminal_status(status) is TerminalClass.RETRYABLE_FAILURE
+        ), status
+
+
+def test_unjudged_terminal_classes_are_the_three_non_verdict_classes() -> None:
+    assert outcome_module.UNJUDGED_TERMINAL_CLASSES == frozenset({
+        TerminalClass.INCONCLUSIVE,
+        TerminalClass.RETRYABLE_FAILURE,
+        TerminalClass.CANCELLED,
+    })
+    assert "UNJUDGED_TERMINAL_CLASSES" in outcome_module.__all__
+    # Budget, accounting-free success, and every ruling stay outside the set.
+    for judged in (
+        TerminalClass.SUCCEEDED,
+        TerminalClass.NO_WORK,
+        TerminalClass.PERMANENT_FAILURE,
+        TerminalClass.BUDGET_EXHAUSTED,
+        TerminalClass.INTERRUPTED,
+        TerminalClass.CONTRACT_ERROR,
+    ):
+        assert judged not in outcome_module.UNJUDGED_TERMINAL_CLASSES
+
+
+def test_tier_unjudged_status_constants_match_the_taxonomy() -> None:
+    from crucible.workflows import tier
+
+    expected = {
+        tier.STATUS_SLICE_INCONCLUSIVE: TerminalClass.INCONCLUSIVE,
+        tier.STATUS_BREACH_INCONCLUSIVE: TerminalClass.INCONCLUSIVE,
+        tier.STATUS_REVIEW_INCONCLUSIVE: TerminalClass.INCONCLUSIVE,
+        tier.STATUS_CANCELLED: TerminalClass.CANCELLED,
+        tier.STATUS_BREACH_FAILED: TerminalClass.PERMANENT_FAILURE,
+        tier.STATUS_BREACH_REJECT: TerminalClass.PERMANENT_FAILURE,
+    }
+    assert {
+        tier.STATUS_SLICE_INCONCLUSIVE,
+        tier.STATUS_BREACH_INCONCLUSIVE,
+        tier.STATUS_REVIEW_INCONCLUSIVE,
+        tier.STATUS_CANCELLED,
+        tier.STATUS_BREACH_FAILED,
+        tier.STATUS_BREACH_REJECT,
+    } == {
+        "slice_inconclusive",
+        "breach_inconclusive",
+        "review_inconclusive",
+        "cancelled",
+        "breach_failed",
+        "breach_reject",
+    }
+    for status, terminal_class in expected.items():
+        assert classify_terminal_status(status) is terminal_class, status
+
+
+def test_unjudged_tier_result_projects_to_an_inconclusive_outcome(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "runs" / "unjudged-slice"
+    run.mkdir(parents=True)
+    begin_run(run, workflow="tier")
+    _write_json(
+        run / "result.json",
+        {"status": "slice_inconclusive", "cost_usd": 0.25},
+    )
+    _write_json(
+        run / "summary.json",
+        {"status": "slice_inconclusive", "rollback_applied": True},
+    )
+
+    outcome = finalize_run(run, spec_version=3)
+
+    assert outcome.detail_status == "slice_inconclusive"
+    assert outcome.terminal_class is TerminalClass.INCONCLUSIVE
+    persisted = json.loads((run / "outcome.json").read_text())
+    assert persisted["detail_status"] == "slice_inconclusive"
+    assert persisted["terminal_class"] == "inconclusive"
+
+
 def test_run_manifest_projects_result_into_typed_outcome(tmp_path: Path) -> None:
     run = tmp_path / "runs" / "r1"
     run.mkdir(parents=True)

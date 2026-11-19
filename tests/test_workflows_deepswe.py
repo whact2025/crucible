@@ -1189,7 +1189,9 @@ def _restoration_receipt_payload(tmp_path: Path) -> dict[str, object]:
                 workspace_device=candidate_stat.st_dev,
                 workspace_inode=candidate_stat.st_ino,
                 namespace=("nested",),
-                split_namespaces=(("nested", ("repo",), nested_device, 1),),
+                split_namespaces=(
+                    ("nested", ("keep.txt", "repo"), nested_device, 1),
+                ),
                 initialized_gitlinks=(
                     (
                         "nested/repo",
@@ -1215,6 +1217,7 @@ def _restoration_receipt_payload(tmp_path: Path) -> dict[str, object]:
                     ("c" * 32, "a" * 32),
                     ("d" * 32, "c" * 32),
                 ),
+                gate_created_paths=("gate-report", "nested/gate-created.lock"),
             ),
             baseline_preflight.DevelopmentPreflightWorkspaceRestoration(
                 label="baseline",
@@ -1226,6 +1229,7 @@ def _restoration_receipt_payload(tmp_path: Path) -> dict[str, object]:
                 initialized_gitlinks=(),
                 journal_transaction_id="b" * 32,
                 journal_family=(("b" * 32, None),),
+                gate_created_paths=(),
             ),
         )
     )
@@ -1282,6 +1286,14 @@ def test_development_preflight_restoration_receipt_round_trips_without_fs(
         "duplicate_gitlink_guard",
         "tampered_gitlink_guard_slice",
         "disconnected_family",
+        "missing_gate_created_paths",
+        "gate_created_paths_not_a_list",
+        "unsorted_gate_created_paths",
+        "nested_gate_created_paths",
+        "escaping_gate_created_path",
+        "gate_created_path_below_gitlink",
+        "gate_created_path_in_namespace",
+        "gate_created_path_in_split_namespace",
     ],
 )
 def test_development_preflight_restoration_receipt_rejects_tamper(
@@ -1349,6 +1361,23 @@ def test_development_preflight_restoration_receipt_rejects_tamper(
         candidate["initialized_gitlinks"][1]["guard_slice_id"] += "-tampered"
     elif case == "disconnected_family":
         candidate["journal_family"][1]["parent_transaction_id"] = "d" * 32
+    elif case == "missing_gate_created_paths":
+        del candidate["gate_created_paths"]
+    elif case == "gate_created_paths_not_a_list":
+        candidate["gate_created_paths"] = "gate-report"
+    elif case == "unsorted_gate_created_paths":
+        candidate["gate_created_paths"].reverse()
+    elif case == "nested_gate_created_paths":
+        candidate["gate_created_paths"].insert(1, "gate-report/index.html")
+    elif case == "escaping_gate_created_path":
+        candidate["gate_created_paths"] = ["../gate-report"]
+    elif case == "gate_created_path_below_gitlink":
+        candidate["gate_created_paths"] = ["nested/repo/build"]
+    elif case == "gate_created_path_in_namespace":
+        # A name the checkout had before the gate ran was not created by it.
+        candidate["gate_created_paths"] = ["nested"]
+    elif case == "gate_created_path_in_split_namespace":
+        candidate["gate_created_paths"] = ["nested/keep.txt"]
     else:  # pragma: no cover - parameter inventory is closed above
         raise AssertionError(case)
 
@@ -2320,6 +2349,14 @@ def test_dev_verify_preflight_exactly_restores_both_writable_checkouts(
     ]
     assert restoration.fingerprint.startswith("sha256:")
     assert len(restoration.fingerprint) == 71
+    # Of everything the gate run touched, only what a slice gate would
+    # charge is recorded: the new untracked file and the new ignored
+    # directory below an existing one.  The new ignored top-level tree, the
+    # tracked file and the inherited untracked and ignored files are not.
+    assert [item.gate_created_paths for item in restoration.workspaces] == [
+        ("existing/generated", "new-top-level.txt"),
+        ("existing/generated", "new-top-level.txt"),
+    ]
     for workspace in (candidate, baseline):
         assert _preflight_checkout_image(workspace) == before[workspace]
         assert not (workspace / "new-ignored").exists()
@@ -2465,6 +2502,7 @@ def test_dev_verify_restoration_receipt_is_independent_of_build_outcome(
     def _build(*_args, **_kwargs):
         for workspace in (candidate, baseline):
             (workspace / "tracked.txt").write_text("preflight mutation\n")
+            (workspace / "gate-created.lock").write_text("locked\n")
         if mode.startswith("exception"):
             raise RuntimeError("injected build exception")
         if mode.startswith("keyboard_interrupt"):
@@ -2522,6 +2560,12 @@ def test_dev_verify_restoration_receipt_is_independent_of_build_outcome(
     assert type(receipts[0]) is (
         baseline_preflight.DevelopmentPreflightRestorationReceipt
     )
+    # Whatever the gate run returned or raised, the receipt names the path
+    # it created.
+    assert [item.gate_created_paths for item in receipts[0].workspaces] == [
+        ("gate-created.lock",),
+        ("gate-created.lock",),
+    ]
     for workspace in (candidate, baseline):
         assert _preflight_checkout_image(workspace) == before[workspace]
 
@@ -2765,6 +2809,11 @@ def test_dev_verify_preflight_failure_stops_before_provider_invocation(
     assert summary["dev_verify_preflight"]["returncode"] == 2
     assert summary["cleanup_status"] == "complete"
     assert "verifier" not in calls
+    # Architect was never started; the real summary of this stop is what the
+    # run-status projection files as unjudged.
+    assert "architect_operation_id" not in summary
+    assert summary["architect_terminal_class"] is None
+    assert wf._all_task_failures_are_unjudged([summary]) is True
 
 
 def test_dev_verify_preflight_exception_publishes_classifiable_failure_rc(
@@ -2886,6 +2935,11 @@ def test_rust_toolchain_unavailable_is_retryable_before_hidden_verifier(
     lifecycle = wf._lifecycle_record(summary)
     assert lifecycle["status_policy"] == "retryable"
     assert wf._checkpoint_is_reusable(lifecycle, args=ns) is False
+    # Architect was never started: the run-status projection files this real
+    # summary as unjudged.
+    assert "architect_operation_id" not in summary
+    assert summary["architect_terminal_class"] is None
+    assert wf._all_task_failures_are_unjudged([summary]) is True
 
 
 def test_verifier_toolchain_failure_never_executes_hidden_command(
@@ -2958,6 +3012,8 @@ def test_verifier_toolchain_failure_never_executes_hidden_command(
     assert summary["hidden_verifier_measurement_ref"] is None
     assert summary["hidden_verifier_lifecycle_ref"] is None
     assert calls["events"].count("verifier_toolchain_probe") == 1
+    # A one-shot oracle failure is never relabelled as unjudged work.
+    assert wf._all_task_failures_are_unjudged([summary]) is False
     lifecycle = wf._lifecycle_record(summary)
     assert lifecycle["status_policy"] == "reusable"
     assert wf._checkpoint_is_reusable(lifecycle, args=ns) is True
@@ -3399,6 +3455,13 @@ def test_strict_authoring_stop_failure_blocks_capture_and_hidden_verifier(
     assert summary["status"] == "setup_failed"
     assert calls["strict_stop"] == ["authoring-cid"]
     assert "verifier" not in calls
+    # Architect ran and completed: this setup stop is not "Architect never
+    # started". The row stays retryable, but the run-status projection does
+    # not file the task as unjudged.
+    assert summary["architect_operation_id"]
+    assert summary["architect_terminal_class"] == "succeeded"
+    assert wf._lifecycle_record(summary)["status_policy"] == "retryable"
+    assert wf._all_task_failures_are_unjudged([summary]) is False
     # The id is retained after the failed proof and retried by final cleanup.
     assert ("authoring-cid", None) in calls["teardown"]
     assert ("baseline-cid", None) in calls["teardown"]
@@ -3652,6 +3715,14 @@ def test_unproven_tier_journal_settlement_blocks_full_candidate_capture(
             "inconclusive",
             "retryable",
         ),
+        # The planner backend was lost: no plan was ruled on, so the task
+        # is neither cached as a permanent veto nor filed as judged.
+        (
+            "planner_infrastructure_failure",
+            "inconclusive",
+            "inconclusive",
+            "retryable",
+        ),
     ],
 )
 def test_zero_tier_architect_failure_skips_candidate_and_hidden_verifier(
@@ -3742,6 +3813,12 @@ def test_zero_tier_architect_failure_skips_candidate_and_hidden_verifier(
     assert wf._checkpoint_is_reusable(lifecycle, args=ns) is (
         status_policy == "permanent"
     )
+    # The run-status projection reads the same task summary: a deterministic
+    # veto is a judged failure, a lost ruling is not.
+    assert wf._all_task_failures_are_unjudged([summary]) is (
+        status_policy == "retryable"
+    )
+    assert wf._all_task_failures_are_retryable([summary]) is False
 
 
 def test_zero_tier_settlement_failure_is_secondary_to_architect_failure(
@@ -4783,6 +4860,8 @@ def test_run_task_cascade_binds_only_a_full_base_commit_id(
     assert summary["base_commit"] is None
     assert len(calls["populate"]) == 1
     assert "authoring" not in calls
+    assert "architect_operation_id" not in summary
+    assert wf._all_task_failures_are_unjudged([summary]) is True
     # No starter Spec was synthesized from an id that is not the checkout's.
     assert (
         Corpus(
@@ -6301,6 +6380,443 @@ def test_retryable_task_projection_requires_every_failed_task_to_match():
             ]
         )
         is False
+    )
+
+
+def _unjudged_task_summary(inst, **override) -> dict:
+    """A settled pre-oracle task failure whose Architect reached no ruling."""
+
+    return {
+        "task_id": inst.task_id,
+        "ext_id": inst.ext_id,
+        "status": "candidate_failed",
+        "architect_operation_id": "architect-test",
+        "architect_detail_status": "inconclusive_tier_failure",
+        "architect_terminal_class": "inconclusive",
+        "rc": 1,
+        "reward": None,
+        "resolved": None,
+        "hidden_invocation_measurement_ref": None,
+        "cost_usd": 0.0,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+
+
+def _setup_stop_task_summary(inst, **override) -> dict:
+    """A settled stop before Architect was started."""
+
+    return {
+        "task_id": inst.task_id,
+        "ext_id": inst.ext_id,
+        "status": "setup_failed",
+        "failure_phase": "dev_verify_preflight",
+        "failure_kind": "dev_verify_unavailable",
+        "architect_detail_status": None,
+        "architect_terminal_class": None,
+        "rc": 2,
+        "reward": None,
+        "resolved": None,
+        "hidden_invocation_measurement_ref": None,
+        "cost_usd": 0.0,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+
+
+def _run_status_for_task_summaries(tmp_path: Path, monkeypatch, build_rows):
+    """Run the serial implement loop over stubbed task results.
+
+    ``build_rows`` receives the selected instances and returns one task
+    summary per instance. Returns ``(rc, result.json, outcome.json)``.
+    """
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    selected = wf._load_and_filter(ns)
+    rows = build_rows(selected)
+    selected = selected[: len(rows)]
+    by_task = {
+        inst.task_id: row for inst, row in zip(selected, rows, strict=True)
+    }
+    monkeypatch.setattr(
+        wf,
+        "_run_task_cascade",
+        lambda inst, **kwargs: by_task[inst.task_id],
+    )
+
+    rc = wf._implement_serial(selected, args=ns)
+
+    run_dir = next((tmp_path / "s" / "runs").iterdir())
+    result = json.loads((run_dir / "result.json").read_text())
+    outcome = json.loads((run_dir / "outcome.json").read_text())
+    return rc, result, outcome
+
+
+@pytest.mark.parametrize(
+    "build_rows",
+    [
+        pytest.param(
+            lambda insts: [_unjudged_task_summary(insts[0])],
+            id="inconclusive-architect",
+        ),
+        pytest.param(
+            lambda insts: [_unjudged_task_summary(
+                insts[0],
+                architect_detail_status="cancelled",
+                architect_terminal_class="cancelled",
+            )],
+            id="cancelled-architect",
+        ),
+        pytest.param(
+            lambda insts: [_unjudged_task_summary(
+                insts[0],
+                architect_detail_status="planner_infrastructure_failure",
+                rc=2,
+            )],
+            id="planner-backend-lost",
+        ),
+        pytest.param(
+            lambda insts: [
+                _unjudged_task_summary(
+                    insts[0],
+                    architect_detail_status="retryable_tier_failure",
+                    architect_terminal_class="retryable_failure",
+                ),
+                _unjudged_task_summary(insts[1]),
+            ],
+            id="one-retryable-one-inconclusive",
+        ),
+        pytest.param(
+            lambda insts: [
+                _lifecycle_summary(insts[0].task_id, insts[0].ext_id),
+                _unjudged_task_summary(insts[1]),
+            ],
+            id="one-resolved-one-inconclusive",
+        ),
+    ],
+)
+def test_implement_reports_unjudged_failures_as_inconclusive_at_run_boundary(
+    tmp_path: Path,
+    monkeypatch,
+    build_rows,
+):
+    """A run whose failed tasks were never judged is not ``tasks_failed``."""
+
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path, monkeypatch, build_rows,
+    )
+
+    assert rc == 1
+    assert result["status"] == "inconclusive_tasks_failed"
+    assert outcome["detail_status"] == "inconclusive_tasks_failed"
+    assert outcome["terminal_class"] == "inconclusive"
+
+
+@pytest.mark.parametrize(
+    "build_rows",
+    [
+        pytest.param(
+            lambda insts: [
+                _unjudged_task_summary(insts[0]),
+                {
+                    **_lifecycle_summary(
+                        insts[1].task_id, insts[1].ext_id, status="unresolved",
+                    ),
+                    "hidden_invocation_measurement_ref": "sha256:" + "a" * 64,
+                },
+            ],
+            id="one-unresolved",
+        ),
+        pytest.param(
+            lambda insts: [
+                _unjudged_task_summary(insts[0]),
+                _unjudged_task_summary(
+                    insts[1],
+                    architect_detail_status="partial_failed",
+                    architect_terminal_class="permanent_failure",
+                ),
+            ],
+            id="one-judged-architect-failure",
+        ),
+        pytest.param(
+            lambda insts: [
+                _setup_stop_task_summary(insts[0]),
+                _unjudged_task_summary(
+                    insts[1],
+                    architect_detail_status="inflation_veto",
+                    architect_terminal_class="permanent_failure",
+                ),
+            ],
+            id="setup-stop-and-judged-architect-failure",
+        ),
+    ],
+)
+def test_one_judged_failure_keeps_tasks_failed(
+    tmp_path: Path,
+    monkeypatch,
+    build_rows,
+):
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path, monkeypatch, build_rows,
+    )
+
+    assert rc == 1
+    assert result["status"] == "tasks_failed"
+    assert outcome["terminal_class"] == "permanent_failure"
+
+
+def test_all_retryable_failures_keep_retryable_tasks_failed(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The retryable projection is tested first and is not widened."""
+
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path,
+        monkeypatch,
+        lambda insts: [_unjudged_task_summary(
+            insts[0],
+            architect_detail_status="retryable_tier_failure",
+            architect_terminal_class="retryable_failure",
+        )],
+    )
+
+    assert rc == 1
+    assert result["status"] == "retryable_tasks_failed"
+    assert outcome["terminal_class"] == "retryable_failure"
+
+
+@pytest.mark.parametrize(
+    ("drop_field", "override"),
+    [
+        # The settlement terms of the retryable projection.
+        (None, {"hidden_invocation_measurement_ref": "sha256:" + "a" * 64}),
+        ("hidden_invocation_measurement_ref", {}),
+        (None, {"cost_incomplete": True}),
+        (None, {"cost_incomplete": 0}),
+        ("cost_incomplete", {}),
+        (None, {"cleanup_status": "failed"}),
+        ("cleanup_status", {}),
+        (None, {"status": "unresolved"}),
+        (None, {"status": "verification_incomplete"}),
+        # A class that is a ruling, a budget stop or a contract error.
+        (None, {"architect_terminal_class": "permanent_failure"}),
+        (None, {"architect_terminal_class": "contract_error"}),
+        (None, {"architect_terminal_class": "succeeded"}),
+        (None, {"architect_terminal_class": "budget_exhausted"}),
+        (None, {"architect_terminal_class": "interrupted"}),
+        # A setup stop raised after Architect returned: Architect ran, and
+        # its class decides.
+        (None, {"status": "setup_failed", "architect_terminal_class": "succeeded"}),
+        (
+            None,
+            {
+                "status": "toolchain_unavailable",
+                "architect_terminal_class": "permanent_failure",
+            },
+        ),
+        # Without a typed class only a setup stop before Architect counts,
+        # and only when Architect was never started.
+        (None, {"architect_terminal_class": None}),
+        ("architect_terminal_class", {}),
+        (
+            None,
+            {"status": "cascade_error", "architect_terminal_class": None},
+        ),
+        (
+            None,
+            {"status": "storage_quota_exceeded", "architect_terminal_class": None},
+        ),
+        (None, {"status": "setup_failed", "architect_terminal_class": None}),
+        # Architect never started, but the stop is not a setup stop.
+        (
+            None,
+            {
+                "status": "cascade_error",
+                "architect_terminal_class": None,
+                "architect_operation_id": None,
+            },
+        ),
+        (
+            "architect_operation_id",
+            {"status": "storage_quota_exceeded", "architect_terminal_class": None},
+        ),
+        ("architect_operation_id", {"architect_terminal_class": None}),
+    ],
+)
+def test_unjudged_task_projection_requires_exact_preoracle_settlement(
+    drop_field,
+    override,
+):
+    summary = {
+        "status": "candidate_failed",
+        "architect_operation_id": "architect-test",
+        "architect_terminal_class": "inconclusive",
+        "hidden_invocation_measurement_ref": None,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+    if drop_field is not None:
+        summary.pop(drop_field)
+
+    assert wf._all_task_failures_are_unjudged([summary]) is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {},
+        {"architect_terminal_class": "cancelled"},
+        {"architect_terminal_class": "retryable_failure"},
+        {"status": "cascade_error"},
+        {
+            "status": "setup_failed",
+            "architect_terminal_class": None,
+            "architect_operation_id": None,
+        },
+        {
+            "status": "toolchain_unavailable",
+            "architect_terminal_class": None,
+            "architect_operation_id": None,
+        },
+    ],
+)
+def test_unjudged_task_projection_accepts_only_unjudged_failures(override):
+    summary = {
+        "status": "candidate_failed",
+        "architect_operation_id": "architect-test",
+        "architect_terminal_class": "inconclusive",
+        "hidden_invocation_measurement_ref": None,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+    resolved = {"status": "resolved"}
+
+    assert wf._all_task_failures_are_unjudged([summary]) is True
+    assert wf._all_task_failures_are_unjudged([resolved, summary]) is True
+    assert wf._all_task_failures_are_unjudged([resolved]) is False
+    assert wf._all_task_failures_are_unjudged([]) is False
+    assert wf._all_task_failures_are_unjudged(
+        [summary, {**summary, "status": "unresolved"}]
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            {"failure_kind": "dev_verify_unavailable"},
+            id="preflight-gate-could-not-run",
+        ),
+        pytest.param(
+            {"failure_kind": "dev_verify_failed", "rc": 1},
+            id="preflight-baseline-red",
+        ),
+        pytest.param(
+            {
+                "failure_phase": "container_setup",
+                "failure_kind": "InstanceContainerSetupError",
+            },
+            id="container-setup",
+        ),
+        pytest.param(
+            {
+                "status": "toolchain_unavailable",
+                "failure_phase": "container_setup",
+                "failure_kind": "toolchain_unavailable",
+            },
+            id="toolchain-unavailable",
+        ),
+    ],
+)
+def test_setup_stop_only_run_ends_inconclusive_tasks_failed(
+    tmp_path: Path,
+    monkeypatch,
+    override,
+):
+    """No model was called and no work exists: nothing was judged.
+
+    The rows of such a run re-run by default, so the run is not filed under
+    the permanent ``tasks_failed``.
+    """
+
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path,
+        monkeypatch,
+        lambda insts: [_setup_stop_task_summary(insts[0], **override)],
+    )
+
+    assert rc == 1
+    assert result["status"] == "inconclusive_tasks_failed"
+    assert outcome["detail_status"] == "inconclusive_tasks_failed"
+    assert outcome["terminal_class"] == "inconclusive"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            {
+                "status": "toolchain_unavailable",
+                "failure_phase": "container_setup",
+                "failure_kind": "toolchain_unavailable",
+                "architect_operation_id": "architect-test",
+                "architect_detail_status": "partial_failed",
+                "architect_terminal_class": "permanent_failure",
+            },
+            id="after-a-judged-architect-failure",
+        ),
+        pytest.param(
+            {
+                "failure_phase": "container_setup",
+                "failure_kind": "InstanceContainerSetupError",
+                "architect_operation_id": "architect-test",
+                "architect_detail_status": "complete",
+                "architect_terminal_class": "succeeded",
+            },
+            id="after-a-completed-architect",
+        ),
+        pytest.param(
+            {
+                "failure_phase": "container_setup",
+                "failure_kind": "InstanceContainerSetupError",
+                "architect_operation_id": "architect-test",
+            },
+            id="architect-started-without-a-typed-outcome",
+        ),
+        pytest.param({"cost_incomplete": True}, id="cost-incomplete"),
+        pytest.param({"cleanup_status": "failed"}, id="cleanup-failed"),
+    ],
+)
+def test_setup_stop_after_architect_started_keeps_its_run_status(
+    tmp_path: Path,
+    monkeypatch,
+    override,
+):
+    """The setup arm needs positive proof that Architect never started."""
+
+    rc, result, _outcome_json = _run_status_for_task_summaries(
+        tmp_path,
+        monkeypatch,
+        lambda insts: [_setup_stop_task_summary(insts[0], **override)],
+    )
+
+    assert rc == 1
+    assert result["status"] == (
+        "cost_incomplete" if override.get("cost_incomplete") else "tasks_failed"
     )
 
 

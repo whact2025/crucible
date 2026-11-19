@@ -56,6 +56,9 @@ _MIN_TMPFS_BYTES = 256 * 1024 * 1024
 _MAX_TMPFS_BYTES = 4096 * 1024 * 1024
 _SUPERVISOR_CLEANUP_FRACTION = 0.5
 CONTAINMENT_UNUSABLE_RC = _SUPERVISOR_FAILURE_RC
+# No attested command outcome can be 122: the supervisor reports a command
+# status above 119 as 123, and 120, 124, 125 and 126 are its own verdicts.
+CONTAINMENT_NOT_STARTED_RC = 122
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,9 +597,18 @@ int main(int argc, char **argv) {
 
 
 class ExecContainmentError(RuntimeError):
-    """The trusted exec supervisor could not be prepared or invoked."""
+    """The trusted exec supervisor could not be prepared or invoked.
 
-    def __init__(self, message: str, *, returncode: int = 125) -> None:
+    Without an explicit ``returncode`` the error means that Docker or the
+    supervisor failed before the command could start.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int = CONTAINMENT_NOT_STARTED_RC,
+    ) -> None:
         super().__init__(message)
         self.returncode = returncode
 
@@ -1368,14 +1380,33 @@ def run_contained_docker_exec(
     cleanup_timeout: float = 5.0,
     profile: ContainerExecProfile = DEEPSWE_EXEC_PROFILE,
 ) -> tuple[int, str, str]:
-    """Run one command and prove that none of its descendants survive."""
+    """Run one command and prove that none of its descendants survive.
+
+    Returns ``(returncode, stdout, stderr)``.  The return code is
+
+    - ``CONTAINMENT_NOT_STARTED_RC`` when the invocation was invalid or Docker
+      or the supervisor failed before the command started: nothing ran and
+      the source container stays usable;
+    - 124 when the execution window closed before the command started, and
+      127 when Docker or the helper compiler is missing on the host: nothing
+      ran either;
+    - ``CONTAINMENT_UNUSABLE_RC`` when the source container is unusable: its
+      in-flight marker could not be armed, or the command started and its
+      completion could not be attested;
+    - otherwise the supervisor's attested outcome for the command, 124 for a
+      command that exceeded the execution window.
+    """
 
     if not isinstance(container_id, str) or not _SOURCE_CONTAINER_RE.fullmatch(
         container_id
     ):
-        return 125, "", "invalid source container id"
+        return CONTAINMENT_NOT_STARTED_RC, "", "invalid source container id"
     if not isinstance(command, str) or not command:
-        return 125, "", "contained command must be non-empty"
+        return (
+            CONTAINMENT_NOT_STARTED_RC,
+            "",
+            "contained command must be non-empty",
+        )
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
@@ -1497,7 +1528,12 @@ def run_contained_docker_exec(
             staged = False
             stderr = f"{result.stderr or ''}\n{diagnostic}".strip()
             return CONTAINMENT_UNUSABLE_RC, result.stdout or "", stderr
-        if result.returncode == _SUPERVISOR_FAILURE_RC or result.returncode >= 128:
+        if (
+            result.returncode == _SUPERVISOR_FAILURE_RC
+            or result.returncode >= 128
+            # A command that ran is never reported as one that did not.
+            or result.returncode == CONTAINMENT_NOT_STARTED_RC
+        ):
             assert cache_directory is not None
             diagnostic = _make_source_unusable(
                 container_id,
@@ -1567,6 +1603,7 @@ def run_contained_docker_exec(
 
 
 __all__ = [
+    "CONTAINMENT_NOT_STARTED_RC",
     "CONTAINMENT_UNUSABLE_RC",
     "ContainerExecProfile",
     "DEEPSWE_EXEC_PROFILE",

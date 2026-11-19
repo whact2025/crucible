@@ -111,3 +111,18 @@ An exit-1 summary may report `retryable_tier_failure` when every failed child
 Tier supplied an immutable `retryable_failure` terminal. This is retry
 classification only: Architect has already stopped and has not promoted a
 partial topological result.
+
+In the same way an exit-1 summary reports `cancelled` when every failed child
+Tier was cancelled, and `inconclusive_tier_failure` when every failed child
+Tier ended without a ruling on its work (an inconclusive, retryable, or
+cancelled terminal, for example `slice_inconclusive`, `breach_inconclusive`,
+or `review_inconclusive`). One judged, contract-error, or untyped Tier keeps
+`partial_failed`; incomplete accounting and budget exhaustion are reported
+first. Neither status continues the walk, retries a Tier, or promotes a
+partial result.
+
+A validation-repair re-plan that nobody ruled on keeps its own typed status
+under exit `2` (for example `planner_infrastructure_failure` when the Planner
+backend was lost) instead of `replan_validate_failed`. Planning with one
+planner reports the same status when the Planner backend returned no reply
+by the end of the round budget; `outcome.json` files it as `inconclusive`.

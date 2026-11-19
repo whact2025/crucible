@@ -53,7 +53,14 @@ remains distinct from the authoring cascade classification. A cascade that
 ends on its budget ceiling, like one that raises, is partial work: its
 candidate stays in the Corpus, the instance is reported
 `cascade_aborted_partial`, and official inline evaluation is skipped even when
-`--submit-any-nonempty-best-effort` publishes the patch.
+`--submit-any-nonempty-best-effort` publishes the patch. The same holds for a
+cascade that returned a failure without a ruling on its work: its Architect
+terminal is inconclusive, retryable, or cancelled (a gate, reviewer, breach
+loop, or planning backend gave no verdict). A judged failure such as
+`partial_failed` and an accounting terminal are not partial work in this
+sense. Each `per_instance` row of a run names its own Architect terminal in
+`architect_detail_status` and `architect_terminal_class`; both are `null` for
+an instance restored from an earlier run.
 
 The [profile catalog](../../products/swebench/backend_profile_catalog.yaml)
 names exact selectable adapter/model/transport identities. Bind an explicit

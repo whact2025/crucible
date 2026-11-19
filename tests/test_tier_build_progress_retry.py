@@ -978,7 +978,7 @@ def _run_tier_with_gate_sequence(
     tmp_path: Path,
     monkeypatch,
     outcomes: tuple[BuildVerifyOutcome, ...],
-) -> tuple[int, _EditingBackend, int]:
+) -> tuple[int, _EditingBackend, int, Path]:
     repository = tmp_path / "repo"
     repository.mkdir()
     base_commit = _init_repo(repository)
@@ -1025,11 +1025,19 @@ def _run_tier_with_gate_sequence(
         breach_policy=BreachPolicy(enabled=False),
         build_retries=1,
     )
-    return rc, backend, gate_calls
+    return rc, backend, gate_calls, spec_dir
+
+
+def _tier_run_documents(spec_dir: Path) -> tuple[dict, dict]:
+    run_dir = sorted((spec_dir / "runs").glob("*tier*"))[-1]
+    return (
+        json.loads((run_dir / "summary.json").read_text(encoding="utf-8")),
+        json.loads((run_dir / "outcome.json").read_text(encoding="utf-8")),
+    )
 
 
 @pytest.mark.parametrize(
-    ("outcomes", "expected_rc", "expected_calls"),
+    ("outcomes", "expected_rc", "expected_calls", "expected_status"),
     [
         pytest.param(
             (
@@ -1047,19 +1055,32 @@ def _run_tier_with_gate_sequence(
             ),
             0,
             3,
+            "complete",
             id="strict-failure-subset-grants-one-progress-retry",
         ),
         pytest.param(
             (_failure(FAILURE_A), _failure(FAILURE_A_NOISY), _success()),
             1,
             2,
+            # A gate that ran and failed judged the slice.
+            "slice_failed",
             id="normalized-identical-failure-stops-at-base-limit",
         ),
         pytest.param(
             (_dev_verify_unavailable(),),
             1,
             1,
+            "slice_inconclusive",
             id="infrastructure-unavailable-never-spends-model-retry",
+        ),
+        pytest.param(
+            # The gate judged the first candidate and the model repaired it;
+            # nothing judged the repaired candidate.
+            (_failure(FAILURE_A), _dev_verify_unavailable()),
+            1,
+            2,
+            "slice_inconclusive",
+            id="unavailable-gate-after-a-feedback-retry-is-unjudged",
         ),
         pytest.param(
             (
@@ -1086,6 +1107,7 @@ def _run_tier_with_gate_sequence(
             ),
             1,
             3,
+            "slice_failed",
             id="only-one-progress-extension-is-available",
         ),
     ],
@@ -1096,8 +1118,9 @@ def test_tier_build_retry_loop_extends_only_for_bounded_progress(
     outcomes: tuple[BuildVerifyOutcome, ...],
     expected_rc: int,
     expected_calls: int,
+    expected_status: str,
 ):
-    rc, backend, gate_calls = _run_tier_with_gate_sequence(
+    rc, backend, gate_calls, spec_dir = _run_tier_with_gate_sequence(
         tmp_path,
         monkeypatch,
         outcomes,
@@ -1106,3 +1129,32 @@ def test_tier_build_retry_loop_extends_only_for_bounded_progress(
     assert rc == expected_rc
     assert gate_calls == expected_calls
     assert backend.implement_calls == expected_calls
+    summary, _outcome = _tier_run_documents(spec_dir)
+    assert summary["status"] == expected_status
+
+
+def test_dev_verify_gate_that_could_not_run_ends_slice_inconclusive(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """An unavailable gate judged nothing: restored, halted, not permanent."""
+
+    rc, backend, gate_calls, spec_dir = _run_tier_with_gate_sequence(
+        tmp_path,
+        monkeypatch,
+        (_dev_verify_unavailable(),),
+    )
+
+    assert rc == 1
+    assert gate_calls == 1
+    assert backend.implement_calls == 1
+    summary, outcome = _tier_run_documents(spec_dir)
+    assert summary["status"] == "slice_inconclusive"
+    assert outcome["detail_status"] == "slice_inconclusive"
+    assert outcome["terminal_class"] == "inconclusive"
+    row = summary["phase_1_slices"][0]
+    assert row["classification"] == "dev_verify_unavailable"
+    assert row["build_verify"] == "dev_verify_unavailable"
+    assert summary["rollback_applied"] is True
+    assert not (tmp_path / "repo" / "file_0.py").exists()
+    assert summary["phase_3_breach"] is None

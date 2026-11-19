@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 
 DEVELOPMENT_PREFLIGHT_RESTORATION_SCHEMA = (
-    "crucible.deepswe-development-preflight-restoration.v1"
+    "crucible.deepswe-development-preflight-restoration.v2"
 )
 _JOURNAL_TRANSACTION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _RESTORATION_LABELS = ("candidate", "baseline")
@@ -49,6 +49,7 @@ _WORKSPACE_RESTORATION_KEYS = frozenset({
     "journal_family",
     "journal_state",
     "journal_cleanup_pending",
+    "gate_created_paths",
 })
 _SPLIT_NAMESPACE_KEYS = frozenset({
     "relative",
@@ -132,7 +133,23 @@ def _exact_canonical_workspace(value: object) -> str:
 
 @dataclass(frozen=True)
 class DevelopmentPreflightWorkspaceRestoration:
-    """Exact post-rollback authority for one preflight checkout."""
+    """Exact post-rollback authority for one preflight checkout.
+
+    ``gate_created_paths`` names what the gate run created in this checkout
+    and the restoration removed again, limited to what a later slice gate
+    would charge to its slice: untracked files Git does not ignore, and new
+    directories inside the mutation journal's directory authority (not
+    ignored, or ignored below a directory that existed before the gate run).
+    The entries are checkout-relative roots, sorted, none below another.  A
+    new top-level directory whose whole content Git ignores, and an ignored
+    file, are not recorded: a slice gate accepts them.
+
+    Two effects of a gate run are restored here without being recorded,
+    although a slice gate charges them: a path added below a directory that
+    was already untracked before the gate run (Git lists such a directory as
+    one root, however empty), and a changed or deleted file the checkout
+    already had, tracked or untracked.
+    """
 
     label: str
     workspace: str
@@ -143,6 +160,7 @@ class DevelopmentPreflightWorkspaceRestoration:
     initialized_gitlinks: tuple[tuple[str, int, int, str, str], ...]
     journal_transaction_id: str
     journal_family: tuple[tuple[str, str | None], ...]
+    gate_created_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if type(self) is not DevelopmentPreflightWorkspaceRestoration:
@@ -246,6 +264,40 @@ class DevelopmentPreflightWorkspaceRestoration:
                         "development preflight nested path is outside its "
                         "recorded parent namespace"
                     )
+        if type(self.gate_created_paths) is not tuple:
+            raise ValueError("development preflight gate-created paths are invalid")
+        for created in self.gate_created_paths:
+            _exact_relative_path(created, field="gate-created path")
+        gate_created = frozenset(self.gate_created_paths)
+        if tuple(sorted(gate_created)) != self.gate_created_paths or any(
+            parent.as_posix() in gate_created
+            for created in self.gate_created_paths
+            for parent in PurePosixPath(created).parents
+        ):
+            raise ValueError(
+                "development preflight gate-created paths are not canonical"
+            )
+        for created in self.gate_created_paths:
+            if any(
+                created == gitlink_path
+                or created.startswith(gitlink_path + "/")
+                for gitlink_path in gitlink_paths
+            ):
+                raise ValueError(
+                    "development preflight gate-created path lies in an "
+                    "initialized Git link"
+                )
+            # The recorded namespaces are the names that existed before the
+            # gate ran, so none of them can be one the gate run created.
+            parent, _separator, name = created.rpartition("/")
+            parent_namespace = (
+                self.namespace if not parent else nested_namespaces.get(parent)
+            )
+            if parent_namespace is not None and name in parent_namespace:
+                raise ValueError(
+                    "development preflight gate-created path existed before "
+                    "the gate run"
+                )
         identities = [
             (self.workspace_device, self.workspace_inode),
             *(
@@ -460,6 +512,14 @@ class DevelopmentPreflightWorkspaceRestoration:
                 raise ValueError("development preflight journal family is invalid")
             journal_family.append((transaction_id, parent_transaction_id))
 
+        gate_created_paths = tuple(
+            _exact_relative_path(item, field="gate-created path")
+            for item in _exact_list(
+                record["gate_created_paths"],
+                field="gate-created paths",
+            )
+        )
+
         result = DevelopmentPreflightWorkspaceRestoration(
             label=cast(str, record["label"]),
             workspace=cast(str, record["workspace"]),
@@ -476,6 +536,7 @@ class DevelopmentPreflightWorkspaceRestoration:
             initialized_gitlinks=tuple(initialized_gitlinks),
             journal_transaction_id=cast(str, record["journal_transaction_id"]),
             journal_family=tuple(journal_family),
+            gate_created_paths=gate_created_paths,
         )
         if result.to_payload() != record:
             raise ValueError("development preflight workspace payload is not canonical")
@@ -523,6 +584,7 @@ class DevelopmentPreflightWorkspaceRestoration:
             ],
             "journal_state": "rolled_back",
             "journal_cleanup_pending": False,
+            "gate_created_paths": list(self.gate_created_paths),
         }
 
 
@@ -532,6 +594,8 @@ class DevelopmentPreflightRestorationReceipt:
 
     This receipt does not bind the verifier result or process settlement.  A
     future executor must compose those independent authorities explicitly.
+    It is emitted whatever the gate run returned or raised, and names the
+    paths that run created in each checkout.
     """
 
     workspaces: tuple[DevelopmentPreflightWorkspaceRestoration, ...]
@@ -747,6 +811,105 @@ def _preflight_untracked_roots(worktree: Path) -> tuple[str, ...]:
     )
 
 
+def _preflight_gate_residue(
+    worktree: Path,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """List what the two slice-gate checks treat as untracked in a checkout.
+
+    Returns the collapsed roots Git reports as untracked and not ignored
+    (files, and directories however empty), and the collapsed ignored
+    directory roots from which the mutation journal derives its directory
+    authority.  Neither listing descends into a collapsed directory.
+    """
+
+    from crucible.workflows import _mutation_journal  # noqa: PLC0415
+
+    raw = _mutation_journal._git(
+        worktree,
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--directory",
+    )
+    return (
+        frozenset(
+            os.fsdecode(encoded).rstrip("/")
+            for encoded in raw.split(b"\0")
+            if encoded
+        ),
+        frozenset(_mutation_journal._ignored_directory_roots(worktree)),
+    )
+
+
+def _preflight_gate_created_roots(
+    before: tuple[frozenset[str], frozenset[str]],
+    after: tuple[frozenset[str], frozenset[str]],
+    *,
+    namespace: frozenset[str],
+    split_namespaces: tuple[tuple[str, frozenset[str], int, int], ...],
+    initialized_gitlinks: tuple[tuple[str, int, int], ...],
+) -> tuple[str, ...]:
+    """Name the roots a gate run created that a slice gate would charge.
+
+    A later slice gate fails its slice for an untracked file Git reports and
+    for a new directory inside the mutation journal's directory authority.
+    The journal keeps an ignored directory root opaque only when it is
+    disjoint from every directory that existed before: a new ignored root at
+    the top level is, one below an existing directory is not.  So the record
+    is every new untracked root Git does not ignore, without the new
+    top-level directories the journal treats as ignored roots, plus every
+    new ignored directory root below the top level.
+
+    Names that existed before the gate ran are left out where the preflight
+    knows them (the top level and each split ancestor): a tracked path the
+    gate run merely stopped tracking was not created by it.
+
+    Both listings are collapsed, so the record is a difference of roots.  A
+    directory that was untracked before the gate ran is the same one root
+    afterwards: what the gate run added below it is not in the record, and
+    a slice gate, which lists every untracked file, still charges it.
+    """
+
+    from crucible.workflows import _mutation_journal  # noqa: PLC0415
+
+    visible_before, ignored_before = before
+    visible_after, ignored_after = after
+    created = {
+        root
+        for root in visible_after - visible_before
+        if "/" in root or root not in ignored_after
+    }
+    created.update(
+        root for root in ignored_after - ignored_before if "/" in root
+    )
+    existing_names = {
+        "": namespace,
+        **{
+            relative: ancestor_namespace
+            for relative, ancestor_namespace, _device, _inode in split_namespaces
+        },
+    }
+
+    def _created_by_gate(root: str) -> bool:
+        if any(
+            root == gitlink or root.startswith(gitlink + "/")
+            for gitlink, _device, _inode in initialized_gitlinks
+        ):
+            # Residue in an initialized submodule is a restoration error.
+            return False
+        parent, _separator, name = root.rpartition("/")
+        return name not in existing_names.get(parent, frozenset())
+
+    return tuple(
+        sorted(
+            _mutation_journal._dedupe_roots(
+                root for root in created if _created_by_gate(root)
+            )
+        )
+    )
+
+
 def _preflight_initialized_gitlinks(
     workspace: Path,
     *,
@@ -947,6 +1110,11 @@ def run_development_verifier_preflight(
             _mutation_journal.WorkspaceMutationJournal,
         ]
     ] = []
+    # The record of gate-created paths travels in the restoration receipt, so
+    # the checkouts are listed only when a caller consumes that receipt.
+    residue_before: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+    gate_created: dict[str, tuple[str, ...]] = {}
+    record_errors: list[BaseException] = []
     preflight_ready = False
     with ExitStack() as locks:
         for workspace in sorted(
@@ -1040,6 +1208,8 @@ def run_development_verifier_preflight(
                     gitlink_journal_bindings,
                     journal,
                 )
+                if restoration_callback is not None:
+                    residue_before[label] = _preflight_gate_residue(workspace)
 
             preflight_ready = True
             return _build_verify.build_and_verify(
@@ -1068,6 +1238,20 @@ def run_development_verifier_preflight(
             ) in reversed(sealed):
                 workspace_errors: list[BaseException] = []
                 observed_nested_untracked: dict[str, tuple[str, ...]] = {}
+                if preflight_ready and label in residue_before:
+                    # Name what the gate run created before the rollback
+                    # below removes it.  A listing failure never stops that
+                    # rollback and is not a restoration failure.
+                    try:
+                        gate_created[label] = _preflight_gate_created_roots(
+                            residue_before[label],
+                            _preflight_gate_residue(workspace),
+                            namespace=namespace,
+                            split_namespaces=split_namespaces,
+                            initialized_gitlinks=initialized_gitlinks,
+                        )
+                    except BaseException as exc:
+                        record_errors.append(exc)
                 try:
                     workspace_metadata = workspace.lstat()
                     if (
@@ -1252,7 +1436,7 @@ def run_development_verifier_preflight(
                 control_error = next(
                     (
                         error
-                        for error in restore_errors
+                        for error in (*restore_errors, *record_errors)
                         if not isinstance(error, Exception)
                     ),
                     None,
@@ -1278,8 +1462,26 @@ def run_development_verifier_preflight(
                         control_error.__traceback__
                     ) from restoration_error
                 raise restoration_error from restore_errors[0]
+            record_control_error = next(
+                (
+                    error
+                    for error in record_errors
+                    if not isinstance(error, Exception)
+                ),
+                None,
+            )
+            if record_control_error is not None:
+                raise record_control_error.with_traceback(
+                    record_control_error.__traceback__
+                )
             if restoration_callback is not None and preflight_ready:
                 try:
+                    if record_errors:
+                        raise _mutation_journal.MutationJournalError(
+                            "development-verifier preflight restored both "
+                            "writable checkouts but could not list the paths "
+                            "its gate run created"
+                        ) from record_errors[0]
                     restored = []
                     for (
                         label,
@@ -1339,6 +1541,7 @@ def run_development_verifier_preflight(
                                         journal._manifest
                                     )
                                 ),
+                                gate_created_paths=gate_created[label],
                             )
                         )
                     by_label = {item.label: item for item in restored}

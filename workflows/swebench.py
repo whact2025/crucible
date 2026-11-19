@@ -516,7 +516,12 @@ class InstanceOutcome:
                                           flight (budget exhaustion,
                                           persistence-veto exception,
                                           backend transport error,
-                                          etc). The captured diff
+                                          etc), or returned without a
+                                          ruling on its work (a gate,
+                                          reviewer, breach loop or
+                                          planning backend gave no
+                                          verdict; the run was
+                                          cancelled). The captured diff
                                           represents partial cascade
                                           work — eval skipped inline and
                                           verified-only predictions remain
@@ -566,6 +571,11 @@ class InstanceOutcome:
     output_tokens: int = 0
     planning_backend_calls: int = 0
     planning_transport_failure: bool = False
+    # Typed terminal of this run's saga-bound Architect child: its detail
+    # status and terminal class. Run-local like the planning fields above;
+    # an instance restored from a prior run carries ``None``.
+    architect_detail_status: str | None = None
+    architect_terminal_class: str | None = None
     # Prediction capture is source-only.  Keep the filtering decision
     # auditable without placing filtered test contents in the prediction or
     # authoring context.
@@ -896,7 +906,8 @@ def _replace_outcome_eval_status(
     Decision table (in priority order):
       - ``cascade_aborted=True``: ``"cascade_aborted_partial"`` —
         the cascade was truncated mid-flight (budget cap, persistence-
-        veto exception, backend transport error, etc); the captured
+        veto exception, backend transport error, etc) or returned without
+        a ruling on its work; the captured
         diff represents partial cascade work. Eval is skipped inline and the
         ineligible candidate is retained in the Corpus; predictions.jsonl
         remains empty unless best-effort submission was explicitly requested.
@@ -1535,6 +1546,24 @@ def _pool_worker_unleased(payload: _PoolPayload) -> InstanceOutcome:
                         inst.instance_id,
                     )
                     cascade_aborted = True
+                architect_status, architect_class = _architect_terminal_label(
+                    payload.parent_run_dir, operation_id,
+                )
+                if not cascade_aborted and _architect_ended_unjudged(
+                    rc, architect_status, architect_class,
+                ):
+                    # Nothing ruled on the cascade's work: a gate, reviewer,
+                    # breach loop or planning backend returned no verdict,
+                    # or the run was cancelled. Like a budget stop this is
+                    # partial work; ``rc`` stays the Architect's own value.
+                    logger.warning(
+                        "swebench worker: instance %s cascade ended without "
+                        "a ruling on its work (%s) — capturing partial "
+                        "workspace diff; eval skipped inline (recoverable "
+                        "post-sweep)",
+                        inst.instance_id, architect_status,
+                    )
+                    cascade_aborted = True
                 architect_cost, architect_rollup_incomplete = (
                     _architect_cost_for_operation(
                         payload.parent_run_dir, operation_id,
@@ -1564,6 +1593,11 @@ def _pool_worker_unleased(payload: _PoolPayload) -> InstanceOutcome:
                     output_tokens=architect_output_tokens,
                     planning_backend_calls=architect_backend_calls,
                     planning_transport_failure=architect_transport_failure,
+                )
+                outcome = dataclasses.replace(
+                    outcome,
+                    architect_detail_status=architect_status,
+                    architect_terminal_class=architect_class,
                 )
                 # Re-materialize the exact content-addressed source patch in a
                 # second one-commit workspace and container. This final visible
@@ -2935,6 +2969,57 @@ def _architect_stopped_on_budget(
     return (
         outcome.workflow == "architect"
         and outcome.terminal_class is _outcome.TerminalClass.BUDGET_EXHAUSTED
+    )
+
+
+def _architect_terminal_label(
+    parent_run_dir: Path | str,
+    operation_id: str,
+) -> tuple[str | None, str | None]:
+    """Return detail status and terminal class of the Architect child.
+
+    The typed terminal of the parent's own saga-bound child is the only
+    authority, as for ``_architect_stopped_on_budget``. A missing or misbound
+    child, or a child of another workflow, labels nothing.
+    """
+
+    try:
+        outcome = _outcome.child_outcome(parent_run_dir, operation_id)
+    except ValueError:
+        return None, None
+    if outcome.workflow != "architect":
+        return None, None
+    return outcome.detail_status, outcome.terminal_class.value
+
+
+# Architect terminals that report an open cost rollup. They share the
+# inconclusive class with unjudged work, but every tier may have been judged
+# and landed; the instance's ``cost_incomplete`` flag carries them.
+_ARCHITECT_ACCOUNTING_STATUSES = frozenset({
+    "budget_accounting_incomplete",
+    "cost_incomplete",
+    "incomplete_accounting",
+})
+
+
+def _architect_ended_unjudged(
+    rc: int,
+    detail_status: str | None,
+    terminal_class: str | None,
+) -> bool:
+    """Whether a returned Architect failure is not a ruling on its work.
+
+    True for an inconclusive, retryable or cancelled terminal of a failed
+    return. An accounting terminal and a returned success are excluded; a
+    budget stop has its own rule.
+    """
+
+    return (
+        rc != 0
+        and detail_status is not None
+        and detail_status not in _ARCHITECT_ACCOUNTING_STATUSES
+        and terminal_class
+        in {item.value for item in _outcome.UNJUDGED_TERMINAL_CLASSES}
     )
 
 
@@ -5268,6 +5353,8 @@ def main(argv: list[str] | None = None) -> int:
                     "planning_transport_failure": (
                         o.planning_transport_failure
                     ),
+                    "architect_detail_status": o.architect_detail_status,
+                    "architect_terminal_class": o.architect_terminal_class,
                     "resumed": o.resumed,
                     "checkpoint_fingerprint": o.checkpoint_fingerprint,
                     "image_digest": o.image_digest,

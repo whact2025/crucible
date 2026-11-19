@@ -17,6 +17,7 @@ from assay import (
     ExecutionCompleteness,
     Invocation,
     InvocationResult,
+    MaxTurnsExceeded,
     Message,
     StaleConversation,
     Usage,
@@ -137,6 +138,33 @@ class _Backend:
                     operation_digest=request.operation_digest,
                 ),
             )
+        if outcome_kind.startswith("turn_limit:"):
+            # A complete turn-limit terminal; the provider's own turn count
+            # follows the colon.
+            return InvocationResult(
+                final_message="",
+                transcript=(),
+                usage=Usage(input_tokens=10, output_tokens=5, cost_usd=0.2),
+                stop_reason="max_turns",
+                error=MaxTurnsExceeded(
+                    turns_used=int(outcome_kind.split(":", 1)[1]),
+                    turns_limit=invocation.max_turns,
+                    message=f"hit max_turns={invocation.max_turns}",
+                ),
+                completeness=_COMPLETE,
+                execution_trace=trace,
+                conversation=ConversationTransportOutcome(
+                    state="active",
+                    opaque_id=f"thread-{len(self.invocations)}",
+                    identity_fingerprint=request.identity_fingerprint,
+                    operation_digest=request.operation_digest,
+                ),
+            )
+        assistant_messages = (
+            int(outcome_kind.split(":", 1)[1])
+            if outcome_kind.startswith("messages:")
+            else 1
+        )
         completeness = (
             ExecutionCompleteness()
             if outcome_kind == "incomplete"
@@ -144,8 +172,9 @@ class _Backend:
         )
         return InvocationResult(
             final_message='{"tiers": []}',
-            transcript=(
-                Message(role="assistant", content='{"tiers": []}'),
+            transcript=tuple(
+                Message(role="assistant", content='{"tiers": []}')
+                for _ in range(assistant_messages)
             ),
             usage=Usage(input_tokens=10, output_tokens=5, cost_usd=0.2),
             stop_reason="end_turn",
@@ -594,6 +623,115 @@ def test_cumulative_remaining_turn_and_usd_are_forwarded(
     with pytest.raises(_conversation.ConversationBudgetExceeded):
         wrapper.invoke(_invocation("third"))
     assert len(backend.invocations) == 2
+
+
+def test_turn_limit_terminal_charges_the_admitted_turns(
+    tmp_path: Path,
+) -> None:
+    """A provider count of limit + 1 at the turn limit is not an overrun.
+
+    The Claude CLI reports ``num_turns == limit + 1`` after ``limit`` requests.
+    The typed turn-limit result must reach the caller; the session ledger
+    ends at the ceiling this call was admitted with.
+    """
+
+    backend = _Backend("turn_limit:6")
+    wrapper = planner_session.PlannerBoundaryBackend(
+        backend,
+        conversation=_config(tmp_path),
+    )
+    invocation = _invocation()
+
+    result = wrapper.invoke(invocation)
+
+    assert [item.max_turns for item in backend.invocations] == [5]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.kind == "max_turns"
+    assert result.error.turns_used == 6
+    assert result.stop_reason == "max_turns"
+    handle = wrapper._controller(invocation).load()  # noqa: SLF001
+    assert handle is not None
+    assert handle.pending_operation is None
+    assert handle.turns_used == 5
+    assert handle.usage.cost_usd == pytest.approx(0.2)
+    assert len(handle.operation_digests) == 1
+
+
+def test_turn_limit_terminal_after_earlier_turns_charges_the_remaining_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The ceiling is what this call was admitted with, not the session cap."""
+
+    backend = _Backend("messages:2", "turn_limit:4")
+    wrapper = planner_session.PlannerBoundaryBackend(
+        backend,
+        conversation=_config(tmp_path),
+    )
+
+    wrapper.invoke(_invocation("first"))
+    result = wrapper.invoke(_invocation("second"))
+
+    assert [item.max_turns for item in backend.invocations] == [5, 3]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    handle = wrapper._controller(_invocation("second")).load()  # noqa: SLF001
+    assert handle is not None
+    assert handle.turns_used == 5
+
+
+def test_turn_limit_terminal_leaves_no_turn_for_a_further_call(
+    tmp_path: Path,
+) -> None:
+    backend = _Backend("turn_limit:6", "active")
+    wrapper = planner_session.PlannerBoundaryBackend(
+        backend,
+        conversation=_config(tmp_path),
+    )
+
+    wrapper.invoke(_invocation("first"))
+    with pytest.raises(_conversation.ConversationBudgetExceeded):
+        wrapper.invoke(_invocation("second"))
+
+    assert len(backend.invocations) == 1
+
+
+def test_turn_limit_terminal_more_than_one_over_the_ceiling_still_blocks(
+    tmp_path: Path,
+) -> None:
+    """Only the exact refused-turn unit is discounted; an overrun is charged."""
+
+    backend = _Backend("turn_limit:7")
+    wrapper = planner_session.PlannerBoundaryBackend(
+        backend,
+        conversation=_config(tmp_path),
+    )
+    invocation = _invocation()
+
+    with pytest.raises(_conversation.ConversationBudgetExceeded):
+        wrapper.invoke(invocation)
+
+    handle = wrapper._controller(invocation).load()  # noqa: SLF001
+    assert handle is not None
+    assert handle.turns_used == 7
+
+
+def test_result_with_more_turns_than_admitted_still_exceeds_the_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A result that is not a turn-limit terminal is charged by its transcript."""
+
+    backend = _Backend("messages:6")
+    wrapper = planner_session.PlannerBoundaryBackend(
+        backend,
+        conversation=_config(tmp_path),
+    )
+    invocation = _invocation()
+
+    with pytest.raises(_conversation.ConversationBudgetExceeded):
+        wrapper.invoke(invocation)
+
+    handle = wrapper._controller(invocation).load()  # noqa: SLF001
+    assert handle is not None
+    assert handle.turns_used == 6
 
 
 def test_unsupported_route_fails_before_backend_transport(

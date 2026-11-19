@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import subprocess
 
 import pytest
 
@@ -1735,3 +1736,177 @@ def test_runner_rejects_partial_baseline_identity(monkeypatch):
     assert rc == 2
     assert payload["values"]["dev_verify_baseline_unavailable"] == 1.0
     assert "metadata is incomplete" in payload["raw_output"]
+
+
+# ---------- paths a baseline command creates in the clean-base checkout ----------
+
+
+_GATE_CREATED = ("coverage",)
+_DECLARED_TEST = "tests/test_declared.py"
+
+
+class _Checkouts:
+    """Candidate and baseline containers that keep what a test command creates.
+
+    Every test command leaves ``coverage`` behind until a removal runs in the
+    same container; ``git status`` reports it for as long as it is there.
+    """
+
+    def __init__(self, *, baseline_removal=None) -> None:
+        self.created = {"candidate": False, "baseline": False}
+        self.baseline_removal = baseline_removal
+        self.calls: list[tuple[str, str]] = []
+
+    def kinds(self, container_id: str) -> list[str]:
+        return [kind for container, kind in self.calls if container == container_id]
+
+    def inspect(self, _args, **_kwargs):
+        # The host-side image-digest probe of the clean-base container.
+        return subprocess.CompletedProcess(
+            _args, 0, stdout="registry.test/image@sha256:" + "a" * 64, stderr="",
+        )
+
+    def __call__(self, container_id, command, **_kwargs):
+        if "git rev-parse" in command:
+            self.calls.append((container_id, "head"))
+            return 0, "b" * 40 + "\n", ""
+        if "git status" in command:
+            self.calls.append((container_id, "status"))
+            dirty = "?? coverage\0" if self.created[container_id] else ""
+            return 0, dirty, ""
+        if command == runner._gate_created_probe_script(_GATE_CREATED):
+            self.calls.append((container_id, "probe"))
+            return 0, "absent\n", ""
+        if command == runner._gate_created_removal_script(_GATE_CREATED):
+            self.calls.append((container_id, "removal"))
+            if container_id == "baseline" and self.baseline_removal is not None:
+                return self.baseline_removal
+            was_created = self.created[container_id]
+            self.created[container_id] = False
+            return 0, "removed\n" if was_created else "absent\n", ""
+        if "readlink -f" in command:
+            return 0, "safe\n", ""
+        self.calls.append(
+            (container_id, "focused" if _DECLARED_TEST in command else "suite")
+        )
+        self.created[container_id] = True
+        return 0, _PYTEST_PASS, ""
+
+
+def _gate_created_baseline_parameters(*, recorded: bool, declared: bool) -> dict:
+    parameters = _baseline_parameters()
+    if recorded:
+        parameters["deepswe_metadata"][runner.GATE_CREATED_PATHS_KEY] = (
+            runner.gate_created_paths_evidence(_GATE_CREATED)
+        )
+    if declared:
+        parameters["declared_verification_surface"] = _declared_surface(
+            _DECLARED_TEST
+        )
+    return parameters
+
+
+def test_unrecorded_baseline_residue_makes_the_next_clean_base_probe_fail(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CRUCIBLE_DEEPSWE_BASELINE_CACHE", str(tmp_path))
+    checkouts = _Checkouts()
+    monkeypatch.setattr(runner, "_run_docker_exec", checkouts)
+    monkeypatch.setattr(runner.subprocess, "run", checkouts.inspect)
+
+    rc, payload = _run_runner(
+        _gate_created_baseline_parameters(recorded=False, declared=True)
+    )
+
+    # The suite's baseline run left ``coverage`` in the clean-base checkout,
+    # so the declared-file probes of the same gate run find it dirty.
+    assert checkouts.kinds("baseline") == ["head", "status", "suite", "head", "status"]
+    assert rc == 2
+    values = payload["values"]
+    assert values["dev_verify_baseline_passed"] == 1.0
+    assert values["dev_verify_declared_probe_unavailable"] == 1.0
+    assert values["dev_verify_infrastructure_unavailable"] == 1.0
+    assert "baseline worktree cleanliness" in payload["raw_output"]
+
+
+def test_baseline_runs_remove_recorded_gate_created_paths_from_the_clean_checkout(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CRUCIBLE_DEEPSWE_BASELINE_CACHE", str(tmp_path))
+    checkouts = _Checkouts()
+    monkeypatch.setattr(runner, "_run_docker_exec", checkouts)
+    monkeypatch.setattr(runner.subprocess, "run", checkouts.inspect)
+    parameters = _gate_created_baseline_parameters(recorded=True, declared=True)
+
+    rc, payload = _run_runner(parameters)
+
+    # Each baseline command, the suite and the focused file, is followed by
+    # its removal, so every clean-base probe finds the checkout clean.
+    assert checkouts.kinds("baseline") == [
+        "head", "status", "suite", "removal",
+        "head", "status", "focused", "removal",
+    ]
+    assert checkouts.kinds("candidate") == [
+        "probe", "suite", "focused", "removal",
+    ]
+    assert checkouts.created == {"candidate": False, "baseline": False}
+    assert rc == 0
+    values = payload["values"]
+    assert values["dev_verify_baseline_passed"] == 1.0
+    assert values["dev_verify_declared_test_baseline_files_compared"] == 1.0
+    assert values["dev_verify_declared_test_files_passed"] == 1.0
+    assert values["dev_verify_infrastructure_unavailable"] == 0.0
+    assert values["dev_verify_gate_created_paths_removed"] == 1.0
+
+    # Both baseline outcomes are cached now: the next gate run sends no test
+    # command to the clean-base container and removes nothing there.
+    checkouts.calls.clear()
+    rc, payload = _run_runner(parameters)
+
+    assert rc == 0
+    assert checkouts.kinds("baseline") == ["head", "status"]
+    assert payload["values"]["dev_verify_baseline_cache_hit"] == 1.0
+    assert payload["values"]["dev_verify_declared_test_baseline_cache_hits"] == 1.0
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_baseline_checkout_that_cannot_be_restored_is_unavailable(
+    tmp_path,
+    monkeypatch,
+    declared,
+):
+    monkeypatch.setenv("CRUCIBLE_DEEPSWE_BASELINE_CACHE", str(tmp_path))
+    # The suite's baseline outcome is cached first when the focused removal
+    # is the one under test, so only that removal can fail.
+    checkouts = _Checkouts()
+    monkeypatch.setattr(runner, "_run_docker_exec", checkouts)
+    monkeypatch.setattr(runner.subprocess, "run", checkouts.inspect)
+    if declared:
+        assert _run_runner(
+            _gate_created_baseline_parameters(recorded=True, declared=False)
+        )[0] == 0
+    cached = sorted(path.name for path in tmp_path.glob("*.json"))
+    checkouts.calls.clear()
+    checkouts.baseline_removal = (44, "", "")
+
+    rc, payload = _run_runner(
+        _gate_created_baseline_parameters(recorded=True, declared=declared)
+    )
+
+    assert rc == 2
+    assert checkouts.kinds("baseline")[-2:] == [
+        "focused" if declared else "suite",
+        "removal",
+    ]
+    values = payload["values"]
+    assert values["dev_verify_infrastructure_unavailable"] == 1.0
+    if declared:
+        assert values["dev_verify_declared_probe_unavailable"] == 1.0
+    else:
+        assert values["dev_verify_baseline_unavailable"] == 1.0
+    assert "clean-base checkout was not restored" in payload["raw_output"]
+    assert "rc=44" in payload["raw_output"]
+    # An outcome from a checkout that was not restored is not cached.
+    assert sorted(path.name for path in tmp_path.glob("*.json")) == cached

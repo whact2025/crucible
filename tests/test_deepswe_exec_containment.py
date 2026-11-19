@@ -754,6 +754,183 @@ def test_cleanup_failure_cannot_report_gate_success(monkeypatch, tmp_path):
     assert "cleanup failed" in stderr
 
 
+@pytest.mark.parametrize(
+    "failure",
+    ["inspect_fails", "not_running", "staging_fails"],
+)
+def test_docker_failure_before_the_command_starts_reports_not_started(
+    monkeypatch, tmp_path, failure,
+):
+    docker_calls: list[list[str]] = []
+    cache_directory = tmp_path / "helper-cache"
+    if failure == "inspect_fails":
+        monkeypatch.setenv(
+            "CRUCIBLE_DEEPSWE_HELPER_DIR", str(cache_directory),
+        )
+
+        def failing_docker(args, **_kwargs):
+            docker_calls.append(list(args[1:]))
+            return subprocess.CompletedProcess(
+                args, 1, stdout="", stderr="Error: No such object: candidate",
+            )
+
+        monkeypatch.setattr(containment.subprocess, "run", failing_docker)
+        expected = "docker inspect -- failed rc=1"
+    elif failure == "not_running":
+        monkeypatch.setenv(
+            "CRUCIBLE_DEEPSWE_HELPER_DIR", str(cache_directory),
+        )
+
+        def not_running(*_args, **_kwargs):
+            raise containment.ExecContainmentError(
+                "source container is not running"
+            )
+
+        monkeypatch.setattr(
+            containment, "_validate_source_container", not_running,
+        )
+        expected = "source container is not running"
+    else:
+        docker_calls, _stage_calls = _mock_contained_invocation(
+            monkeypatch, tmp_path, result_rc=0,
+        )
+
+        def staging_fails(*_args, **_kwargs):
+            raise containment.ExecContainmentError(
+                "static exec-supervisor staging failed rc=1: no space left"
+            )
+
+        monkeypatch.setattr(containment, "_stage_supervisor", staging_fails)
+        expected = "static exec-supervisor staging failed rc=1"
+    monkeypatch.setattr(
+        containment,
+        "_quarantine_source",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a command that never started must not quarantine its source"
+        ),
+    )
+
+    rc, stdout, stderr = containment.run_contained_docker_exec(
+        "candidate", "cd /app && pytest -q", timeout=10, cleanup_timeout=2,
+    )
+
+    assert rc == containment.CONTAINMENT_NOT_STARTED_RC
+    assert stdout == ""
+    assert expected in stderr
+    assert not any(
+        containment._TRUSTED_BINARY in call for call in docker_calls
+    )
+    if failure == "inspect_fails":
+        assert docker_calls == [["inspect", "--", "candidate"]]
+    if failure == "staging_fails":
+        # The in-flight marker is withdrawn: nothing ran, so the source stays
+        # usable for the next command.
+        assert not containment._poison_path(
+            cache_directory, _CANONICAL_ID,
+        ).exists()
+
+
+def test_invalid_invocation_reports_not_started(monkeypatch):
+    monkeypatch.setattr(
+        containment,
+        "_run_docker",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an invalid invocation must not reach Docker"
+        ),
+    )
+
+    assert containment.run_contained_docker_exec(
+        "not a container id", "tests", timeout=10,
+    ) == (
+        containment.CONTAINMENT_NOT_STARTED_RC,
+        "",
+        "invalid source container id",
+    )
+    assert containment.run_contained_docker_exec(
+        "candidate", "", timeout=10,
+    ) == (
+        containment.CONTAINMENT_NOT_STARTED_RC,
+        "",
+        "contained command must be non-empty",
+    )
+
+
+def test_attested_status_equal_to_the_not_started_code_is_unusable(
+    monkeypatch, tmp_path,
+):
+    _mock_contained_invocation(
+        monkeypatch,
+        tmp_path,
+        result_rc=containment.CONTAINMENT_NOT_STARTED_RC,
+    )
+    quarantined: list[str] = []
+    monkeypatch.setattr(
+        containment,
+        "_quarantine_source",
+        lambda container, **_kwargs: (
+            quarantined.append(container) or (True, "force-removed")
+        ),
+    )
+
+    rc, _stdout, stderr = containment.run_contained_docker_exec(
+        "candidate", "tests", timeout=10, cleanup_timeout=2,
+    )
+
+    # A command that ran can never be reported as one that did not.
+    assert rc == containment.CONTAINMENT_UNUSABLE_RC
+    assert quarantined == [_CANONICAL_ID]
+    assert "force-removed" in stderr
+
+
+def test_not_started_code_is_outside_every_started_outcome():
+    not_started = containment.CONTAINMENT_NOT_STARTED_RC
+
+    # The supervisor reports a command's own status only up to 119; the
+    # threshold lives in its C source, so pin that text with the constant.
+    assert (
+        "child_status <= 119 ? child_status : EXIT_CHILD_LARGE_STATUS"
+        in containment._SUPERVISOR_SOURCE
+    )
+    assert "#define EXIT_CHILD_LARGE_STATUS 123\n" in containment._SUPERVISOR_SOURCE
+    assert 119 < not_started < 128
+    assert not_started not in {
+        containment._SUPERVISOR_SIGNAL_RC,
+        123,
+        containment._SUPERVISOR_TIMEOUT_RC,
+        containment._SUPERVISOR_DESCENDANT_RC,
+        containment._SUPERVISOR_FAILURE_RC,
+        containment.CONTAINMENT_UNUSABLE_RC,
+        127,
+    }
+    assert f" {not_started}\n" not in "".join(
+        line + "\n"
+        for line in containment._SUPERVISOR_SOURCE.splitlines()
+        if line.startswith("#define EXIT_")
+    )
+
+
+@pytest.mark.parametrize("returncode", [124, 127])
+def test_timeout_and_missing_docker_before_start_keep_their_codes(
+    monkeypatch, tmp_path, returncode,
+):
+    monkeypatch.setenv(
+        "CRUCIBLE_DEEPSWE_HELPER_DIR", str(tmp_path / "helper-cache"),
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise containment.ExecContainmentError(
+            "docker did not answer", returncode=returncode,
+        )
+
+    monkeypatch.setattr(
+        containment, "_validate_source_container", unavailable,
+    )
+
+    assert containment.run_contained_docker_exec(
+        "candidate", "tests", timeout=10, cleanup_timeout=2,
+    ) == (returncode, "", "docker did not answer")
+
+
 def test_success_path_shares_one_absolute_cleanup_deadline(
     monkeypatch,
     tmp_path,

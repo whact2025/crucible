@@ -923,6 +923,36 @@ def _run_dev_verify_preflight(
     )
 
 
+def _gate_created_paths_summary(
+    restorations: list[DevelopmentPreflightRestorationReceipt],
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Return the candidate's gate-created paths and their summary entries.
+
+    The summary lists at most as many paths as a gate run can be bound to
+    and escapes a name that is not valid UTF-8, so it stays bounded and every
+    JSON writer can encode it; ``gate_created_path_count`` is the full count.
+    """
+
+    from crucible.products.deepswe.runners import (  # noqa: PLC0415
+        deepswe_dev_verify,
+    )
+
+    # The candidate checkout is the first workspace of a receipt.
+    paths = (
+        restorations[-1].workspaces[0].gate_created_paths
+        if restorations
+        else ()
+    )
+    return paths, {
+        "gate_created_paths": [
+            path.encode("utf-8", "backslashreplace").decode("utf-8")
+            for path in paths[: deepswe_dev_verify.MAX_GATE_CREATED_PATHS]
+        ],
+        "gate_created_path_count": len(paths),
+        "gate_created_paths_bound": False,
+    }
+
+
 def _clean_infrastructure_provenance_from_runner(
     runner: Any,
 ) -> dict[str, object] | None:
@@ -2794,6 +2824,7 @@ def _run_task_cascade(
             execution_fingerprint=summary["checkpoint_fingerprint"],
         )
         preflight_log_dir = task_run_dir / "dev-verify-preflight"
+        preflight_restorations: list[DevelopmentPreflightRestorationReceipt] = []
         preflight = _run_dev_verify_preflight(
             spec=instance_corpus.latest_spec(),
             cwd=host_workspace,
@@ -2806,12 +2837,16 @@ def _run_task_cascade(
                 / "final_gate_mutations"
             ),
             extra_parameters=kwargs["extra_parameters"],
+            restoration_callback=preflight_restorations.append,
         )
         preflight_runner = preflight.dev_verify
         clean_infrastructure_provenance = (
             _clean_infrastructure_provenance_from_runner(preflight_runner)
             if preflight_runner is not None
             else None
+        )
+        gate_created_paths, gate_created_summary = _gate_created_paths_summary(
+            preflight_restorations
         )
         summary["dev_verify_preflight"] = {
             "classification": preflight.classification,
@@ -2828,6 +2863,7 @@ def _run_task_cascade(
             "clean_infrastructure_provenance_bound": (
                 clean_infrastructure_provenance is not None
             ),
+            **gate_created_summary,
         }
         if (
             not preflight.classification.startswith("success")
@@ -2875,6 +2911,32 @@ def _run_task_cascade(
             ] = clean_infrastructure_provenance
             architect_parameters["deepswe_metadata"] = architect_metadata
             kwargs["extra_parameters"] = architect_parameters
+        if gate_created_paths:
+            from crucible.products.deepswe.runners import (  # noqa: PLC0415
+                deepswe_dev_verify,
+            )
+
+            # Bound, every later gate run removes these paths again when its
+            # own commands created them.  A record that cannot be bound
+            # exactly stays in the summary and the task runs as without it.
+            gate_created_evidence = (
+                deepswe_dev_verify.gate_created_paths_evidence(
+                    gate_created_paths
+                )
+            )
+            if gate_created_evidence is not None:
+                architect_parameters = dict(kwargs["extra_parameters"])
+                architect_metadata = dict(
+                    architect_parameters["deepswe_metadata"]
+                )
+                architect_metadata[
+                    deepswe_dev_verify.GATE_CREATED_PATHS_KEY
+                ] = gate_created_evidence
+                architect_parameters["deepswe_metadata"] = architect_metadata
+                kwargs["extra_parameters"] = architect_parameters
+                summary["dev_verify_preflight"][
+                    "gate_created_paths_bound"
+                ] = True
         operation_id = _architect_operation_id(inst.task_id)
         summary["architect_operation_id"] = operation_id
         architect_error: Exception | None = None
@@ -3737,6 +3799,62 @@ _LIFECYCLE_REUSABLE_STATUSES = frozenset({
 _LIFECYCLE_RETRYABLE_STATUSES = (
     _LIFECYCLE_TERMINAL_STATUSES - _LIFECYCLE_REUSABLE_STATUSES
 )
+# Stops raised before Architect is started: no model was invoked and no work
+# exists to judge.
+_UNJUDGED_SETUP_STATUSES = frozenset({"setup_failed", "toolchain_unavailable"})
+
+
+def _task_failure_is_unjudged(summary: dict[str, Any]) -> bool:
+    """A settled pre-oracle task failure in which nothing judged the work.
+
+    Either Architect was never started (a setup stop), or its exact typed
+    outcome is not a ruling: inconclusive, retryable or cancelled. The
+    accounting and cleanup terms are those of the retryable projection, so a
+    task with an incomplete cost rollup never qualifies.
+    """
+
+    if not (
+        "hidden_invocation_measurement_ref" in summary
+        and summary["hidden_invocation_measurement_ref"] is None
+        and summary.get("cost_incomplete") is False
+        and summary.get("cleanup_status") == "complete"
+    ):
+        return False
+    architect_class = summary.get("architect_terminal_class")
+    if architect_class is None:
+        # ``architect_operation_id`` is recorded immediately before Architect
+        # starts. A started Architect without a typed outcome proves nothing.
+        return (
+            summary.get("architect_operation_id") is None
+            and summary.get("status") in _UNJUDGED_SETUP_STATUSES
+        )
+    return (
+        summary.get("status") in _LIFECYCLE_RETRYABLE_STATUSES
+        and architect_class
+        in {item.value for item in _outcome.UNJUDGED_TERMINAL_CLASSES}
+    )
+
+
+def _all_task_failures_are_unjudged(
+    task_summaries: list[dict[str, Any]],
+) -> bool:
+    """Keep a run in which no failed task was judged out of ``tasks_failed``.
+
+    This is a label for the aggregate run only. Like the retryable
+    projection it changes no task execution, replay or rerun authority, and
+    it is not a claim that a later attempt would succeed.
+    """
+
+    failed = [
+        summary
+        for summary in task_summaries
+        if summary.get("status") != "resolved"
+    ]
+    return bool(failed) and all(
+        _task_failure_is_unjudged(summary) for summary in failed
+    )
+
+
 # The hidden verifier produced a valid binary reward for the exact candidate.
 _GRADED_TASK_STATUSES = frozenset({"resolved", "unresolved"})
 
@@ -5407,11 +5525,12 @@ def _implement_serial(
     elif halt_reason is not None:
         status = "budget_exhausted"
     elif failed_tasks:
-        status = (
-            "retryable_tasks_failed"
-            if _all_task_failures_are_retryable(task_summaries)
-            else "tasks_failed"
-        )
+        if _all_task_failures_are_retryable(task_summaries):
+            status = "retryable_tasks_failed"
+        elif _all_task_failures_are_unjudged(task_summaries):
+            status = "inconclusive_tasks_failed"
+        else:
+            status = "tasks_failed"
     elif cleanup_failed:
         status = "cleanup_failed"
     else:

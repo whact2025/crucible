@@ -2611,20 +2611,22 @@ def test_incomplete_accounting_restores_partial_without_paid_retry_or_breach(
 
 
 @pytest.mark.parametrize(
-    "error_kind",
+    ("error_kind", "expected_status"),
     [
-        "budget_exhausted",
-        "cancellation",
-        "content_rejected",
-        "incomplete_evidence",
-        "stale_conversation",
-        "timeout",
+        ("budget_exhausted", "slice_failed"),
+        # A cancelled implementer was not judged. Its tier halts all the same.
+        ("cancellation", "cancelled"),
+        ("content_rejected", "slice_failed"),
+        ("incomplete_evidence", "slice_failed"),
+        ("stale_conversation", "slice_failed"),
+        ("timeout", "slice_failed"),
     ],
 )
 def test_backend_terminal_partial_write_never_becomes_breach_seed(
     tmp_path,
     monkeypatch,
     error_kind,
+    expected_status,
 ):
     backend = _NonAuthorizingTerminalBackend(error_kind=error_kind)
     breach_called = []
@@ -2649,6 +2651,8 @@ def test_backend_terminal_partial_write_never_becomes_breach_seed(
     )
 
     assert rc == 1
+    assert summary["status"] == expected_status
+    assert summary["rollback_applied"] is True
     assert len(backend.invocations) == 1
     assert breach_called == []
     assert repo.joinpath("target.py").read_text(encoding="utf-8") == (

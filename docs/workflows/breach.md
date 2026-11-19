@@ -27,6 +27,21 @@ terminal. The workflow owns attack authoring and execution through language-awar
 runners and observation contracts. Models receive source and scoped write
 tools; deterministic workflow code owns the verification commands.
 
+A gate that could not run judged nothing. When a round's pre-fix or post-fix
+gate, or the final shipping gate, reports that it produced no evidence (the
+`dev_verify` runner's unavailable flag, or an exact-observation failure of
+kind `infrastructure`), the loop ends `inconclusive_gate_unavailable`: no
+Test Author repair turn, Defender recovery turn, or Judge call follows, and
+the workspace is restored as for every non-accepted end. The kind is the
+runner's own statement, with one exception: a gate command that timed out is
+not such a gate. The runner has one window for the command and the observers,
+so the `infrastructure` failure that follows the timeout keeps `incomplete`
+unless the runner also set its flag, as Tier files the same timeout as a
+failed gate. An exact-observation failure of kind `channel` or `configuration`
+without that flag keeps `incomplete` too, because the candidate or the
+generated test can cause it. A gate that changed source or Git state keeps its
+integrity status whether or not it could run.
+
 A captured Corpus diff can be selected with `--diff-hash` instead of a file.
 Budget is cumulative across attack/repair/review work. Response-repair bounds
 are distinct from semantic adversarial rounds. See [rubric contracts](../../rubrics/README.md).
@@ -78,4 +93,4 @@ files; events, traces, and domain artifacts are conditional. Source:
 | `0` | Breaker found no attacks, or Judge emitted `decision=pass` and every required attack had a named, passing post-fix observation; in either case the final shipping build+verify also passed. |
 | `1` | `revise` remained at max rounds, the persistence-veto threshold was reached, or cumulative budget was exhausted; workspace restored. |
 | `2` | Judge emitted `decision=reject`, or setup/authority/runner preflight failed before a complete adversarial result; workspace restored when a transaction had begun. |
-| `3` | Breaker/Judge emitted `inconclusive`, a required post-fix observation was missing/errored, a schema/transport failure prevented adjudication, a positively quiesced mutation terminal prevented adjudication, or setup never produced a complete review; workspace restored. Unresolved cleanup raises the exact mutation terminal instead of returning a code. |
+| `3` | Breaker/Judge emitted `inconclusive`, a required post-fix observation was missing/errored, a schema/transport failure prevented adjudication, a positively quiesced mutation terminal prevented adjudication, a round gate or the final shipping build+verify could not run (`inconclusive_gate_unavailable`), the final shipping build+verify did not pass (`inconclusive_post_strip_verify`), or setup never produced a complete review; workspace restored. Unresolved cleanup raises the exact mutation terminal instead of returning a code. |

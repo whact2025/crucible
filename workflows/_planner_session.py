@@ -246,9 +246,15 @@ def _request_context_bytes(invocation: Invocation) -> int:
     )
 
 
-def _turns_used(result: InvocationResult) -> int:
+def _turns_used(result: InvocationResult, *, admitted_turns: int) -> int:
     error = result.error
     if isinstance(error, MaxTurnsExceeded):
+        # A turn-limit terminal may count the turn the provider refused to
+        # start (Claude CLI: num_turns == limit + 1 after ``limit`` requests).
+        # That one unit was neither admitted nor run. Any larger count is a
+        # real overrun and is charged in full.
+        if error.turns_used == admitted_turns + 1:
+            return admitted_turns
         return error.turns_used
     assistant_messages = sum(
         message.role == "assistant" for message in result.transcript
@@ -608,7 +614,9 @@ class PlannerBoundaryBackend:
         invocation: Invocation,
         *,
         operation_digest: str,
-    ) -> InvocationResult:
+    ) -> tuple[InvocationResult, int]:
+        """Return the result and the turn ceiling forwarded to the adapter."""
+
         controller.claim_operation(
             operation_digest=operation_digest,
             started_at=self._now(),
@@ -654,7 +662,7 @@ class PlannerBoundaryBackend:
                 operation_digest,
                 "planner backend returned a non-InvocationResult outcome",
             )
-        return result
+        return result, forwarded.max_turns
 
     def _record_typed_stale(
         self,
@@ -762,7 +770,7 @@ class PlannerBoundaryBackend:
             invocation,
             minimum_attempt=minimum_attempt,
         )
-        result = self._invoke_attempt(
+        result, admitted_turns = self._invoke_attempt(
             controller,
             invocation,
             operation_digest=operation,
@@ -790,7 +798,7 @@ class PlannerBoundaryBackend:
                 invocation,
                 minimum_attempt=attempt + 1,
             )
-            result = self._invoke_attempt(
+            result, admitted_turns = self._invoke_attempt(
                 controller,
                 invocation,
                 operation_digest=operation,
@@ -809,7 +817,7 @@ class PlannerBoundaryBackend:
         controller.commit_operation(
             operation_digest=operation,
             opaque_id=outcome.opaque_id,
-            turns=_turns_used(result),
+            turns=_turns_used(result, admitted_turns=admitted_turns),
             context_bytes=_request_context_bytes(invocation),
             usage=result.usage,
         )

@@ -51,6 +51,27 @@ Pristine visible verification and hidden verification replay exact candidate
 bytes independently. Private tests, hidden commands, evaluator mounts, and
 truth artifacts stay outside authoring tools, prompts, and image context.
 
+Before any model call the development gate runs once on the untouched
+candidate and baseline checkouts, and both are restored. The paths that run
+created are recorded where a later slice gate would charge them to its slice:
+an untracked file Git does not ignore, and a new directory that Git does not
+ignore or that is ignored below a directory the checkout already had. A new
+top-level directory Git ignores as a whole, such as a cache that ignores
+itself, and an ignored file are not recorded; a slice gate accepts them. Two
+effects of that run are restored without being recorded, and fail a slice
+whose gate repeats them: a path added below a directory that was already
+untracked in the checkout, even an empty one, and a changed or deleted file
+the checkout already had, tracked or untracked. The
+task summary lists the candidate's record in
+`dev_verify_preflight.gate_created_paths` (at most 256 of
+`gate_created_path_count` paths). When `gate_created_paths_bound` is true,
+the development verifier removes exactly those paths after each gate run in
+which they were new, so they are not charged to a slice. A record that cannot
+be bound exactly (more than 256 paths, more than 16,384 bytes of names, or a
+name that is not a canonical UTF-8 path) is listed unbound and the task runs
+as without it. Any other path a gate run leaves outside the slice's scope
+still fails the slice.
+
 A verifier result is a grade only when its reward artifact matches the private
 tests snapshot. When that snapshot's `tests/config.json` declares a whitelist,
 the grade is the DeepSWE 1.1 `reward.json`: exactly the contract fields, a
@@ -173,4 +194,15 @@ files; events, traces, and domain artifacts are conditional. Source:
 | `2` | Missing dataset, invalid routing or CLI input, missing mode, unavailable Docker, or container/disk preflight failure. |
 
 `result.json`/`outcome.json` distinguish ordinary permanent `tasks_failed`
-from `retryable_tasks_failed`; both use exit code `1`.
+from `retryable_tasks_failed` and `inconclusive_tasks_failed`; all three use
+exit code `1`. `retryable_tasks_failed` means every failed task stopped before
+the hidden oracle with a retryable Architect terminal.
+`inconclusive_tasks_failed` means no failed task was judged: each one either
+stopped before Architect was started (`setup_failed` or
+`toolchain_unavailable`, including a development-verifier preflight that was
+red or could not run), or stopped before the hidden oracle with an Architect
+terminal that is not a ruling on its work (inconclusive, retryable, or
+cancelled). Both need complete cost accounting and cleanup for every failed
+task, and one judged task keeps `tasks_failed`. The status is a label for the
+run: it changes no task status, checkpoint, or rerun rule, and it is not a
+claim that another attempt would succeed.
