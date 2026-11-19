@@ -516,7 +516,7 @@ class _PlanCitationTypoBackend:
 
 
 def test_chunk_policy_disables_unavailable_source_reference_modes():
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
 
     policy = _assay_response_repair_policy(
         backend=backend,
@@ -1092,7 +1092,7 @@ def test_anchor_only_repair_growth_fails_before_second_backend_call(
 
 
 def test_plan_review_downgrades_to_anchors_only_after_json_failure():
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
 
     policy = _assay_response_repair_policy(
         backend=backend,
@@ -1115,7 +1115,7 @@ def test_plan_review_downgrades_to_anchors_only_after_json_failure():
 
 def test_anchor_only_policy_is_required_from_first_attempt():
     backend = _AnchorResponseBackend(
-        model="kimi-k2.7-code-highspeed", name="kimi"
+        model="kimi-k3.1-pro", name="kimi"
     )
 
     policy = _assay_response_repair_policy(
@@ -1231,7 +1231,7 @@ def test_large_single_review_degrades_initial_anchor_requirement(
     )
     corpus = Corpus(tmp_path / "corpus")
     backend = _AnchorResponseBackend(
-        model="kimi-k2.7-code-highspeed",
+        model="kimi-k3.1-pro",
         name="kimi",
     )
 
@@ -1396,7 +1396,7 @@ def test_plan_anchor_repair_scope_comes_from_manifest_metadata(rubric_name):
 def test_plan_anchor_only_repair_accepts_exact_live_assay_suffixes(
     validation_error,
 ):
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
     policy = ReviewResponseRepairPolicy(
         materialize_source_anchors=True,
         materialize_json_paths=True,
@@ -1427,7 +1427,7 @@ def test_plan_anchor_only_repair_accepts_exact_live_assay_suffixes(
 def test_plan_anchor_only_repair_accepts_exact_nonverbatim_evidence_error(
     validation_error,
 ):
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
     policy = ReviewResponseRepairPolicy(
         materialize_source_anchors=True,
         materialize_json_paths=True,
@@ -1469,7 +1469,7 @@ def test_plan_anchor_only_repair_accepts_exact_nonverbatim_evidence_error(
 def test_plan_nonverbatim_anchor_fallback_rejects_near_misses(
     validation_error,
 ):
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
     policy = ReviewResponseRepairPolicy(
         materialize_source_anchors=True,
         materialize_json_paths=True,
@@ -1487,7 +1487,7 @@ def test_plan_nonverbatim_anchor_fallback_rejects_near_misses(
     ("model", "rubric_name", "expected"),
     (
         ("another-model", "plan_judge", True),
-        ("nvidia/zai-org/glm-5.2", "spec_clarity", False),
+        ("nvidia/zai-org/glm-5.3", "spec_clarity", False),
     ),
 )
 def test_nonverbatim_anchor_fallback_is_backend_neutral_and_plan_scoped(
@@ -1514,7 +1514,7 @@ def test_nonverbatim_anchor_fallback_is_backend_neutral_and_plan_scoped(
 
 
 def test_nonverbatim_anchor_fallback_retains_non_chunk_policy_gate():
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
     chunk_policy = ReviewResponseRepairPolicy(
         materialize_source_anchors=False,
         materialize_json_paths=False,
@@ -1541,19 +1541,19 @@ def test_nonverbatim_anchor_fallback_retains_non_chunk_policy_gate():
             True,
         ),
         (
-            "nvidia/zai-org/glm-5.2",
+            "nvidia/zai-org/glm-5.3",
             "spec_clarity",
             "unresolved deterministic JSON path",
             False,
         ),
         (
-            "nvidia/zai-org/glm-5.2",
+            "nvidia/zai-org/glm-5.3",
             "plan_judge",
             "invalid review_v2 response: missing=['findings']",
             False,
         ),
         (
-            "nvidia/zai-org/glm-5.2",
+            "nvidia/zai-org/glm-5.3",
             "plan_judge",
             (
                 "invalid review_v2 response: unresolved deterministic source "
@@ -1562,7 +1562,7 @@ def test_nonverbatim_anchor_fallback_retains_non_chunk_policy_gate():
             False,
         ),
         (
-            "nvidia/zai-org/glm-5.2",
+            "nvidia/zai-org/glm-5.3",
             "plan_judge",
             (
                 "invalid review_v2 response: declared character span does not "
@@ -1592,9 +1592,62 @@ def test_anchor_only_fallback_is_exactly_scoped(
     ) is expected
 
 
+def test_glm_review_gates_are_exact_to_the_current_gateway_id():
+    review_module = importlib.import_module("crucible.workflows._review")
+    current = SimpleNamespace(
+        name="openai_compat",
+        model="nvidia/zai-org/glm-5.3",
+    )
+    retired = SimpleNamespace(
+        name="openai_compat",
+        model="nvidia/zai-org/glm-5.2",
+    )
+    length_verdict = SimpleNamespace(
+        decision="inconclusive",
+        findings=(SimpleNamespace(
+            id="backend_max_turns",
+            source="deterministic",
+            category="backend_error",
+            evidence=(SimpleNamespace(
+                excerpt="server returned finish_reason=length",
+            ),),
+        ),),
+    )
+    policy = ReviewResponseRepairPolicy(
+        materialize_source_anchors=True,
+        materialize_json_paths=True,
+    )
+
+    def gates(backend):
+        return (
+            _assay_response_repair_policy(
+                backend=backend,
+                rollout="auto",
+                chunk_protocol=False,
+            ) is not None,
+            review_module._retryable_output_length_error(
+                backend=backend,
+                verdict=length_verdict,
+            ) is not None,
+            review_module._glm_plan_decision_consistency_error(
+                backend=backend,
+                rubric_name="plan_judge",
+                validation_error=(
+                    review_module._GLM_PLAN_DECISION_CONSISTENCY_ERROR
+                ),
+                response_repair_policy=policy,
+            ),
+        )
+
+    assert review_module._NVIDIA_GLM_MODEL == current.model
+    assert gates(current) == (True, True, True)
+    # The predecessor still answers on the gateway; it gets no recovery.
+    assert gates(retired) == (False, False, False)
+
+
 def test_glm_review_enables_assay_anchor_materialization(tmp_path):
     corpus = Corpus(tmp_path / "corpus")
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
 
     verdict = review(
         _ARTIFACT,
@@ -1814,7 +1867,7 @@ def test_deterministic_source_evidence_repair_requires_a_bool(tmp_path):
 
 def test_off_policy_cannot_be_bypassed_with_direct_assay_policy(tmp_path):
     corpus = Corpus(tmp_path / "corpus")
-    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.2")
+    backend = _AnchorResponseBackend(model="nvidia/zai-org/glm-5.3")
 
     with pytest.raises(TypeError, match="response_repair_policy is adapter-owned"):
         review(
@@ -1852,7 +1905,7 @@ def test_backend_capability_can_opt_in_to_assay_response_repair(tmp_path):
 def test_retry_manifest_retains_each_assay_response_repair_ref(tmp_path):
     corpus = Corpus(tmp_path / "corpus")
     backend = _AnchorResponseBackend(
-        model="nvidia/zai-org/glm-5.2",
+        model="nvidia/zai-org/glm-5.3",
         invalid_first_contract=True,
     )
 

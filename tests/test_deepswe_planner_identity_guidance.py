@@ -52,7 +52,7 @@ def _payload(*, directive_id="s0"):
 class _Planner:
     def __init__(self, name, responses):
         self.name = name
-        self.model = "kimi-k3" if name == "kimi" else "fixture"
+        self.model = "kimi-k3.1-pro" if name == "kimi" else "fixture"
         self.features = feature_profile_for_route(
             name,
             model=self.model,

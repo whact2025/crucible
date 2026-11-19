@@ -328,7 +328,7 @@ def test_controller_rejects_unsupported_workflow_continuity_before_state_use(
     [
         ("codex", "gpt-5.6-sol", True),
         ("claude", "aws/anthropic/bedrock-claude-opus-5", True),
-        ("kimi", "kimi-k2.7-code-highspeed", False),
+        ("kimi", "kimi-k3.1-pro", False),
         ("openai_compat", "unqualified-model", False),
     ],
 )

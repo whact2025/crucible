@@ -23,21 +23,32 @@
 #
 # Model routing:
 # - Every SWE-bench comparison role explicitly pins
-#   `nvidia/zai-org/glm-5.2`; the default also fail-closes future roles to the
+#   `nvidia/zai-org/glm-5.3`; the default also fail-closes future roles to the
 #   same route. `expected_served_model` rejects response-identity drift.
+# - On 2026-11-18 the hub listed this id and answered one-line requests for
+#   it through `OpenAIBackend` under this model name: text, a strict
+#   `json_schema` response, a tool loop that ended in the constrained
+#   finalization, and a write turn with `tool_choice: "required"`. That is a
+#   transport observation, not a qualification.
 #
-# Cost: the GLM-5.2 model id is in `backends/pricing.py::DEFAULT_PRICING` as
-# an explicit zero-rate entry. Token counts flow through
+# Cost: the GLM-5.3 model id is in `backends/pricing.py::DEFAULT_PRICING` as
+# an explicit zero-rate entry, carried over from the GLM-5.2 row; no
+# per-token charge has been verified for this id, and on 2026-11-18 the
+# hub's model information reported a non-zero cost per token for it, so the
+# zero may understate (see the row comment). Token counts flow through
 # `costs.total_input_tokens`, `costs.total_output_tokens`, and the nested
 # planning-role usage rollup; `costs.by_model` attributes dollars. The
 # summary's `total_usd` reads 0 by design.
 #
-# Structured output: NVIDIA's hosted GLM-5.2 route currently rejects the valid
-# JSON Schema `uniqueItems` keyword and returns constrained JSON in
-# `reasoning_content`. `OpenAIBackend` applies an exact-route compatibility
-# shim while Assay retains the original schema and enforces uniqueness after
-# parsing. Tool-enabled roles explore first and use a separate no-tools
-# constrained finalization so schema enforcement cannot suppress tool calls.
+# Structured output: on 2026-11-18 this route accepted Assay's schema
+# unmodified, the JSON Schema `uniqueItems` keyword included, and returned
+# the constrained JSON in `content` with its reasoning in
+# `reasoning_content`. `OpenAIBackend` sends the schema as it is and never
+# reads `reasoning_content` as an answer. Tool-enabled roles explore first
+# and use a separate no-tools constrained finalization so schema enforcement
+# cannot suppress tool calls. No structured-output qualification is recorded
+# for this route: it carries the generic OpenAI-compatible feature profile,
+# and `feature_admission: diagnostic` retains its planner and reviewer roles.
 
 schema_version: crucible.backend-routing.v1
 
@@ -45,69 +56,69 @@ default:
   backend: openai_compat
   base_url: ${INFER_BASE_URL}
   api_key: ${INFER_AUTH_TOKEN}
-  model: nvidia/zai-org/glm-5.2
+  model: nvidia/zai-org/glm-5.3
   feature_admission: diagnostic
   extra:
-    expected_served_model: nvidia/zai-org/glm-5.2
+    expected_served_model: nvidia/zai-org/glm-5.3
 
 roles:
   architect_planner:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   architect_critic:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   architect_judge:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   implementer:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   breach_defender:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   swebench_impl_breaker:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   breach_judge:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   diff_scope:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   tier_completeness:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   review_conflict_authority:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic

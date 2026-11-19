@@ -59,7 +59,11 @@ The [profile catalog](../../products/swebench/backend_profile_catalog.yaml)
 names exact selectable adapter/model/transport identities. Bind an explicit
 profile with `--backend-config` to change routes. Diagnostic Kimi, DeepSeek,
 local, and OpenAI-compatible profiles retain their declared admission and
-completeness limits. DeepSeek construction templates require
+completeness limits. The diagnostic Kimi SDK profiles need the cost
+upper-bound policy, which `crucible swebench` has no option to select: a
+budgeted suite run on one of them pays for the planner replies and then stops
+on incomplete accounting, so use them with `architect`, `tier`, `breach`, or
+`review` and the policy. DeepSeek construction templates require
 [route binding](backend_config_bind_deepseek.md). Catalog metadata does not
 establish launch or promotion authority.
 

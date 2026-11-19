@@ -94,7 +94,7 @@ def test_backend_factory_registers_kimi_as_dedicated_adapter(monkeypatch):
 
     backend = resolve(
         "kimi",
-        model="kimi-k2.7-code-highspeed",
+        model="kimi-k3.1-pro",
         cwd="/workspace",
     )
 
@@ -103,7 +103,7 @@ def test_backend_factory_registers_kimi_as_dedicated_adapter(monkeypatch):
     assert captured == {
         "cwd": "/workspace",
         "log_dir": None,
-        "model": "kimi-k2.7-code-highspeed",
+        "model": "kimi-k3.1-pro",
     }
 
 
@@ -487,33 +487,35 @@ def test_routing_fingerprint_redacts_credential_rotation():
 
 
 def test_routing_fingerprint_binds_backend_feature_profile():
-    nvidia = BackendRouting(
+    # Same adapter and model on two hosts: the Kimi feature row is qualified
+    # by the exact Moonshot endpoint, so only the host tells the two apart.
+    moonshot = BackendRouting(
         default=RoleConfig(
-            backend="openai_compat",
-            model="nvidia/moonshotai/kimi-k2.6",
-            base_url="https://inference-api.nvidia.com",
+            backend="kimi",
+            model="kimi-k3.1-pro",
+            base_url="https://api.moonshot.ai/v1",
             api_key="secret",
         ),
     )
     unqualified = BackendRouting(
         default=RoleConfig(
-            backend="openai_compat",
-            model="nvidia/moonshotai/kimi-k2.6",
+            backend="kimi",
+            model="kimi-k3.1-pro",
             base_url="https://example.invalid/v1",
             api_key="secret",
         ),
     )
-    assert routing_feature_fingerprint(nvidia) != routing_feature_fingerprint(
+    assert routing_feature_fingerprint(moonshot) != routing_feature_fingerprint(
         unqualified
     )
-    assert routing_fingerprint(nvidia) != routing_fingerprint(unqualified)
+    assert routing_fingerprint(moonshot) != routing_fingerprint(unqualified)
 
 
 def test_kimi_route_fingerprint_binds_dedicated_feature_profile():
     dedicated = BackendRouting(
         default=RoleConfig(
             backend="kimi",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             base_url="https://api.moonshot.ai/v1",
             api_key="secret",
         ),
@@ -521,7 +523,7 @@ def test_kimi_route_fingerprint_binds_dedicated_feature_profile():
     control = BackendRouting(
         default=RoleConfig(
             backend="openai_compat",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             base_url="https://api.moonshot.ai/v1",
             api_key="secret",
         ),
@@ -1009,14 +1011,18 @@ def test_routing_lint_accepts_already_measured_bytes_without_path_reopen(
 
 
 @pytest.mark.parametrize("product", ["swebench", "deepswe"])
-def test_inference_hub_profile_routes_every_role_to_glm_5_2(product):
+def test_inference_hub_profile_routes_every_role_to_glm_5_3(product):
     path = Path(__file__).parents[1] / f"products/{product}/backends_inference_hub.yaml"
     routing = lint_routing_config(path)
 
     assert routing.default.backend == "openai_compat"
-    assert routing.default.model == "nvidia/zai-org/glm-5.2"
+    assert routing.default.model == "nvidia/zai-org/glm-5.3"
     assert routing.default.base_url == "${INFER_BASE_URL}"
     assert routing.default.feature_admission == "diagnostic"
+    assert routing.default.effort is None
+    assert routing.default.extra == {
+        "expected_served_model": "nvidia/zai-org/glm-5.3",
+    }
     expected_roles = {
         "architect_planner",
         "architect_critic",
@@ -1063,10 +1069,14 @@ def test_kimi_inference_profile_is_diagnostic_openai_control(product):
     routing = lint_routing_config(path)
 
     assert routing.default.backend == "openai_compat"
-    assert routing.default.model == "nvidia/moonshotai/kimi-k2.6"
+    assert routing.default.model == "nvidia/moonshotai/kimi-k3.1-pro"
+    assert routing.default.effort == "high"
     assert routing.default.base_url == "${INFER_BASE_URL}"
     assert routing.default.api_key == "${INFER_AUTH_TOKEN}"
     assert routing.default.feature_admission == "diagnostic"
+    assert routing.default.extra == {
+        "expected_served_model": "nvidia/moonshotai/kimi-k3.1-pro",
+    }
 
 
 @pytest.mark.parametrize("product", ["swebench", "deepswe"])
@@ -1075,7 +1085,8 @@ def test_kimi_sdk_profile_is_dedicated_arm_not_openai_alias(product):
     routing = lint_routing_config(path)
 
     assert routing.default.backend == "kimi"
-    assert routing.default.model == "kimi-k2.7-code-highspeed"
+    assert routing.default.model == "kimi-k3.1-pro"
+    assert routing.default.effort == "max"
     assert routing.default.base_url == "${KIMI_BASE_URL}"
     assert routing.default.api_key == "${MOONSHOT_API_KEY}"
     assert routing.default.extra == {"worker_source": "project_locked"}
@@ -1097,13 +1108,13 @@ def test_kimi_sdk_profile_is_dedicated_arm_not_openai_alias(product):
 
 @pytest.mark.parametrize(
     "value",
-    [True, 0, -1, 262_145, "16384"],
+    [True, 0, -1, 1_048_577, "16384"],
 )
 def test_kimi_max_response_tokens_routing_extra_is_closed(value):
     routing = BackendRouting(
         default=RoleConfig(
             backend="kimi",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             extra={"max_response_tokens": value},
         ),
     )
@@ -1120,7 +1131,7 @@ def test_kimi_timeout_seconds_routing_extra_is_closed(value):
     routing = BackendRouting(
         default=RoleConfig(
             backend="kimi",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             extra={"timeout_seconds": value},
         ),
     )
@@ -1163,7 +1174,7 @@ def test_kimi_expected_worker_runtime_fingerprint_reaches_adapter(
     routing = BackendRouting(
         default=RoleConfig(
             backend="kimi",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             base_url="https://api.moonshot.ai/v1",
             api_key="runtime-test-token",
             extra={
@@ -1220,7 +1231,7 @@ def test_kimi_expected_worker_runtime_fingerprint_is_closed(
     routing = BackendRouting(
         default=RoleConfig(
             backend="kimi",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             base_url="https://api.moonshot.ai/v1",
             api_key="runtime-test-token",
             extra=extra,
@@ -1234,7 +1245,7 @@ def test_kimi_expected_worker_runtime_fingerprint_is_closed(
 def _kimi_diagnostic_writer_routing(**overrides):
     values = {
         "backend": "kimi",
-        "model": "kimi-k2.7-code-highspeed",
+        "model": "kimi-k3.1-pro",
         "base_url": "https://api.moonshot.ai/v1",
         "api_key": "runtime-test-token",
         "feature_admission": "diagnostic",
@@ -1255,12 +1266,14 @@ def test_kimi_diagnostic_writer_profile_is_closed_and_outside_e12(
     linted = lint_routing_config(path)
 
     assert linted.default.backend == "kimi"
-    assert linted.default.model == "kimi-k2.7-code-highspeed"
+    assert linted.default.model == "kimi-k3.1-pro"
+    assert linted.default.effort == "max"
     assert linted.default.base_url == "${KIMI_BASE_URL}"
     assert linted.default.api_key == "${MOONSHOT_API_KEY}"
     assert linted.default.feature_admission == "diagnostic"
     assert linted.default.extra == {
         "diagnostic_workspace_write": True,
+        "diagnostic_cost_upper_bound": True,
         "worker_source": "project_locked",
     }
     for role in (
@@ -1269,11 +1282,13 @@ def test_kimi_diagnostic_writer_profile_is_closed_and_outside_e12(
     ):
         assert linted.for_role(role).extra == {
             "diagnostic_workspace_write": True,
+            "diagnostic_cost_upper_bound": True,
             "worker_source": "project_locked",
             "max_response_tokens": 16_384,
         }
     expected_implementer_extra = {
         "diagnostic_workspace_write": True,
+        "diagnostic_cost_upper_bound": True,
         "worker_source": "project_locked",
     }
     if product == "deepswe":
@@ -1298,6 +1313,7 @@ def test_kimi_diagnostic_writer_profile_is_closed_and_outside_e12(
     assert loaded.default.api_key == "runtime-test-token"
     assert loaded.default.extra == {
         "diagnostic_workspace_write": True,
+        "diagnostic_cost_upper_bound": True,
         "worker_source": "project_locked",
     }
 
@@ -1346,11 +1362,19 @@ def test_kimi_diagnostic_writer_control_requires_an_exact_bool(
             "requires feature_admission='diagnostic'",
         ),
         (
-            {"model": "kimi-k2.7-code"},
+            {"model": "kimi-k3"},
             "requires an exact admitted model",
         ),
         (
-            {"model": "nvidia/moonshotai/kimi-k2.6"},
+            {"model": "kimi-k2.7-code-highspeed"},
+            "requires an exact admitted model",
+        ),
+        (
+            {"model": "kimi-k3.1-pro-highspeed"},
+            "requires an exact admitted model",
+        ),
+        (
+            {"model": "nvidia/moonshotai/kimi-k3.1-pro"},
             "requires an exact admitted model",
         ),
         (
@@ -1368,8 +1392,10 @@ def test_kimi_diagnostic_writer_control_requires_an_exact_bool(
     ],
     ids=[
         "enforcing",
-        "standard-model-fallback",
-        "wrong-model",
+        "retired-k3",
+        "retired-k27-highspeed",
+        "unadmitted-k31-pro-highspeed",
+        "gateway-model-id",
         "wrong-endpoint",
         "missing-api-key",
         "blank-api-key",
@@ -1513,9 +1539,11 @@ def test_deepswe_pool_resolves_confined_kimi_diagnostic_writer_exactly(
         "log_dir": log_dir,
         "cwd": str(tmp_path),
         "capability": "workspace_write",
-        "model": "kimi-k2.7-code-highspeed",
+        "model": "kimi-k3.1-pro",
+        "effort": "max",
         "expected_base_url": "https://api.moonshot.ai/v1",
         "worker_source": "project_locked",
+        "diagnostic_cost_upper_bound": True,
         "timeout_seconds": 1_200,
     }
     assert captured["toolset"] is profile
@@ -1547,7 +1575,7 @@ def test_kimi_workspace_write_is_promotion_blocked_before_construction(
     routing = BackendRouting(
         default=RoleConfig(
             backend="kimi",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             base_url="https://api.moonshot.ai/v1",
             api_key="must-not-reach-construction",
             feature_admission=admission,
@@ -1585,7 +1613,7 @@ def test_resolve_for_role_does_not_forward_kimi_credentials(
     routing = BackendRouting(
         default=RoleConfig(
             backend="kimi",
-            model="kimi-k2.7-code-highspeed",
+            model="kimi-k3.1-pro",
             base_url="https://api.moonshot.ai/v1",
             api_key="never-forward-this-secret",
         ),
@@ -1594,7 +1622,7 @@ def test_resolve_for_role_does_not_forward_kimi_credentials(
     resolve_for_role("implementer", routing=routing)
 
     assert captured["name"] == "kimi"
-    assert captured["kwargs"]["model"] == "kimi-k2.7-code-highspeed"
+    assert captured["kwargs"]["model"] == "kimi-k3.1-pro"
     assert "base_url" not in captured["kwargs"]
     assert "api_key" not in captured["kwargs"]
     assert captured["kwargs"]["expected_base_url"] == "https://api.moonshot.ai/v1"

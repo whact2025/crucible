@@ -7,26 +7,30 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import yaml
 
+from assay import Invocation, InvocationResult
 from crucible.backends import BACKEND_NAMES
 from crucible.backends import config as config_module
+from crucible.backends import openai_compat as openai_compat_module
 from crucible.backends.config import (
     lint_routing_config,
     load_routing,
     resolve_for_role,
 )
 from crucible.backends.features import FeatureAdmissionError
-from crucible.backends.pricing import DEFAULT_PRICING
+from crucible.backends.pricing import DEFAULT_PRICING, ModelPricing
 from crucible.tools import ToolContext
 from crucible.tools.profiles import (
     build_autonomous_implementer_profile,
     build_breach_defender_profile,
 )
 from crucible.tools.source import build_source_tools
+from crucible.workflows import _review as review_module
 from crucible.workflows._backends import _BackendPool
 
 
@@ -101,7 +105,7 @@ EXPECTED_PROFILES = {
     "deepseek_responses_diagnostic": {
         "routing": "backends_deepseek_diagnostic.yaml",
         "backend": "deepseek",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "transport": "native_responses",
         "feature_admission": "diagnostic",
         "availability": "diagnostic",
@@ -110,7 +114,7 @@ EXPECTED_PROFILES = {
     "kimi_sdk": {
         "routing": "backends_kimi_sdk.yaml",
         "backend": "kimi",
-        "model": "kimi-k2.7-code-highspeed",
+        "model": "kimi-k3.1-pro",
         "transport": "kimi_agent_sdk",
         "feature_admission": "enforce",
         "availability": "blocked",
@@ -119,43 +123,43 @@ EXPECTED_PROFILES = {
     "kimi_sdk_diagnostic": {
         "routing": "backends_kimi_sdk_diagnostic.yaml",
         "backend": "kimi",
-        "model": "kimi-k2.7-code-highspeed",
+        "model": "kimi-k3.1-pro",
         "transport": "kimi_agent_sdk",
         "feature_admission": "diagnostic",
         "availability": "diagnostic",
         "runtime_binding": "project_locked",
     },
-    "kimi_k3_sdk_diagnostic": {
-        "routing": "backends_kimi_k3_sdk_diagnostic.yaml",
+    "kimi_k31_pro_sdk_diagnostic": {
+        "routing": "backends_kimi_k31_pro_sdk_diagnostic.yaml",
         "backend": "kimi",
-        "model": "kimi-k3",
+        "model": "kimi-k3.1-pro",
         "transport": "kimi_agent_sdk",
         "feature_admission": "diagnostic",
         "availability": "diagnostic",
         "runtime_binding": "project_locked",
     },
-    "openai_glm52_diagnostic": {
+    "openai_glm53_diagnostic": {
         "routing": "backends_inference_hub.yaml",
         "backend": "openai_compat",
-        "model": "nvidia/zai-org/glm-5.2",
+        "model": "nvidia/zai-org/glm-5.3",
         "transport": "openai_chat_completions",
         "feature_admission": "diagnostic",
         "availability": "diagnostic",
         "runtime_binding": "configured_endpoint",
     },
-    "openai_kimi26_diagnostic": {
+    "openai_kimi_k31_pro_diagnostic": {
         "routing": "backends_kimi_inference.yaml",
         "backend": "openai_compat",
-        "model": "nvidia/moonshotai/kimi-k2.6",
+        "model": "nvidia/moonshotai/kimi-k3.1-pro",
         "transport": "openai_chat_completions",
         "feature_admission": "diagnostic",
         "availability": "diagnostic",
         "runtime_binding": "configured_endpoint",
     },
-    "local_glm52_diagnostic": {
-        "routing": "backends_local_glm52_diagnostic.yaml",
+    "local_glm53_diagnostic": {
+        "routing": "backends_local_glm53_diagnostic.yaml",
         "backend": "local",
-        "model": "nvidia/zai-org/glm-5.2",
+        "model": "nvidia/zai-org/glm-5.3",
         "transport": "openai_chat_completions",
         "feature_admission": "diagnostic",
         "availability": "diagnostic",
@@ -190,9 +194,9 @@ USABLE_WORKFLOW_PROFILES = (
     ("codex_official_sdk_diagnostic", "codex", "official_sdk"),
     ("deepseek_responses_diagnostic", "deepseek", "native_responses"),
     ("kimi_sdk_diagnostic", "kimi", "kimi_agent_sdk"),
-    ("kimi_k3_sdk_diagnostic", "kimi", "kimi_agent_sdk"),
-    ("local_glm52_diagnostic", "local", "openai_chat_completions"),
-    ("openai_glm52_diagnostic", "openai_compat", "openai_chat_completions"),
+    ("kimi_k31_pro_sdk_diagnostic", "kimi", "kimi_agent_sdk"),
+    ("local_glm53_diagnostic", "local", "openai_chat_completions"),
+    ("openai_glm53_diagnostic", "openai_compat", "openai_chat_completions"),
 )
 
 
@@ -236,6 +240,14 @@ def test_product_catalog_is_closed_complete_and_non_promotional(product: str) ->
         assert entry["feature_admission"] in {"enforce", "diagnostic"}
         assert entry["availability"] in NON_EXECUTABLE_AVAILABILITY
         assert entry["promotion_evidence"] is False
+
+
+@pytest.mark.parametrize("product", tuple(PRODUCT_ROLES))
+def test_every_catalogued_model_has_an_explicit_default_price(product: str) -> None:
+    # Pricing admission fails closed on an unpriced routed model. A profile
+    # moved to a new model id must therefore bring its own price row.
+    for name, entry in _catalog(product)["profiles"].items():
+        assert entry["model"] in DEFAULT_PRICING, (product, name, entry["model"])
 
 
 def test_product_catalogs_have_symmetric_adapter_and_transport_inventory() -> None:
@@ -376,8 +388,8 @@ def test_every_registered_adapter_has_one_all_role_checked_in_route(
         "codex": "codex_official_sdk_diagnostic",
         "deepseek": "deepseek_responses_diagnostic",
         "kimi": "kimi_sdk_diagnostic",
-        "local": "local_glm52_diagnostic",
-        "openai_compat": "openai_glm52_diagnostic",
+        "local": "local_glm53_diagnostic",
+        "openai_compat": "openai_glm53_diagnostic",
     }
     assert set(profile_for_backend) == set(BACKEND_NAMES)
     monkeypatch.delenv("CRUCIBLE_BACKEND_CONFIG", raising=False)
@@ -619,7 +631,7 @@ def test_deepseek_diagnostic_profile_requires_run_local_identity_before_use(
         "deepseek" for _role in PRODUCT_ROLES[product]
     ]
     assert all(
-        kwargs["model"] == "deepseek-v4-flash"
+        kwargs["model"] == "deepseek-flash"
         and kwargs["expected_worker_runtime_fingerprint"] == fingerprint
         for _name, kwargs in calls
     )
@@ -636,25 +648,25 @@ def test_checked_in_local_route_resolves_every_product_role(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert _catalog(product)["profiles"]["local_glm52_diagnostic"] == {
-        "routing": "backends_local_glm52_diagnostic.yaml",
+    assert _catalog(product)["profiles"]["local_glm53_diagnostic"] == {
+        "routing": "backends_local_glm53_diagnostic.yaml",
         "backend": "local",
-        "model": "nvidia/zai-org/glm-5.2",
+        "model": "nvidia/zai-org/glm-5.3",
         "transport": "openai_chat_completions",
         "feature_admission": "diagnostic",
         "availability": "diagnostic",
         "runtime_binding": "configured_endpoint",
         "promotion_evidence": False,
     }
-    path = ROOT / "products" / product / "backends_local_glm52_diagnostic.yaml"
+    path = ROOT / "products" / product / "backends_local_glm53_diagnostic.yaml"
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert raw["default"]["base_url"] == "${CRUCIBLE_LOCAL_URL}"
     assert "api_key" not in raw["default"]
     assert raw["default"]["extra"] == {
-        "expected_served_model": "nvidia/zai-org/glm-5.2",
+        "expected_served_model": "nvidia/zai-org/glm-5.3",
         "max_tokens": 16384,
     }
-    pricing = DEFAULT_PRICING["nvidia/zai-org/glm-5.2"]
+    pricing = DEFAULT_PRICING["nvidia/zai-org/glm-5.3"]
     assert pricing.input_per_mtok == 0.0
     assert pricing.output_per_mtok == 0.0
     monkeypatch.delenv("CRUCIBLE_BACKEND_CONFIG", raising=False)
@@ -681,10 +693,141 @@ def test_checked_in_local_route_resolves_every_product_role(
         "local" for _role in PRODUCT_ROLES[product]
     ]
     assert all(
-        kwargs["model"] == "nvidia/zai-org/glm-5.2"
+        kwargs["model"] == "nvidia/zai-org/glm-5.3"
         and kwargs["base_url"] == "http://127.0.0.1:8000/v1"
-        and kwargs["expected_served_model"] == "nvidia/zai-org/glm-5.2"
+        and kwargs["expected_served_model"] == "nvidia/zai-org/glm-5.3"
         and kwargs["max_tokens"] == 16384
         and "api_key" not in kwargs
         for _name, kwargs in calls
     )
+
+
+GATEWAY_PROFILES = (
+    # catalog key, exact route id, predecessor id
+    (
+        "openai_glm53_diagnostic",
+        "nvidia/zai-org/glm-5.3",
+        "nvidia/zai-org/glm-5.2",
+    ),
+    (
+        "openai_kimi_k31_pro_diagnostic",
+        "nvidia/moonshotai/kimi-k3.1-pro",
+        "nvidia/moonshotai/kimi-k2.6",
+    ),
+    (
+        "local_glm53_diagnostic",
+        "nvidia/zai-org/glm-5.3",
+        "nvidia/zai-org/glm-5.2",
+    ),
+)
+
+
+def _chat_completion(model: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        id="request-1",
+        model=model,
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="ok",
+                tool_calls=None,
+                reasoning_content=None,
+                provider_specific_fields=None,
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=20),
+    )
+
+
+@pytest.mark.parametrize("product", tuple(PRODUCT_ROLES))
+@pytest.mark.parametrize(("profile", "model", "predecessor"), GATEWAY_PROFILES)
+def test_checked_in_gateway_profiles_enforce_exact_served_model(
+    product: str,
+    profile: str,
+    model: str,
+    predecessor: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CRUCIBLE_BACKEND_CONFIG", raising=False)
+    # The built-in price row is what ``invoke`` must find before transport.
+    monkeypatch.delenv("CRUCIBLE_PRICING_CONFIG", raising=False)
+    monkeypatch.setenv("INFER_BASE_URL", "https://inference-api.nvidia.com/v1")
+    monkeypatch.setenv("INFER_AUTH_TOKEN", "provider-free-test-token")
+    monkeypatch.setenv("CRUCIBLE_LOCAL_URL", "http://127.0.0.1:8000/v1")
+    entry = _catalog(product)["profiles"][profile]
+    assert entry["model"] == model
+    routing = load_routing(
+        config_path=ROOT / "products" / product / entry["routing"],
+    )
+
+    def invoke(served_model: str | None) -> InvocationResult:
+        backend = resolve_for_role(
+            "breach_judge",
+            routing=routing,
+            capability="text",
+            native_shell=False,
+            allow_trusted_project_instructions=False,
+            cwd=str(tmp_path.resolve()),
+        )
+        assert type(backend) is openai_compat_module.OpenAIBackend
+        backend._client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **_kwargs: _chat_completion(served_model),
+                ),
+            ),
+        )
+        return backend.invoke(Invocation(
+            system="s",
+            user="u",
+            tools=None,
+            max_turns=1,
+            budget_usd=None,
+        ))
+
+    admitted = invoke(model)
+    assert admitted.error is None
+    assert admitted.stop_reason == "end_turn"
+    assert admitted.final_message == "ok"
+    assert admitted.execution_trace is not None
+    assert admitted.execution_trace.requested_model == model
+    assert admitted.execution_trace.served_model == model
+    assert admitted.usage.cost_usd == 0.0
+
+    # A reply that names the predecessor is a different model, not an alias.
+    mismatch = invoke(predecessor)
+    assert mismatch.stop_reason == "model_mismatch"
+    assert mismatch.final_message == ""
+    assert mismatch.error is not None
+    assert mismatch.error.kind == "incomplete_evidence"
+    assert mismatch.execution_trace is not None
+    assert mismatch.execution_trace.served_model == predecessor
+
+    missing = invoke(None)
+    assert missing.stop_reason == "missing_model_identity"
+    assert missing.final_message == ""
+    assert missing.error is not None
+    assert missing.error.kind == "incomplete_evidence"
+
+
+def test_gateway_identity_tables_agree_on_current_ids() -> None:
+    glm = "nvidia/zai-org/glm-5.3"
+    kimi = "nvidia/moonshotai/kimi-k3.1-pro"
+
+    assert review_module._NVIDIA_GLM_MODEL == glm
+    for product in PRODUCT_ROLES:
+        profiles = _catalog(product)["profiles"]
+        assert profiles["openai_glm53_diagnostic"]["model"] == glm
+        assert profiles["local_glm53_diagnostic"]["model"] == glm
+        assert profiles["openai_kimi_k31_pro_diagnostic"]["model"] == kimi
+        assert not (
+            ROOT / "products" / product / "backends_local_glm52_diagnostic.yaml"
+        ).exists()
+    zero_rate = ModelPricing(input_per_mtok=0.0, output_per_mtok=0.0)
+    assert DEFAULT_PRICING[glm] == zero_rate
+    assert DEFAULT_PRICING[kimi] == zero_rate
+    # The predecessors still answer on the gateway, so only the closed tables
+    # can show that the move was complete.
+    for retired in ("nvidia/zai-org/glm-5.2", "nvidia/moonshotai/kimi-k2.6"):
+        assert retired not in DEFAULT_PRICING

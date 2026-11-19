@@ -1,11 +1,16 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-# DeepSWE diagnostic control — Kimi K2.6 over OpenAI-compatible HTTP.
+# DeepSWE diagnostic control — Kimi K3.1 Pro over OpenAI-compatible HTTP.
 #
 # This profile qualifies the NVIDIA wire route; it is not the dedicated Kimi
-# SDK comparison arm. Its served-model pin rejects response identity drift.
-# Source ~/.config/crucible/env before use.
+# SDK comparison arm. That qualification has not been repeated for K3.1 Pro.
+# On 2026-11-18 the hub listed the id and answered one-line requests for it
+# through `OpenAIBackend` under this model name (text, a strict `json_schema`
+# response, a tool loop with the constrained finalization, a required write
+# turn); an earlier request that day was rate-limited. That is a transport
+# observation, not a qualification. Its served-model pin rejects response
+# identity drift. Source ~/.config/crucible/env before use.
 
 schema_version: crucible.backend-routing.v1
 
@@ -13,87 +18,87 @@ default:
   backend: openai_compat
   base_url: ${INFER_BASE_URL}
   api_key: ${INFER_AUTH_TOKEN}
-  model: nvidia/moonshotai/kimi-k2.6
+  model: nvidia/moonshotai/kimi-k3.1-pro
   effort: high
   feature_admission: diagnostic
   extra:
-    expected_served_model: nvidia/moonshotai/kimi-k2.6
+    expected_served_model: nvidia/moonshotai/kimi-k3.1-pro
 
 roles:
   architect_planner:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   architect_critic:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   architect_judge:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   implementer:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   breach_defender:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   impl_breaker:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   breach_judge:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   diff_scope:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   tier_completeness:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   api_contract_fidelity:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic
   review_conflict_authority:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     effort: high
     feature_admission: diagnostic

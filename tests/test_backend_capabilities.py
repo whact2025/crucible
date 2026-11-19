@@ -204,7 +204,7 @@ def test_exclusive_writer_pool_cannot_bypass_kimi_promotion_gate(
         BackendRouting(
             default=RoleConfig(
                 backend="kimi",
-                model="kimi-k2.7-code-highspeed",
+                model="kimi-k3.1-pro",
                 base_url="https://api.moonshot.ai/v1",
                 api_key="must-not-reach-construction",
                 feature_admission="diagnostic",

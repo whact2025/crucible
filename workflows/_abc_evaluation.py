@@ -93,12 +93,12 @@ _EXPECTED_LANES: Mapping[ArmId, tuple[str, str, str | None]] = {
         "claude-opus-5",
         "high",
     ),
-    "C": ("kimi", "kimi-k2.7-code-highspeed", None),
+    "C": ("kimi", "kimi-k3.1-pro", "max"),
 }
 _EXPECTED_QUALITY_SETTINGS: Mapping[ArmId, str] = {
     "A": "max",
     "B": "high",
-    "C": "high",
+    "C": "max",
 }
 _EXPECTED_ROLE_EFFORT_OVERRIDES: Mapping[
     tuple[str, ArmId],

@@ -138,7 +138,7 @@ class _FakeBackend:
         ),
         (
             "kimi",
-            "kimi-k2.7-code-highspeed",
+            "kimi-k3.1-pro",
             "https://api.moonshot.ai/v1",
             "hard",
             "post_hoc",
@@ -236,7 +236,7 @@ def test_strict_kimi_usd_limit_rejects_post_hoc_accounting(
             routing=BackendRouting(
                 default=RoleConfig(
                     backend="kimi",
-                    model="kimi-k2.7-code-highspeed",
+                    model="kimi-k3.1-pro",
                     base_url="https://api.moonshot.ai/v1",
                 ),
             ),
@@ -310,7 +310,7 @@ def test_reusable_strict_kimi_budget_policy_rejects_before_construction(
             routing=BackendRouting(
                 default=RoleConfig(
                     backend="kimi",
-                    model="kimi-k2.7-code-highspeed",
+                    model="kimi-k3.1-pro",
                     base_url="https://api.moonshot.ai/v1",
                 ),
             ),
@@ -465,7 +465,7 @@ def test_strict_kimi_turn_only_contract_is_admitted(
         routing=BackendRouting(
             default=RoleConfig(
                 backend="kimi",
-                model="kimi-k2.7-code-highspeed",
+                model="kimi-k3.1-pro",
                 base_url="https://api.moonshot.ai/v1",
             ),
         ),
