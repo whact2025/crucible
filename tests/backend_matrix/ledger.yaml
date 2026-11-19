@@ -1,0 +1,292 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The ledger of the backend conformance matrix.
+#
+# known_gaps: a cell listed here is an expected failure only while it fails
+#   with exactly these codes. If it passes, the run fails with "gap fixed,
+#   delete the entry"; if it fails in another way, with "different deviation".
+#   A fix deletes its entry in the same change and edits nothing else here.
+#   Only a behaviour cell of a real kind and the static cells H01 and H02 may
+#   be listed: a toy cell and the other static cells (P01, P02, P04, H03, H04)
+#   check the matrix itself and are never expected failures.
+# registry: permanent. A record stays when its gap is fixed, so the passing
+#   cell stays pinned. `observed_under` and `closes_under` hold the governing
+#   declared values of the cell's scenario; they are equal unless the record
+#   names the `declaration_change` (field, from, to, citation) that is the
+#   gap's listed resolution. `predicted` holds the codes expected of the cell
+#   before the first run of its column; the first run corrects them.
+# ceilings: counts may not exceed them. They rise while entries land and are
+#   frozen at the gate (pack A) and at the end of pack B; after that they only
+#   fall.
+#
+# Cell ids read <kind>/<scenario>/<role>/<lens>.
+
+schema_version: crucible.backend-matrix.ledger.v1
+
+ceilings:
+  max_known_gaps:
+    pack_a: 8
+    pack_b: 0
+  max_declared_differences: 0
+
+registry:
+  G02:
+    title: Kimi labels a tool-budget stop a transport error and records no limit event
+    origin: gap list
+    severity: high
+    cells:
+      - cell: kimi/S12/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted:
+          - "kind:transport!=max_turns"
+          - "event.missing:limit/tool_dispatch_budget"
+
+  G03:
+    title: Kimi does not credit a write as progress (frozen wrapper handed to the mutation host)
+    origin: gap list
+    severity: high
+    cells:
+      - cell: kimi/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+        # While G02 is open the denied read ends as a transport error; the
+        # kind code becomes kind:max_turns!=none once G02 is fixed.
+        predicted:
+          - "progress:write_not_credited"
+          - "kind:transport!=none"
+          - "stop:tool_budget_exhausted!=end_turn"
+          - "dispatch.missing:read_a"
+          - "request.unconsumed"
+
+  G04:
+    title: Kimi worker tests skip without the worker runtime, and the column is not driven
+    origin: gap list
+    severity: high
+    cells:
+      # The skip markers sit in the test files inventory.yaml lists for the
+      # Kimi worker; a marker anywhere else is static:worker_skip_unpinned.
+      - cell: kimi/H01/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:worker_skip"]
+      - cell: kimi/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  G14:
+    title: DeepSeek appends a limit event after the terminal event, so invoke raises
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S10a/primary/raw
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+        predicted: ["raise:ValueError@after_request/assay.types.invocation"]
+      - cell: deepseek/S13/primary/raw
+        observed_under: {usd_limit: post_hoc}
+        closes_under: {usd_limit: post_hoc}
+        predicted: ["raise:ValueError@after_request/assay.types.invocation"]
+      - cell: deepseek/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+        # The call ends at the first result over the budget, so the rest of
+        # the script is never requested.
+        predicted:
+          - "raise:ValueError@after_request/assay.types.invocation"
+          - "request.unconsumed"
+
+  G15:
+    title: DeepSeek raises before transport for max_turns above 64
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S11/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted:
+          - "raise:ValueError@before_request/crucible.backends.deepseek"
+          - "request.unconsumed"
+
+  G16:
+    title: DeepSeek records one request event per provider round, which the limit guard rejects
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S03/primary/guarded
+        observed_under: {event_detail: tool_calls}
+        closes_under: {event_detail: tool_calls}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: deepseek/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+
+  G17:
+    title: DeepSeek does not credit a write as progress (frozen wrapper handed to the mutation host)
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted:
+          - "progress:write_not_credited"
+          - "kind:max_turns!=none"
+          - "stop:tool_budget_exhausted!=end_turn"
+          - "dispatch.missing:read_a"
+          - "request.unconsumed"
+
+  G18:
+    title: DeepSeek has no content-rejected path
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S23a/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["kind:transport!=content_rejected"]
+      - cell: deepseek/S23b/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["kind:transport!=content_rejected"]
+      - cell: deepseek/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["kind:transport!=content_rejected"]
+
+  G20:
+    title: No DeepSeek test runs a protocol exchange; the column is not driven
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  G28:
+    title: The gateway adapter records one request event per completion, which the limit guard rejects
+    origin: gap list
+    severity: high
+    cells:
+      - cell: openai_compat:hosted/S03/primary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:hosted/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:local/S03/primary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:local/S04/primary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+
+  G29:
+    title: The gateway adapter clears the accounting flags after a forced finalisation
+    origin: gap list
+    severity: high
+    cells:
+      - cell: openai_compat:hosted/S04/primary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S10a/primary/raw
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:local/S04/primary/raw
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:local/S04/primary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:local/S10a/primary/raw
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+
+  G30:
+    title: Every gateway test stubs the client and the local route has no test; the columns are not driven
+    origin: gap list
+    severity: high
+    cells:
+      - cell: openai_compat:hosted/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+      - cell: openai_compat:local/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  M01:
+    title: The Claude columns are not driven by the matrix yet
+    origin: matrix
+    severity: medium
+    cells:
+      - cell: claude/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  M02:
+    title: The Codex app-server column is not driven by the matrix yet
+    origin: matrix
+    severity: medium
+    cells:
+      - cell: codex:legacy/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  M03:
+    title: The Codex official-SDK column is not driven by the matrix yet
+    origin: matrix
+    severity: medium
+    cells:
+      - cell: codex:official/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+known_gaps:
+  - cell: kimi/H01/-/static
+    observed_under: {}
+    codes: {"static:worker_skip": G04}
+  - cell: openai_compat:hosted/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": G30}
+  - cell: openai_compat:local/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": G30}
+  - cell: deepseek/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": G20}
+  - cell: kimi/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": G04}
+  - cell: claude/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": M01}
+  - cell: codex:legacy/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": M02}
+  - cell: codex:official/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": M03}
+
+declared_differences: []

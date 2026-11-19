@@ -1,0 +1,898 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+"""The result contract: what a workflow can see of one backend call.
+
+A cell is judged on an :class:`Observation` only: the result or the raise, the
+provider ledger, the tool dispatch log, the limit terminal and what is still
+running afterwards. The clauses C0-C10 are consumer-backed statements about
+that observation; each returns deviation codes from one closed vocabulary, so
+a ledger signature stays stable when a reply is re-recorded. Codes carry
+types, phases, module names and relations, never messages or numbers.
+
+Which clauses apply to a cell follows from the cell's definition (lens,
+ToolSet, expected outcome), never from what the backend did. A clause that
+applies returns ``ok``, deviation codes, ``not_evaluated`` (which must be
+pinned in the inventory) or ``stood_for``: a raise stands for the result
+clauses, and a guard rewrite stands for the kind and stop reason it replaced.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, Mapping, NamedTuple, Sequence
+
+import psutil
+
+from assay import BackendFeatureSet, InvocationResult
+from crucible.backends.features import feature_profile_digest
+from crucible.backends.limits import InvocationLimitTerminal
+from crucible.backends.pricing import ModelPricing
+
+from .provider import ProviderLedger
+from .toolsets import Dispatch, ToolBinding
+
+FLAGS = (
+    "token_usage_complete",
+    "cost_complete",
+    "terminal_complete",
+    "trace_complete",
+)
+CLAUSES = ("C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10")
+RESULT_CLAUSES = ("C2", "C3", "C4", "C6", "C7")
+SCENARIO = "S"
+# Stop reasons the limit guard writes when it replaces a result
+# (crucible/backends/limits.py: _attempt_evidence_result,
+# _incomplete_limit_evidence_result).
+GUARD_STOP_REASONS = frozenset({"limit_contract_violated", "limit_evidence_incomplete"})
+MAX_ERROR_TEXT = 2000
+
+# The closed deviation vocabulary: every code a cell may emit, with the clause
+# it is booked under ("S" is the scenario contract, "D" the declaration lock).
+_VOCABULARY: tuple[tuple[str, str], ...] = (
+    (r"request\.(extra|unconsumed)", "C0"),
+    (r"raise:\w+@after_request/[\w.]+", "C1"),
+    (r"raise:\w+@before_request/[\w.]+", SCENARIO),
+    (r"raise:\w+@close/[\w.]+", "C8"),
+    (r"kind:\w+!=\w+", "C2"),
+    (r"retriable:(True|False)", "C2"),
+    (r"http_status:\w+!=\w+", "C2"),
+    (r"stop:\w+!=\w+", "C3"),
+    (r"event\.terminal:[\w.:-]+!=\w+", "C4"),
+    (r"flag:(terminal_complete|trace_complete)=(True|False)", "C4"),
+    (r"guard:\w+", "C5"),
+    (r"flag:(token_usage_complete|cost_complete)=(True|False)", "C6"),
+    (r"usage\.(input_tokens|output_tokens|cost_usd):(lt|gt)", "C6"),
+    (r"pricing:(none|unreconciled)", "C6"),
+    (r"digest\.(missing|mismatch):\w+", "C7"),
+    (r"request\.content:model", "C7"),
+    (r"served_model:not_requested", "C7"),
+    (r"child:alive", "C8"),
+    (r"secret:leak", "C9"),
+    (r"text:unbounded", "C9"),
+    (r"dispatch\.(extra|missing):\w+", "C10"),
+    (r"event\.(missing|extra):\w+/[\w-]+", SCENARIO),
+    (r"text:mismatch", SCENARIO),
+    (r"request\.content:\w+", SCENARIO),
+    (r"context:over_budget", SCENARIO),
+    (r"progress:write_not_credited", SCENARIO),
+    (r"decl\.(changed|over|under|mismatch):\w+", "D"),
+    (r"static:\w+", "static"),
+)
+
+
+def clause_of(code: str) -> str:
+    """Return the clause a code is booked under; an unknown code is an error."""
+
+    for pattern, clause in _VOCABULARY:
+        if re.fullmatch(pattern, code):
+            return clause
+    raise ValueError(f"deviation code {code!r} is not in the closed vocabulary")
+
+
+class Deviation(NamedTuple):
+    """One deviation: the code that is compared, and what was observed."""
+
+    code: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class Raised:
+    """An exception that left ``invoke`` (or build, attach or ``close``)."""
+
+    type: str
+    phase: Literal["before_request", "after_request", "close"]
+    module: str
+    # What a workflow would log. Never part of the code; C9 reads it.
+    message: str = ""
+
+    @property
+    def code(self) -> str:
+        return f"raise:{self.type}@{self.phase}/{self.module}"
+
+    @classmethod
+    def from_exception(cls, exc: BaseException, *, phase: str) -> Raised:
+        """Name the module of the innermost frame that raised."""
+
+        module = "unknown"
+        traceback = exc.__traceback__
+        while traceback is not None:
+            module = str(traceback.tb_frame.f_globals.get("__name__", "unknown"))
+            traceback = traceback.tb_next
+        return cls(
+            type=type(exc).__name__,
+            phase=phase,  # type: ignore[arg-type]
+            module=module,
+            message=str(exc),
+        )
+
+
+@dataclass(frozen=True)
+class SecondCall:
+    """The guarded lens's second plain call on the backend the cell used."""
+
+    refused: bool = False  # the limit guard refused it
+    raised: str | None = None  # the type of any other exception it raised
+    error_kind: str | None = None  # the error kind of the result it returned
+    requests: int = 0  # provider requests it made
+
+
+@dataclass(frozen=True)
+class Settlement:
+    """What the cell left behind after ``invoke`` and ``close()``."""
+
+    children_alive: tuple[int, ...] = ()
+    listeners: tuple[int, ...] = ()
+    close_raised: Raised | None = None
+    late_requests: int = 0
+
+
+@dataclass(frozen=True)
+class Observation:
+    """Everything a cell may assert on."""
+
+    result: InvocationResult | None
+    raised: Raised | None
+    provider: ProviderLedger
+    toolset_log: tuple[Dispatch, ...]
+    wrapper_snapshot: Any | None
+    write_applied: bool | None
+    declarations: BackendFeatureSet | None
+    backend_name: str
+    backend_model: str
+    limit_terminal: InvocationLimitTerminal | None
+    second_call: SecondCall | None
+    settlement: Settlement
+    wall_seconds: float
+    debug_dump_text: str
+
+
+@dataclass(frozen=True)
+class Reference:
+    """What the observation is compared with, none of it from the adapter."""
+
+    routed: BackendFeatureSet
+    # The model the route of the cell's role names: what the wire must carry.
+    model: str
+    pricing: ModelPricing
+    secrets: tuple[str, ...]
+    tool_authority_digest: str | None
+    bindings: Mapping[str, ToolBinding]
+    write_slot: str
+
+
+@dataclass(frozen=True)
+class Expectation:
+    """The result a scenario's selected variant expects."""
+
+    outcome: Literal["result", "refused"] = "result"
+    refused_type: str = ""
+    kind: str = "none"
+    stop: tuple[str, ...] = ("end_turn",)
+    stop_not: tuple[str, ...] = ()
+    retriable: bool | None = None
+    flags: tuple[str, ...] = FLAGS
+    events: tuple[str, ...] = ()
+    final_text: str | None = None
+    dispatch: tuple[str, ...] = ()
+    dispatch_optional: tuple[str, ...] = ()
+
+    @property
+    def stop_label(self) -> str:
+        return self.stop[0] if self.stop else "other"
+
+
+Check = Callable[[Observation, Reference], Sequence[Deviation]]
+
+
+@dataclass(frozen=True)
+class ClauseOutcome:
+    status: Literal["ok", "deviation", "not_evaluated", "stood_for"]
+    deviations: tuple[Deviation, ...] = ()
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class Report:
+    """The outcome of every clause that applies to one cell."""
+
+    outcomes: Mapping[str, ClauseOutcome]
+    seam_problems: tuple[str, ...] = ()
+
+    @property
+    def codes(self) -> frozenset[str]:
+        return frozenset(
+            item.code for outcome in self.outcomes.values() for item in outcome.deviations
+        )
+
+    def tripped(self) -> frozenset[str]:
+        return frozenset(
+            clause
+            for clause, outcome in self.outcomes.items()
+            if outcome.status == "deviation"
+        )
+
+    def evaluated(self) -> frozenset[str]:
+        return frozenset(
+            clause
+            for clause, outcome in self.outcomes.items()
+            if outcome.status in ("ok", "deviation")
+        )
+
+    def not_evaluated(self) -> frozenset[str]:
+        return frozenset(
+            clause
+            for clause, outcome in self.outcomes.items()
+            if outcome.status == "not_evaluated"
+        )
+
+    def describe(self) -> str:
+        """Which clause, which code, what was observed: one line each."""
+
+        lines: list[str] = []
+        for clause, outcome in self.outcomes.items():
+            if outcome.status == "deviation":
+                lines.extend(
+                    f"  {clause} {item.code}: {item.detail}"
+                    for item in outcome.deviations
+                )
+            elif outcome.status != "ok":
+                lines.append(f"  {clause} {outcome.status}: {outcome.reason}")
+        return "\n".join(lines) or "  no deviation"
+
+
+def applicable(*, lens: str, toolset: bool, expects_result: bool) -> tuple[str, ...]:
+    """The clauses of a cell, from its definition alone."""
+
+    clauses = {"C0", "C1", "C8", "C9"}
+    if expects_result:
+        clauses.update(RESULT_CLAUSES)
+    if lens == "guarded":
+        clauses.add("C5")
+    if toolset:
+        clauses.add("C10")
+    return tuple(clause for clause in CLAUSES if clause in clauses)
+
+
+# -- settlement probe (C8) -------------------------------------------------
+
+
+def _listening_ports(process: psutil.Process) -> frozenset[int]:
+    connections = getattr(process, "net_connections", None) or process.connections
+    return frozenset(
+        int(item.laddr.port)
+        for item in connections(kind="tcp")
+        if item.status == psutil.CONN_LISTEN and item.laddr
+    )
+
+
+def _live_children(process: psutil.Process) -> frozenset[int]:
+    live: set[int] = set()
+    for child in process.children(recursive=True):
+        try:
+            if child.status() != psutil.STATUS_ZOMBIE:
+                live.add(child.pid)
+        except psutil.NoSuchProcess:
+            continue
+    return frozenset(live)
+
+
+def settlement_baseline() -> tuple[frozenset[int], frozenset[int]]:
+    """The test process's children and listening ports when a cell starts."""
+
+    process = psutil.Process()
+    return _live_children(process), _listening_ports(process)
+
+
+def settle(
+    baseline: tuple[frozenset[int], frozenset[int]],
+    *,
+    driver_children: Sequence[int],
+    own_ports: Sequence[int],
+    close_raised: Raised | None,
+    grace_seconds: float = 0.5,
+) -> Settlement:
+    """Differential settlement: what exists now that did not when the cell began.
+
+    A child is left when it is a new child of this process or one the driver
+    names, whichever sees it: a detached process is no child any more.
+    """
+
+    process = psutil.Process()
+    children_before, ports_before = baseline
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        left = (_live_children(process) - children_before) | frozenset(
+            pid for pid in driver_children if _alive(pid)
+        )
+        if not left or time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    listeners = _listening_ports(process) - ports_before - frozenset(own_ports)
+    return Settlement(
+        children_alive=tuple(sorted(left)),
+        listeners=tuple(sorted(listeners)),
+        close_raised=close_raised,
+    )
+
+
+def _alive(pid: int) -> bool:
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
+# -- clauses ---------------------------------------------------------------
+
+
+def _c0(obs: Observation) -> list[Deviation]:
+    out: list[Deviation] = []
+    if obs.provider.extra:
+        out.append(
+            Deviation(
+                "request.extra",
+                f"{obs.provider.extra} request(s) matched no scripted step "
+                f"({obs.provider.request_count} seen in all)",
+            )
+        )
+    if obs.provider.unconsumed:
+        out.append(
+            Deviation(
+                "request.unconsumed",
+                f"{obs.provider.unconsumed} scripted step(s) were never requested "
+                f"({obs.provider.request_count} request(s) seen)",
+            )
+        )
+    return out
+
+
+def _guard_rewrote(obs: Observation) -> bool:
+    result = obs.result
+    if result is None:
+        return False
+    # Every call the guard lets through leaves a terminal; the runner refuses
+    # a guarded cell whose driver did not bind the guard.
+    assert obs.limit_terminal is not None
+    return result.stop_reason in GUARD_STOP_REASONS or bool(obs.limit_terminal.overshoots)
+
+
+def _c2(result: InvocationResult, exp: Expectation) -> list[Deviation]:
+    out: list[Deviation] = []
+    error = result.error
+    got = "none" if error is None else str(error.kind)
+    if got != exp.kind:
+        out.append(Deviation(f"kind:{got}!={exp.kind}", f"error is {error!r}"))
+    if (
+        error is not None
+        and exp.retriable is not None
+        and bool(error.retriable) != exp.retriable
+    ):
+        out.append(
+            Deviation(
+                f"retriable:{bool(error.retriable)}",
+                f"the scenario expects retriable={exp.retriable}",
+            )
+        )
+    return out
+
+
+def _c3(result: InvocationResult, exp: Expectation) -> list[Deviation]:
+    stop = result.stop_reason
+    if (exp.stop and stop not in exp.stop) or stop in exp.stop_not:
+        accepted = f"one of {list(exp.stop)}" if exp.stop else f"not {list(exp.stop_not)}"
+        return [
+            Deviation(
+                f"stop:{stop}!={exp.stop_label}",
+                f"stop_reason is {stop!r}; the scenario accepts {accepted}",
+            )
+        ]
+    return []
+
+
+def _c4(result: InvocationResult, exp: Expectation) -> list[Deviation]:
+    out: list[Deviation] = []
+    flags = result.completeness
+    if "terminal_complete" in exp.flags and not flags.terminal_complete:
+        out.append(
+            Deviation("flag:terminal_complete=False", "the result disowns its terminal")
+        )
+    if not flags.trace_complete:
+        out.append(
+            Deviation(
+                "flag:trace_complete=False",
+                "the trace is flagged incomplete, so its terminal cannot be checked",
+            )
+        )
+        return out
+    # With a complete trace assay guarantees exactly one terminal event, last.
+    assert result.execution_trace is not None
+    terminal = result.execution_trace.events[-1]
+    if terminal.name != result.stop_reason:
+        out.append(
+            Deviation(
+                f"event.terminal:{terminal.name or 'none'}!={result.stop_reason}",
+                "the terminal event is not named after stop_reason",
+            )
+        )
+    return out
+
+
+def _c5(obs: Observation) -> list[Deviation]:
+    out: list[Deviation] = []
+    if _guard_rewrote(obs):
+        assert obs.result is not None and obs.limit_terminal is not None
+        out.append(
+            Deviation(
+                f"guard:{obs.result.stop_reason}",
+                "the limit guard replaced the result (terminal reason "
+                f"{obs.limit_terminal.terminal_reason!r}, "
+                f"{obs.limit_terminal.physical_attempts} physical attempt(s) recorded)",
+            )
+        )
+    second = obs.second_call
+    if second is not None and second.refused:
+        out.append(
+            Deviation(
+                "guard:revoked",
+                "a second plain call on the same backend was refused by the guard",
+            )
+        )
+    elif (
+        second is None
+        or second.raised is not None
+        or second.error_kind is not None
+        or second.requests != 1
+    ):
+        # Admitted is not enough: the backend must still answer, with one request.
+        seen = (
+            "was not made"
+            if second is None
+            else f"raised {second.raised}"
+            if second.raised is not None
+            else f"returned error kind {second.error_kind!r} after "
+            f"{second.requests} provider request(s)"
+        )
+        out.append(
+            Deviation(
+                "guard:second_call_failed",
+                f"a second plain call on the same backend {seen}; it must return "
+                "a result without error from exactly one provider request",
+            )
+        )
+    return out
+
+
+def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
+    assert obs.result is not None
+    out: list[Deviation] = []
+    usage, flags = obs.result.usage, obs.result.completeness
+    billed = obs.provider.billed_total()
+    for name in ("token_usage_complete", "cost_complete"):
+        if name in exp.flags and not getattr(flags, name):
+            out.append(
+                Deviation(
+                    f"flag:{name}=False",
+                    "the provider reported usage for every response",
+                )
+            )
+    for field_name in ("input_tokens", "output_tokens"):
+        got, want = getattr(usage, field_name), getattr(billed, field_name)
+        if got == want or (not flags.token_usage_complete and got < want):
+            continue  # exact, or an honest lower bound
+        out.append(
+            Deviation(
+                f"usage.{field_name}:{'lt' if got < want else 'gt'}",
+                f"result reports {got}, the provider billed {want} "
+                f"(token_usage_complete={flags.token_usage_complete})",
+            )
+        )
+    priced = math.fsum(
+        ref.pricing.compute_cost(
+            input_tokens=item.input_tokens, output_tokens=item.output_tokens
+        )
+        for item in obs.provider.billed
+    )
+    cost = float(usage.cost_usd)
+    exact = math.isclose(cost, priced, rel_tol=1e-9, abs_tol=1e-12)
+    if not exact and (flags.cost_complete or cost > priced):
+        out.append(
+            Deviation(
+                f"usage.cost_usd:{'lt' if cost < priced else 'gt'}",
+                f"result reports {cost:.9f} USD, the rate card prices the billed "
+                f"usage at {priced:.9f} USD (cost_complete={flags.cost_complete})",
+            )
+        )
+    if flags.cost_complete:
+        evidence = obs.result.pricing_evidence
+        if evidence is None:
+            out.append(
+                Deviation("pricing:none", "cost is flagged complete without evidence")
+            )
+        elif not evidence.complete or not evidence.reconciles(usage):
+            out.append(
+                Deviation(
+                    "pricing:unreconciled",
+                    "the pricing evidence does not explain the reported usage",
+                )
+            )
+    return out
+
+
+def _c7(obs: Observation, ref: Reference, *, toolset: bool) -> list[Deviation]:
+    assert obs.result is not None
+    out: list[Deviation] = []
+    # No substitution: every scripted request names the model of the route the
+    # cell's role resolves to, whatever the adapter says about itself.
+    wire = {request.model for request in obs.provider.requests if request.matched}
+    substituted = sorted(wire - {ref.model})
+    if substituted:
+        out.append(
+            Deviation(
+                "request.content:model",
+                f"a request carried model {substituted[0]!r}; the route's model "
+                f"is {ref.model!r}",
+            )
+        )
+    trace = obs.result.execution_trace
+    if trace is None:
+        out.append(Deviation("digest.missing:trace", "the result carries no trace"))
+        return out
+    if trace.backend != obs.backend_name:
+        out.append(
+            Deviation(
+                "digest.mismatch:backend",
+                f"trace names {trace.backend!r}, the adapter is {obs.backend_name!r}",
+            )
+        )
+    if trace.requested_model != obs.backend_model:
+        out.append(
+            Deviation(
+                "digest.mismatch:requested_model",
+                "trace.requested_model is not the routed model",
+            )
+        )
+    served = obs.provider.served_models[-1] if obs.provider.served_models else None
+    if served is not None:
+        if trace.served_model is None:
+            out.append(
+                Deviation("digest.missing:served_model", "the provider named a model")
+            )
+        elif trace.served_model != served:
+            out.append(
+                Deviation(
+                    "digest.mismatch:served_model",
+                    "trace.served_model is not the model the provider named",
+                )
+            )
+        # Served equals requested. Asserted when the provider answered under a
+        # model it was asked for; a provider that names another model is a
+        # scenario of its own, with its own expected result.
+        if served in wire and trace.requested_model != served:
+            out.append(
+                Deviation(
+                    "served_model:not_requested",
+                    "the provider answered under the model it was asked for, and "
+                    "the trace records another model as the requested one",
+                )
+            )
+    if trace.feature_profile_digest is None:
+        out.append(
+            Deviation(
+                "digest.missing:feature_profile",
+                "the trace does not bind the route's feature profile",
+            )
+        )
+    elif trace.feature_profile_digest != feature_profile_digest(ref.routed):
+        out.append(
+            Deviation(
+                "digest.mismatch:feature_profile",
+                "the trace digest is not that of the routed feature profile",
+            )
+        )
+    if toolset:
+        if trace.tool_authority_digest is None:
+            out.append(
+                Deviation(
+                    "digest.missing:tool_authority",
+                    "a ToolSet was attached and the trace does not bind it",
+                )
+            )
+        elif trace.tool_authority_digest != ref.tool_authority_digest:
+            out.append(
+                Deviation(
+                    "digest.mismatch:tool_authority",
+                    "the trace digest is not the shared tool-authority digest",
+                )
+            )
+    return out
+
+
+def _c8(obs: Observation) -> list[Deviation]:
+    out: list[Deviation] = []
+    settlement = obs.settlement
+    if settlement.close_raised is not None:
+        out.append(Deviation(settlement.close_raised.code, "close() raised"))
+    if settlement.children_alive or settlement.listeners or settlement.late_requests:
+        out.append(
+            Deviation(
+                "child:alive",
+                f"after close(): child processes {list(settlement.children_alive)}, "
+                f"listening ports {list(settlement.listeners)}, "
+                f"{settlement.late_requests} late provider request(s)",
+            )
+        )
+    return out
+
+
+def _c9(obs: Observation, ref: Reference) -> list[Deviation]:
+    texts = [obs.debug_dump_text]
+    # A workflow logs the text of whatever a call or close() raised.
+    texts.extend(
+        raised.message
+        for raised in (obs.raised, obs.settlement.close_raised)
+        if raised is not None
+    )
+    message = ""
+    if obs.result is not None:
+        result = obs.result
+        message = "" if result.error is None else str(result.error.message)
+        texts.extend(
+            [result.final_message, message, repr(result.execution_trace)]
+            + [item.content for item in result.transcript]
+        )
+    out: list[Deviation] = []
+    if any(secret and secret in text for secret in ref.secrets for text in texts):
+        out.append(
+            Deviation(
+                "secret:leak",
+                "a scripted credential or token appears in a result, trace, raise, "
+                "log or debug dump",
+            )
+        )
+    if len(message) > MAX_ERROR_TEXT:
+        out.append(
+            Deviation(
+                "text:unbounded",
+                f"the error message is {len(message)} characters long",
+            )
+        )
+    return out
+
+
+def _aligned(sent: Sequence[Any], logged: Sequence[Any]) -> tuple[set[int], set[int]]:
+    """Indices of a longest common subsequence of two short call sequences."""
+
+    lengths = [[0] * (len(logged) + 1) for _ in range(len(sent) + 1)]
+    for i in range(len(sent) - 1, -1, -1):
+        for j in range(len(logged) - 1, -1, -1):
+            lengths[i][j] = (
+                lengths[i + 1][j + 1] + 1
+                if sent[i] == logged[j]
+                else max(lengths[i + 1][j], lengths[i][j + 1])
+            )
+    matched_sent: set[int] = set()
+    matched_logged: set[int] = set()
+    i = j = 0
+    while i < len(sent) and j < len(logged):
+        if sent[i] == logged[j]:
+            matched_sent.add(i)
+            matched_logged.add(j)
+            i, j = i + 1, j + 1
+        elif lengths[i + 1][j] >= lengths[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return matched_sent, matched_logged
+
+
+def _c10(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
+    out: list[Deviation] = []
+    slot_by_name = {binding.name: slot for slot, binding in ref.bindings.items()}
+    reads: list[Dispatch] = []
+    for item in obs.toolset_log:
+        slot = slot_by_name.get(item.name)
+        if slot is None:
+            out.append(
+                Deviation(
+                    f"dispatch.extra:{item.name}",
+                    "a tool outside the scripted calls reached the ToolSet",
+                )
+            )
+        elif slot != ref.write_slot:
+            reads.append(item)
+    # A write may run in another process, so it is judged by its effect; the
+    # reads are aligned, in order, with the calls the provider actually sent.
+    sent = list(obs.provider.sent_calls)
+    sent_reads = [index for index, call in enumerate(sent) if call.slot != ref.write_slot]
+    matched_sent, matched_logged = _aligned(
+        [(ref.bindings[sent[i].slot].name, dict(sent[i].arguments)) for i in sent_reads],
+        [(item.name, dict(item.arguments)) for item in reads],
+    )
+    dispatched_reads = {sent_reads[position] for position in matched_sent}
+    for index, call in enumerate(sent):
+        name = ref.bindings[call.slot].name
+        if call.slot == ref.write_slot:
+            dispatched = bool(obs.write_applied)
+        else:
+            dispatched = index in dispatched_reads
+        required = index < len(exp.dispatch)
+        allowed = index < len(exp.dispatch) + len(exp.dispatch_optional)
+        if required and not dispatched:
+            out.append(
+                Deviation(
+                    f"dispatch.missing:{call.slot}",
+                    f"scripted call {index + 1} ({name}) did not reach the ToolSet "
+                    "with the arguments the model sent",
+                )
+            )
+        elif dispatched and not allowed:
+            out.append(
+                Deviation(
+                    f"dispatch.extra:{call.slot}",
+                    f"scripted call {index + 1} ({name}) must not be dispatched "
+                    "after the terminal condition",
+                )
+            )
+    for position, item in enumerate(reads):
+        if position not in matched_logged:
+            out.append(
+                Deviation(
+                    f"dispatch.extra:{slot_by_name[item.name]}",
+                    f"{item.name} reached the ToolSet without a matching scripted call",
+                )
+            )
+    return out
+
+
+def _scenario(
+    obs: Observation, exp: Expectation, ref: Reference, checks: Sequence[Check]
+) -> list[Deviation]:
+    assert obs.result is not None
+    out: list[Deviation] = []
+    trace = obs.result.execution_trace
+    for wanted in exp.events:
+        kind, _, name = wanted.partition("/")
+        present = trace is not None and any(
+            event.kind == kind and (name == "-" or event.name == name)
+            for event in trace.events
+        )
+        if not present:
+            out.append(
+                Deviation(f"event.missing:{wanted}", "the trace has no such event")
+            )
+    # A final message is asserted on a result without error only: an error
+    # result promises no answer, and its kind already says so.
+    answered = obs.result.error is None
+    if answered and exp.final_text is not None and obs.result.final_message != exp.final_text:
+        out.append(
+            Deviation(
+                "text:mismatch",
+                "final_message is not the text the provider sent",
+            )
+        )
+    for check in checks:
+        out.extend(check(obs, ref))
+    return out
+
+
+def _outcome(deviations: Sequence[Deviation]) -> ClauseOutcome:
+    for item in deviations:
+        clause_of(item.code)  # the vocabulary is closed
+    if deviations:
+        return ClauseOutcome("deviation", tuple(deviations))
+    return ClauseOutcome("ok")
+
+
+def evaluate(
+    obs: Observation,
+    exp: Expectation,
+    ref: Reference,
+    *,
+    lens: str,
+    toolset: bool,
+    canary: bool = False,
+    checks: Sequence[Check] = (),
+) -> Report:
+    """Evaluate every clause that applies to the cell."""
+
+    expects_result = exp.outcome == "result"
+    clauses = applicable(lens=lens, toolset=toolset, expects_result=expects_result)
+    outcomes: dict[str, ClauseOutcome] = {"C0": _outcome(_c0(obs))}
+    if canary:
+        # The canary proves the seam and C0 only; the inventory pins the rest.
+        for clause in clauses[1:]:
+            outcomes[clause] = ClauseOutcome(
+                "not_evaluated", reason="the canary checks the seam and C0 only"
+            )
+        return Report(outcomes, tuple(obs.provider.seam_problems))
+
+    raised = obs.raised
+    scenario: list[Deviation] = []
+    c1: list[Deviation] = []
+    if raised is not None:
+        detail = f"{raised.type} left the call {raised.phase.replace('_', ' ')}"
+        if raised.phase == "after_request":
+            c1.append(Deviation(raised.code, detail))
+        elif expects_result or raised.type != exp.refused_type:
+            wanted = "a result" if expects_result else f"a {exp.refused_type} refusal"
+            scenario.append(Deviation(raised.code, f"{detail}; expected {wanted}"))
+    elif not expects_result:
+        assert obs.result is not None
+        error = obs.result.error
+        got = "none" if error is None else str(error.kind)
+        scenario.append(
+            Deviation(
+                f"kind:{got}!=refused",
+                f"invoke returned a result; expected a {exp.refused_type} refusal",
+            )
+        )
+    outcomes["C1"] = _outcome(c1)
+
+    result = obs.result
+    rewrote = "C5" in clauses and _guard_rewrote(obs)
+    for clause in clauses:
+        if clause in ("C0", "C1"):
+            continue
+        if clause in RESULT_CLAUSES and result is None:
+            assert raised is not None
+            outcomes[clause] = ClauseOutcome("stood_for", reason=raised.code)
+        elif clause in ("C2", "C3") and rewrote:
+            assert result is not None
+            outcomes[clause] = ClauseOutcome(
+                "stood_for", reason=f"guard:{result.stop_reason}"
+            )
+        elif clause == "C2":
+            outcomes[clause] = _outcome(_c2(result, exp))  # type: ignore[arg-type]
+        elif clause == "C3":
+            outcomes[clause] = _outcome(_c3(result, exp))  # type: ignore[arg-type]
+        elif clause == "C4":
+            outcomes[clause] = _outcome(_c4(result, exp))  # type: ignore[arg-type]
+        elif clause == "C5":
+            outcomes[clause] = _outcome(_c5(obs))
+        elif clause == "C6":
+            outcomes[clause] = _outcome(_c6(obs, exp, ref))
+        elif clause == "C7":
+            outcomes[clause] = _outcome(_c7(obs, ref, toolset=toolset))
+        elif clause == "C8":
+            outcomes[clause] = _outcome(_c8(obs))
+        elif clause == "C9":
+            outcomes[clause] = _outcome(_c9(obs, ref))
+        elif clause == "C10":
+            outcomes[clause] = _outcome(_c10(obs, exp, ref))
+
+    if result is not None and expects_result:
+        scenario.extend(_scenario(obs, exp, ref, checks))
+        outcomes[SCENARIO] = _outcome(scenario)
+    elif scenario:
+        outcomes[SCENARIO] = _outcome(scenario)
+    elif expects_result:
+        assert raised is not None
+        outcomes[SCENARIO] = ClauseOutcome("stood_for", reason=raised.code)
+    else:
+        outcomes[SCENARIO] = ClauseOutcome("ok")
+    return Report(outcomes, tuple(obs.provider.seam_problems))

@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The pinned inventory of the backend conformance matrix.
+#
+# cell_counts: behaviour cells per driver kind. Static cell H03 compares them
+#   with what the generator yields, so a cell cannot vanish unnoticed. A real
+#   kind has no behaviour cell until its driver lands.
+# not_evaluated: (cell, clause) pairs a cell cannot evaluate for a reason of
+#   its driver. An unpinned pair fails the cell, and so does a pinned pair
+#   whose clause was evaluated. Which clauses apply to a cell is computed from
+#   its definition and is not pinned here. Nothing may be pinned on the toy
+#   kind except the canary row.
+# not_expressible: (scenario or scenario form, kind, script step) triples the
+#   wire of a kind cannot carry, each with its reason and checklist row. This
+#   is the only way to mark a cell so. A row has no field for a declared
+#   value: no declaration, route extra or admission outcome selects it.
+# worker_skip_files: by worker kind, the test files (relative to tests/) that
+#   carry a skipif on that worker's interpreter while its H01 cell is a known
+#   gap. File names, not counts: static cell H01 reports a marker in a listed
+#   file as static:worker_skip and a marker in any other file as
+#   static:worker_skip_unpinned, which no entry covers. The list is emptied
+#   by the fix that deletes the H01 entry.
+
+schema_version: crucible.backend-matrix.inventory.v1
+
+cell_counts:
+  toy: 85
+  claude: 0
+  "codex:legacy": 0
+  "codex:official": 0
+  deepseek: 0
+  kimi: 0
+  "openai_compat:hosted": 0
+  "openai_compat:local": 0
+
+not_evaluated:
+  - scenario: S00
+    kind: "*"
+    role: "*"
+    lens: "*"
+    clauses: [C1, C2, C3, C4, C5, C6, C7, C8, C9, C10]
+    reason: >-
+      The seam canary proves that the real layers ran and checks C0 only, so
+      that it can pass on a column that has contract gaps.
+
+not_expressible: []
+
+worker_skip_files:
+  kimi:
+    - test_backends_kimi.py
+    - test_backends_kimi_k3.py
+    - test_backends_kimi_k3_cost_bounds.py
+    - test_backends_kimi_k3_stream_contract.py

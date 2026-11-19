@@ -1,0 +1,213 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# Snapshot of the declared feature profile of every matrix column, by driver
+# kind and column role. Static cell P04 recomputes each row with the call
+# routing itself makes and requires equality in both directions. A change of a
+# declared value therefore fails P04 until this file is edited in the same
+# change. If that change is meant to close a known gap, the gap's record in
+# ledger.yaml must name it as a `declaration_change`.
+
+schema_version: crucible.backend-matrix.declared-profiles.v1
+
+columns:
+  claude:
+    primary:
+      adapter: claude
+      features:
+        structured_output: native
+        tool_loop: sdk_owned
+        session_continuity: workflow_bound
+        event_detail: usage
+        turn_limit: provider_stop
+        response_token_limit: unsupported
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: invocation
+        cache_control: provider_owned
+        cancellation: process_kill
+        project_instructions: suppressible
+        native_delegation: none
+    secondary:
+      adapter: claude
+      features:
+        structured_output: native
+        tool_loop: sdk_owned
+        session_continuity: workflow_bound
+        event_detail: usage
+        turn_limit: provider_stop
+        response_token_limit: unsupported
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: invocation
+        cache_control: provider_owned
+        cancellation: process_kill
+        project_instructions: suppressible
+        native_delegation: none
+
+  "codex:legacy":
+    primary:
+      adapter: codex
+      features:
+        structured_output: native
+        tool_loop: sdk_owned
+        session_continuity: workflow_bound
+        event_detail: usage
+        turn_limit: unsupported
+        response_token_limit: unsupported
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: invocation
+        cache_control: provider_owned
+        cancellation: process_kill
+        project_instructions: suppressible
+        native_delegation: none
+
+  "codex:official":
+    primary:
+      adapter: codex
+      features:
+        structured_output: native
+        tool_loop: sdk_owned
+        session_continuity: workflow_bound
+        event_detail: usage
+        turn_limit: unsupported
+        response_token_limit: unsupported
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: invocation
+        cache_control: provider_owned
+        cancellation: process_kill
+        project_instructions: suppressible
+        native_delegation: none
+
+  deepseek:
+    primary:
+      adapter: deepseek
+      features:
+        structured_output: prompt_only
+        tool_loop: adapter_owned
+        session_continuity: none
+        event_detail: tool_calls
+        turn_limit: hard
+        response_token_limit: provider_stop
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: unsupported
+        cache_control: provider_owned
+        cancellation: boundary_only
+        project_instructions: not_applicable
+        native_delegation: none
+
+  kimi:
+    blocked:
+      adapter: kimi
+      features:
+        structured_output: prompt_only
+        tool_loop: sdk_owned
+        session_continuity: none
+        event_detail: tool_calls
+        turn_limit: hard
+        response_token_limit: provider_stop
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: hard_invocation
+        retry_scope: invocation
+        cache_control: unsupported
+        cancellation: boundary_only
+        project_instructions: suppressible
+        native_delegation: none
+    primary:
+      adapter: kimi
+      features:
+        structured_output: prompt_only
+        tool_loop: sdk_owned
+        session_continuity: none
+        event_detail: tool_calls
+        turn_limit: hard
+        response_token_limit: provider_stop
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: hard_invocation
+        retry_scope: invocation
+        cache_control: unsupported
+        cancellation: boundary_only
+        project_instructions: suppressible
+        native_delegation: none
+    secondary:
+      adapter: kimi
+      features:
+        structured_output: prompt_only
+        tool_loop: sdk_owned
+        session_continuity: none
+        event_detail: tool_calls
+        turn_limit: hard
+        response_token_limit: provider_stop
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: hard_invocation
+        retry_scope: invocation
+        cache_control: unsupported
+        cancellation: boundary_only
+        project_instructions: suppressible
+        native_delegation: none
+
+  "openai_compat:hosted":
+    primary:
+      adapter: openai_compat
+      features:
+        structured_output: prompt_only
+        tool_loop: adapter_owned
+        session_continuity: none
+        event_detail: usage
+        turn_limit: round_boundary
+        response_token_limit: provider_stop
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: per_completion
+        cache_control: unsupported
+        cancellation: boundary_only
+        project_instructions: not_applicable
+        native_delegation: none
+    secondary:
+      adapter: openai_compat
+      features:
+        structured_output: prompt_only
+        tool_loop: adapter_owned
+        session_continuity: none
+        event_detail: usage
+        turn_limit: round_boundary
+        response_token_limit: provider_stop
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: per_completion
+        cache_control: unsupported
+        cancellation: boundary_only
+        project_instructions: not_applicable
+        native_delegation: none
+
+  "openai_compat:local":
+    primary:
+      adapter: openai_compat
+      features:
+        structured_output: unsupported
+        tool_loop: adapter_owned
+        session_continuity: none
+        event_detail: usage
+        turn_limit: round_boundary
+        response_token_limit: provider_stop
+        context_byte_limit: unsupported
+        usd_limit: post_hoc
+        deadline: request_only
+        retry_scope: per_completion
+        cache_control: unsupported
+        cancellation: boundary_only
+        project_instructions: not_applicable
+        native_delegation: none
