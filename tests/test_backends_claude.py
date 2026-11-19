@@ -2613,7 +2613,7 @@ def test_agent_sdk_synthetic_api_error_requires_exact_http_status(
 
 @pytest.mark.parametrize(
     "result_subtype",
-    [None, True, "error_max_budget_usd", "future_error"],
+    [None, True, "error_max_budget_usd", "error_max_turns", "future_error"],
 )
 def test_agent_sdk_synthetic_api_error_requires_exact_success_subtype(
     monkeypatch,
@@ -4984,6 +4984,425 @@ def test_agent_public_invoke_preserves_explicit_max_turn_terminal(monkeypatch):
         event.kind == "limit" and event.name == "max_turns"
         for event in result.execution_trace.events
     )
+
+
+# ----------------------------------------------------------------------
+# Provider turn-limit terminal (``subtype="error_max_turns"``)
+# ----------------------------------------------------------------------
+
+_TURN_LIMIT_PROSE = "Reached maximum number of turns (5)"
+_TURN_LIMIT_PARTIAL_TEXT = "patched convert.py; running the suite next"
+
+
+def _max_turns_terminal(
+    *,
+    is_error=True,
+    errors=None,
+    num_turns=6,
+    output_tokens=3,
+    result=None,
+    **overrides,
+):
+    """The terminal Claude Code emits when a session uses up ``max_turns``."""
+
+    return _result_message(
+        subtype="error_max_turns",
+        # The last API stop reason, not the reason the session ended.
+        stop_reason="tool_use",
+        is_error=is_error,
+        errors=errors,
+        num_turns=num_turns,
+        output_tokens=output_tokens,
+        result=result,
+        **overrides,
+    )
+
+
+def _turn_limit_text_turn(text=_TURN_LIMIT_PARTIAL_TEXT):
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="claude-opus-5",
+    )
+
+
+def _limit_event_names(result):
+    assert result.execution_trace is not None
+    return [
+        event.name
+        for event in result.execution_trace.events
+        if event.kind == "limit"
+    ]
+
+
+def _invoke_turn_limit_streams(
+    monkeypatch,
+    streams,
+    *,
+    on_max_turns="raise",
+    max_turns=5,
+    trailing_error=None,
+):
+    """Invoke the public retry boundary over one faked SDK stream per query.
+
+    ``streams[i]`` is the message list of physical query ``i``.  Returns the
+    result and the observation ``query_max_turns`` (the ``max_turns`` option
+    of every physical query, in order) / ``closed`` (streams torn down).
+    """
+
+    import claude_agent_sdk
+
+    observed = SimpleNamespace(query_max_turns=[], closed=0)
+
+    async def fake_query(*, prompt, options):  # noqa: ARG001
+        index = len(observed.query_max_turns)
+        observed.query_max_turns.append(options.max_turns)
+        try:
+            for message in streams[index]:
+                yield message
+            if trailing_error is not None:
+                raise trailing_error
+        finally:
+            observed.closed += 1
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    result = ClaudeBackend(model=_EXPLICIT_OPUS_MODEL).invoke(Invocation(
+        system="s",
+        user="u",
+        tools=None,
+        max_turns=max_turns,
+        budget_usd=None,
+        policy=BackendPolicy(
+            retry_budget=3,
+            timeout_seconds=10.0,
+            on_cancellation="raise",
+            on_max_turns=on_max_turns,
+        ),
+    ))
+    return result, observed
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+@pytest.mark.parametrize(
+    "errors",
+    [None, [], [_TURN_LIMIT_PROSE]],
+    ids=["errors-none", "errors-empty", "errors-prose"],
+)
+def test_agent_max_turns_terminal_is_typed_for_every_reported_shape(
+    monkeypatch,
+    is_error,
+    errors,
+):
+    """The provider subtype, not ``is_error`` or error prose, is the limit."""
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(is_error=is_error, errors=errors),
+        ]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.kind == "max_turns"
+    assert result.error.retriable is False
+    assert result.error.turns_used == 6
+    assert result.error.turns_limit == 5
+    assert _TURN_LIMIT_PROSE not in result.error.message
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert result.usage.output_tokens == 3
+    assert result.completeness.token_usage_complete is True
+    assert result.completeness.cost_complete is True
+    assert result.completeness.terminal_complete is True
+    assert _limit_event_names(result) == ["max_turns"]
+    assert result.execution_trace.terminal_event_count == 1
+    assert not any(
+        event.kind == "retry" for event in result.execution_trace.events
+    )
+
+
+def test_agent_max_turns_result_precedes_trailing_cli_exit(monkeypatch):
+    """Claude Code's exit after the turn-limit terminal is not the outcome."""
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[_turn_limit_text_turn(), _max_turns_terminal(num_turns=21)]],
+        max_turns=20,
+        # The pinned SDK's text for an error result that reported no errors.
+        trailing_error=Exception(
+            "Claude Code returned an error result: error_max_turns"
+        ),
+    )
+
+    assert observed.closed == 1
+    assert observed.query_max_turns == [20]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.turns_used == 21
+    assert result.error.turns_limit == 20
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert result.completeness.terminal_complete is True
+    assert result.execution_trace is not None
+    assert not any(
+        event.kind == "retry" for event in result.execution_trace.events
+    )
+
+
+def test_agent_max_turns_terminal_after_retry_reports_logical_turns(
+    monkeypatch,
+):
+    """A retried call that then hits the limit counts both physical queries."""
+    from assay import MaxTurnsExceeded
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(
+        "crucible.backends.claude.asyncio.sleep",
+        no_sleep,
+    )
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [
+            [
+                _result_message(
+                    output_tokens=2,
+                    is_error=True,
+                    api_error_status=529,
+                    num_turns=2,
+                ),
+            ],
+            [_turn_limit_text_turn(), _max_turns_terminal(num_turns=4)],
+        ],
+    )
+
+    # The second physical query receives the turns the first one left.
+    assert observed.query_max_turns == [5, 3]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.turns_used == 6
+    assert result.error.turns_limit == 5
+    assert result.stop_reason == "max_turns"
+    assert _limit_event_names(result) == ["max_turns"]
+    assert [event.kind for event in result.execution_trace.events].count(
+        "retry"
+    ) == 1
+
+
+def test_agent_max_turns_subtype_is_authoritative_below_the_turn_count(
+    monkeypatch,
+):
+    """The subtype is terminal authority; ``num_turns`` is accounting only."""
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[_turn_limit_text_turn(), _max_turns_terminal(num_turns=2)]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.turns_used == 2
+    assert result.error.turns_limit == 5
+    assert result.stop_reason == "max_turns"
+    assert _limit_event_names(result) == ["max_turns"]
+
+
+@pytest.mark.parametrize(
+    "terminal_result",
+    [None, "", _TURN_LIMIT_PROSE],
+    ids=["result-none", "result-empty", "result-prose"],
+)
+def test_agent_max_turns_terminal_with_continue_policy_returns_partial_result(
+    monkeypatch,
+    terminal_result,
+):
+    """``continue_with_warning`` returns the model's work, never CLI prose."""
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(result=terminal_result),
+        ]],
+        on_max_turns="continue_with_warning",
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.error is None
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert [
+        (message.role, message.content) for message in result.transcript
+    ] == [("assistant", _TURN_LIMIT_PARTIAL_TEXT)]
+    assert _limit_event_names(result) == ["max_turns"]
+
+
+def test_agent_max_turns_terminal_result_prose_is_not_the_typed_reply(
+    monkeypatch,
+):
+    """Under ``raise`` the CLI's limit prose is neither reply nor message."""
+    from assay import MaxTurnsExceeded
+
+    result, _observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(
+                result=_TURN_LIMIT_PROSE,
+                errors=[_TURN_LIMIT_PROSE],
+            ),
+        ]],
+    )
+
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert _TURN_LIMIT_PROSE not in result.error.message
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert [
+        (message.role, message.content) for message in result.transcript
+    ] == [("assistant", _TURN_LIMIT_PARTIAL_TEXT)]
+
+
+def test_agent_text_free_max_turns_terminal_is_not_an_empty_completion(
+    monkeypatch,
+):
+    """A tool-only session at its limit is not the retriable stall shape."""
+    from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            AssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="t1",
+                        name="Bash",
+                        input={"command": "ls"},
+                    ),
+                ],
+                model="claude-opus-5",
+            ),
+            _max_turns_terminal(output_tokens=0),
+        ]],
+        on_max_turns="continue_with_warning",
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.error is None
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == ""
+    assert result.usage.output_tokens == 0
+    assert _limit_event_names(result) == ["max_turns"]
+
+
+def test_agent_max_turns_malformed_terminal_is_typed_and_incomplete(
+    monkeypatch,
+):
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(errors="malformed-terminal-field"),
+        ]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.retriable is False
+    assert result.stop_reason == "max_turns"
+    assert result.completeness.terminal_complete is False
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+@pytest.mark.parametrize("on_max_turns", ["raise", "continue_with_warning"])
+def test_agent_max_turns_terminal_requires_served_model_identity(
+    monkeypatch,
+    is_error,
+    on_max_turns,
+):
+    """A turn-limit terminal needs the served-model proof a success needs."""
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _max_turns_terminal(
+                is_error=is_error,
+                model_usage=None,
+                result="unproven content must not be admitted",
+            ),
+        ]],
+        on_max_turns=on_max_turns,
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.stop_reason == "missing_model_identity"
+    assert result.error is not None
+    assert result.error.kind == "incomplete_evidence"
+    assert result.final_message == ""
+    assert result.transcript == ()
+    assert result.completeness.terminal_complete is False
+
+
+def test_agent_max_turns_terminal_does_not_outrank_permission_denial(
+    monkeypatch,
+):
+    import dataclasses
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            dataclasses.replace(
+                _max_turns_terminal(),
+                permission_denials=[{"tool": "Write"}],
+            ),
+        ]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.stop_reason == "permission_denied"
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert result.error.retriable is False
+    assert _limit_event_names(result) == ["permission_denial"]
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    ["error_during_execution", "error_max_structured_output_retries"],
+)
+def test_agent_other_error_terminal_subtypes_stay_transport_failures(
+    monkeypatch,
+    subtype,
+):
+    """Only the exact turn-limit subtype is a limit; the count is not one."""
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _result_message(
+                subtype=subtype,
+                stop_reason="tool_use",
+                is_error=True,
+                num_turns=6,
+                output_tokens=3,
+            ),
+        ]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert result.error.retriable is False
+    assert result.stop_reason != "max_turns"
+    assert "max_turns" not in _limit_event_names(result)
 
 
 @pytest.mark.parametrize(

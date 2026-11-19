@@ -2646,6 +2646,170 @@ def test_pool_worker_workspace_error_returns_outcome(
     assert outcome.model_patch == ""
 
 
+def _run_worker_with_stopped_architect_child(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    status: str,
+    submit_any_nonempty_best_effort: bool,
+):
+    """Run one worker whose Architect child kept one slice and returned 1.
+
+    Returns the worker outcome and the patches offered to inline evaluation.
+    """
+    import contextlib as _contextlib
+    import subprocess
+
+    from assay import Implementation
+    from assay.corpus.runs import RunResult
+    from assay.corpus.store import Corpus
+    from crucible.products.swebench.eval import InstanceEvalReport
+    from crucible.workflows._run import exec_ctx_now, open_run_with_capture
+    from crucible.workflows.swebench import _pool_worker, _PoolPayload
+
+    corpus = _setup_corpus(tmp_path)
+    repo = tmp_path / "fake_repo"
+    repo.mkdir()
+    base = _init_git_repo(repo)
+
+    @_contextlib.contextmanager
+    def fake_workspace(instance, *, cache_dir=None, timeout=600):
+        yield repo
+
+    def stopped_architect(**kwargs) -> int:
+        # The real Architect returns 1 for a stopped cascade; it does not
+        # raise. Its typed terminal is published under the worker's saga.
+        workspace = Path(kwargs["cwd"])
+        instance_corpus = Corpus(kwargs["spec"])
+        (workspace / "seed.py").write_text("def f(): return 99\n")
+        diff = subprocess.run(
+            ["git", "diff", "HEAD", "--", "seed.py"],
+            cwd=workspace, check=True, capture_output=True,
+        ).stdout
+        instance_corpus.commit(implementations=(Implementation(
+            slice_id="s0",
+            base_commit=base,
+            result_commit=None,
+            diff_ref=instance_corpus.put_artifact(
+                diff, kind="diffs", name_hint="s0.diff",
+            ),
+            transcript_ref=instance_corpus.put_artifact(
+                b"[]", kind="transcripts", name_hint="s0.json",
+            ),
+            files_modified=("seed.py",),
+            classification="success",
+            execution=exec_ctx_now("test"),
+            scope_escapes=(),
+            cost_usd=0.0,
+            artifacts={},
+        ),))
+        with open_run_with_capture(instance_corpus, "architect") as handle:
+            handle.write_summary({
+                "status": status,
+                "authoritative_spent_usd": 1.0,
+                "costs": {"total_usd": 1.0, "rollup_incomplete": False},
+            })
+            handle.finalize(RunResult(status=status, cost_usd=1.0))
+        return 1
+
+    evaluated_patches: list[str] = []
+
+    def inline_evaluation(inst, outcome, routed_model, **kwargs):
+        if not outcome.model_patch:
+            return None
+        evaluated_patches.append(outcome.model_patch)
+        return InstanceEvalReport(
+            instance_id=inst.instance_id,
+            resolved=False,
+            patch_applied=True,
+            raw_report={"resolved": False},
+        )
+
+    monkeypatch.setattr(
+        "crucible.workflows.swebench.repo_workspace", fake_workspace,
+    )
+    monkeypatch.setattr(
+        "crucible.workflows.architect.run_architect", stopped_architect,
+    )
+    monkeypatch.setattr(
+        "crucible.workflows.swebench._evaluate_prediction_inline",
+        inline_evaluation,
+    )
+
+    inst = SwebenchInstance(
+        instance_id="fake-1", repo="fake/repo",
+        base_commit=base, patch="", test_patch="",
+        problem_statement="Make f return 99", fail_to_pass=(),
+        pass_to_pass=(),
+    )
+    parent_run = _prepare_swebench_parent(tmp_path / "runs" / "swebench-parent")
+    payload = _PoolPayload(
+        instance=inst,
+        workspace_root_spec_dir=str(corpus.spec_dir),
+        backend_config_path=str(_default_backend_config(tmp_path)), max_turns=10,
+        budget_usd=10.0,
+        repo_cache_dir=None,
+        log_dir=str(tmp_path / "worker_log"),
+        parent_run_dir=str(parent_run),
+        include_breach=False,
+        include_review=False,
+        enable_build_verify=False,
+        evaluate_inline=True,
+        routed_model="aws/anthropic/bedrock-claude-opus-4-8",
+        submit_any_nonempty_best_effort=submit_any_nonempty_best_effort,
+    )
+    return _pool_worker(payload), evaluated_patches
+
+
+@pytest.mark.parametrize(
+    "submit_any_nonempty_best_effort",
+    [True, False],
+    ids=["best_effort", "verified_only"],
+)
+def test_budget_stopped_cascade_is_partial_and_not_evaluated_inline(
+    tmp_path: Path,
+    monkeypatch,
+    submit_any_nonempty_best_effort: bool,
+):
+    """A budget stop returns 1 instead of raising, yet is truncated work."""
+    outcome, evaluated_patches = _run_worker_with_stopped_architect_child(
+        tmp_path,
+        monkeypatch,
+        status="budget_exhausted",
+        submit_any_nonempty_best_effort=submit_any_nonempty_best_effort,
+    )
+
+    assert evaluated_patches == []
+    assert outcome.eval_status == "cascade_aborted_partial"
+    # The Architect's own return value still classifies the instance.
+    assert outcome.classification == "architect_rc_1"
+    assert outcome.submission_decision is not None
+    if submit_any_nonempty_best_effort:
+        assert "return 99" in outcome.model_patch
+        assert outcome.submission_decision.submitted is True
+    else:
+        assert outcome.model_patch == ""
+        assert outcome.submission_decision.submitted is False
+
+
+def test_non_budget_architect_failure_keeps_best_effort_inline_evaluation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Only the budget terminal class marks a returned cascade as truncated."""
+    outcome, evaluated_patches = _run_worker_with_stopped_architect_child(
+        tmp_path,
+        monkeypatch,
+        status="partial_failed",
+        submit_any_nonempty_best_effort=True,
+    )
+
+    assert len(evaluated_patches) == 1
+    assert "return 99" in evaluated_patches[0]
+    assert outcome.eval_status == "unresolved"
+    assert outcome.classification == "architect_rc_1"
+
+
 def test_implement_max_concurrent_1_uses_serial_path(
     tmp_path: Path, monkeypatch,
 ):
@@ -2924,6 +3088,38 @@ def test_concurrent_architect_children_keep_distinct_saga_identity(tmp_path: Pat
         )
         assert cost == pytest.approx(expected_cost)
         assert incomplete is False
+
+
+def test_architect_budget_stop_is_read_from_the_saga_bound_child(tmp_path: Path):
+    """Only the parent's own Architect child proves a budget stop."""
+
+    from assay.corpus.runs import RunResult
+    from assay.corpus.store import Corpus
+    from crucible.workflows import swebench as wf
+    from crucible.workflows._run import open_run_with_capture
+
+    parent = _prepare_swebench_parent(tmp_path / "parent" / "swebench-run")
+
+    def publish(instance_id: str, workflow: str, status: str) -> str:
+        operation_id = wf._architect_operation_id(instance_id)
+        child_corpus = Corpus(tmp_path / "instances" / instance_id / "corpus")
+        with _outcome.child_operation(
+            parent, operation_id=operation_id, workflow=workflow,
+        ):
+            with open_run_with_capture(child_corpus, workflow) as handle:
+                handle.write_summary({"status": status})
+                handle.finalize(RunResult(status=status, cost_usd=1.0))
+        return operation_id
+
+    budget_stopped = publish("instance-a", "architect", "budget_exhausted")
+    completed = publish("instance-b", "architect", "complete")
+    other_workflow = publish("instance-c", "tier", "budget_exhausted")
+    never_ran = wf._architect_operation_id("instance-d")
+
+    assert wf._architect_stopped_on_budget(parent, budget_stopped) is True
+    assert wf._architect_stopped_on_budget(parent, completed) is False
+    assert wf._architect_stopped_on_budget(parent, other_workflow) is False
+    assert wf._architect_stopped_on_budget(parent, never_ran) is False
 
 
 def test_resumability_retries_hard_failed_instances_by_default(

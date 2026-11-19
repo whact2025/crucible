@@ -24,9 +24,12 @@ from crucible.products.deepswe.dataset import (
     filter_instances,
     fingerprint_task_tests_tree,
     load_dataset,
+    load_snapshot_test_inventory,
+    load_task_test_inventory,
     resolve_task_tests_dir,
     snapshot_task_tests_tree,
 )
+from crucible.products.deepswe.secure_artifacts import RewardTestInventory
 
 
 # ---------- fixture builders ----------
@@ -828,6 +831,139 @@ def test_snapshot_rejects_symlinked_private_staging_root(tmp_path: Path):
             expected_identity=identity,
         )
     assert list(outside.iterdir()) == []
+
+
+def _snapshot_with_config(tmp_path: Path, config: bytes | None):
+    """Snapshot one task whose tests tree optionally declares a whitelist."""
+
+    tasks_root = tmp_path / "tasks"
+    tasks_root.mkdir()
+    task_dir = _write_task_dir(tasks_root, task_id="t1", ext_id="kh1")
+    tests_dir = _add_snapshot_test_files(task_dir)
+    if config is not None:
+        (tests_dir / "config.json").write_bytes(config)
+    manifest_path = _write_manifest(
+        tasks_root,
+        [_manifest_entry("t1", ext_id="kh1", repo="ex/ex")],
+    )
+    snapshot = snapshot_task_tests_tree(
+        manifest_path,
+        "t1",
+        tmp_path / "private",
+        expected_identity=fingerprint_task_tests_tree(manifest_path, "t1"),
+    )
+    return manifest_path, tests_dir, snapshot
+
+
+def _tests_config(f2p: object, p2p: object) -> bytes:
+    return json.dumps(
+        {
+            "base_commit": "0" * 40,
+            "f2p_node_ids": f2p,
+            "grade": {"format": "ctrf", "reports": []},
+            "p2p_node_ids": p2p,
+        }
+    ).encode()
+
+
+def test_snapshot_test_inventory_counts_deduplicated_stripped_ids(
+    tmp_path: Path,
+):
+    # The dataset grader strips each id and drops blanks and repeats.
+    manifest_path, _tests_dir, snapshot = _snapshot_with_config(
+        tmp_path,
+        _tests_config(["a", " a ", "b", "", "  "], ["x"]),
+    )
+
+    expected = RewardTestInventory(f2p_total=2, p2p_total=1)
+    assert load_snapshot_test_inventory(snapshot) == expected
+    assert load_task_test_inventory(manifest_path, "t1") == expected
+    assert expected.to_payload() == {"f2p_total": 2, "p2p_total": 1}
+
+
+def test_snapshot_test_inventory_is_absent_without_config_json(tmp_path: Path):
+    manifest_path, _tests_dir, snapshot = _snapshot_with_config(tmp_path, None)
+
+    assert load_snapshot_test_inventory(snapshot) is None
+    assert load_task_test_inventory(manifest_path, "t1") is None
+
+
+@pytest.mark.parametrize(
+    ("config", "reason"),
+    (
+        (b"{not json", "not strict JSON"),
+        (b'{"f2p_node_ids": ["a"], "p2p_node_ids": ["\xff"]}', "not strict JSON"),
+        (b'["a"]', "one JSON object"),
+        (b'{"f2p_node_ids": ["a"]}', "p2p_node_ids must be an exact string list"),
+        (b'{"p2p_node_ids": ["a"]}', "f2p_node_ids must be an exact string list"),
+        (_tests_config("a", ["x"]), "f2p_node_ids must be an exact string list"),
+        (_tests_config(["a"], {"x": 1}), "p2p_node_ids must be an exact string list"),
+        (_tests_config(["a", 7], ["x"]), "f2p_node_ids must be an exact string list"),
+        (
+            b'{"f2p_node_ids": ["a"], "p2p_node_ids": [], "f2p_node_ids": []}',
+            "repeats a JSON object key",
+        ),
+        (
+            b'{"f2p_node_ids": ["a"], "p2p_node_ids": [], "grade": NaN}',
+            "non-finite",
+        ),
+    ),
+    ids=(
+        "not_json",
+        "invalid_utf8",
+        "top_level_list",
+        "p2p_missing",
+        "f2p_missing",
+        "ids_not_a_list",
+        "ids_a_mapping",
+        "non_string_id",
+        "duplicate_key",
+        "non_finite_constant",
+    ),
+)
+def test_snapshot_test_inventory_rejects_malformed_config(
+    tmp_path: Path,
+    config: bytes,
+    reason: str,
+):
+    manifest_path, _tests_dir, snapshot = _snapshot_with_config(tmp_path, config)
+
+    with pytest.raises(DeepSWEInstanceError, match=reason):
+        load_snapshot_test_inventory(snapshot)
+    with pytest.raises(DeepSWEInstanceError, match=reason):
+        load_task_test_inventory(manifest_path, "t1")
+
+
+def test_snapshot_test_inventory_reads_the_private_copy(tmp_path: Path):
+    manifest_path, tests_dir, snapshot = _snapshot_with_config(
+        tmp_path,
+        _tests_config(["a", "b"], ["x", "y", "z"]),
+    )
+    (tests_dir / "config.json").write_bytes(_tests_config(["a"], []))
+
+    assert load_snapshot_test_inventory(snapshot) == RewardTestInventory(
+        f2p_total=2,
+        p2p_total=3,
+    )
+    # The live tree is what the fail-fast check reads; it is not authority.
+    assert load_task_test_inventory(manifest_path, "t1") == RewardTestInventory(
+        f2p_total=1,
+        p2p_total=0,
+    )
+
+
+def test_test_inventory_never_follows_a_config_symlink(tmp_path: Path):
+    manifest_path, tests_dir, snapshot = _snapshot_with_config(tmp_path, None)
+    outside = tmp_path / "outside-config.json"
+    outside.write_bytes(_tests_config(["a"], ["x"]))
+    (tests_dir / "config.json").symlink_to(outside)
+    snapshot.root.chmod(0o700)
+    (snapshot.root / "config.json").symlink_to(outside)
+
+    with pytest.raises(DeepSWEInstanceError, match="must not be a symlink"):
+        load_task_test_inventory(manifest_path, "t1")
+    with pytest.raises(DeepSWEInstanceError, match="must not be a symlink"):
+        load_snapshot_test_inventory(snapshot)
 
 
 def test_load_dataset_manifest_entry_missing_field(tmp_path: Path):

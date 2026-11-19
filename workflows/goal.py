@@ -7,7 +7,9 @@ Blue emits one complete canonical goal replacement.  The workflow parses and
 deterministically validates that replacement, lets the Judge adjudicate the
 complete evidence chain, and stages valid ``revise`` candidates in memory for
 the next round.  Only a candidate that passes both deterministic validation and
-the independent Judge is promoted into the authoritative Spec lineage.
+the independent Judge is promoted into the authoritative Spec lineage.  A Red
+review that ends ``inconclusive`` ends the debate before Blue and can never be
+promoted.
 """
 
 from __future__ import annotations
@@ -256,6 +258,21 @@ def main(argv: list[str] | None = None) -> int:
                         budget_reason=(
                             "cumulative budget exhausted after Red review"
                         ),
+                    ),
+                )
+                break
+            if red.decision == "inconclusive":
+                # Red did not review the goal (incomplete input, or a harness
+                # failure): nothing was challenged, so Blue has nothing to
+                # answer and a Judge pass would approve an unreviewed goal.
+                final_judge = terminal_verdict(
+                    corpus,
+                    goal_artifact,
+                    rubric="goal_red_inconclusive",
+                    decision="inconclusive",
+                    reasoning=(
+                        "Red review was inconclusive; the goal was not "
+                        "challenged, so Blue and Judge were not consulted"
                     ),
                 )
                 break

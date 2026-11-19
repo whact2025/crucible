@@ -1523,6 +1523,18 @@ def _pool_worker_unleased(payload: _PoolPayload) -> InstanceOutcome:
                     )
                     rc = 3  # halt-shape rc; mirrors review_failed code
                     cascade_aborted = True
+                if not cascade_aborted and _architect_stopped_on_budget(
+                    payload.parent_run_dir, operation_id,
+                ):
+                    # ``rc`` stays the Architect's own return value; only the
+                    # inline evaluation and the status label change.
+                    logger.warning(
+                        "swebench worker: instance %s cascade stopped by its "
+                        "budget ceiling — capturing partial workspace diff; "
+                        "eval skipped inline (recoverable post-sweep)",
+                        inst.instance_id,
+                    )
+                    cascade_aborted = True
                 architect_cost, architect_rollup_incomplete = (
                     _architect_cost_for_operation(
                         payload.parent_run_dir, operation_id,
@@ -2902,6 +2914,28 @@ def _architect_operation_id(instance_id: str) -> str:
         "instance_id": instance_id,
     })
     return f"architect-{identity.removeprefix('sha256:')}"
+
+
+def _architect_stopped_on_budget(
+    parent_run_dir: Path | str,
+    operation_id: str,
+) -> bool:
+    """Return whether the saga-bound Architect child ended on its budget.
+
+    ``run_architect`` returns 1 for a budget stop instead of raising, so the
+    exception handler that marks a truncated cascade never sees it. The typed
+    terminal of the parent's own child is the only authority; a missing or
+    misbound child proves nothing.
+    """
+
+    try:
+        outcome = _outcome.child_outcome(parent_run_dir, operation_id)
+    except ValueError:
+        return False
+    return (
+        outcome.workflow == "architect"
+        and outcome.terminal_class is _outcome.TerminalClass.BUDGET_EXHAUSTED
+    )
 
 
 def _architect_cost_for_operation(

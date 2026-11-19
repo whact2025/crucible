@@ -17,7 +17,9 @@ in one Corpus transition. `final_goal.yaml` is retained as an output artifact;
 review and validation records attach to the accepted lineage. Generated
 revisions do not become source evidence. Goal refinement is optional before
 planning; planning requires a valid promoted Spec, not a previous Goal run.
-The budget covers every role across rounds.
+The budget covers every role across rounds. A Red review that ends
+`inconclusive` stops the run before Blue, because an unchallenged goal is not
+adjudicated.
 
 ## Options
 
@@ -44,6 +46,6 @@ files; events, traces, and domain artifacts are conditional. Source:
 | Code | Meaning |
 |---|---|
 | `0` | Judge issued `pass`. |
-| `1` | Judge issued `revise`, or the round/budget limit was exhausted before `pass`. |
+| `1` | Judge issued `revise`, including when the round limit was exhausted before `pass`. |
 | `2` | Judge issued `reject`, or the Spec was missing before the debate. |
-| `3` | Judge issued `inconclusive`, or no complete round ran. |
+| `3` | Red or Judge issued `inconclusive`, the budget was exhausted, or no complete round ran. |

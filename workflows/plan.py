@@ -2017,12 +2017,17 @@ def run_plan(
     synthesize a starter Spec and run plan→tier per instance compose
     ``run_plan(...)`` directly without going through argparse.
 
-    ``cwd`` (optional) is the working directory the caller's
-    ``planner_backend`` was constructed with. ``assay.primitives.plan`` itself doesn't
-    consume cwd directly; the backend's tool-sandbox cwd is what
-    matters and is set at backend-construction time. The kwarg
-    exists so multi-threaded fan-out callers can carry a consistent workspace
-    contract across planning, tier, architect, and breach entry points.
+    ``cwd`` (optional) is the project root the caller's ``planner_backend``
+    and its source tools were constructed with. The backend's tool-sandbox cwd
+    is set at backend-construction time; here the same directory roots source
+    context capture and source revalidation, and for a generated plan it is
+    forwarded, resolved, to ``assay.primitives.plan`` as ``project_root``.
+    Planner scope paths are therefore canonicalized against it and never
+    against the process working directory, so multi-threaded fan-out callers
+    carry one workspace contract across planning, tier, architect, and breach
+    entry points. Without ``cwd`` a leading project-name segment is always
+    stripped. A ``cwd`` that is not an existing directory raises from Assay
+    before any Planner call.
 
     ``allowed_tools`` is forwarded to ``assay.primitives.plan`` for
     the planner's tool-use loop. Repository-backed planning can use a
@@ -2114,6 +2119,12 @@ def run_plan(
             budget_usd=budget_usd,
             allowed_tools=allowed_tools,
             prompt_toolset=prompt_toolset,
+            # A fixed candidate is reviewed, not parsed, so it needs no root.
+            project_root=(
+                Path(cwd).resolve()
+                if cwd is not None and planner_backend is not None
+                else None
+            ),
             candidate_transform=effective_candidate_transform,
             candidate_validator=candidate_validator,
             candidate_context_provider=source_context_provider(

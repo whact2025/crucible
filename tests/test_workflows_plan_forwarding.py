@@ -32,7 +32,13 @@ from assay.corpus.store import Corpus
 from assay.types.findings import ReviewCoverage, Verdict
 
 from crucible.constraints import LanguagesConstraint
+from crucible.rubrics import load as load_rubric
 from crucible.workflows import plan as plan_workflow
+from crucible.workflows._plan_validation import (
+    build_pre_review_candidate_validator,
+)
+from tests.test_plan_review_response_retry import _Backend
+from tests.test_workflows_plan_candidate_import import _candidate_payload, _spec
 
 
 def _forwarding_outcome(spec: Spec) -> PlanOutcome:
@@ -431,6 +437,168 @@ def test_run_plan_forwards_prompt_toolset_as_metadata(monkeypatch):
     )
 
     assert captured["prompt_toolset"] is toolset
+
+
+def test_run_plan_forwards_cwd_as_assay_project_root(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_plan(_spec, **kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return _forwarding_outcome(_spec)
+
+    monkeypatch.setattr(plan_workflow, "plan", fake_plan)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    def run(**kwargs):
+        plan_workflow.run_plan(
+            _language_spec(),
+            critic_backend=SimpleNamespace(),
+            judge_backend=None,
+            corpus=SimpleNamespace(),
+            critic_rubric=SimpleNamespace(),
+            **kwargs,
+        )
+
+    run(planner_backend=SimpleNamespace(), cwd=str(project))
+    assert captured["project_root"] == project.resolve()
+
+    monkeypatch.chdir(tmp_path)
+    run(planner_backend=SimpleNamespace(), cwd="project")
+    assert captured["project_root"] == project.resolve()
+
+    run(planner_backend=SimpleNamespace())
+    assert captured["project_root"] is None
+
+    # A fixed candidate is reviewed, not parsed: no root is forwarded for it.
+    run(candidate_dag=_candidate_with_languages(), cwd=str(project))
+    assert captured["project_root"] is None
+
+
+def _plan_same_named_project(monkeypatch, tmp_path, *scopes, repairs=0):
+    """Plan project ``demo`` whose root holds a real ``demo`` directory.
+
+    Each ``(files_in_scope, creates_paths)`` pair is one Planner reply. The
+    release pre-review gate is rooted at the same directory as ``cwd`` while
+    the process runs elsewhere. Returns ``(outcome, planner)``.
+    """
+
+    repo = tmp_path / "repo"
+    (repo / "demo" / "src").mkdir(parents=True)
+    (repo / "demo" / "src" / "thing.py").write_text("x = 1\n")
+    (repo / "src").mkdir()
+    (repo / "src" / "other.py").write_text("y = 1\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    replies = []
+    for files_in_scope, creates_paths in scopes:
+        payload = _candidate_payload()
+        directive = payload["tiers"][0]["slices"][0]["directive"]
+        directive["files_in_scope"] = files_in_scope
+        directive["creates_paths"] = creates_paths
+        directive["blast_radius"]["max_files"] = 3
+        replies.append(json.dumps(payload))
+    corpus = Corpus(tmp_path / "corpus")
+
+    def passing_review(artifact, rubric, **kwargs):
+        return Verdict(
+            rubric=rubric.name, decision="pass", findings=(),
+            artifact_ref=corpus.put_artifact(artifact, kind="reviewed_artifacts"),
+            artifact_commit=None, reasoning="fixture review",
+            coverage=ReviewCoverage(
+                complete=True,
+                sources_reviewed=("artifact",),
+                omissions=(), artifact_chars_total=len(artifact),
+                artifact_chars_reviewed=len(artifact),
+            ),
+            backend_name="fixture", transcript_ref=None, cost_usd=0,
+            execution=None, kind=kwargs["kind"],
+            cache_creation_tokens=0, cache_read_tokens=0,
+            execution_completeness=ExecutionCompleteness(
+                token_usage_complete=True, cost_complete=True,
+                terminal_complete=True, trace_complete=True,
+            ),
+        )
+
+    monkeypatch.setattr(plan_workflow, "strict_review", passing_review)
+    planner = _Backend(*replies)
+    spec = _spec()
+
+    outcome = plan_workflow.run_plan(
+        spec,
+        corpus=corpus,
+        cwd=str(repo),
+        planner_backend=planner,
+        critic_backend=_Backend(),
+        judge_backend=_Backend(),
+        critic_rubric=load_rubric("spec_clarity"),
+        judge_rubric=load_rubric("spec_clarity"),
+        candidate_validator=build_pre_review_candidate_validator(
+            spec=spec, project_root=repo
+        ),
+        max_candidate_validation_repairs=repairs,
+    )
+    return outcome, planner
+
+
+def test_run_plan_keeps_real_same_named_directory_from_any_process_cwd(
+    monkeypatch,
+    tmp_path,
+):
+    """Planner scope canonicalization follows ``cwd``, not the process cwd.
+
+    The existing file and the file created beside it both keep the real
+    ``demo/`` directory, so the candidate passes the pre-review gate as
+    written and the new file is not moved to the project root.
+    """
+
+    outcome, planner = _plan_same_named_project(
+        monkeypatch,
+        tmp_path,
+        (["demo/src/thing.py"], ["demo/src/new_mod.py"]),
+    )
+
+    assert outcome.accepted
+    assert len(planner.invocations) == 1
+    assert outcome.spec.tier_dag is not None
+    scoped = outcome.spec.tier_dag.tiers[0].slices[0].directive
+    assert scoped.files_in_scope == ("demo/src/thing.py",)
+    assert scoped.creates_paths == ("demo/src/new_mod.py",)
+
+
+def test_run_plan_reports_repeated_project_name_under_real_same_named_directory(
+    monkeypatch,
+    tmp_path,
+):
+    """A path that only repeats the project name is reported, not rewritten.
+
+    ``demo/src/other.py`` names nothing (the file is ``src/other.py``). With a
+    real ``demo/`` directory Assay keeps the spelling, the pre-review gate
+    reports the missing path, and the Planner's one correction is admitted.
+    """
+
+    outcome, planner = _plan_same_named_project(
+        monkeypatch,
+        tmp_path,
+        (["demo/src/thing.py", "demo/src/other.py"], []),
+        (["demo/src/thing.py", "src/other.py"], []),
+        repairs=1,
+    )
+
+    assert len(planner.invocations) == 2
+    assert (
+        "missing_files_in_scope__s0__demo/src/other.py"
+        in planner.invocations[1].user
+    )
+    assert "missing_files_in_scope__s0__demo/src/thing.py" not in (
+        planner.invocations[1].user
+    )
+    assert outcome.accepted
+    assert outcome.spec.tier_dag is not None
+    scoped = outcome.spec.tier_dag.tiers[0].slices[0].directive
+    assert scoped.files_in_scope == ("demo/src/thing.py", "src/other.py")
 
 
 def test_run_plan_stops_on_planner_accounting_debt_before_critic(

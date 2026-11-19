@@ -34,7 +34,7 @@ from assay import (
     TierDAG,
 )
 from assay.corpus.store import Corpus
-from assay.primitives.implement import capture_workspace_delta
+from assay.primitives.implement import GitCaptureError, capture_workspace_delta
 from assay.types.artifacts import Implementation
 
 from crucible.constraints import AuthoringFinalizationConstraint
@@ -2191,6 +2191,298 @@ def test_empty_diff_fails_unless_allow_empty(env, capsys):
     assert rc == 0
     impls = _latest_impls(corpus)
     assert impls["s1"].classification == "soft_fail_no_changes"
+
+
+def _fail_capture_when(monkeypatch, should_fail) -> None:
+    """Make Handoff's working-tree capture fail for the selected scopes."""
+    from crucible.workflows import handoff as handoff_mod
+
+    def capture(*, cwd, path_scope):
+        if should_fail(path_scope):
+            raise GitCaptureError(
+                "capture Git status failed: fatal: index file corrupt"
+            )
+        return capture_workspace_delta(cwd=cwd, path_scope=path_scope)
+
+    monkeypatch.setattr(handoff_mod, "capture_workspace_delta", capture)
+
+
+def _assert_durable_capture_setup_error(spec_dir: Path, printed: dict) -> None:
+    """The retained run, not stdout, is the authority for the terminal."""
+    (handoff_run,) = (spec_dir / "runs").glob("*_handoff_*")
+    summary = json.loads((handoff_run / "summary.json").read_text())
+    result = json.loads((handoff_run / "result.json").read_text())
+    outcome = json.loads((handoff_run / "outcome.json").read_text())
+    assert summary == printed
+    assert result["status"] == "setup_error"
+    assert outcome["detail_status"] == "setup_error"
+    assert outcome["error_kind"] == "workspace_capture_failed"
+
+
+def test_unscoped_capture_failure_is_a_setup_error(env, capsys, monkeypatch):
+    repo, corpus, spec_dir = env
+    (repo / "seed.txt").write_text("seed\nedited by hand\n")
+    _fail_capture_when(monkeypatch, lambda path_scope: path_scope is None)
+
+    rc = handoff_main([
+        "--spec", str(spec_dir), "--slice", "s0",
+        "--cwd", str(repo), "--skip-verify",
+    ])
+
+    assert rc == 2
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "setup_error"
+    assert summary["error_kind"] == "workspace_capture_failed"
+    assert "index file corrupt" in summary["error"]
+    assert summary["targets"] == []
+    assert summary["landed"] is False
+    assert _latest_impls(corpus) == {}
+    assert corpus.latest_spec().implementation_refs == ()
+
+
+def test_slice_capture_failure_stops_the_handoff_as_setup_error(
+    env, capsys, monkeypatch,
+):
+    import crucible.workflows.handoff as handoff_mod
+
+    repo, corpus, spec_dir = env
+    (repo / "seed.txt").write_text("seed\nedited by hand\n")
+    (repo / "other.txt").write_text("second slice\n")
+    _fail_capture_when(
+        monkeypatch,
+        lambda path_scope: path_scope == ("other.txt",),
+    )
+    review_calls = []
+
+    def forbidden_review(argv):
+        review_calls.append(argv)
+        pytest.fail("a capture setup error must stop the follow-on gates")
+
+    monkeypatch.setattr(handoff_mod, "review_main", forbidden_review)
+
+    rc = handoff_main([
+        "--spec", str(spec_dir), "--tier", "t0",
+        "--cwd", str(repo), "--skip-verify", "--with-review", "--land",
+    ])
+
+    assert rc == 2
+    assert review_calls == []
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "setup_error"
+    assert summary["error_kind"] == "workspace_capture_failed"
+    assert "'s1'" in summary["error"]
+    assert summary["landed"] is False
+    _assert_durable_capture_setup_error(spec_dir, summary)
+    # The earlier target keeps its own evidence; the typed terminal still
+    # names it so the setup error is not read as "nothing happened".
+    assert {row["slice"]: row["action"] for row in summary["targets"]} == {
+        "s0": "recorded",
+        "s1": "failed",
+    }
+    # Its requested gate never ran, so the record stays provisional.
+    (recorded_row,) = [r for r in summary["targets"] if r["slice"] == "s0"]
+    assert recorded_row["classification"] == "pending_gates"
+    (failed_row,) = [r for r in summary["targets"] if r["slice"] == "s1"]
+    assert "index file corrupt" in failed_row["reason"]
+    assert failed_row["out_of_scope_changes"] == []
+    recorded = _latest_impls(corpus)
+    assert set(recorded) == {"s0"}
+    assert recorded["s0"].classification == "pending_gates"
+    final = corpus.latest_spec()
+    assert len(final.implementation_refs) == 1
+    assert final.lifecycle_event_refs == ()
+
+
+def test_prior_candidate_capture_failure_is_a_setup_error(
+    env, capsys, monkeypatch,
+):
+    repo, corpus, spec_dir = env
+    (repo / "seed.txt").write_text("v1\n")
+    argv = [
+        "--spec", str(spec_dir), "--slice", "s0",
+        "--cwd", str(repo), "--skip-verify",
+    ]
+    assert handoff_main(argv) == 0
+    capsys.readouterr()
+    _fail_capture_when(
+        monkeypatch,
+        lambda path_scope: path_scope == ("seed.txt", "gen.py"),
+    )
+
+    rc = handoff_main(argv)
+
+    assert rc == 2
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "setup_error"
+    assert summary["error_kind"] == "workspace_capture_failed"
+    # An uncapturable live candidate cannot prove it still matches the
+    # prior record, so the target is never reported as already complete.
+    (row,) = summary["targets"]
+    assert row["action"] == "failed"
+    assert len(corpus.latest_spec().implementation_refs) == 1
+
+
+def test_repository_filter_config_is_reported_as_capture_setup_error(
+    env, capsys,
+):
+    repo, corpus, spec_dir = env
+    # What a repository-local Git LFS install writes; the capture refuses
+    # repository filter controls because they can rewrite captured content.
+    subprocess.run(
+        ["git", "config", "filter.lfs.clean", "git-lfs clean -- %f"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "seed.txt").write_text("seed\nedited by hand\n")
+
+    rc = handoff_main([
+        "--spec", str(spec_dir), "--slice", "s0",
+        "--cwd", str(repo), "--skip-verify",
+    ])
+
+    assert rc == 2
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "setup_error"
+    assert summary["error_kind"] == "workspace_capture_failed"
+    assert "filter.lfs.clean" in summary["error"]
+    _assert_durable_capture_setup_error(spec_dir, summary)
+    assert _latest_impls(corpus) == {}
+    assert corpus.latest_spec().implementation_refs == ()
+
+
+def test_uncapturable_out_of_scope_entry_is_a_capture_setup_error(
+    env, capsys,
+):
+    repo, corpus, spec_dir = env
+    # An untracked nested repository without a commit lies outside the slice
+    # scope, but the out-of-scope report captures the whole tree and Git
+    # cannot stage that entry.
+    nested = repo / "vendor"
+    nested.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=nested, check=True)
+    (repo / "seed.txt").write_text("seed\nedited by hand\n")
+
+    rc = handoff_main([
+        "--spec", str(spec_dir), "--slice", "s0",
+        "--cwd", str(repo), "--skip-verify",
+    ])
+
+    assert rc == 2
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "setup_error"
+    assert summary["error_kind"] == "workspace_capture_failed"
+    assert "vendor" in summary["error"]
+    assert summary["targets"] == []
+    assert _latest_impls(corpus) == {}
+    assert corpus.latest_spec().implementation_refs == ()
+
+
+def test_land_is_blocked_when_the_live_candidate_cannot_be_recaptured(
+    env, capsys, monkeypatch,
+):
+    repo, corpus, spec_dir = env
+    (repo / "seed.txt").write_text("seed\nedited by hand\n")
+    scoped_captures = []
+
+    def fails_after_the_record(path_scope) -> bool:
+        if path_scope != ("seed.txt", "gen.py"):
+            return False
+        scoped_captures.append(path_scope)
+        # First scoped capture records the slice; the next one is the
+        # landing re-check of the live tree against that record.
+        return len(scoped_captures) > 1
+
+    _fail_capture_when(monkeypatch, fails_after_the_record)
+
+    rc = handoff_main([
+        "--spec", str(spec_dir), "--slice", "s0",
+        "--cwd", str(repo), "--skip-verify", "--land",
+    ])
+
+    assert rc == 1
+    assert len(scoped_captures) == 2
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "failed"
+    assert summary["landed"] is False
+    assert summary["candidate_landing_blockers"] == ["s0"]
+    (row,) = summary["targets"]
+    assert row["action"] == "candidate-mismatch"
+    # Nothing was compared, so the evidence names the capture failure and
+    # never claims that the tree differs from the record.
+    capture_error = "capture Git status failed: fatal: index file corrupt"
+    assert row["reason"] == (
+        "live candidate could not be re-captured before landing: "
+        + capture_error
+    )
+    (handoff_run,) = (spec_dir / "runs").glob("*_handoff_*")
+    (land_event,) = [
+        event
+        for event in map(
+            json.loads,
+            (handoff_run / "events.jsonl").read_text().splitlines(),
+        )
+        if event.get("phase") == "land"
+    ]
+    assert land_event["slices"] == ["s0"]
+    assert land_event["capture_errors"] == {"s0": capture_error}
+    assert json.loads((handoff_run / "summary.json").read_text()) == summary
+    assert corpus.latest_spec().lifecycle_event_refs == ()
+
+
+def _nested_repository_env(tmp_path: Path) -> tuple[Path, Corpus, Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    vendor = repo / "vendor"
+    vendor.mkdir()
+    _init_repo(vendor)
+    corpus = Corpus(tmp_path / "corpus")
+    base = Spec.from_yaml(MINIMAL_YAML)
+    corpus.put_spec(base)
+    corpus.put_spec(
+        base.with_tier_dag(
+            TierDAG(
+                tiers=(
+                    Tier(
+                        tier_id="t0",
+                        depends_on=(),
+                        slices=(_slice("vendored", (), creates=("vendor",)),),
+                    ),
+                )
+            )
+        )
+    )
+    return repo, corpus, tmp_path / "corpus"
+
+
+@pytest.mark.parametrize(
+    "mode_args",
+    [("--skip-verify",), (), ("--dry-run", "--skip-verify")],
+    ids=["skip_verify", "default_gate", "dry_run"],
+)
+def test_nested_repository_in_scope_is_not_recorded(
+    tmp_path, capsys, mode_args,
+):
+    """Git lists an untracked nested repository as one ``dir/`` entry.
+
+    Its diff is a commit pointer, not content, so the target fails before
+    any gate, preview row, or record treats it as captured work.
+    """
+    repo, corpus, spec_dir = _nested_repository_env(tmp_path)
+
+    rc = handoff_main([
+        "--spec", str(spec_dir), "--slice", "vendored",
+        "--cwd", str(repo), *mode_args,
+    ])
+
+    assert rc == 1
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "failed"
+    (row,) = summary["targets"]
+    assert row["action"] == "failed"
+    assert "vendor/" in row["reason"]
+    assert _latest_impls(corpus) == {}
+    assert corpus.latest_spec().implementation_refs == ()
 
 
 def _conditional_absence_env(tmp_path, *, selector_symlink: bool = False):

@@ -28,8 +28,11 @@ What it does, per target slice (in tier topo order):
 4. **Stamp** ``LifecycleEvent(kind="landed")`` with ``--land`` once
    every targeted slice records as complete.
 
-Out-of-scope edits in the tree are REPORTED (summary + warning), never
-captured and never fatal — the operator consciously owns the tree.
+Out-of-scope edits in the tree are REPORTED (summary + warning) and never
+captured — the operator consciously owns the tree. Their content is never
+fatal. The report itself captures the whole tree, so an entry Git cannot
+capture (for example an untracked nested repository without a commit) ends
+the run as a setup error even when it lies outside every targeted scope.
 
 The interactive loop lives one level up (the ``crucible-handoff``
 skill / Claude Code): edit → ``handoff --dry-run`` to preview exactly
@@ -37,8 +40,11 @@ what would be captured → ``handoff`` to record. ``breach`` / ``review``
 remain available as follow-on gates on the recorded diff.
 
 Exit codes: 0 = all targets recorded; 1 = some target failed
-(empty diff without ``--allow-empty``, verification or optional-gate failure);
-2 = usage error (unknown slice/tier, no tier_dag).
+(empty diff without ``--allow-empty``, a directory entry in the scoped
+capture, verification or optional-gate failure) or landing was blocked
+(for example a recorded candidate Git could not re-capture); 2 = usage or
+setup error (unknown slice/tier, no tier_dag, a working-tree delta Git could
+not capture before recording).
 """
 
 from __future__ import annotations
@@ -59,7 +65,7 @@ from typing import Any, Protocol, TypeVar
 from assay.corpus.runs import RunResult
 from assay.corpus.store import Corpus
 from assay.canonical import hash_record
-from assay.primitives.implement import capture_workspace_delta
+from assay.primitives.implement import GitCaptureError, capture_workspace_delta
 from assay.types.artifacts import Implementation, LifecycleEvent
 from assay.types.execution import ExecutionContext
 from assay.types.identity import ContentHash
@@ -1912,7 +1918,49 @@ def main(argv: list[str] | None = None) -> int:
             slice_.id: tier_id for tier_id, slice_ in pairs
         }
 
-        _, all_modified, _ = capture_workspace_delta(cwd=cwd, path_scope=None)
+        def workspace_capture_failed(
+            exc: GitCaptureError,
+            *,
+            tier_id: str | None = None,
+            slice_id: str | None = None,
+            out_of_scope_changes: list[str] | None = None,
+        ) -> int:
+            """Publish the setup terminal for a delta Git could not capture."""
+
+            target = (
+                "the working tree" if slice_id is None else f"slice {slice_id!r}"
+            )
+            message = (
+                f"cannot capture the working-tree delta of {target} in "
+                f"{cwd!r}: {exc}"
+            )
+            if slice_id is not None:
+                rows.append({
+                    "tier": tier_id, "slice": slice_id, "action": "failed",
+                    "reason": f"capture error: {exc}",
+                    "out_of_scope_changes": out_of_scope_changes or [],
+                })
+            # Targets recorded earlier in this run keep their own evidence;
+            # the rows keep the typed terminal from reading as "nothing ran".
+            summary = {
+                "status": "setup_error",
+                "error_kind": "workspace_capture_failed",
+                "error": message,
+                "targets": rows,
+                "landed": False,
+            }
+            handle.write_summary(summary)
+            print(json.dumps(summary, indent=2))
+            handle.finalize_elapsed(RunResult(status="setup_error"))
+            logger.error("handoff: %s", message)
+            return 2
+
+        try:
+            _, all_modified, _ = capture_workspace_delta(
+                cwd=cwd, path_scope=None,
+            )
+        except GitCaptureError as exc:
+            return workspace_capture_failed(exc)
         out_of_scope = sorted(set(all_modified) - union_scope)
         if out_of_scope:
             logger.warning(
@@ -1947,7 +1995,9 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                 )
-            except (KeyError, OSError, TypeError, ValueError):
+            except (GitCaptureError, KeyError, OSError, TypeError, ValueError):
+                # An uncapturable live candidate cannot prove it matches the
+                # prior record. The scoped capture below owns the terminal.
                 prior_candidate_matches = False
             prior_verification_admitted = bool(
                 already is not None
@@ -2014,15 +2064,42 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if scope:
-                diff_bytes, files_modified, base_commit = capture_workspace_delta(
-                    cwd=cwd, path_scope=scope
-                )
+                try:
+                    diff_bytes, files_modified, base_commit = (
+                        capture_workspace_delta(cwd=cwd, path_scope=scope)
+                    )
+                except GitCaptureError as exc:
+                    return workspace_capture_failed(
+                        exc,
+                        tier_id=tier_id,
+                        slice_id=sl.id,
+                        out_of_scope_changes=out_of_scope,
+                    )
             else:
                 # ``None`` means unscoped capture. An explicitly empty slice
                 # is verification-only and must never absorb ambient dirt.
                 diff_bytes = b""
                 files_modified = ()
                 base_commit = spec.project_context.base_commit
+
+            directory_entries = [
+                path for path in files_modified if path.endswith("/")
+            ]
+            if directory_entries:
+                # Before any gate, preview row, or record: the entry would
+                # otherwise be journaled, previewed, or recorded as content.
+                rows.append({
+                    "tier": tier_id, "slice": sl.id, "action": "failed",
+                    "reason": (
+                        "scoped capture lists directory entries "
+                        f"{directory_entries!r}: Git reports an untracked "
+                        "nested repository as one path and the captured "
+                        "diff cannot carry its content"
+                    ),
+                    "out_of_scope_changes": out_of_scope,
+                })
+                failed = True
+                continue
 
             if not files_modified and not args.allow_empty:
                 rows.append({
@@ -3254,6 +3331,7 @@ def main(argv: list[str] | None = None) -> int:
                     break
 
         candidate_landing_blockers: list[str] = []
+        candidate_capture_errors: dict[str, str] = {}
         if args.land and not failed and not args.dry_run:
             landing_candidates = {
                 **skipped_impls_for_land,
@@ -3267,11 +3345,25 @@ def main(argv: list[str] | None = None) -> int:
                 scope = tuple(
                     (*directive.files_in_scope, *directive.creates_paths)
                 )
-                observed = (
-                    capture_workspace_delta(cwd=cwd, path_scope=scope)
-                    if scope
-                    else (b"", (), spec.project_context.base_commit)
-                )
+                try:
+                    observed = (
+                        capture_workspace_delta(cwd=cwd, path_scope=scope)
+                        if scope
+                        else (b"", (), spec.project_context.base_commit)
+                    )
+                except GitCaptureError as exc:
+                    # A live candidate Git cannot capture cannot prove it
+                    # still is the recorded one, so it blocks landing. Nothing
+                    # was compared: the evidence keeps the capture error as
+                    # the cause instead of reporting a mismatch.
+                    logger.warning(
+                        "handoff %s: live candidate could not be re-captured "
+                        "before landing: %s",
+                        slice_id, exc,
+                    )
+                    candidate_capture_errors[slice_id] = str(exc)
+                    candidate_landing_blockers.append(slice_id)
+                    continue
                 try:
                     expected = (
                         corpus.get_artifact(implementation.diff_ref),
@@ -3287,15 +3379,28 @@ def main(argv: list[str] | None = None) -> int:
                 failed = True
                 for row in rows:
                     if row.get("slice") in candidate_landing_blockers:
+                        capture_error = candidate_capture_errors.get(
+                            row["slice"]
+                        )
                         row["action"] = "candidate-mismatch"
                         row["reason"] = (
                             "live workspace no longer matches the terminal candidate"
+                            if capture_error is None
+                            else (
+                                "live candidate could not be re-captured "
+                                f"before landing: {capture_error}"
+                            )
                         )
                 handle.write_event(
                     {
                         "phase": "land",
                         "classification": "candidate_mismatch",
                         "slices": candidate_landing_blockers,
+                        **(
+                            {"capture_errors": candidate_capture_errors}
+                            if candidate_capture_errors
+                            else {}
+                        ),
                     }
                 )
 

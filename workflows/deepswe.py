@@ -120,6 +120,8 @@ from crucible.products.deepswe.dataset import (
     filter_instances,
     fingerprint_task_tests_tree,
     load_dataset,
+    load_snapshot_test_inventory,
+    load_task_test_inventory,
     snapshot_task_tests_tree,
 )
 from crucible.products.deepswe.dev_verify_overrides import (
@@ -131,6 +133,7 @@ from crucible.products.deepswe.instance_container import (
     capture_model_patch_from_container,
     check_disk_headroom,
     docker_available,
+    is_full_commit_id,
     populate_workspace_from_image,
     pull_image,
     reconcile_orphans,
@@ -186,7 +189,11 @@ from crucible.products.deepswe.patch_limits import (
     configured_patch_byte_limit,
     validate_patch_byte_limit,
 )
-from crucible.products.deepswe.secure_artifacts import read_reward_artifact
+from crucible.products.deepswe.secure_artifacts import (
+    RewardCounts,
+    RewardTestInventory,
+    read_reward_artifact,
+)
 from crucible.workflows._args import (
     add_backend_limit_args,
     nonnegative_budget_arg,
@@ -1115,27 +1122,53 @@ def _validate_stopped_verifier_reward(
     verdict: dict[str, Any],
     *,
     instance_log_dir: Path,
+    test_inventory: RewardTestInventory | None,
 ) -> dict[str, Any]:
     """Re-read reward evidence after strict verifier quiescence.
 
     The runner deliberately does not open the reward path. The workflow trusts
     only this descriptor-relative, bounded read after Docker has proven the
     verifier stopped, and derives both reward KPIs from that exact token.
+
+    ``test_inventory`` is the whitelist the private tests snapshot declares,
+    or ``None`` when it declares none. The artifact must be the kind that
+    snapshot's grader writes: a ``reward.json`` whose totals are the whitelist
+    sizes when one is declared, a count-less ``reward.txt`` token otherwise.
+    Any other artifact is a ``mismatch`` and carries no reward.
     """
 
     validated = dict(verdict)
-    reward_read = read_reward_artifact(instance_log_dir)
+    reward_read = read_reward_artifact(
+        instance_log_dir,
+        inventory=test_inventory,
+    )
     reward_state = reward_read.state
-    validated["raw_reward"] = reward_read.token
+    reward_error = reward_read.error
+    if reward_state == "valid" and (
+        (reward_read.counts is None) != (test_inventory is None)
+    ):
+        reward_state = "mismatch"
+        reward_error = (
+            "reward.json cannot be bound to a tests/config.json whitelist"
+            if test_inventory is None
+            else "reward.txt cannot grade a task whose tests declare a whitelist"
+        )
+    reward_valid = reward_state == "valid"
+    validated["raw_reward"] = reward_read.token if reward_valid else ""
     validated["reward_pending"] = False
-    if reward_state == "valid":
-        validated["reward"] = reward_read.reward
-        validated["resolved"] = reward_read.reward
-    else:
-        validated["reward"] = None
-        validated["resolved"] = None
+    validated["reward"] = reward_read.reward if reward_valid else None
+    validated["resolved"] = reward_read.reward if reward_valid else None
+    validated["reward_counts"] = (
+        reward_read.counts.to_payload()
+        if reward_valid and reward_read.counts is not None
+        else None
+    )
+    # The reader's reasons name contract fields only, never file content.
+    validated["reward_error"] = (
+        None if reward_valid else (reward_error or reward_state)[:500]
+    )
     validated["reward_state"] = reward_state
-    validated["reward_valid"] = reward_state == "valid"
+    validated["reward_valid"] = reward_valid
     validated["verifier_status"] = _dataset_verifier_status(validated).value
     return validated
 
@@ -1460,6 +1493,18 @@ def _persist_dataset_outcome(
         except (KeyError, TypeError, ValueError):
             # The raw artifact preserves absent/malformed values exactly.
             pass
+    reward_counts = verdict.get("reward_counts")
+    if reward_counts is not None:
+        # Present only beside a valid v1.1 reward; the same exact payload is
+        # in the raw artifact and in the checkpoint committed with it.
+        values.update(
+            {
+                name: float(count)
+                for name, count in RewardCounts.from_payload(
+                    reward_counts
+                ).to_payload().items()
+            }
+        )
 
     execution = exec_ctx_now(
         "deepswe_hidden_verifier",
@@ -2478,6 +2523,8 @@ def _run_task_cascade(
         "rc": None,
         "reward": None,
         "resolved": None,
+        "reward_counts": None,
+        "reward_error": None,
         "verification_rc": None,
         "verify_returncode": None,
         "command_returncode": None,
@@ -2525,9 +2572,11 @@ def _run_task_cascade(
         "storage_peak_growth_bytes": 0,
         "wall_seconds": 0.0,
         "image_digest": inst.docker_image,
+        "base_commit": None,
         "max_patch_bytes": args.max_patch_bytes,
         "tests_snapshot": None,
         "tests_source_identity": None,
+        "test_inventory": None,
     }
 
     started = time.monotonic()
@@ -2555,18 +2604,11 @@ def _run_task_cascade(
         summary["image_digest"] = immutable_image
         tests_identity = fingerprint_task_tests_tree(args.dataset, inst.task_id)
         summary["tests_source_identity"] = tests_identity.to_payload()
-        # Per-task Corpus + starter Spec persistence. Existing lineage is
-        # retained for audit, while ``restart`` below guarantees its landed
-        # slices are replayed into this run's fresh workspace.
-        instance_corpus = Corpus(instance_spec_dir)
-        had_lineage = _prepare_task_corpus(
-            instance_corpus,
-            synthesize_starter_spec(
-                inst,
-                task_budget_usd=summary["budget_usd"],
-            ),
-            task_id=inst.task_id,
-        )
+        # Fail fast, before any container or provider spend, on a whitelist
+        # the grade could never be bound to. The live tree is not authority:
+        # the inventory that binds the reward is read from the private
+        # snapshot immediately before the hidden verifier.
+        load_task_test_inventory(args.dataset, inst.task_id)
 
         # Workspaces are deliberately outside the directory bind-mounted at
         # /logs. Otherwise the model can reach sibling baseline/pristine
@@ -2601,19 +2643,45 @@ def _run_task_cascade(
                 docker_settlement.register_container(reference)
 
             register_container = _register_settlement_container
-        populate_workspace_from_image(
+        # The dataset pins a few tasks by an abbreviated base commit. The
+        # first population resolves the pin, once, to the full object id of
+        # the image checkout. From here the two roles stay apart:
+        # ``inst.base_commit_hash`` remains the dataset pin and the task
+        # identity of checkpoints and Measurements, while ``base_commit`` /
+        # ``checkout_inst`` carry the full id to every comparison with Git.
+        base_commit = populate_workspace_from_image(
             inst.docker_image,
             host_workspace,
             base_commit=inst.base_commit_hash,
             labels=_settlement_labels(phase="workspace-population"),
             register_container=register_container,
         )
+        if not is_full_commit_id(base_commit):
+            raise InstanceContainerSetupError(
+                "deepswe: workspace population did not resolve a full base "
+                f"commit id for task {inst.task_id!r}"
+            )
+        checkout_inst = dataclasses.replace(inst, base_commit_hash=base_commit)
+        summary["base_commit"] = base_commit
+        # Per-task Corpus + starter Spec persistence. Existing lineage is
+        # retained for audit, while ``restart`` below guarantees its landed
+        # slices are replayed into this run's fresh workspace. The Spec's
+        # project context carries the full id that Tier compares with HEAD.
+        instance_corpus = Corpus(instance_spec_dir)
+        had_lineage = _prepare_task_corpus(
+            instance_corpus,
+            synthesize_starter_spec(
+                checkout_inst,
+                task_budget_usd=summary["budget_usd"],
+            ),
+            task_id=inst.task_id,
+        )
         baseline_workspace = workspace_root / "baseline"
         baseline_workspace.mkdir(parents=True, exist_ok=True)
         populate_workspace_from_image(
             inst.docker_image,
             baseline_workspace,
-            base_commit=inst.base_commit_hash,
+            base_commit=base_commit,
             labels=_settlement_labels(phase="baseline-workspace-population"),
             register_container=register_container,
         )
@@ -2622,7 +2690,7 @@ def _run_task_cascade(
         populate_workspace_from_image(
             inst.docker_image,
             verifier_workspace,
-            base_commit=inst.base_commit_hash,
+            base_commit=base_commit,
             labels=_settlement_labels(phase="verifier-workspace-population"),
             register_container=register_container,
         )
@@ -2631,7 +2699,7 @@ def _run_task_cascade(
         populate_workspace_from_image(
             inst.docker_image,
             grading_workspace,
-            base_commit=inst.base_commit_hash,
+            base_commit=base_commit,
             labels=_settlement_labels(phase="grading-workspace-population"),
             register_container=register_container,
         )
@@ -2715,7 +2783,7 @@ def _run_task_cascade(
             )
 
         kwargs = _build_run_architect_kwargs(
-            args=args, inst=inst,
+            args=args, inst=checkout_inst,
             instance_spec_dir=instance_spec_dir,
             container_id=authoring_id,
             baseline_container_id=baseline_id,
@@ -2947,7 +3015,7 @@ def _run_task_cascade(
                 _establish_capture_mutation_settlement(
                     instance_corpus,
                     child_run_dir,
-                    inst=inst,
+                    inst=checkout_inst,
                     host_workspace=host_workspace,
                     max_patch_bytes=args.max_patch_bytes,
                 )
@@ -3027,7 +3095,7 @@ def _run_task_cascade(
         try:
             rendered_patch = capture_model_patch_from_container(
                 render_id,
-                base_commit=inst.base_commit_hash,
+                base_commit=base_commit,
                 max_bytes=args.max_patch_bytes,
             )
         finally:
@@ -3082,7 +3150,7 @@ def _run_task_cascade(
         apply_report = prepare_candidate_replay(
             verifier_workspace,
             candidate,
-            expected_base_commit=inst.base_commit_hash,
+            expected_base_commit=base_commit,
             max_bytes=args.max_patch_bytes,
         )
         summary["candidate_apply"] = apply_report.to_payload()
@@ -3091,7 +3159,7 @@ def _run_task_cascade(
                 candidate,
                 apply_report,
                 b"",
-                expected_base_commit=inst.base_commit_hash,
+                expected_base_commit=base_commit,
                 max_bytes=args.max_patch_bytes,
             )
         else:
@@ -3113,7 +3181,7 @@ def _run_task_cascade(
             try:
                 replayed_render = capture_model_patch_from_container(
                     render_id,
-                    base_commit=inst.base_commit_hash,
+                    base_commit=base_commit,
                     max_bytes=args.max_patch_bytes,
                 )
             finally:
@@ -3124,7 +3192,7 @@ def _run_task_cascade(
                 candidate,
                 apply_report,
                 replayed_render,
-                expected_base_commit=inst.base_commit_hash,
+                expected_base_commit=base_commit,
                 max_bytes=args.max_patch_bytes,
             )
         summary["pristine_replay"] = pristine_replay.to_payload()
@@ -3169,6 +3237,14 @@ def _run_task_cascade(
         if tests_snapshot.sha256 != tests_identity.sha256:
             raise RuntimeError("hidden tests snapshot identity mismatch")
         summary["tests_snapshot"] = tests_snapshot.to_payload()
+        # The whitelist sizes come from the exact private bytes the verifier
+        # mounts, so the reward's totals are bound to the snapshot digest.
+        # Read before the invocation marker: a malformed whitelist must not
+        # consume the one-shot verifier.
+        test_inventory = load_snapshot_test_inventory(tests_snapshot)
+        summary["test_inventory"] = (
+            None if test_inventory is None else test_inventory.to_payload()
+        )
         host_tests_dir = tests_snapshot.root
         verifier_patch_path = instance_log_dir / "artifacts" / "model.patch"
         verifier_patch_path.unlink(missing_ok=True)
@@ -3245,9 +3321,12 @@ def _run_task_cascade(
         verdict = _validate_stopped_verifier_reward(
             verdict,
             instance_log_dir=instance_log_dir,
+            test_inventory=test_inventory,
         )
         summary["reward"] = verdict["reward"]
         summary["resolved"] = verdict["resolved"]
+        summary["reward_counts"] = verdict.get("reward_counts")
+        summary["reward_error"] = verdict.get("reward_error")
         summary["verify_returncode"] = verdict.get("verify_returncode")
         for field in _VERIFIER_OBSERVABILITY_FIELDS:
             summary[field] = verdict.get(field)
@@ -3490,20 +3569,50 @@ def _emit_summary(
     cost: CostAccumulator,
     status: str,
     halt_reason: str | None,
+    tasks_selected: int,
+    tasks_not_started: int,
 ) -> Path:
-    """Publish the outer run summary transactionally. Returns its path."""
+    """Publish the outer run summary transactionally. Returns its path.
+
+    ``tasks_selected`` is the size of the filtered selection and
+    ``tasks_not_started`` the number of its tasks that were never handed to
+    execution. The roll-up keeps apart what a single ``tasks_failed`` number
+    cannot: a task graded 0 (``tasks_unresolved``), a task this run executed
+    or resumed without a valid grade (``tasks_ungraded``), a task another
+    process holds (``tasks_lease_busy``), a task that was handed to execution
+    but ended without a task summary (``tasks_unrecorded``), and a task the
+    run never reached (``tasks_not_started``).
+    """
     total_cost = cost.total_cost_usd
     cost_summary = cost.to_dict()
     cost_incomplete = any(
         bool(summary.get("cost_incomplete"))
         for summary in task_summaries
     )
+    tasks_by_status: dict[str, int] = {}
+    for summary in task_summaries:
+        task_status = str(summary["status"])
+        tasks_by_status[task_status] = tasks_by_status.get(task_status, 0) + 1
+    tasks_unresolved = tasks_by_status.get("unresolved", 0)
+    tasks_graded = tasks_by_status.get("resolved", 0) + tasks_unresolved
+    tasks_lease_busy = tasks_by_status.get("task_lease_busy", 0)
+    counted = [
+        RewardCounts.from_payload(summary["reward_counts"])
+        for summary in task_summaries
+        if summary["status"] in _GRADED_TASK_STATUSES
+        and summary.get("reward_counts") is not None
+    ]
     payload = {
         "workflow": "deepswe",
         "status": status,
         "halt_reason": halt_reason,
         "spec_dir": str(args.spec),
         "dataset": str(args.dataset),
+        "tasks_selected": tasks_selected,
+        "tasks_not_started": tasks_not_started,
+        "tasks_unrecorded": (
+            tasks_selected - len(task_summaries) - tasks_not_started
+        ),
         "tasks_total": len(task_summaries),
         "tasks_ok": sum(
             1 for s in task_summaries if s["status"] == "resolved"
@@ -3522,6 +3631,33 @@ def _emit_summary(
         "tasks_cleanup_failed": sum(
             1 for s in task_summaries if s.get("cleanup_status") == "failed"
         ),
+        "tasks_graded": tasks_graded,
+        "tasks_unresolved": tasks_unresolved,
+        "tasks_ungraded": (
+            len(task_summaries) - tasks_graded - tasks_lease_busy
+        ),
+        "tasks_lease_busy": tasks_lease_busy,
+        # Results a plain re-run does not reuse. This is the lifecycle
+        # status policy, not a claim that the failure was transient.
+        "tasks_rerun_by_default": sum(
+            1
+            for s in task_summaries
+            if s["status"] in _LIFECYCLE_TERMINAL_STATUSES
+            and _task_status_policy(s) == "retryable"
+        ),
+        "tasks_by_status": dict(sorted(tasks_by_status.items())),
+        # Per-test counts summed over graded tasks that report them. A task
+        # graded from a count-less v1.0 token is graded but not counted.
+        "reward_counts": {
+            "tasks_counted": len(counted),
+            "tasks_apply_failed": sum(
+                1 for counts in counted if counts.apply_failed
+            ),
+            "f2p_passed": sum(counts.f2p_passed for counts in counted),
+            "f2p_total": sum(counts.f2p_total for counts in counted),
+            "p2p_passed": sum(counts.p2p_passed for counts in counted),
+            "p2p_total": sum(counts.p2p_total for counts in counted),
+        },
         "cost_total_usd": total_cost,
         "planner_count": args.planner_count,
         "budget_usd": args.budget_usd,
@@ -3577,7 +3713,7 @@ def _all_task_failures_are_retryable(
     )
 
 
-_LIFECYCLE_SCHEMA = "crucible.deepswe.lifecycle.v4"
+_LIFECYCLE_SCHEMA = "crucible.deepswe.lifecycle.v5"
 _LIFECYCLE_TERMINAL_STATUSES = frozenset({
     "candidate_failed",
     "cascade_error",
@@ -3601,6 +3737,8 @@ _LIFECYCLE_REUSABLE_STATUSES = frozenset({
 _LIFECYCLE_RETRYABLE_STATUSES = (
     _LIFECYCLE_TERMINAL_STATUSES - _LIFECYCLE_REUSABLE_STATUSES
 )
+# The hidden verifier produced a valid binary reward for the exact candidate.
+_GRADED_TASK_STATUSES = frozenset({"resolved", "unresolved"})
 
 
 def _effective_deepswe_backend_pricing_identity(
@@ -3789,6 +3927,12 @@ def _deepswe_checkpoint_fingerprint(
             "hidden_verifier_runner": file_digest(
                 product_root / "runners" / "deepswe_verifier.py"
             ),
+            # Whether a verifier result is a grade is decided by the reward
+            # reader and by the whitelist rule of the dataset loader.
+            "reward_artifact_reader": file_digest(
+                product_root / "secure_artifacts.py"
+            ),
+            "dataset_loader": file_digest(product_root / "dataset.py"),
             "instance_container": file_digest(
                 product_root / "instance_container.py"
             ),
@@ -3887,6 +4031,22 @@ def _is_proven_permanent_preimplementation_terminal(
     )
 
 
+def _task_status_policy(summary: dict[str, Any]) -> str:
+    """Classify what a later run may do with one task result.
+
+    ``reusable`` and a proven ``permanent`` terminal are kept; ``retryable``
+    carries no reuse authority, so a plain re-run executes the task again.
+    """
+
+    if summary.get("diagnostic_cost_policy") is not None:
+        return "diagnostic_only"
+    if summary["status"] in _LIFECYCLE_REUSABLE_STATUSES:
+        return "reusable"
+    if _is_proven_permanent_preimplementation_terminal(summary):
+        return "permanent"
+    return "retryable"
+
+
 def _checkpoint_is_reusable(
     record: dict[str, Any], *, args: argparse.Namespace,
 ) -> bool:
@@ -3941,6 +4101,7 @@ def _lifecycle_record(summary: dict[str, Any]) -> dict[str, Any]:
         "rc": summary.get("rc"),
         "reward": summary.get("reward"),
         "resolved": summary.get("resolved"),
+        "reward_counts": summary.get("reward_counts"),
         "verification_rc": summary.get("verification_rc"),
         "verify_returncode": summary.get("verify_returncode"),
         **{
@@ -3975,13 +4136,7 @@ def _lifecycle_record(summary: dict[str, Any]) -> dict[str, Any]:
             summary.get("zero_tier_settlement_proven") is True
         ),
         "secondary_failures": summary.get("secondary_failures", []),
-        "status_policy": (
-            "reusable"
-            if summary["status"] in _LIFECYCLE_REUSABLE_STATUSES
-            else "permanent"
-            if _is_proven_permanent_preimplementation_terminal(summary)
-            else "retryable"
-        ),
+        "status_policy": _task_status_policy(summary),
     }
     architect_costs = summary.get("architect_costs")
     if summary.get("diagnostic_cost_policy") is not None:
@@ -3990,7 +4145,6 @@ def _lifecycle_record(summary: dict[str, Any]) -> dict[str, Any]:
             "diagnostic_only": True,
             "rankable": False,
             "promotable": False,
-            "status_policy": "diagnostic_only",
         })
     if (
         type(architect_costs) is dict
@@ -4032,6 +4186,7 @@ def _validate_lifecycle_record(
             value.setdefault(field, None)
     elif legacy_schema not in {
         "crucible.deepswe.lifecycle.v3",
+        "crucible.deepswe.lifecycle.v4",
         _LIFECYCLE_SCHEMA,
     }:
         raise ValueError(
@@ -4058,6 +4213,9 @@ def _validate_lifecycle_record(
         value.setdefault(field, None)
     value.setdefault("zero_tier_settlement_proven", False)
     value.setdefault("secondary_failures", [])
+    # V5 adds the per-test counts of a v1.1 reward. Older rows carry none;
+    # the counts are explicitly unknown, never derived from the reward.
+    value.setdefault("reward_counts", None)
     for field in (
         "task_id", "ext_id", "status", "checkpoint_fingerprint",
     ):
@@ -4130,6 +4288,23 @@ def _validate_lifecycle_record(
         raise ValueError(
             f"lifecycle JSONL line {line_number} has unproven permanent policy"
         )
+    if value["reward_counts"] is not None:
+        try:
+            reward_counts = RewardCounts.from_payload(value["reward_counts"])
+        except ValueError as exc:
+            raise ValueError(
+                f"lifecycle JSONL line {line_number} has invalid reward_counts"
+            ) from exc
+        # Counts exist only beside the binary reward they earn.
+        reward = value.get("reward")
+        if (
+            type(reward) not in (int, float)
+            or reward != reward_counts.earned_reward
+        ):
+            raise ValueError(
+                f"lifecycle JSONL line {line_number} reward_counts contradict "
+                "its reward"
+            )
     try:
         cost_usd = float(value.get("cost_usd"))
     except (TypeError, ValueError) as exc:
@@ -5016,6 +5191,8 @@ def _implement_serial(
                 cost=cost,
                 status=status,
                 halt_reason=status,
+                tasks_selected=len(filtered),
+                tasks_not_started=len(filtered),
             )
             handle.finalize(RunResult(
                 status=status,
@@ -5025,6 +5202,10 @@ def _implement_serial(
             ))
             return 1
 
+    # Tasks handed to execution. A handed task normally ends with a task
+    # summary; a lifecycle conflict, checkpoint failure, or lease error ends
+    # it without one, possibly after its cascade and hidden verifier ran.
+    tasks_handed = 0
     for i, inst in enumerate(filtered, 1):
         logger.info(
             "deepswe: [%d/%d] task=%s repo=%s lang=%s",
@@ -5050,6 +5231,7 @@ def _implement_serial(
             args.budget_usd,
             cost.total_cost_usd,
         )
+        tasks_handed += 1
         try:
             task_summary, resumed_after_lease = _execute_task_with_checkpoint(
                 inst,
@@ -5254,6 +5436,8 @@ def _implement_serial(
         cost=cost,
         status=status,
         halt_reason=halt_reason,
+        tasks_selected=len(filtered),
+        tasks_not_started=len(filtered) - tasks_handed,
     )
     logger.info("deepswe: summary written to %s", summary_path)
     handle.finalize(RunResult(
@@ -5270,9 +5454,15 @@ def _finalize_empty_run(
     args: argparse.Namespace,
     status: str,
     rc: int,
+    tasks_selected: int,
     error: Exception | str | None = None,
 ) -> int:
-    """Publish summary, event, and result for an early implement terminal."""
+    """Publish summary, event, and result for an early implement terminal.
+
+    ``tasks_selected`` is the filtered selection when the terminal is reached
+    after filtering, and 0 when no selection exists yet. None of its tasks
+    was started.
+    """
 
     error_text = None if error is None else str(error)[:2000]
     _emit_summary(
@@ -5282,6 +5472,8 @@ def _finalize_empty_run(
         cost=CostAccumulator(),
         status=status,
         halt_reason=status,
+        tasks_selected=tasks_selected,
+        tasks_not_started=tasks_selected,
     )
     handle.write_event({
         "phase": "terminal",
@@ -5318,6 +5510,7 @@ def _run_implement_mode(args: argparse.Namespace) -> int:
                 args=args,
                 status="dataset_missing",
                 rc=2,
+                tasks_selected=0,
                 error=exc,
             )
         except DeepSWEInstanceError as exc:
@@ -5327,13 +5520,15 @@ def _run_implement_mode(args: argparse.Namespace) -> int:
                 args=args,
                 status="dataset_invalid",
                 rc=1,
+                tasks_selected=0,
                 error=exc,
             )
 
         if getattr(args, "diagnostic_cost_policy", None) is not None and len(filtered) != 1:
             return _finalize_empty_run(
                 handle, args=args, status="diagnostic_task_shape_unsupported",
-                rc=2, error="diagnostic upper-bound pilot requires exactly one fresh task",
+                rc=2, tasks_selected=len(filtered),
+                error="diagnostic upper-bound pilot requires exactly one fresh task",
             )
 
         explicit_filters = bool(
@@ -5353,6 +5548,7 @@ def _run_implement_mode(args: argparse.Namespace) -> int:
                 args=args,
                 status="no_tasks_matched",
                 rc=1,
+                tasks_selected=0,
                 error=message,
             )
         if not filtered:
@@ -5362,6 +5558,7 @@ def _run_implement_mode(args: argparse.Namespace) -> int:
                 args=args,
                 status="no_work",
                 rc=1,
+                tasks_selected=0,
                 error=f"dataset {args.dataset} contains zero tasks",
             )
 
@@ -5388,6 +5585,7 @@ def _run_implement_mode(args: argparse.Namespace) -> int:
                 args=args,
                 status="setup_error",
                 rc=2,
+                tasks_selected=len(filtered),
                 error=exc,
             )
 
@@ -5404,6 +5602,7 @@ def _run_implement_mode(args: argparse.Namespace) -> int:
                 args=args,
                 status="container_runtime_required",
                 rc=2,
+                tasks_selected=len(filtered),
                 error="Docker is unavailable",
             )
         try:
@@ -5421,6 +5620,7 @@ def _run_implement_mode(args: argparse.Namespace) -> int:
                 args=args,
                 status="container_preflight_failed",
                 rc=2,
+                tasks_selected=len(filtered),
                 error=e,
             )
 

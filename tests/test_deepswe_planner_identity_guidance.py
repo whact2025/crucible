@@ -121,6 +121,45 @@ def test_real_planner_invocation_renders_identity_and_json_guidance(
     assert slice_.id == slice_.directive.slice_id == "s0"
 
 
+@pytest.mark.parametrize("budget", [None, 12.0])
+def test_real_planner_invocation_renders_contract_and_capture_guidance(
+    tmp_path, budget
+):
+    spec = synthesize_starter_spec(
+        _instance(instruction=_INTENT), task_budget_usd=budget
+    )
+    backend = _Planner("generic", [json.dumps(_payload())])
+
+    _, _, error, _ = _run_planner(
+        spec,
+        backend,
+        Corpus(tmp_path / "corpus"),
+        (),
+        (),
+        0,
+        7,
+        1.0,
+        planner_guidance=spec.plan_policy.planner_guidance,
+    )
+
+    (invocation,) = backend.invocations
+    rendered = " ".join(invocation.user.split())
+    requirements, policy_heading, policy = rendered.partition(
+        "## Product decomposition policy"
+    )
+    assert policy_heading
+    capture = "Plan every new file at a path the repository does not ignore"
+    contract = "Edits that form one contract belong in one slice"
+    assert capture in policy
+    # A compact plan has exactly one slice, so it cannot split a contract.
+    assert (contract in policy) is (budget is None)
+    # Guidance is product policy; the citable root requirement stays the task.
+    assert capture not in requirements
+    assert contract not in requirements
+    assert spec.intent == _INTENT
+    assert error is None
+
+
 @pytest.mark.parametrize("name", ["generic", "kimi"])
 @pytest.mark.parametrize("initial_failure", ["json", "identity"])
 def test_guidance_does_not_repair_ids_or_expand_one_correction(

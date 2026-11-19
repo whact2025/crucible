@@ -25,6 +25,7 @@ from assay import (
     Tier,
     TierDAG,
 )
+from crucible.rules.cited_path_exists import CitedPathExistsContext
 from crucible.rules.scope_covers_intent import (
     _extract_referenced_paths,
     scope_covers_intent,
@@ -295,3 +296,100 @@ def test_multiple_slices_independently_flagged(tmp_path):
     assert len(findings) == 1
     f = findings[0]
     assert f.id == "scope_omits_referenced_path__s1__src/shared.h"
+
+
+# ----------------------------------------------------------------------
+# Post-implementation: a proven create of this plan is not pre-existing
+# ----------------------------------------------------------------------
+
+
+def _spec_naming_upstream_create(tmp_path) -> Spec:
+    """``up/creator`` creates ``pkg/new.py``; ``t0/s`` names it in prose."""
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "seed.py").write_text("")
+    (tmp_path / "pkg" / "new.py").write_text("")
+    spec = _spec(
+        intent="Then import from pkg/new.py in the seed module.",
+        files_in_scope=["pkg/seed.py"],
+    )
+    creator = ImplementationDirective(
+        slice_id="creator",
+        intent="Create the new module.",
+        files_in_scope=(),
+        creates_paths=("pkg/new.py",),
+        verify_mode="build_only",
+        blast_radius={"max_files": 1},
+    )
+    upstream = Tier(
+        tier_id="up",
+        depends_on=(),
+        slices=(Slice(id="creator", directive=creator),),
+    )
+    downstream = replace(spec.tier_dag.tiers[0], depends_on=("up",))
+    return replace(spec, tier_dag=TierDAG(tiers=(upstream, downstream)))
+
+
+def test_verified_plan_create_is_not_a_preexisting_reference(tmp_path):
+    spec = _spec_naming_upstream_create(tmp_path)
+    ctx = CitedPathExistsContext(
+        workspace_root=tmp_path,
+        successful_plan_bound_slices=frozenset({("up", "creator")}),
+        verified_create_paths=frozenset({("up", "creator", "pkg/new.py")}),
+    )
+
+    # The file did not exist when the plan was accepted, so the reference
+    # keeps the verdict it had then.
+    assert scope_covers_intent(spec, ctx) == ()
+
+
+@pytest.mark.parametrize(
+    "ctx_fields",
+    [
+        # Planning carries no post-implementation proof at all.
+        None,
+        # The create is recorded but its slice is not successful/plan-bound.
+        {
+            "verified_create_paths": frozenset({
+                ("up", "creator", "pkg/new.py"),
+            }),
+        },
+        # The slice is successful but this path's postimage was not verified.
+        {"successful_plan_bound_slices": frozenset({("up", "creator")})},
+        # Another path of the same slice was verified.
+        {
+            "successful_plan_bound_slices": frozenset({("up", "creator")}),
+            "verified_create_paths": frozenset({
+                ("up", "creator", "pkg/other.py"),
+            }),
+        },
+        # The proof names a slice that does not declare the path.
+        {
+            "successful_plan_bound_slices": frozenset({("t0", "s")}),
+            "verified_create_paths": frozenset({("t0", "s", "pkg/new.py")}),
+        },
+        {
+            "successful_plan_bound_slices": frozenset({("gone", "creator")}),
+            "verified_create_paths": frozenset({
+                ("gone", "creator", "pkg/new.py"),
+            }),
+        },
+    ],
+)
+def test_existing_reference_without_proven_create_still_blocks(
+    tmp_path, ctx_fields,
+):
+    spec = _spec_naming_upstream_create(tmp_path)
+    ctx = (
+        RuleContext(workspace_root=tmp_path)
+        if ctx_fields is None
+        else CitedPathExistsContext(workspace_root=tmp_path, **ctx_fields)
+    )
+
+    findings = scope_covers_intent(spec, ctx)
+
+    assert [finding.id for finding in findings] == [
+        "scope_omits_referenced_path__s__pkg/new.py",
+    ]
+    assert findings[0].severity == "Critical"
+    assert findings[0].category == "scope_omits_referenced_path"

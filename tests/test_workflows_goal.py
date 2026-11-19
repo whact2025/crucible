@@ -485,6 +485,94 @@ def test_goal_judge_cannot_override_failed_deterministic_validation(
     assert summary["rounds"][0]["judge_decision"] == "inconclusive"
 
 
+def _red_inconclusive(*, with_finding: bool) -> str:
+    payload = json.loads(_red_only_medium())
+    payload["decision"] = "inconclusive"
+    payload["reasoning"] = "the goal input is incomplete"
+    if not with_finding:
+        payload["findings"] = []
+    return json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "with_finding",
+    [True, False],
+    ids=["sub_floor_finding", "no_findings"],
+)
+def test_goal_red_inconclusive_stops_before_blue_and_cannot_promote(
+    tmp_path: Path,
+    monkeypatch,
+    with_finding: bool,
+):
+    corpus = _setup_corpus(tmp_path)
+    red_ids = ("minor_style",) if with_finding else ()
+    scripted = ScriptedBackend([
+        _red_inconclusive(with_finding=with_finding),
+        # Neither call may happen: an unchallenged goal is not adjudicated.
+        _blue_revises(*red_ids),
+        _judge_proceed(*red_ids),
+    ])
+    _patch_backend(monkeypatch, scripted)
+
+    from crucible.workflows.goal import main
+
+    rc = main([
+        "--spec", str(corpus.spec_dir),
+        "--max-rounds", "1",
+    ])
+    assert rc == 3
+    assert len(scripted.calls) == 1
+    spec = corpus.latest_spec()
+    assert spec is not None
+    assert spec.intent == "make the renderer faster"
+    verdicts = [
+        corpus.get_record(ref, as_type=Verdict)
+        for ref in spec.verdict_refs
+    ]
+    assert [verdict.rubric for verdict in verdicts] == [
+        "goal_red",
+        "goal_red_inconclusive",
+    ]
+    assert verdicts[-1].decision == "inconclusive"
+    run_dir = max((corpus.spec_dir / "runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["status"] == "inconclusive"
+    assert summary["promotions"] == 0
+    assert summary["rounds"][0]["red_decision"] == "inconclusive"
+    assert summary["rounds"][0]["blue_decision"] is None
+    assert summary["rounds"][0]["judge_decision"] is None
+
+
+def test_goal_red_harness_failure_stops_before_blue(
+    tmp_path: Path,
+    monkeypatch,
+):
+    corpus = _setup_corpus(tmp_path)
+    scripted = ScriptedBackend([
+        "I could not review this goal.",
+        _blue_revises(),
+        _judge_proceed(),
+    ])
+    _patch_backend(monkeypatch, scripted)
+
+    from crucible.workflows.goal import main
+
+    rc = main([
+        "--spec", str(corpus.spec_dir),
+        "--max-rounds", "1",
+    ])
+    assert rc == 3
+    assert len(scripted.calls) == 1
+    spec = corpus.latest_spec()
+    assert spec is not None
+    assert spec.intent == "make the renderer faster"
+    run_dir = max((corpus.spec_dir / "runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["status"] == "inconclusive"
+    assert summary["rounds"][0]["red_decision"] == "inconclusive"
+    assert summary["rounds"][0]["blue_decision"] is None
+
+
 def test_goal_red_accounting_debt_stops_before_blue_and_cannot_promote(
     tmp_path: Path,
     monkeypatch,

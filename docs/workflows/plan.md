@@ -15,7 +15,9 @@ uv run crucible plan --spec /path/to/corpus --cwd /path/to/context-root \
 ```
 
 When `project_context.submodule_path` is set, `--cwd` is the outer context root;
-source tools and validators compose the declared submodule once. Source access
+source tools and validators compose the declared submodule once. Single-track
+Planner scope paths are canonicalized against that resolved project root, never
+the process working directory. Source access
 is explicit and read-only. Planner source-call and payload-byte ceilings are
 workflow-owned and apply across the shared operation.
 
@@ -105,4 +107,4 @@ become canonical Spec versions. Source:
 | `0` | `PlanOutcome.decision="accepted"`; the enabled validation gate passed and an executable DAG was persisted. |
 | `1` | The accepted candidate failed the final deterministic TOCTOU recheck. |
 | `2` | `PlanOutcome.decision="rejected"` or a handled setup failure. |
-| `3` | `PlanOutcome.decision="inconclusive"`, including budget/round exhaustion, missing DAG, or incomplete review coverage. |
+| `3` | `PlanOutcome.decision="inconclusive"`, including budget/round exhaustion, missing DAG, incomplete review coverage, or a Planner backend that returned no reply by the end of the round budget (`planner_infrastructure_failure`). |

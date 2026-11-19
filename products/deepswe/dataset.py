@@ -70,6 +70,7 @@ from crucible.common.authority_io import (
     read_exact_regular_at,
     stat_identity,
 )
+from crucible.products.deepswe.secure_artifacts import RewardTestInventory
 
 
 class DeepSWEInstanceError(ValueError):
@@ -982,6 +983,86 @@ def _identity_from_open_tests_tree(tests_fd: int) -> DeepSWETestsTreeIdentity:
     return builder.finish()
 
 
+def _reject_duplicate_tests_config_key(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DeepSWEInstanceError(
+                "tests/config.json repeats a JSON object key"
+            )
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_tests_config_constant(_value: str) -> Any:
+    raise DeepSWEInstanceError(
+        "tests/config.json contains a non-finite numeric constant"
+    )
+
+
+def _test_inventory_from_open_tests_tree(
+    tests_fd: int,
+) -> RewardTestInventory | None:
+    """Read the whitelist sizes that ``tests/config.json`` declares.
+
+    The DeepSWE 1.1 grader reports these sizes as the totals of its reward:
+    the number of distinct, whitespace-stripped, non-empty ids in each list.
+    A tests tree without ``config.json`` declares no whitelist.
+    """
+
+    try:
+        before = os.stat("config.json", dir_fd=tests_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DeepSWEInstanceError("cannot inspect tests/config.json") from exc
+    if stat.S_ISLNK(before.st_mode):
+        raise DeepSWEInstanceError("tests/config.json must not be a symlink")
+    try:
+        payload, _metadata = read_exact_regular_at(
+            tests_fd,
+            "config.json",
+            maximum=_MAX_TASK_TEXT_BYTES,
+        )
+    except AuthorityIOError as exc:
+        raise DeepSWEInstanceError(
+            "cannot safely read tests/config.json"
+        ) from exc
+    try:
+        config = json.loads(
+            payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_tests_config_key,
+            parse_constant=_reject_nonfinite_tests_config_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise DeepSWEInstanceError(
+            "tests/config.json is not strict JSON"
+        ) from exc
+    if type(config) is not dict:
+        raise DeepSWEInstanceError(
+            "tests/config.json must contain one JSON object"
+        )
+    sizes = {
+        field: len(
+            {
+                stripped
+                for node_id in _require_exact_string_list(
+                    config.get(field),
+                    label=f"tests/config.json {field}",
+                )
+                if (stripped := node_id.strip())
+            }
+        )
+        for field in ("f2p_node_ids", "p2p_node_ids")
+    }
+    return RewardTestInventory(
+        f2p_total=sizes["f2p_node_ids"],
+        p2p_total=sizes["p2p_node_ids"],
+    )
+
+
 def _remove_private_snapshot(path: Path) -> None:
     if not path.exists():
         return
@@ -1775,6 +1856,41 @@ def fingerprint_task_tests_tree(
         return _identity_from_open_tests_tree(tests_fd)
 
 
+def load_task_test_inventory(
+    manifest_path: Path,
+    task_id: str,
+) -> RewardTestInventory | None:
+    """Read the whitelist sizes from the live tests tree, without authority.
+
+    This is a fail-fast check before a task spends anything: a malformed
+    ``tests/config.json`` is rejected here instead of after the cascade. The
+    grade is bound to :func:`load_snapshot_test_inventory`, never to this
+    read of a tree that can still change.
+    """
+
+    with _open_task_tests_tree(manifest_path, task_id) as tests_fd:
+        return _test_inventory_from_open_tests_tree(tests_fd)
+
+
+def load_snapshot_test_inventory(
+    snapshot: DeepSWETestsSnapshot,
+) -> RewardTestInventory | None:
+    """Read the whitelist sizes from the private tests copy.
+
+    The sizes come from the exact bytes the verifier mounts at ``/tests``, so
+    they are bound to the snapshot digest that is checkpoint authority.
+    ``None`` means the tests tree declares no whitelist.
+    """
+
+    if not isinstance(snapshot, DeepSWETestsSnapshot):
+        raise TypeError("snapshot must be a DeepSWETestsSnapshot")
+    snapshot_fd = os.open(snapshot.root, _nofollow_flags(directory=True))
+    try:
+        return _test_inventory_from_open_tests_tree(snapshot_fd)
+    finally:
+        os.close(snapshot_fd)
+
+
 def snapshot_task_tests_tree(
     manifest_path: Path,
     task_id: str,
@@ -1928,6 +2044,8 @@ __all__ = [
     "fingerprint_task_tests_tree",
     "load_dataset",
     "load_dataset_with_tests_identity",
+    "load_snapshot_test_inventory",
+    "load_task_test_inventory",
     "filter_instances",
     "resolve_task_tests_dir",
     "snapshot_task_tests_tree",

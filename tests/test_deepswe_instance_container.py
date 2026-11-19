@@ -1144,6 +1144,188 @@ def test_sanitize_workspace_history_prunes_descendants(tmp_path: Path):
     ).strip() == ""
 
 
+def _checkout_with_descendant(tmp_path: Path) -> tuple[Path, str, str]:
+    """Return a checkout detached at its base that still holds a descendant."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=workspace, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Crucible Test"],
+        cwd=workspace, check=True,
+    )
+    source = workspace / "module.py"
+    source.write_text("value = 'base'\n")
+    subprocess.run(["git", "add", "module.py"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=workspace, check=True)
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, text=True,
+    ).strip()
+    source.write_text("value = 'gold'\n")
+    subprocess.run(
+        ["git", "commit", "-qam", "descendant fix"],
+        cwd=workspace,
+        check=True,
+    )
+    descendant = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, text=True,
+    ).strip()
+    subprocess.run(
+        ["git", "checkout", "--detach", base], cwd=workspace, check=True,
+        capture_output=True,
+    )
+    return workspace, base, descendant
+
+
+@pytest.mark.parametrize("length", (7, 39))
+def test_sanitize_workspace_history_resolves_abbreviated_base_commit(
+    tmp_path: Path,
+    length: int,
+):
+    workspace, base, descendant = _checkout_with_descendant(tmp_path)
+
+    resolved = ic._sanitize_workspace_history(
+        workspace, base_commit=base[:length],
+    )
+
+    assert resolved == base
+    assert (workspace / ".git" / "shallow").read_text() == base + "\n"
+    assert subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, text=True,
+    ).strip() == base
+    assert subprocess.check_output(
+        ["git", "rev-list", "--count", "HEAD"], cwd=workspace, text=True,
+    ).strip() == "1"
+    assert subprocess.run(
+        ["git", "cat-file", "-e", descendant], cwd=workspace,
+        capture_output=True,
+    ).returncode != 0
+    assert subprocess.check_output(
+        ["git", "remote"], cwd=workspace, text=True,
+    ).strip() == ""
+
+
+def test_sanitize_workspace_history_returns_full_base_commit_unchanged(
+    tmp_path: Path,
+):
+    workspace, base, _descendant = _checkout_with_descendant(tmp_path)
+
+    assert ic._sanitize_workspace_history(workspace, base_commit=base) == base
+
+
+def test_sanitize_workspace_history_rejects_abbreviation_of_another_commit(
+    tmp_path: Path,
+):
+    workspace, base, descendant = _checkout_with_descendant(tmp_path)
+    assert descendant[:7] != base[:7]
+
+    with pytest.raises(
+        ic.InstanceContainerSetupError,
+        match="does not match dataset base_commit",
+    ):
+        ic._sanitize_workspace_history(workspace, base_commit=descendant[:7])
+
+
+def test_sanitize_workspace_history_rejects_ref_named_like_the_pin(
+    tmp_path: Path,
+):
+    """A ref name is never a commit id, even when it points at HEAD."""
+
+    workspace, base, _descendant = _checkout_with_descendant(tmp_path)
+    pin = "0123abc" if not base.startswith("0123abc") else "abc0123"
+    subprocess.run(["git", "tag", pin, base], cwd=workspace, check=True)
+    assert subprocess.check_output(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{pin}"],
+        cwd=workspace,
+        text=True,
+    ).strip() == base
+
+    with pytest.raises(
+        ic.InstanceContainerSetupError,
+        match="does not match dataset base_commit",
+    ):
+        ic._sanitize_workspace_history(workspace, base_commit=pin)
+
+
+def _abbreviation_with_hex_letter(commit: str) -> str:
+    """Return the shortest abbreviation of 12 or more characters with a letter.
+
+    A commit id changes with the commit time and may start with digits only,
+    which upper-casing leaves unchanged.
+    """
+
+    for length in range(12, len(commit)):
+        if commit[:length] != commit[:length].upper():
+            return commit[:length]
+    raise AssertionError("commit id abbreviation holds no hexadecimal letter")
+
+
+@pytest.mark.parametrize(
+    ("commit", "expected"),
+    (
+        ("0123456789abcdef0123456789abcdef01234567", "0123456789ab"),
+        (
+            "012345678901234567890123456789abcdef0123",
+            "012345678901234567890123456789a",
+        ),
+    ),
+    ids=("letter_within_twelve", "twelve_leading_digits"),
+)
+def test_abbreviation_with_hex_letter_extends_past_leading_digits(
+    commit: str,
+    expected: str,
+):
+    abbreviation = _abbreviation_with_hex_letter(commit)
+
+    assert abbreviation == expected
+    assert abbreviation.upper() != abbreviation
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ("six_characters", "upper_case", "not_hex", "longer_than_head", "empty"),
+)
+def test_sanitize_workspace_history_rejects_malformed_base_commit(
+    tmp_path: Path,
+    monkeypatch,
+    malformed: str,
+):
+    workspace, base, _descendant = _checkout_with_descendant(tmp_path)
+    lettered = _abbreviation_with_hex_letter(base)
+    pin = {
+        "six_characters": base[:6],
+        "upper_case": lettered.upper(),
+        "not_hex": base[:7] + "g",
+        "longer_than_head": base + "0",
+        "empty": "",
+    }[malformed]
+    if malformed == "upper_case":
+        assert pin != lettered
+        assert pin.lower() == lettered
+    actual_run_git = ic._run_git
+    calls: list[tuple[str, ...]] = []
+
+    def _recording_run_git(path: Path, *args: str):
+        calls.append(args)
+        return actual_run_git(path, *args)
+
+    monkeypatch.setattr(ic, "_run_git", _recording_run_git)
+
+    with pytest.raises(
+        ic.InstanceContainerSetupError,
+        match="does not match dataset base_commit",
+    ):
+        ic._sanitize_workspace_history(workspace, base_commit=pin)
+
+    # The pin is judged against the observed HEAD only; Git is never asked to
+    # resolve a string that is not an exact prefix of it.
+    assert calls == [("rev-parse", "HEAD")]
+
+
 def test_sanitize_replaces_local_config_before_first_host_git(
     tmp_path: Path,
     monkeypatch,
@@ -1327,6 +1509,33 @@ def test_populate_workspace_happy_path(tmp_path: Path, monkeypatch):
         "docker", "cp", "throwaway_abc123:/app/.", f"{ws}/",
     ]
     assert fake.calls[2] == ["docker", "rm", "throwaway_abc123"]
+
+
+def test_populate_workspace_returns_resolved_base_commit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_subprocess(rc=0, stdout="throwaway_abc123\n"),
+    )
+    observed: dict[str, Any] = {}
+
+    def _sanitize(workspace: Path, *, base_commit: str) -> str:
+        observed["workspace"] = workspace
+        observed["base_commit"] = base_commit
+        return "f" * 40
+
+    monkeypatch.setattr(ic, "_sanitize_workspace_history", _sanitize)
+    workspace = tmp_path / "workspace"
+
+    resolved = ic.populate_workspace_from_image(
+        "myimage:latest", workspace, base_commit="fffffff",
+    )
+
+    assert resolved == "f" * 40
+    assert observed == {"workspace": workspace, "base_commit": "fffffff"}
 
 
 def test_populate_registers_create_before_copy(tmp_path: Path, monkeypatch):

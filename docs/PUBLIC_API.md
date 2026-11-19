@@ -131,6 +131,13 @@ transports expose only attached tools. Directives own writable paths.
 
 `common.runners` defines runner contexts and normalized build/test/verify
 results. Configured runner modules use the Assay JSON subprocess contract.
+A runner outside the `crucible.` namespace starts in Python safe-path mode,
+and the empty and relative `PYTHONPATH` entries of its environment are
+removed, because Python resolves them against the working directory. Neither
+the launch nor such an entry adds the gated workspace (the working directory)
+to the import path, so the module must be importable from the environment
+(installed, or under an absolute `PYTHONPATH` entry). The rest of the
+environment reaches the runner unchanged.
 Deterministic workflow code owns gate execution, timeout, and settlement.
 An optional Tier smoke benchmark requires an explicit runner and explicit
 `metric_directions`; unknown metric direction is a configuration error.

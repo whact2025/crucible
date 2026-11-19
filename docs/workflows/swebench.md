@@ -49,7 +49,11 @@ Patch capture admits production source and rejects test-only, out-of-scope,
 metadata, or ambiguous candidates according to suite policy. Exact captured
 bytes drive pristine replay and prediction publication. Hidden tests are
 available only to deterministic evaluator code. Official evaluation outcome
-remains distinct from the authoring cascade classification.
+remains distinct from the authoring cascade classification. A cascade that
+ends on its budget ceiling, like one that raises, is partial work: its
+candidate stays in the Corpus, the instance is reported
+`cascade_aborted_partial`, and official inline evaluation is skipped even when
+`--submit-any-nonempty-best-effort` publishes the patch.
 
 The [profile catalog](../../products/swebench/backend_profile_catalog.yaml)
 names exact selectable adapter/model/transport identities. Bind an explicit

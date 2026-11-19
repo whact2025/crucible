@@ -1222,6 +1222,7 @@ def test_specialized_planners_keep_required_failure_taxonomies():
             "missing_sequencing",
             "incomplete_increment",
             "parallel_conflict",
+            "ignored_path",
         },
         "swebench_impl_breaker": {
             "unstated_boundary",
@@ -1278,6 +1279,233 @@ def test_deepswe_plan_critic_uses_independent_coherent_increment_granularity():
     assert "tightly coupled validation/lookup wiring may be one increment" in prompt
     assert "UNFIXABLE_PROOF:" in prompt
     assert '"scope":"deepswe_directive"' in prompt
+
+
+def _deepswe_critic_rule_body() -> str:
+    """Return the authored DeepSWE critic rules, whitespace-normalized.
+
+    The generated response contract lists every manifest category, so a rule
+    pin on the complete prompt could pass without the rule that explains it.
+    """
+
+    body, marker, _ = load("deepswe_plan_critic").system_prompt.partition(
+        "=== MANDATORY ASSAY.REVIEW.V2 CONTRACT ==="
+    )
+    assert marker
+    return " ".join(body.split())
+
+
+def _deepswe_critic_revise_verdict(
+    *, criterion_id: str, category: str
+) -> SimpleNamespace:
+    finding = SimpleNamespace(
+        id="new-file-at-ignored-path",
+        criterion_id=criterion_id,
+        category=category,
+        severity="High",
+        disposition="confirmed",
+        targets=(),
+        evidence=(
+            SimpleNamespace(source_id="artifact", kind="current_state"),
+            SimpleNamespace(
+                source_id="context:spec_intent", kind="directive",
+            ),
+        ),
+        proposal=SimpleNamespace(
+            action="Create the file at a path the repository tracks.",
+            replacement=None,
+        ),
+        attack_spec=None,
+    )
+    return SimpleNamespace(
+        decision="revise",
+        coverage=SimpleNamespace(
+            complete=True,
+            sources_reviewed=("artifact", "context:spec_intent"),
+        ),
+        findings=(finding,),
+    )
+
+
+def test_deepswe_plan_critic_keeps_one_contract_in_one_slice():
+    body = _deepswe_critic_rule_body()
+
+    assert "Contract atomicity" in body
+    for shape in (
+        "Mirrored or forwarded signatures",
+        "An interface and its implementers",
+        "A public API and its registry",
+        "A signature and its call sites",
+        "A required field and its construction sites",
+    ):
+        assert shape in body
+    assert "implements and gates one slice at a time" in body
+    assert "sibling slices of one tier OR slices in different tiers" in body
+    assert (
+        "High `incomplete_increment` finding with "
+        "`criterion_id=responsibility_size`"
+    ) in body
+    assert "MERGE" in body
+    assert "NEVER to split further" in body
+    assert "do not file `under_decomposed` or `scope_too_broad`" in body
+    assert "OPTIONAL field with an inline default" in body
+    # A mirrored signature is one contract even when the parameter is
+    # optional: the project's signature-consistency test still needs both.
+    assert (
+        "a new optional parameter on a signature that nothing mirrors, "
+        "re-exposes, or forwards"
+    ) in body
+    assert (
+        "shape (a) applies to a mirrored signature even when the new "
+        "parameter is optional"
+    ) in body
+    assert "does not license bundling" in body
+    # A Critic without repository access cannot assume that the other side of
+    # a contract exists, and an unanswerable finding would reject the plan.
+    assert (
+        "file that finding only when the root directive, the TierDAG, or the "
+        "captured read-only source evidence shows that the other side exists"
+    ) in body
+    assert (
+        "A slice whose intent names the paired sites inside its write scope, "
+        "or states that none exist outside it, satisfies this rule"
+    ) in body
+    # Every slice is gated on its own; no gate waits for a tier's siblings.
+    assert "combined change" not in body
+    assert "once every slice of a tier" not in body
+    assert "incomplete_increment" in dict(
+        contract("deepswe_plan_critic").criterion_categories
+    )["responsibility_size"]
+
+
+def test_deepswe_plan_critic_does_not_tier_the_parts_of_one_contract():
+    body = _deepswe_critic_rule_body()
+    template = " ".join(load("deepswe_plan_critic").user_template.split())
+
+    assert (
+        "a tier boundary is not a way to separate the parts of one contract"
+    ) in body
+    assert (
+        "A new type or interface with no existing implementer or caller is "
+        "such a prerequisite, not a contract part"
+    ) in body
+    assert "do not file `missing_sequencing`" in body
+    assert "every contract pairing in rule 8" in template
+
+
+def test_deepswe_ignored_path_rule_matches_manifest_criterion():
+    mapped_criteria = {
+        criterion
+        for criterion, categories in contract(
+            "deepswe_plan_critic"
+        ).criterion_categories
+        if "ignored_path" in categories
+    }
+
+    assert mapped_criteria == {"path_grounding"}
+    assert "`ignored_path` finding with `criterion_id=path_grounding`" in (
+        _deepswe_critic_rule_body()
+    )
+
+
+def test_deepswe_plan_critic_flags_new_files_at_ignored_paths():
+    body = _deepswe_critic_rule_body()
+    template = " ".join(load("deepswe_plan_critic").user_template.split())
+    _, heading, tail = body.partition("New files at ignored paths")
+    assert heading
+    rule, scale_heading, tail = tail.partition("Severity scale")
+    assert scale_heading
+    scale, closing, _ = tail.partition("Be evidence-grounded")
+    assert closing
+
+    for phrase in (
+        "`git add -A`",
+        "`.gitignore`",
+        "`creates_paths`",
+        "never captured",
+        "High `ignored_path` finding",
+    ):
+        assert phrase in rule
+
+    # A supplied pattern proves a match. Only the complete root file shows
+    # that nothing matches; otherwise the path heuristics still apply.
+    supplied, unsupplied_label, rest = rule.partition(
+        "Ignore rules not supplied"
+    )
+    assert unsupplied_label
+    assert (
+        "captured read-only source evidence contains the repository's ignore "
+        "rules"
+    ) in supplied
+    assert "judge every `creates_paths` entry against them" in supplied
+    assert (
+        "A supplied pattern that matches an entry proves the defect"
+    ) in supplied
+    assert "including `build/` or `dist/`" in supplied
+    assert (
+        "show that NO pattern matches only when they include the complete "
+        "root `.gitignore`: its reference starts at line 1 and the citing "
+        "slice's intent states that the reference is the whole file"
+    ) in supplied
+    assert (
+        "File nothing for an entry that such complete rules do not match"
+    ) in supplied
+    assert (
+        "judge an entry that no supplied pattern matches by the second case"
+    ) in supplied
+    assert "File nothing when the supplied rules show no match" not in body
+    assert (
+        "Unless the captured read-only source evidence includes them, you are "
+        "not shown the repository's ignore rules"
+    ) in rest
+    assert "a partial excerpt shows only some of them" in rest
+
+    listed, exemption, exempt = rest.partition("Do NOT flag")
+    assert exemption
+    for pattern in (
+        "`__pycache__/`",
+        "`node_modules/`",
+        "`.venv/`",
+        "`*.pyc`",
+        "`.env`",
+    ):
+        assert pattern in listed
+    # Generated files are routinely tracked; only "ignored" is a trigger.
+    assert "the slice itself describes the location as ignored." in listed
+    assert "ignored or generated" not in body
+    assert (
+        "cite the complete root `.gitignore` and any `.gitignore` in a "
+        "parent directory of the path as read-only references"
+    ) in listed
+    assert "governing `.gitignore` lines" not in body
+    for directory in ("`build/`", "`dist/`", "`target/`"):
+        assert directory in exempt
+    assert "the root directive itself names that exact path" in exempt
+    assert "hold existing repository files" in exempt
+    assert "Never apply this rule to `files_in_scope`" in exempt
+
+    assert "Medium `ignored_path`" not in body
+    assert "never reach verification" in scale
+    assert "rule 10" in template
+
+
+def test_deepswe_plan_critic_ignored_path_finding_satisfies_runtime_contract():
+    verdict = _deepswe_critic_revise_verdict(
+        criterion_id="path_grounding", category="ignored_path",
+    )
+
+    assert validate_verdict_contract("deepswe_plan_critic", verdict) == ()
+
+
+def test_deepswe_plan_critic_rejects_ignored_path_outside_path_grounding():
+    verdict = _deepswe_critic_revise_verdict(
+        criterion_id="sequencing", category="ignored_path",
+    )
+
+    errors = validate_verdict_contract("deepswe_plan_critic", verdict)
+
+    assert any("not allowed for criterion" in error for error in errors)
+    assert not any("undeclared category" in error for error in errors)
 
 
 def test_deepswe_plan_review_prompts_are_compact_and_delta_focused():

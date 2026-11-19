@@ -6,14 +6,7 @@
 from __future__ import annotations
 
 import collections
-import re
 from pathlib import Path
-
-
-def benchmark_slug(name: str) -> str:
-    """Sanitize a benchmark name for use as a directory component."""
-    stem = Path(name).stem
-    return re.sub(r"[^\w\-]", "_", stem)
 
 
 def read_tail(path: Path, n: int = 250) -> str:

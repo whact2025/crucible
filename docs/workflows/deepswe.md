@@ -51,6 +51,16 @@ Pristine visible verification and hidden verification replay exact candidate
 bytes independently. Private tests, hidden commands, evaluator mounts, and
 truth artifacts stay outside authoring tools, prompts, and image context.
 
+A verifier result is a grade only when its reward artifact matches the private
+tests snapshot. When that snapshot's `tests/config.json` declares a whitelist,
+the grade is the DeepSWE 1.1 `reward.json`: exactly the contract fields, a
+reward and ratios that follow from its own fail-to-pass and pass-to-pass
+counts, and totals equal to the whitelist sizes. When the snapshot declares no
+whitelist, the grade is the `reward.txt` token `0` or `1`, which carries no
+counts. A missing artifact, a malformed one (`reward_invalid`), or one that
+contradicts itself or the snapshot (`reward_mismatch`) leaves the task
+`verification_failed` with no reward; it is never reported as reward 0.
+
 The [profile catalog](../../products/deepswe/backend_profile_catalog.yaml)
 records exact selectable adapters, models, transports, and diagnostic status.
 Use the matching suite routing file. Diagnostic writer opt-ins and incomplete
@@ -66,7 +76,11 @@ uv sync --project backends/deepseek_worker --frozen --reinstall --link-mode copy
 ```
 
 Checkpoints bind dataset, task, candidate, recipe, route-source bytes, policy,
-image, and budget identities. Resume accepts only matching evidence. `--rerun`
+image, and budget identities. The dataset pins a few tasks by an abbreviated
+base commit: the first workspace population resolves it once, from the image
+checkout, to the full object id that every Git comparison then binds, while
+the dataset pin remains the task identity of checkpoints and measurements.
+Resume accepts only matching evidence. `--rerun`
 explicitly replaces completed task attempts; repeatable `--rerun-status` filters
 that selection. Count, planning share, execution fingerprint, and planning
 source recipe also bind the accepted plan. A completed candidate or hidden
@@ -84,6 +98,29 @@ evidence, lifecycle records, cost completeness, and typed outcomes. Report
 resolved/unresolved tasks, binary rewards, incomplete verification, failed
 setup, cleanup, and budget terminals separately. A task is resolved only when
 its verifier and cleanup contracts complete.
+
+`summary.json` keeps unsolved, ungraded, and unreached tasks apart. Of the
+`tasks_selected` tasks, `tasks_total` have a task summary, `tasks_unrecorded`
+were handed to execution but ended without one (a lifecycle conflict or a
+checkpoint or lease error, possibly after the cascade ran), and
+`tasks_not_started` were never reached. The task status decides what is a
+grade: `tasks_graded` are the `resolved` and `unresolved` summaries
+(`tasks_resolved` plus `tasks_unresolved`), `tasks_lease_busy` belong to
+another process, and `tasks_ungraded` are the rest, executed or resumed with
+any other status. `tasks_rerun_by_default` counts results a plain re-run does
+not reuse; it is the lifecycle status policy, not a claim that the failure was
+transient. `tasks_by_status` lists every task status.
+
+A DeepSWE 1.1 task summary reports the `reward_counts` of its valid reward
+artifact: fail-to-pass and pass-to-pass passed and total, and whether the
+grader could not apply the patch. A valid artifact alone is not a grade. A
+verifier that wrote one and then exited non-zero, timed out, or failed the
+candidate patch proof leaves the task `verification_failed`; its summary and
+lifecycle record still show the `reward` and `reward_counts` the artifact
+held, and the task stays ungraded. The run-level `reward_counts` sums the
+per-test counts of graded tasks only: `tasks_counted` of them carry counts and
+`tasks_apply_failed` of those report a patch that did not apply. These counts
+do not change the exit status.
 
 ## Options
 
