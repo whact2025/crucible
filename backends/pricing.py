@@ -487,8 +487,10 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     # an unknown-model fallback; it is not evidence that the hub charges
     # operators nothing. The release entered the rows directly below as
     # hosted models that published no per-token charge to Crucible
-    # operators; no row cites a dated confirmation of that from the hub's
-    # owner. The two successor rows after them have their own comment.
+    # operators. The maintainer of these rows stated on 2026-11-19 that
+    # calls through the hub are not charged to the account the rows were
+    # entered for; no row cites a confirmation of that from the hub itself.
+    # The two successor rows after them have their own comment.
     # Operator-hosted local models must likewise declare a zero-rate entry in
     # pricing.yaml.
     "nvidia/nvidia/nemotron-3-super-v3": ModelPricing(
@@ -507,11 +509,15 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     # ``nvidia/zai-org/glm-5.2`` rows. The NVIDIA Inference Hub model list
     # (https://inference-api.nvidia.com/v1/models) named both ids on
     # 2026-11-18. On that date the hub's per-model information
-    # (https://inference-api.nvidia.com/model/info) reported a non-zero input
-    # and output cost per token for both ids. Whether Crucible operators are
-    # charged it is not confirmed by the hub's owner: the zero rate is carried
-    # over from the predecessor rows, is unverified for these ids and may
-    # understate. It is not a vendor price.
+    # (https://inference-api.nvidia.com/model/info) listed 1.60 / 8.00 USD
+    # per million input / output tokens for nvidia/moonshotai/kimi-k3.1-pro
+    # and 1.40 / 4.40 for nvidia/zai-org/glm-5.3. The zero rate is kept on
+    # the maintainer's statement of 2026-11-19 that calls through the hub are
+    # not charged to the account these rows were entered for. It rests on
+    # that statement: it is not a vendor price and not a confirmation by the
+    # hub. An operator who is charged the listed prices declares them for
+    # both ids in pricing.yaml (an override replaces the row); otherwise
+    # budgets and cost reports understate.
     "nvidia/moonshotai/kimi-k3.1-pro": ModelPricing(
         input_per_mtok=0.0, output_per_mtok=0.0,
     ),
