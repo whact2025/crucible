@@ -2749,10 +2749,11 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
         logger.info("deepswe_dev_verify: stderr (tail):\n%s", exec_stderr[-2000:])
 
     if rc == CONTAINMENT_NOT_STARTED_RC:
-        # Docker or the supervisor failed before the command existed: nothing
-        # the candidate wrote was executed, so there is no outcome to parse
-        # and nothing a model turn can act on.  The observer commands of a
-        # breach round are not tried either; its gate ends typed instead.
+        # Docker or the supervisor failed before the command existed: this
+        # command executed nothing the candidate wrote, so it has no outcome
+        # to parse and nothing a model turn can act on.  The observer
+        # commands of a breach round are not tried either; its gate ends
+        # typed instead.
         _emit_kpi(
             stdout,
             values={
@@ -3111,7 +3112,11 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
             # A gate whose own residue stays in the checkout is neither a
             # pass nor evidence against the slice.  A gate command that timed
             # out is the exception: the timeout stays attributed to the
-            # candidate, and the failed removal is only reported.
+            # candidate, and the failed removal is only reported.  Every
+            # other status of the gate command, that of a gate whose tests
+            # failed included, sets ``dev_verify_infrastructure_unavailable``
+            # here.  Tier files such a slice ``dev_verify_unavailable`` and,
+            # once its transaction is restored, halts ``slice_inconclusive``.
             effective_rc = max(effective_rc, 2)
             values.update({
                 "returncode": float(effective_rc),

@@ -373,6 +373,9 @@ def test_gate_replan_no_tier_dag_fails(tmp_path, monkeypatch):
         # An open accounting terminal keeps its own name as well, as on the
         # planning path; a parent reads that name as accounting debt.
         ("inconclusive", "incomplete_accounting"),
+        # A status of class retryable (a member of ``_RETRYABLE`` in
+        # ``workflows/_outcome.py``) is passed through like the others.
+        ("inconclusive", "transport_failed"),
     ],
 )
 def test_gate_replan_without_a_ruling_keeps_its_status(
@@ -413,6 +416,11 @@ def test_gate_replan_without_a_ruling_keeps_its_status(
         ("rejected", "judge_rejected"),
         # In no table: an unknown status is never read as "no ruling".
         ("inconclusive", "accounting_incomplete"),
+        # The terminal of the default three-planner competition is in no
+        # status table today either, so such a re-plan stays
+        # ``replan_validate_failed``. This pins today's behaviour; the class
+        # of the status is an open decision (outcome-taxonomy/O3-P3).
+        ("inconclusive", "plan_competition_inconclusive"),
     ],
 )
 def test_gate_replan_ruled_against_stays_replan_validate_failed(

@@ -1738,6 +1738,49 @@ def test_runner_rejects_partial_baseline_identity(monkeypatch):
     assert "metadata is incomplete" in payload["raw_output"]
 
 
+def test_clean_base_suite_that_never_started_is_unavailable_and_not_cached(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CRUCIBLE_DEEPSWE_BASELINE_CACHE", str(tmp_path))
+    calls = []
+
+    def fake_exec(container_id, _command, **_kwargs):
+        calls.append(container_id)
+        if container_id == "baseline":
+            return (
+                runner.CONTAINMENT_NOT_STARTED_RC,
+                "",
+                "docker inspect -- failed rc=1: "
+                "Cannot connect to the Docker daemon",
+            )
+        return 0, _PYTEST_PASS, ""
+
+    monkeypatch.setattr(runner, "_run_docker_exec", fake_exec)
+    monkeypatch.setattr(
+        runner,
+        "_probe_clean_baseline_container",
+        lambda _baseline, **_kwargs: "",
+    )
+
+    rc, payload = _run_runner(_baseline_parameters())
+
+    # The status of this one later command goes to the outcome parser, which
+    # finds no test summary in it: no clean-base outcome, no comparison.
+    assert rc == 2
+    assert calls == ["candidate", "baseline"]
+    values = payload["values"]
+    assert values["tests_passed"] == 1.0
+    assert values["dev_verify_baseline_attempted"] == 1.0
+    assert values["dev_verify_baseline_unavailable"] == 1.0
+    assert values["dev_verify_infrastructure_unavailable"] == 1.0
+    assert not list(tmp_path.glob("*.json"))
+
+    # Nothing was cached: the next gate run sends the command again.
+    assert _run_runner(_baseline_parameters())[0] == 2
+    assert calls == ["candidate", "baseline", "candidate", "baseline"]
+
+
 # ---------- paths a baseline command creates in the clean-base checkout ----------
 
 

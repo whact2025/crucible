@@ -5072,3 +5072,57 @@ def test_run_architect_reconciles_and_finalizes_after_child_exception(
     assert tier_result["cost_rollup_incomplete"] is True
     assert tier_result["budget_remaining_usd"] == 0.0
     assert _architect_result(corpus)["status"] == "budget_accounting_incomplete"
+
+
+def test_run_architect_repair_replan_without_a_ruling_keeps_its_status(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A repair re-plan nobody ruled on is published under its own status.
+
+    The validation gate hands the re-plan's typed terminal to the run: the
+    run exits 2, and summary, ``result.json`` and ``outcome.json`` carry
+    ``planner_infrastructure_failure`` with the validation phase.
+    """
+
+    corpus = _make_corpus(tmp_path)
+    _install_architect_stubs(
+        monkeypatch,
+        dag=_three_tier_dag(),
+        plan_cost=1.0,
+        tier_costs=[],
+    )
+
+    monkeypatch.setattr(
+        arch,
+        "_validation_gate",
+        lambda **kwargs: (
+            kwargs["planned"],
+            "planner_infrastructure_failure",
+            0.5,
+        ),
+    )
+
+    rc = arch.run_architect(
+        planner_count=1,
+        spec=Path(corpus.spec_dir),
+        cwd=str(tmp_path),
+        budget_usd=3.0,
+    )
+
+    assert rc == 2
+    summary = _architect_summary(corpus)
+    assert summary["status"] == "planner_infrastructure_failure"
+    assert summary["failure_phase"] == "architect_validation"
+    assert summary["tiers_executed"] == 0
+    assert _architect_result(corpus)["status"] == (
+        "planner_infrastructure_failure"
+    )
+    outcome_path = next(
+        path
+        for path in (Path(corpus.spec_dir) / "runs").glob("*/outcome.json")
+        if "_architect_" in path.parent.name
+    )
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    assert outcome["detail_status"] == "planner_infrastructure_failure"
+    assert outcome["terminal_class"] == "inconclusive"

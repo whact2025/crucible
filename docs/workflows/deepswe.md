@@ -68,9 +68,12 @@ task summary lists the candidate's record in
 the development verifier removes exactly those paths after each gate run in
 which they were new, so they are not charged to a slice. A record that cannot
 be bound exactly (more than 256 paths, more than 16,384 bytes of names, or a
-name that is not a canonical UTF-8 path) is listed unbound and the task runs
-as without it. Any other path a gate run leaves outside the slice's scope
-still fails the slice.
+name that is not a canonical UTF-8 path) is listed unbound, and the task stops
+at the preflight before any model call: status `setup_failed`, `failure_phase`
+`dev_verify_preflight`, `failure_kind` `gate_created_paths_unbindable`. The
+cause is deterministic for the task, so a later run of the task repeats the
+preflight and stops again. Any other path a gate run leaves outside the
+slice's scope still fails the slice.
 
 A verifier result is a grade only when its reward artifact matches the private
 tests snapshot. When that snapshot's `tests/config.json` declares a whitelist,

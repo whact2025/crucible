@@ -1366,10 +1366,20 @@ def test_deepswe_plan_critic_keeps_one_contract_in_one_slice():
         "file that finding only when the root directive, the TierDAG, or the "
         "captured read-only source evidence shows that the other side exists"
     ) in body
+    # Naming the paired sites closes the finding for every shape. The
+    # statement that none exist outside the slice closes it for shapes
+    # (a)-(d) only; shape (e) keeps its named seeding site. This pins
+    # today's text; letting that statement close the finding for shape
+    # (e) as well is an open decision.
     assert (
         "A slice whose intent names the paired sites inside its write scope, "
-        "or states that none exist outside it, satisfies this rule"
+        "or, for shapes (a)-(d) only, states that none exist outside it, "
+        "satisfies this rule"
     ) in body
+    assert (
+        "write scope, or states that none exist outside it, satisfies this "
+        "rule"
+    ) not in body
     # Every slice is gated on its own; no gate waits for a tier's siblings.
     assert "combined change" not in body
     assert "once every slice of a tier" not in body
@@ -1390,6 +1400,8 @@ def test_deepswe_plan_critic_does_not_tier_the_parts_of_one_contract():
         "such a prerequisite, not a contract part"
     ) in body
     assert "do not file `missing_sequencing`" in body
+    # The cross-references use the rule number, so bind it to its heading.
+    assert "8. **Contract atomicity" in body
     assert "every contract pairing in rule 8" in template
 
 
@@ -1438,6 +1450,12 @@ def test_deepswe_plan_critic_flags_new_files_at_ignored_paths():
         "rules"
     ) in supplied
     assert "judge every `creates_paths` entry against them" in supplied
+    # A nested `.gitignore` governs only the entries below its own directory.
+    assert (
+        "A pattern from a `.gitignore` below the root applies only to "
+        "entries under that file's directory (the reference `path` shows "
+        "it)."
+    ) in supplied
     assert (
         "A supplied pattern that matches an entry proves the defect"
     ) in supplied
@@ -1480,12 +1498,21 @@ def test_deepswe_plan_critic_flags_new_files_at_ignored_paths():
     assert "governing `.gitignore` lines" not in body
     for directory in ("`build/`", "`dist/`", "`target/`"):
         assert directory in exempt
-    assert "the root directive itself names that exact path" in exempt
+    # A path the root directive names is exempt in a sentence of its own,
+    # ahead of the insufficient reasons that "merely because" introduces.
+    assert (
+        "Do not file this finding for a path the root directive itself names."
+    ) in listed
+    assert (
+        "because the root directive itself names that exact path"
+    ) not in body
     assert "hold existing repository files" in exempt
     assert "Never apply this rule to `files_in_scope`" in exempt
 
     assert "Medium `ignored_path`" not in body
     assert "never reach verification" in scale
+    # The cross-reference uses the rule number, so bind it to its heading.
+    assert "10. **New files at ignored paths" in body
     assert "rule 10" in template
 
 

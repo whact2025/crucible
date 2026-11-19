@@ -897,6 +897,10 @@ def _preflight_gate_created_roots(
             for gitlink, _device, _inode in initialized_gitlinks
         ):
             # Residue in an initialized submodule is a restoration error.
+            # While its Git link is in the index, Git does not list an
+            # initialized submodule or its content in the superproject's
+            # untracked listing, so this filter then guards against a
+            # listing Git does not produce today.
             return False
         parent, _separator, name = root.rpartition("/")
         return name not in existing_names.get(parent, frozenset())

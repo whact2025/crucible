@@ -12996,7 +12996,9 @@ def _run_tier_locked_body(
                 # failed breach. The halt is the same; the exact child status
                 # stays in summary["phase_3_breach"]. A deferred seed takes
                 # this branch too: its repair loop was lost, and its own gate
-                # result stays in its Phase 1 row. A child that ended on a
+                # result stays in its Phase 1 row. The branch is also taken
+                # when Breach left a deferred seed unrepaired and its final
+                # shipping gate could not run. A child that ended on a
                 # deterministic refusal (an accepted candidate the final
                 # shipping gate ran and did not pass, a gate that changed
                 # source) is not such a loop and falls through to

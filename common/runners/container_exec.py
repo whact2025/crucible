@@ -1385,8 +1385,9 @@ def run_contained_docker_exec(
     Returns ``(returncode, stdout, stderr)``.  The return code is
 
     - ``CONTAINMENT_NOT_STARTED_RC`` when the invocation was invalid or Docker
-      or the supervisor failed before the command started: nothing ran and
-      the source container stays usable;
+      or the supervisor failed before the command started: nothing ran, and
+      the source container stays usable unless its in-flight marker could
+      not be withdrawn (the next call then reports the container unusable);
     - 124 when the execution window closed before the command started, and
       127 when Docker or the helper compiler is missing on the host: nothing
       ran either;

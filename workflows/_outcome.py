@@ -237,7 +237,11 @@ _PERMANENT = frozenset({
 
 # Classes that are not a ruling on the work: nothing judged it, or the run
 # was stopped. None of them is a retry instruction; a parent uses the set
-# only to keep such a child apart from a judged failure.
+# only to keep such a child apart from a judged failure. The inconclusive
+# class also holds the accounting terminals (``incomplete_accounting``,
+# ``cost_incomplete``, ``budget_accounting_incomplete``) and
+# ``partial_stopped``, after which the work may have been judged in full; a
+# reader tests accounting and budget first.
 UNJUDGED_TERMINAL_CLASSES: frozenset[TerminalClass] = frozenset({
     TerminalClass.INCONCLUSIVE,
     TerminalClass.RETRYABLE_FAILURE,

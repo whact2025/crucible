@@ -2382,17 +2382,17 @@ def test_land_is_blocked_when_the_live_candidate_cannot_be_recaptured(
 ):
     repo, corpus, spec_dir = env
     (repo / "seed.txt").write_text("seed\nedited by hand\n")
-    scoped_captures = []
 
-    def fails_after_the_record(path_scope) -> bool:
-        if path_scope != ("seed.txt", "gen.py"):
-            return False
-        scoped_captures.append(path_scope)
-        # First scoped capture records the slice; the next one is the
-        # landing re-check of the live tree against that record.
-        return len(scoped_captures) > 1
+    def fails_once_the_slice_is_recorded(path_scope) -> bool:
+        # The scoped capture that records the slice succeeds. Once the Spec
+        # carries that record, the next scoped capture is the landing
+        # re-check of the live tree against it.
+        return (
+            path_scope == ("seed.txt", "gen.py")
+            and bool(corpus.latest_spec().implementation_refs)
+        )
 
-    _fail_capture_when(monkeypatch, fails_after_the_record)
+    _fail_capture_when(monkeypatch, fails_once_the_slice_is_recorded)
 
     rc = handoff_main([
         "--spec", str(spec_dir), "--slice", "s0",
@@ -2400,7 +2400,6 @@ def test_land_is_blocked_when_the_live_candidate_cannot_be_recaptured(
     ])
 
     assert rc == 1
-    assert len(scoped_captures) == 2
     summary = json.loads(capsys.readouterr().out)
     assert summary["status"] == "failed"
     assert summary["landed"] is False
@@ -2429,7 +2428,11 @@ def test_land_is_blocked_when_the_live_candidate_cannot_be_recaptured(
     assert corpus.latest_spec().lifecycle_event_refs == ()
 
 
-def _nested_repository_env(tmp_path: Path) -> tuple[Path, Corpus, Path]:
+def _nested_repository_env(
+    tmp_path: Path,
+    *,
+    files: tuple[str, ...] = (),
+) -> tuple[Path, Corpus, Path]:
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -2446,7 +2449,9 @@ def _nested_repository_env(tmp_path: Path) -> tuple[Path, Corpus, Path]:
                     Tier(
                         tier_id="t0",
                         depends_on=(),
-                        slices=(_slice("vendored", (), creates=("vendor",)),),
+                        slices=(
+                            _slice("vendored", files, creates=("vendor",)),
+                        ),
                     ),
                 )
             )
@@ -2456,19 +2461,33 @@ def _nested_repository_env(tmp_path: Path) -> tuple[Path, Corpus, Path]:
 
 
 @pytest.mark.parametrize(
-    "mode_args",
-    [("--skip-verify",), (), ("--dry-run", "--skip-verify")],
-    ids=["skip_verify", "default_gate", "dry_run"],
+    ("mode_args", "files"),
+    [
+        pytest.param(("--skip-verify",), (), id="skip_verify"),
+        pytest.param((), (), id="default_gate"),
+        pytest.param(("--dry-run", "--skip-verify"), (), id="dry_run"),
+        # The capture also lists an edited tracked file: one directory entry
+        # among the captured paths fails the target, not only a capture that
+        # consists of the entry alone.
+        pytest.param(("--skip-verify",), ("seed.txt",), id="mixed_capture"),
+    ],
 )
 def test_nested_repository_in_scope_is_not_recorded(
-    tmp_path, capsys, mode_args,
+    tmp_path, capsys, mode_args, files,
 ):
     """Git lists an untracked nested repository as one ``dir/`` entry.
 
     Its diff is a commit pointer, not content, so the target fails before
     any gate, preview row, or record treats it as captured work.
     """
-    repo, corpus, spec_dir = _nested_repository_env(tmp_path)
+    repo, corpus, spec_dir = _nested_repository_env(tmp_path, files=files)
+    if files:
+        (repo / "seed.txt").write_text("seed\nedited by hand\n")
+        _diff, captured, _base = capture_workspace_delta(
+            cwd=str(repo),
+            path_scope=(*files, "vendor"),
+        )
+        assert tuple(captured) == ("seed.txt", "vendor/")
 
     rc = handoff_main([
         "--spec", str(spec_dir), "--slice", "vendored",

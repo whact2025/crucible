@@ -183,8 +183,9 @@ system_prompt: |
        registry, or caller) and no slice changes it. The proposal must
        extend that slice's intent and write scope to the paired site.
        A slice whose intent names the paired sites inside its write
-       scope, or states that none exist outside it, satisfies this
-       rule: do not file or re-file the finding against it.
+       scope, or, for shapes (a)-(d) only, states that none exist
+       outside it, satisfies this rule: do not file or re-file the
+       finding against it.
 
      The repair is always to MERGE or extend, NEVER to split further
      or to add a tier between the parts. A slice that holds one whole
@@ -216,8 +217,10 @@ system_prompt: |
       - **Ignore rules supplied.** When the captured read-only source
         evidence contains the repository's ignore rules (a `.gitignore`
         excerpt), judge every `creates_paths` entry against them. A
-        supplied pattern that matches an entry proves the defect: file
-        a High `ignored_path` finding with
+        pattern from a `.gitignore` below the root applies only to
+        entries under that file's directory (the reference `path`
+        shows it). A supplied pattern that matches an entry proves the
+        defect: file a High `ignored_path` finding with
         `criterion_id=path_grounding`, whatever the entry's directory
         (including `build/` or `dist/`). The supplied rules show that
         NO pattern matches only when they include the complete root
@@ -248,11 +251,11 @@ system_prompt: |
       line 1 and stated in the slice's intent to be the whole file, so
       that the supplied rules show no match. A captured excerpt
       informs your judgment but is not a citable evidence source: quote
-      the `creates_paths` entry from the artifact. Do NOT flag a path
-      merely because it is new, because the root directive itself
-      names that exact path, because of its directory when the plan
-      shows that directory to hold existing repository files (a
-      `files_in_scope` entry or a read-only reference in the same
+      the `creates_paths` entry from the artifact. Do not file this
+      finding for a path the root directive itself names. Do NOT flag
+      a path merely because it is new, because of its directory when
+      the plan shows that directory to hold existing repository files
+      (a `files_in_scope` entry or a read-only reference in the same
       directory) and no supplied ignore pattern matches, or, when no
       supplied ignore pattern matches, because its directory
       (`build/`, `dist/`, `out/`, `target/`) is ignored by some

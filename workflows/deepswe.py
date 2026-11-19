@@ -2918,25 +2918,51 @@ def _run_task_cascade(
 
             # Bound, every later gate run removes these paths again when its
             # own commands created them.  A record that cannot be bound
-            # exactly stays in the summary and the task runs as without it.
+            # exactly stays listed in the summary, unbound, and stops the
+            # task here as a preflight failure: before the Architect
+            # operation id is recorded and before any provider invocation.
             gate_created_evidence = (
                 deepswe_dev_verify.gate_created_paths_evidence(
                     gate_created_paths
                 )
             )
-            if gate_created_evidence is not None:
-                architect_parameters = dict(kwargs["extra_parameters"])
-                architect_metadata = dict(
-                    architect_parameters["deepswe_metadata"]
+            if gate_created_evidence is None:
+                summary.update({
+                    "rc": 2,
+                    "cascade_status": "failed",
+                    "authoring_status": "failed",
+                    "status": "setup_failed",
+                    "failure_phase": "dev_verify_preflight",
+                    "failure_kind": "gate_created_paths_unbindable",
+                    "error": (
+                        "clean development-verifier preflight recorded "
+                        f"{len(gate_created_paths)} gate-created path(s) "
+                        "that cannot be bound exactly before provider "
+                        "invocation; a bound record holds at most "
+                        f"{deepswe_dev_verify.MAX_GATE_CREATED_PATHS} paths "
+                        "and "
+                        f"{deepswe_dev_verify.MAX_GATE_CREATED_PATH_BYTES} "
+                        "bytes of canonical UTF-8 names"
+                    ),
+                })
+                logger.warning(
+                    "deepswe: task %s development-verifier preflight "
+                    "recorded %d gate-created path(s) that cannot be bound "
+                    "exactly; skipping Architect",
+                    inst.task_id,
+                    len(gate_created_paths),
                 )
-                architect_metadata[
-                    deepswe_dev_verify.GATE_CREATED_PATHS_KEY
-                ] = gate_created_evidence
-                architect_parameters["deepswe_metadata"] = architect_metadata
-                kwargs["extra_parameters"] = architect_parameters
-                summary["dev_verify_preflight"][
-                    "gate_created_paths_bound"
-                ] = True
+                return summary
+            architect_parameters = dict(kwargs["extra_parameters"])
+            architect_metadata = dict(
+                architect_parameters["deepswe_metadata"]
+            )
+            architect_metadata[
+                deepswe_dev_verify.GATE_CREATED_PATHS_KEY
+            ] = gate_created_evidence
+            architect_parameters["deepswe_metadata"] = architect_metadata
+            kwargs["extra_parameters"] = architect_parameters
+            summary["dev_verify_preflight"]["gate_created_paths_bound"] = True
         operation_id = _architect_operation_id(inst.task_id)
         summary["architect_operation_id"] = operation_id
         architect_error: Exception | None = None

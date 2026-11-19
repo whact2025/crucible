@@ -39,7 +39,9 @@ Exit codes:
 - 3: Runner / build error not classifiable by the loop. A round gate or the
   final shipping gate that could not run ends
   ``inconclusive_gate_unavailable``: no Test Author repair, Defender recovery
-  or Judge call follows it, and nothing judged the candidate.
+  or Judge call follows it. After a round gate nothing judged the candidate;
+  after the final shipping gate, which runs on a result Breach had accepted,
+  no ruling stands.
 """
 
 from __future__ import annotations
@@ -1350,6 +1352,11 @@ _BREACH_DEFENDER_EMPTY_CLASSES = frozenset({
 _BREACH_INCOMPLETE_TERMINAL_CLASSES = frozenset({
     "hard_fail_budget_exhausted",
     "hard_fail_cancellation",
+    # Assay gives a record this classification when the Git capture after the
+    # call, or the workspace check that precedes that capture, failed. A role
+    # whose delta could not be captured cannot authorize its writes: they are
+    # restored and the Breach loop ends.
+    "hard_fail_capture",
     "hard_fail_content_rejected",
     "hard_fail_incomplete_evidence",
     "hard_fail_max_turns",

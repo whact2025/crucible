@@ -22,8 +22,8 @@ Runner protocol (mirrors ``assay.bench``):
   resolves them against the working directory. Neither the launch nor such
   an entry adds the working directory to ``sys.path``, so the runner must be
   importable from the environment (installed, or under an absolute
-  ``PYTHONPATH`` entry). The rest of the environment reaches the runner
-  unchanged.
+  ``PYTHONPATH`` entry). Apart from the Git hook override, the rest of the
+  environment reaches the runner unchanged.
 - The workflow injects both ``parameters.role`` and
   ``parameters.runner_mode``.  The former selects the build/verify gate;
   the latter distinguishes ordinary tests from a requested benchmark

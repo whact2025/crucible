@@ -2702,6 +2702,10 @@ def test_pre_breach_fallback_review_infrastructure_failure_is_terminal(
     fallback = summary["phase_4_pre_breach_fallback"]
     assert fallback["status"] == "review_failed"
     assert fallback["infrastructure_failure"] is True
+    # A lost fallback reviewer keeps the tier status of the review it
+    # replaced, and the summary does not name a review without a verdict.
+    assert summary["status"] == "review_failed"
+    assert "phase_4_review_inconclusive" not in summary
 
 
 def test_post_breach_review_amendment_reproves_admitted_attacks(

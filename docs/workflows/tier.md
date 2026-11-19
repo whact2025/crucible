@@ -133,7 +133,8 @@ continues the run, retries, or lands anything:
   benchmark seed whose repair loop was lost; the seed is restored and its
   gate result stays in `phase_1_slices`. It also includes a breach round
   gate or the final shipping gate that could not run
-  (`inconclusive_gate_unavailable`). Two
+  (`inconclusive_gate_unavailable`), also when Breach left a deferred seed
+  unrepaired and its final shipping gate could not run. Two
   inconclusive child statuses record a deterministic refusal, not a lost
   ruling, and keep `breach_failed`: `inconclusive_post_strip_verify` (Breach
   accepted the candidate and the final shipping gate ran and did not pass
@@ -146,10 +147,11 @@ continues the run, retries, or lands anything:
 - `review_inconclusive` (exit `3`): a gating reviewer returned no verdict and
   no gating reviewer ruled against the candidate under review.
   `phase_4_review_inconclusive` names the rubric and the cause (`protocol`,
-  `infrastructure`, or `budget`). A ruling against the candidate keeps
-  `review_failed`, whether it came from another gating rubric of the same
-  pass or from an earlier pass whose feedback retry left the candidate
-  unchanged.
+  `infrastructure`, or `budget`). The key can remain in a summary whose
+  status is `incomplete_accounting` or `budget_exhausted`. A ruling against
+  the candidate keeps `review_failed`, whether it came from another gating
+  rubric of the same pass or from an earlier pass whose feedback retry left
+  the candidate unchanged.
 
 A cancelled implementer ends the tier `cancelled` (`outcome.json` class
 `cancelled`) when the slice transaction was restored and the cancelled call

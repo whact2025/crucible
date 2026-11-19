@@ -907,6 +907,14 @@ def test_snapshot_test_inventory_is_absent_without_config_json(tmp_path: Path):
             b'{"f2p_node_ids": ["a"], "p2p_node_ids": [], "grade": NaN}',
             "non-finite",
         ),
+        # More digits than Python converts to an integer: ``json.loads``
+        # raises a plain ``ValueError`` for it, not a ``JSONDecodeError``.
+        (
+            b'{"f2p_node_ids": ["a"], "p2p_node_ids": [], "grade": '
+            + b"1" * 5000
+            + b"}",
+            "not strict JSON",
+        ),
     ),
     ids=(
         "not_json",
@@ -919,6 +927,7 @@ def test_snapshot_test_inventory_is_absent_without_config_json(tmp_path: Path):
         "non_string_id",
         "duplicate_key",
         "non_finite_constant",
+        "oversized_integer",
     ),
 )
 def test_snapshot_test_inventory_rejects_malformed_config(
@@ -963,6 +972,45 @@ def test_test_inventory_never_follows_a_config_symlink(tmp_path: Path):
     with pytest.raises(DeepSWEInstanceError, match="must not be a symlink"):
         load_task_test_inventory(manifest_path, "t1")
     with pytest.raises(DeepSWEInstanceError, match="must not be a symlink"):
+        load_snapshot_test_inventory(snapshot)
+
+
+def _oversized_config(path: Path) -> None:
+    # One byte over the read limit; the file is sparse until it is copied.
+    with path.open("wb") as file:
+        file.truncate(dataset_module._MAX_TASK_TEXT_BYTES + 1)
+
+
+@pytest.mark.parametrize(
+    "place",
+    (_oversized_config, Path.mkdir),
+    ids=("oversized", "directory"),
+)
+def test_test_inventory_rejects_a_config_it_cannot_read_safely(
+    tmp_path: Path,
+    place,
+):
+    tasks_root = tmp_path / "tasks"
+    tasks_root.mkdir()
+    task_dir = _write_task_dir(tasks_root, task_id="t1", ext_id="kh1")
+    tests_dir = _add_snapshot_test_files(task_dir)
+    place(tests_dir / "config.json")
+    manifest_path = _write_manifest(
+        tasks_root,
+        [_manifest_entry("t1", ext_id="kh1", repo="ex/ex")],
+    )
+    # The snapshot copies such a tree as it is; both loaders refuse it.
+    snapshot = snapshot_task_tests_tree(
+        manifest_path,
+        "t1",
+        tmp_path / "private",
+        expected_identity=fingerprint_task_tests_tree(manifest_path, "t1"),
+    )
+
+    reason = "cannot safely read tests/config.json"
+    with pytest.raises(DeepSWEInstanceError, match=reason):
+        load_task_test_inventory(manifest_path, "t1")
+    with pytest.raises(DeepSWEInstanceError, match=reason):
         load_snapshot_test_inventory(snapshot)
 
 

@@ -479,9 +479,20 @@ def test_preflight_records_a_name_that_is_not_valid_utf8_as_decoded(
     tmp_path: Path,
     monkeypatch,
 ):
-    preflight = _Preflight(tmp_path, monkeypatch)
     raw_name = b"gate-\xff.lock"
     decoded = os.fsdecode(raw_name)
+    # A file system that requires UTF-8 file names cannot hold this fixture.
+    name_probe = os.path.join(os.fsencode(tmp_path), raw_name)
+    try:
+        with open(name_probe, "wb"):
+            pass
+    except OSError as exc:
+        pytest.skip(
+            "the file system refuses a file name that is not valid UTF-8: "
+            f"{exc}"
+        )
+    os.unlink(name_probe)
+    preflight = _Preflight(tmp_path, monkeypatch)
 
     def _gate(workspace: Path) -> None:
         with open(os.path.join(os.fsencode(workspace), raw_name), "wb") as file:
@@ -680,13 +691,14 @@ def test_slice_gate_accepts_recorded_kinds_removed_within_the_gate_run(
 # ---------- the two generated scripts, run by bash on a real tree ----------
 
 
-def _bash(command: str) -> tuple[int, str, str]:
+def _bash(command: str, *, cwd: Path | None = None) -> tuple[int, str, str]:
     result = subprocess.run(
         ["bash", "-c", command],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
+        cwd=cwd,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -757,15 +769,23 @@ def test_generated_scripts_handle_every_kind_of_recorded_path(
         for path in paths
     ]
     before = _tree(root)
+    # Neither script changes directory: a name the shell evaluated would
+    # create ``injected`` in the directory bash was started in.
+    shell_cwd = tmp_path / "shell-cwd"
+    shell_cwd.mkdir()
 
-    probe = _bash(dv._gate_created_probe_script(paths, workspace_root=str(root)))
+    probe = _bash(
+        dv._gate_created_probe_script(paths, workspace_root=str(root)),
+        cwd=shell_cwd,
+    )
 
     # The probe prints one line per path and changes nothing.
     assert probe == (0, "".join(f"{state}\n" for state in expected), "")
     assert _tree(root) == before
 
     removal = _bash(
-        dv._gate_created_removal_script(paths, workspace_root=str(root))
+        dv._gate_created_removal_script(paths, workspace_root=str(root)),
+        cwd=shell_cwd,
     )
 
     assert removal == (
@@ -779,6 +799,7 @@ def test_generated_scripts_handle_every_kind_of_recorded_path(
     # Exactly the recorded paths are gone: no glob matched ``globbed.txt``
     # and no name was evaluated by the shell.
     assert _tree(root) == bystanders
+    assert not list(shell_cwd.iterdir())
     assert not list(tmp_path.rglob("injected"))
 
     # The callers read the same protocol.
@@ -1039,6 +1060,13 @@ def _receipt(
 def _run_cascade(tmp_path: Path, monkeypatch, receipt):
     """Run one task cascade whose preflight emits ``receipt`` (if any)."""
 
+    summary, seen = _run_cascade_summary(tmp_path, monkeypatch, receipt)
+    return summary["dev_verify_preflight"], seen
+
+
+def _run_cascade_summary(tmp_path: Path, monkeypatch, receipt):
+    """Run that cascade; return its whole task summary and what was called."""
+
     from crucible.common.cost import CostAccumulator
 
     manifest = _build_corpus(tmp_path)
@@ -1086,7 +1114,7 @@ def _run_cascade(tmp_path: Path, monkeypatch, receipt):
         run_dir=_prepare_parent_run(tmp_path / "s" / "runs" / "gate-created"),
         cost=CostAccumulator(),
     )
-    return summary["dev_verify_preflight"], seen
+    return summary, seen
 
 
 def test_gate_created_paths_reach_the_task_summary_and_the_cascade_gate(
@@ -1135,7 +1163,7 @@ def test_no_gate_created_paths_leave_the_cascade_parameters_unchanged(
 
 
 @pytest.mark.parametrize("case", ["not_utf8", "too_many"])
-def test_unbindable_gate_created_paths_are_listed_but_not_bound(
+def test_unbindable_gate_created_paths_stop_the_task_at_the_preflight(
     tmp_path: Path,
     monkeypatch,
     case: str,
@@ -1149,16 +1177,36 @@ def test_unbindable_gate_created_paths_are_listed_but_not_bound(
         )
         listed = list(paths[: dv.MAX_GATE_CREATED_PATHS])
 
-    preflight, seen = _run_cascade(
+    summary, seen = _run_cascade_summary(
         tmp_path,
         monkeypatch,
         _receipt(tmp_path, paths),
     )
 
-    # The task continues as before: its gate runs are not bound, and the
-    # summary says so with names that every JSON writer can encode.
-    assert seen["architect"] == seen["preflight"]
+    # The task stops as a preflight failure: Architect is never called and
+    # no Architect operation id is recorded.
+    assert "architect" not in seen
+    assert "architect_operation_id" not in summary
+    assert summary["status"] == "setup_failed"
+    assert summary["failure_phase"] == "dev_verify_preflight"
+    assert summary["failure_kind"] == "gate_created_paths_unbindable"
+    assert summary["rc"] == 2
+    assert summary["cascade_status"] == "failed"
+    assert summary["authoring_status"] == "failed"
+    assert summary["cost_usd"] == 0.0
+    # The error names the limits of a record, never a recorded name.
+    assert f"{len(paths)} gate-created path(s)" in summary["error"]
+    assert f"{dv.MAX_GATE_CREATED_PATHS} paths" in summary["error"]
+    assert f"{dv.MAX_GATE_CREATED_PATH_BYTES} bytes" in summary["error"]
+    # What a later run may do with this stop, and how a run of such stops
+    # is filed.
+    assert wf._task_status_policy(summary) == "retryable"
+    assert wf._all_task_failures_are_unjudged([summary]) is True
+    # The summary still lists the record, unbound, with names that every
+    # JSON writer can encode.
+    preflight = summary["dev_verify_preflight"]
+    assert preflight["classification"] == "success"
     assert preflight["gate_created_paths"] == listed
     assert preflight["gate_created_path_count"] == len(paths)
     assert preflight["gate_created_paths_bound"] is False
-    json.dumps(preflight, ensure_ascii=False).encode("utf-8")
+    json.dumps(summary, ensure_ascii=False).encode("utf-8")

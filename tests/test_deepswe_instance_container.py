@@ -1326,6 +1326,16 @@ def test_sanitize_workspace_history_rejects_malformed_base_commit(
     assert calls == [("rev-parse", "HEAD")]
 
 
+def test_sha256_head_is_a_full_commit_id_and_binds_an_equal_base_commit():
+    # The two helpers only: a run through ``_sanitize_workspace_history``
+    # would need a SHA-256 repository.
+    head = "0123456789abcdef" * 4
+    assert len(head) == 64
+
+    assert ic.is_full_commit_id(head) is True
+    assert ic._resolve_base_commit(base_commit=head, head=head) == head
+
+
 def test_sanitize_replaces_local_config_before_first_host_git(
     tmp_path: Path,
     monkeypatch,

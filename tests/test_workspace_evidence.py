@@ -192,6 +192,7 @@ def _land_current_workspace(
     slice_id: str | None = None,
     classification: str = "success",
     scope_escapes: tuple[str, ...] = (),
+    bind_resume_identity: bool = True,
 ) -> None:
     spec = corpus.latest_spec()
     assert spec is not None and spec.tier_dag is not None
@@ -228,13 +229,14 @@ def _land_current_workspace(
         execution=exec_ctx_now(implementation_recipe),
         scope_escapes=scope_escapes,
     )
-    implementation = _partition.attach_resume_identity(
-        corpus,
-        spec,
-        tier,
-        slice_,
-        implementation,
-    )
+    if bind_resume_identity:
+        implementation = _partition.attach_resume_identity(
+            corpus,
+            spec,
+            tier,
+            slice_,
+            implementation,
+        )
     corpus.commit(implementations=(implementation,))
     if not publish_lifecycle:
         return
@@ -1027,8 +1029,13 @@ def _run_partial_tier(
     record_failed: bool = True,
     roll_back_failed: bool = True,
     keep_scope_escapes: tuple[str, ...] = (),
+    failed_record_is_unbound_success: bool = False,
 ) -> None:
-    """Leave ``t0`` as Tier does after ``keep`` landed and ``fail`` failed."""
+    """Leave ``t0`` as Tier does after ``keep`` landed and ``fail`` failed.
+
+    With ``failed_record_is_unbound_success`` the record of ``fail`` is a
+    ``success`` record without this plan's resume identity.
+    """
 
     (repo / "kept.txt").write_text("created by keep\n", encoding="utf-8")
     (repo / "edit.txt").write_text("edited by keep\n", encoding="utf-8")
@@ -1048,7 +1055,12 @@ def _run_partial_tier(
             corpus,
             tier_id="t0",
             slice_id="fail",
-            classification="verify_failed",
+            classification=(
+                "success"
+                if failed_record_is_unbound_success
+                else "verify_failed"
+            ),
+            bind_resume_identity=not failed_record_is_unbound_success,
             publish_lifecycle=False,
         )
     if roll_back_failed:
@@ -1263,6 +1275,25 @@ def test_architect_resume_completes_tier_that_retained_a_sibling(
     summary = json.loads((architect_run / "summary.json").read_text())
     assert summary["status"] == "complete"
     assert not (architect_run / "validate_findings.json").exists()
+    # The validation verdict carries the evidence the operator reads: the
+    # row of the resumed tier names the retained sibling as proven.
+    (evidence_ref,) = {
+        verdict.artifacts["architect_retained_workspace_evidence"]
+        for verdict in (
+            corpus.get_record(ref, as_type=Verdict)
+            for ref in corpus.list_artifacts(kind="verdicts")
+        )
+        if "architect_retained_workspace_evidence" in (verdict.artifacts or {})
+    }
+    evidence_artifact = json.loads(corpus.get_artifact(evidence_ref))
+    assert evidence_artifact["schema_version"] == (
+        "crucible.architect.retained-workspace-evidence.v1"
+    )
+    (evidence_row,) = [
+        row for row in evidence_artifact["tiers"] if row["tier_id"] == "t0"
+    ]
+    assert evidence_row["boundary_retained_slices"] == ["s0"]
+    assert evidence_row["boundary_retained_proven"] is True
 
 
 def test_retained_sibling_of_failed_tier_is_proven_and_authorized(
@@ -1309,10 +1340,18 @@ def test_retained_sibling_of_failed_tier_is_proven_and_authorized(
     assert cited_path_exists(spec, evidence.context) == ()
 
 
-@pytest.mark.parametrize("record_failed", [True, False])
+@pytest.mark.parametrize(
+    "sibling_record",
+    [
+        "verify_failed",
+        "unrecorded",
+        # A ``success`` record without this plan's resume identity.
+        "unbound_success",
+    ],
+)
 def test_failed_or_unrecorded_sibling_output_is_never_excused(
     tmp_path: Path,
-    record_failed: bool,
+    sibling_record: str,
 ) -> None:
     repo, corpus = _setup_plan(
         tmp_path,
@@ -1322,9 +1361,14 @@ def test_failed_or_unrecorded_sibling_output_is_never_excused(
     _run_partial_tier(
         repo,
         corpus,
-        record_failed=record_failed,
+        record_failed=sibling_record != "unrecorded",
+        failed_record_is_unbound_success=sibling_record == "unbound_success",
         roll_back_failed=False,
     )
+    if sibling_record == "unbound_success":
+        unbound = _latest_implementation(corpus, "fail")
+        assert unbound.classification == "success"
+        assert "resume_identity" not in (unbound.artifacts or {})
 
     spec, evidence, rows = _evidence(repo, corpus)
 
@@ -1341,6 +1385,74 @@ def test_failed_or_unrecorded_sibling_output_is_never_excused(
     })
     assert rows["t0"]["boundary_retained_slices"] == ["keep"]
     assert rows["t0"]["boundary_retained_proven"] is True
+
+
+def test_retained_no_change_sibling_joins_the_selection_without_create_authority(
+    tmp_path: Path,
+) -> None:
+    repo, corpus = _setup_plan(
+        tmp_path,
+        tiers=(Tier(
+            tier_id="t0",
+            depends_on=(),
+            slices=(
+                _slice("noop", intent="Check the seed; change nothing."),
+                _slice(
+                    "keep",
+                    intent="Create kept.txt.",
+                    creates_paths=("kept.txt",),
+                ),
+                _slice(
+                    "fail",
+                    intent="Create failed.txt.",
+                    creates_paths=("failed.txt",),
+                ),
+            ),
+        ),),
+        base_files={"seed.txt": "seed\n"},
+    )
+    # ``noop`` has no write surface; its record is taken on the clean tree.
+    _land_current_workspace(
+        repo,
+        corpus,
+        tier_id="t0",
+        slice_id="noop",
+        classification="soft_fail_no_changes",
+        publish_lifecycle=False,
+    )
+    assert _latest_implementation(corpus, "noop").files_modified == ()
+    (repo / "kept.txt").write_text("created by keep\n", encoding="utf-8")
+    _land_current_workspace(
+        repo,
+        corpus,
+        tier_id="t0",
+        slice_id="keep",
+        publish_lifecycle=False,
+    )
+    _abandon_tier(corpus, tier_id="t0")
+
+    spec, evidence, rows = _evidence(repo, corpus)
+
+    # The no-change sibling is selected with the create and does not prevent
+    # the adoption of the proof; only the create's slice gets authority.
+    assert evidence.errors == ()
+    assert evidence.workspace_evidence_passed is True
+    assert evidence.context.successful_plan_bound_slices == frozenset({
+        ("t0", "keep"),
+    })
+    assert evidence.context.verified_create_paths == frozenset({
+        ("t0", "keep", "kept.txt"),
+    })
+    assert rows["t0"]["pending_slices"] == ["fail"]
+    # The ids are sorted; the hash pairs follow the slice order of the tier.
+    assert rows["t0"]["boundary_retained_slices"] == ["keep", "noop"]
+    assert rows["t0"]["boundary_retained_proven"] is True
+    assert rows["t0"]["boundary_retained_implementation_hashes"] == [
+        ["noop", hash_record(_latest_implementation(corpus, "noop"))],
+        ["keep", hash_record(_latest_implementation(corpus, "keep"))],
+    ]
+    assert rows["t0"]["boundary_retained_unproven"] == []
+    assert cited_path_exists(spec, evidence.context) == ()
 
 
 @pytest.mark.parametrize("state", ["tampered", "reset", "record_error"])
