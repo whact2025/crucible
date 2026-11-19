@@ -57,9 +57,18 @@ from .contract import (
     SecondCall,
 )
 from .drivers import MatrixSetupError, registered_kinds, toy
-from .provider import UNSCRIPTED_STATUS, LoopbackProvider, ProviderLedger, ToyDialect
+from .provider import (
+    UNSCRIPTED_STATUS,
+    LoopbackProvider,
+    ProviderLedger,
+    Reply,
+    SeenRequest,
+    ToyDialect,
+)
 from .scenarios import (
     BUDGET_USD,
+    D_OAI_SCHEMA_FINAL,
+    D_STRUCT_UNQUALIFIED,
     PACK_A,
     SCENARIOS,
     STARTER,
@@ -69,7 +78,7 @@ from .scenarios import (
     plan_for,
     tool_events_paired,
 )
-from .script import READ_A, Call, Loop, ProviderScript, Say
+from .script import READ_A, Call, Loop, ProviderScript, Say, ServedAs, Step
 from .toolsets import BINDINGS
 
 LEDGER = ledger.load()
@@ -250,6 +259,15 @@ def test_comparator_column_wide_code_is_owed_where_its_clause_ran() -> None:
         ledger.compare(known, other, set(), current={}, evaluated=evaluated)
     # Where C6 was not evaluated (a raise stood for it) the code is not owed...
     ledger.compare(known, other, set(), current={}, evaluated=frozenset({"C0"}))
+    # ...nor where the result's own flags switched its check off (C6 asks for
+    # pricing evidence only of a result that flags its cost complete), and it
+    # is not tolerated there either.
+    unasked = frozenset({"pricing:none"})
+    ledger.compare(known, other, set(), current={}, evaluated=evaluated, unasked=unasked)
+    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation"):
+        ledger.compare(
+            known, other, {"pricing:none"}, current={}, evaluated=evaluated, unasked=unasked
+        )
     # ...and it is tolerated on no other kind.
     with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation"):
         ledger.compare(
@@ -539,6 +557,50 @@ def test_c4_and_c6_report_flags_and_accounting(tmp_path: Path) -> None:
     ) == {"flag:trace_complete=False", "digest.missing:trace"}
 
 
+def test_pricing_evidence_is_asked_only_of_a_result_that_flags_its_cost_complete(
+    tmp_path: Path,
+) -> None:
+    execution = _honest(tmp_path, "S01")
+    result, _trace = _result_and_trace(execution)
+
+    def judged(**changes: Any) -> Report:
+        changed = dataclasses.replace(result, **changes)
+        return contract.evaluate(
+            dataclasses.replace(execution.observation, result=changed),
+            execution.plan.expect,
+            execution.reference,
+            lens="raw",
+            toolset=False,
+            checks=execution.plan.checks,
+        )
+
+    assert execution.report.unasked == frozenset()
+    # Flagged complete without evidence: the check is asked, and it reports.
+    bare = judged(pricing_evidence=None)
+    assert (bare.codes, bare.unasked) == ({"pricing:none"}, frozenset())
+    # Flagged incomplete: a lower bound is owed and no evidence, so a
+    # column-wide "pricing:none" is not owed on such a cell.
+    untold = dataclasses.replace(
+        result.completeness, token_usage_complete=False, cost_complete=False
+    )
+    flagged = judged(completeness=untold, pricing_evidence=None)
+    assert flagged.codes == {"flag:token_usage_complete=False", "flag:cost_complete=False"}
+    assert flagged.unasked == contract.PRICING_CODES == {"pricing:none", "pricing:unreconciled"}
+    # A raise leaves no result: nothing is switched off, the clause was not run.
+    raised = contract.evaluate(
+        dataclasses.replace(
+            execution.observation,
+            result=None,
+            raised=Raised("RuntimeError", "after_request", "crucible.backends.standin"),
+        ),
+        execution.plan.expect,
+        execution.reference,
+        lens="raw",
+        toolset=False,
+    )
+    assert raised.unasked == frozenset() and "C6" not in raised.evaluated()
+
+
 def test_c8_c9_and_c10_report_what_the_cell_left_and_dispatched(tmp_path: Path) -> None:
     execution = _honest(tmp_path, "S03")
     log = execution.observation.toolset_log
@@ -758,6 +820,64 @@ def test_the_reference_model_is_the_model_of_the_route_of_the_cells_role(
     assert codes("S03") == {"request.content:model"}
 
 
+def test_a_cell_is_priced_at_the_model_of_the_route_of_its_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    column = cells.toy_columns()[0]
+    roles = matrix_columns.ROLE_BY_CAPABILITY
+    shipped = matrix_columns.real_columns()[0].routing_path(matrix_columns.COLUMN_PRODUCT)
+    # A model whose built-in price has a long-context tier is priced in another
+    # shape than the plain matrix rate, so the two references can be told apart.
+    tiered = sorted(
+        model
+        for model, price in matrix_columns.DEFAULT_PRICING.items()
+        if price.long_context_threshold_tokens is not None
+    )[0]
+    assert matrix_columns.matrix_rate(tiered) != matrix_columns.matrix_rate(column.model)
+    route = tmp_path / "routing.yaml"
+    route.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": yaml.safe_load(shipped.read_text(encoding="utf-8"))[
+                    "schema_version"
+                ],
+                "default": {
+                    "backend": "local",
+                    "model": column.model,
+                    "base_url": matrix_columns.SCRIPTED_ENV["CRUCIBLE_LOCAL_URL"],
+                },
+                "roles": {roles["read_only"]: {"model": tiered}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    routed = dataclasses.replace(column, routing=((matrix_columns.COLUMN_PRODUCT, route),))
+
+    def priced(scenario: str) -> Any:
+        return runner.execute(Cell(routed, scenario, "raw"), tmp_path / scenario).reference.pricing
+
+    assert priced("S01") == matrix_columns.matrix_rate(column.model)
+    assert priced("S03") == matrix_columns.matrix_rate(tiered)
+    # The rate card the adapters price from holds every model a route names,
+    # not only the default route of each lane.
+    card = matrix_columns.rate_card()
+    assert all(
+        declarations.routed_model(real, role) in card
+        for real in matrix_columns.real_columns()
+        for role in declarations.ROUTED_ROLES
+    )
+    lane = SimpleNamespace(
+        default_route=SimpleNamespace(model="default-model"),
+        role_routes=(SimpleNamespace(model="planner-model"),),
+    )
+    monkeypatch.setattr(matrix_columns, "catalog_lanes", lambda _product: (lane,))
+    assert set(matrix_columns.rate_card()) == {
+        matrix_columns.TOY_MODEL,
+        "default-model",
+        "planner-model",
+    }
+
+
 def test_p02_compares_what_the_guard_bound_with_what_the_profile_implies(
     tmp_path: Path,
 ) -> None:
@@ -880,6 +1000,41 @@ def test_provider_matches_on_method_path_call_ids_and_advertised_tools() -> None
         assert _ask(provider, {})[0] == UNSCRIPTED_STATUS  # the loop needs one round
         seen = provider.freeze()
     assert (seen.extra, seen.unconsumed) == (1, 2)
+
+
+class _FixedServedId(ToyDialect):
+    """Answers every request under one id, whatever model was asked for."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        reply = super().render(step, seen, call_id)
+        return dataclasses.replace(
+            reply, served_model="fixed-id", body={**reply.body, "model": "fixed-id"}
+        )
+
+
+def test_a_reply_under_another_model_without_a_served_as_step_is_a_seam_problem() -> None:
+    script = ProviderScript((Say("one"), ServedAs(Say("two")), Say("three")))
+    asked = {"model": "asked"}
+
+    # The toy dialect echoes the model it was asked for; a ServedAs step is
+    # the one way a script names another.
+    with LoopbackProvider(script, credential="c") as provider:
+        assert [_ask(provider, asked)[1]["model"] for _ in range(3)] == [
+            "asked",
+            "asked-served",
+            "asked",
+        ]
+        seen = provider.freeze()
+    assert seen.served_models == ["asked", "asked-served", "asked"]
+    assert not any("answered under model" in problem for problem in seen.seam_problems)
+    # A dialect that answers under a fixed id would switch off "served equals
+    # requested" for its whole kind, with clause C7 still ok.
+    with LoopbackProvider(script, credential="c", dialect=_FixedServedId()) as provider:
+        for _ in range(3):
+            assert _ask(provider, asked)[1]["model"] == "fixed-id"
+        seen = provider.freeze()
+    named = [problem for problem in seen.seam_problems if "answered under model" in problem]
+    assert len(named) == 1 and "'fixed-id'" in named[0] and "'asked'" in named[0]
 
 
 def test_run_cell_fails_on_a_failed_preflight_a_broken_seam_and_a_wrong_pin(
@@ -1084,8 +1239,16 @@ def test_kinds_without_a_driver_yield_no_cell_and_no_error() -> None:
     generated = cells.generate(cells.all_columns(), registered=frozenset({TOY_KIND}))
 
     assert {cell.column.kind for cell in generated} == {TOY_KIND}
-    assert generated == cells.behaviour_cells()
-    assert set(matrix_columns.REAL_KINDS) & registered_kinds() == set()
+    # The real kinds that are driven today, and no other, have cells.
+    driven = {cell.column.kind for cell in cells.behaviour_cells()} - {TOY_KIND}
+    assert driven == registered_kinds() - {TOY_KIND} == {
+        matrix_columns.HOSTED_GATEWAY_KIND,
+        matrix_columns.LOCAL_GATEWAY_KIND,
+    }
+    assert [cell for cell in cells.behaviour_cells() if cell.column.kind == TOY_KIND] == list(
+        generated
+    )
+    assert set(cells.MODULE_BY_KIND) == registered_kinds()
 
 
 def test_role_scope_and_the_not_expressible_list_shape_a_column() -> None:
@@ -1572,7 +1735,9 @@ def test_h03_registry_rules() -> None:
     # Without the H02 entry of its kind, a predicted cell would be invisible.
     unreachable = _document()
     unreachable["known_gaps"] = [
-        item for item in unreachable["known_gaps"] if item["cell"] != "deepseek/H02/-/static"
+        item
+        for item in unreachable["known_gaps"]
+        if item.get("cell") != "deepseek/H02/-/static"
     ]
     assert "static:registry_cell_unreachable" in _problem_codes(unreachable)
 
@@ -1626,8 +1791,11 @@ def test_h03_entry_rules() -> None:
     assert "static:entry_code_invalid" in _problem_codes(invalid)
 
     ceiling = _document()
-    ceiling["ceilings"]["max_known_gaps"]["pack_a"] = 7
+    ceiling["ceilings"]["max_known_gaps"]["pack_a"] = len(ceiling["known_gaps"]) - 1
     assert "static:ceiling_exceeded" in _problem_codes(ceiling)
+    exact = _document()
+    exact["ceilings"]["max_known_gaps"]["pack_a"] = len(exact["known_gaps"])
+    assert _problem_codes(exact) == set()
 
     reference = _document()
     reference["registry"]["M01"]["cells"].append(
@@ -1650,12 +1818,8 @@ def test_h03_entry_rules() -> None:
         ledger.compare(ledger.parse(empty), empty["known_gaps"][0]["cell"], set(), current={})
 
     differing = _document()
-    differing["declared_differences"] = [
-        {"id": "D-EXAMPLE", "citation": "c", "owner": "o", "date": "2026-11-18", "alternative": "a"}
-    ]
+    differing["ceilings"]["max_declared_differences"] = len(differing["declared_differences"]) - 1
     assert _problem_codes(differing) == {"static:ceiling_exceeded"}
-    differing["ceilings"]["max_declared_differences"] = 1
-    assert _problem_codes(differing) == set()
 
     # A column-wide entry is attributed like any other: its gap must list it.
     wide = _document()
@@ -1666,6 +1830,121 @@ def test_h03_entry_rules() -> None:
     assert _problem_codes(wide) == {"static:entry_not_in_registry"}
     wide["registry"]["G02"]["column_wide"] = [{"kind": "kimi", "code": "pricing:none"}]
     assert _problem_codes(wide) == set()
+
+
+def _difference(document: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(item for item in document["declared_differences"] if item["id"] == name)
+
+
+def test_h03_declared_difference_rules() -> None:
+    shipped = {item.id: item for item in LEDGER.differences}
+    hosted = matrix_columns.HOSTED_GATEWAY_KIND
+    in_force = f"{hosted}/S04/primary/raw"
+
+    # The two of today: one a declared value selects, one in force on listed cells.
+    assert set(shipped) == {D_STRUCT_UNQUALIFIED, D_OAI_SCHEMA_FINAL}
+    assert shipped[D_STRUCT_UNQUALIFIED].cells == ()
+    assert LEDGER.differences_for(in_force) == (D_OAI_SCHEMA_FINAL,)
+    assert LEDGER.differences_for(f"{hosted}/S03/primary/raw") == ()
+    assert cells.world().difference_variants == {D_STRUCT_UNQUALIFIED}
+    assert cells.world().difference_alternatives == {D_OAI_SCHEMA_FINAL: {"S04"}}
+
+    # A scenario may assert an alternative only when the ledger declares it...
+    for name in shipped:
+        undeclared = _document()
+        undeclared["declared_differences"].remove(_difference(undeclared, name))
+        assert _problem_codes(undeclared) == {"static:difference_undeclared"}
+    # ...and the ledger may declare only what a scenario asserts.
+    unused = _document()
+    unused["ceilings"]["max_declared_differences"] += 1
+    unused["declared_differences"].append(
+        {"id": "D-EXAMPLE", "citation": "c", "owner": "o", "date": "2026-11-18", "alternative": "a"}
+    )
+    assert _problem_codes(unused) == {"static:difference_unused"}
+    twice = _document()
+    twice["ceilings"]["max_declared_differences"] += 1
+    twice["declared_differences"].append(copy.deepcopy(_difference(twice, D_OAI_SCHEMA_FINAL)))
+    assert _problem_codes(twice) == {"static:difference_duplicate"}
+
+    def scoped(name: str, listed: list[str]) -> set[str]:
+        document = _document()
+        _difference(document, name)["cells"] = listed
+        return _problem_codes(document)
+
+    # In force on no cell, it asserts nothing.
+    assert scoped(D_OAI_SCHEMA_FINAL, []) == {"static:difference_unused"}
+    # A listed cell is a generated cell of a real kind whose scenario defines
+    # the alternative; never a toy cell, never the canary, never listed twice.
+    canary = next(cell.id for cell in TOY_CELLS if SCENARIOS[cell.scenario].canary)
+    toy_cell = next(cell.id for cell in TOY_CELLS if cell.scenario == "S04")
+    for wrong in (
+        toy_cell,
+        canary,
+        f"{hosted}/S00/primary/raw",
+        f"{hosted}/S03/primary/raw",
+        "kimi/S04/primary/raw",
+        f"{hosted}/S04/tertiary/raw",
+    ):
+        assert scoped(D_OAI_SCHEMA_FINAL, [in_force, wrong]) == {
+            "static:difference_cell_invalid"
+        }, wrong
+    assert scoped(D_OAI_SCHEMA_FINAL, [in_force, in_force]) == {"static:difference_cell_invalid"}
+    # One that a declared value selects has no cell list of its own.
+    assert scoped(D_STRUCT_UNQUALIFIED, [in_force]) == {"static:difference_cell_invalid"}
+    malformed = _document()
+    _difference(malformed, D_OAI_SCHEMA_FINAL)["cells"] = ["S04"]
+    with pytest.raises(MatrixSetupError, match="cell id"):
+        ledger.parse(malformed)
+
+
+def test_an_alternative_is_asserted_positively_and_replaces_no_clause(tmp_path: Path) -> None:
+    column = next(
+        item
+        for item in cells.toy_columns()
+        if item.features is not None and item.features.structured_output == "prompt_only"
+    )
+    cell = Cell(column, "S04", "raw")
+    in_force = (D_OAI_SCHEMA_FINAL,)
+    untold = {"flag:token_usage_complete=False", "flag:cost_complete=False"}
+
+    def codes(name: str, *faults: str, differences: tuple[str, ...] = in_force) -> frozenset[str]:
+        return runner.execute(
+            cell,
+            tmp_path / name,
+            driver=toy.ToyDriver(frozenset(faults)),
+            differences=differences,
+        ).report.codes
+
+    # The alternative holds: one further request without tools carries the
+    # schema, its answer is the final message, its usage is counted.
+    assert codes("honest", toy.FINAL_SCHEMA_REQUEST) == frozenset()
+    # It is asserted, not waived: an adapter that does not behave so fails it,
+    # and so does one that carries the schema on its tool-bearing requests.
+    assert codes("absent") == {"request.content:schema"}
+    assert codes("misplaced", toy.FINAL_SCHEMA_REQUEST, toy.SCHEMA_MISPLACED) == {
+        "request.content:schema"
+    }
+    # It replaces no clause: the accounting of the further request is owed.
+    assert codes("untold", toy.FINAL_SCHEMA_REQUEST, toy.CLEAR_ACCOUNTING_FLAGS) == untold
+    # Where the ledger does not put it in force, the same request is extra.
+    assert "request.extra" in codes("elsewhere", toy.FINAL_SCHEMA_REQUEST, differences=())
+
+    scenario = SCENARIOS["S04"]
+    with pytest.raises(MatrixSetupError, match="defines no alternative"):
+        plan_for(SCENARIOS["S03"], {}, in_force)
+    changes: tuple[dict[str, Any], ...] = (
+        {"expect": Expectation(kind="transport")},
+        {"max_turns": 1},
+        {"script": ProviderScript((Say("another exchange"),))},
+    )
+    for change in changes:
+
+        def widened(plan: Any, change: dict[str, Any] = change) -> Any:
+            return dataclasses.replace(plan, **change)
+
+        wider = dataclasses.replace(scenario, alternatives={"D-WIDER": widened})
+        with pytest.raises(MatrixSetupError, match="never stands in for a contract clause"):
+            plan_for(wider, {}, ("D-WIDER",))
 
 
 def _single_entry_ledger(cell: str, code: str) -> ledger.Ledger:

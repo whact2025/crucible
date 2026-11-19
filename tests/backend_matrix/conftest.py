@@ -11,7 +11,9 @@
 - an expected failure is a failure unless the item is the cell of a ledger
   entry, so a self-test cannot pass by reaching the comparator's verdict;
 - the outcome of every cell is recorded, so that a matrix module can require
-  that the seam canary of each of its columns passed in this process.
+  that the seam canary of each of its columns passed in this process;
+- when the run writes a JUnit file, the cell report of this process is
+  written beside it.
 """
 
 from __future__ import annotations
@@ -52,3 +54,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[Any]) -> No
 def pytest_runtest_makereport(item: Any, call: Any) -> Iterator[None]:
     outcome: Any = yield
     runner.judge_report(item, outcome.get_result(), _KNOWN)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    runner.write_cell_report(session.config)

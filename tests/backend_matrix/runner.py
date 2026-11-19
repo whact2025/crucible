@@ -37,7 +37,8 @@ from crucible.backends.tool_authority import (
 
 from . import cells as matrix_cells
 from . import columns as matrix_columns
-from . import contract, declarations, drivers, ledger, netguard, toolsets
+from . import contract, declarations, drivers, envelopes, ledger, netguard, toolsets
+from . import report as matrix_report
 from .cells import Cell
 from .columns import Column
 from .contract import Deviation, Observation, Raised, Reference, Report, SecondCall
@@ -59,6 +60,10 @@ class Execution:
     reference: Reference
     report: Report
     current: Mapping[str, str]
+    # The declared differences in force, and the grade of the weakest
+    # envelope the provider answered from (``None``: no envelope was used).
+    differences: tuple[str, ...] = ()
+    grade: str | None = None
 
 
 class _LogCapture(logging.Handler):
@@ -135,8 +140,18 @@ def _require_lens(cell: Cell, bound: Bound, terminal: Any, second: SecondCall | 
         )
 
 
-def execute(cell: Cell, tmp_path: Path, *, driver: Driver | None = None) -> Execution:
-    """Play one cell and evaluate it. Never consults the ledger."""
+def execute(
+    cell: Cell,
+    tmp_path: Path,
+    *,
+    driver: Driver | None = None,
+    differences: Sequence[str] = (),
+) -> Execution:
+    """Play one cell and evaluate it. Never consults the ledger.
+
+    ``differences`` are the declared differences in force on the cell; the
+    caller takes them from the ledger.
+    """
 
     scenario = SCENARIOS[cell.scenario]
     column = cell.column
@@ -146,7 +161,9 @@ def execute(cell: Cell, tmp_path: Path, *, driver: Driver | None = None) -> Exec
     routed_model = declarations.routed_model(
         column, matrix_columns.ROLE_BY_CAPABILITY[scenario.capability]
     )
-    plan = plan_for(scenario, declarations.select(scenario.differences, routed))
+    plan = plan_for(
+        scenario, declarations.select(scenario.differences, routed), differences
+    )
     fixture = (
         None
         if scenario.toolset is None
@@ -254,7 +271,8 @@ def execute(cell: Cell, tmp_path: Path, *, driver: Driver | None = None) -> Exec
     reference = Reference(
         routed=routed,
         model=routed_model,
-        pricing=matrix_columns.rate_card()[column.model],
+        # The rate of the model the cell's route names, as its wire model is.
+        pricing=matrix_columns.matrix_rate(routed_model),
         secrets=(matrix_columns.CANARY_CREDENTIAL, *secrets),
         tool_authority_digest=(
             None
@@ -281,7 +299,16 @@ def execute(cell: Cell, tmp_path: Path, *, driver: Driver | None = None) -> Exec
         checks=plan.checks,
     )
     current = declarations.governing_values(routed, scenario.governing)
-    return Execution(cell, plan, observation, reference, report, current)
+    return Execution(
+        cell,
+        plan,
+        observation,
+        reference,
+        report,
+        current,
+        differences=tuple(differences),
+        grade=envelopes.weakest(provider_ledger.envelopes),
+    )
 
 
 def pin_problems(
@@ -374,8 +401,13 @@ def run_cell(
     failure = preflight.get(cell.column.kind)
     if failure is not None:
         pytest.fail(f"cell {cell.id}: column cannot be driven here: {failure}", pytrace=False)
-    execution = execute(cell, tmp_path, driver=driver)
+    execution = execute(
+        cell, tmp_path, driver=driver, differences=known.differences_for(cell.id)
+    )
     report = execution.report
+    if driver is None and pins is None:
+        # The cell as the matrix plays it, not a self-test with its own driver.
+        matrix_report.note_cell(execution, known)
     if report.seam_problems:
         pytest.fail(
             f"cell {cell.id}: the driver seam is broken, so nothing this column "
@@ -393,6 +425,7 @@ def run_cell(
         report.codes,
         current=execution.current,
         evaluated=report.evaluated(),
+        unasked=report.unasked,
         report=report.describe(),
     )
     return execution
@@ -473,6 +506,22 @@ def record_outcome(item: Any, report: Any) -> None:
         passed = report.passed and not hasattr(report, "wasxfail")
         outcomes = item.config.stash.setdefault(OUTCOMES, {})
         outcomes[cell.id] = "passed" if passed else str(report.outcome)
+    # The cell report keeps the outcome of every cell, static ones included.
+    path, name = getattr(item, "path", None), getattr(item, "name", None)
+    judged = (
+        None
+        if path is None or name is None
+        else matrix_cells.cell_of_item(Path(str(path)).stem, str(name))
+    )
+    if judged is not None:
+        matrix_report.note_outcome(
+            judged,
+            "expected_failure"
+            if hasattr(report, "wasxfail")
+            else "passed"
+            if report.passed
+            else str(report.outcome),
+        )
 
 
 def judge_report(item: Any, report: Any, known: ledger.Ledger) -> None:
@@ -480,6 +529,12 @@ def judge_report(item: Any, report: Any, known: ledger.Ledger) -> None:
 
     refuse_stray_expected_failure(item, report, known)
     record_outcome(item, report)
+
+
+def write_cell_report(config: Any) -> Path | None:
+    """What the package conftest does when the session ends."""
+
+    return matrix_report.write(config.getoption("xmlpath", None))
 
 
 def preflight_all() -> dict[str, str | None]:

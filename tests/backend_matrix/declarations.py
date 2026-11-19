@@ -55,17 +55,25 @@ class Variant:
     kind: Literal["BASE", "FALLBACK", "REFUSED"]
     name: str = ""
     citation: str = ""
+    # The declared difference of the ledger this fallback is, if it is one.
+    difference: str = ""
 
 
 BASE = Variant("BASE")
 
 
-def FALLBACK(name: str, citation: str) -> Variant:  # noqa: N802 - table vocabulary
-    """A declared alternative, asserted positively; cites where it is documented."""
+def FALLBACK(  # noqa: N802 - table vocabulary
+    name: str, citation: str, *, difference: str = ""
+) -> Variant:
+    """A declared alternative, asserted positively; cites where it is documented.
+
+    ``difference`` names the declared difference of the ledger whose
+    alternative contract this fallback asserts.
+    """
 
     if not name or not citation:
         raise MatrixSetupError("a FALLBACK needs a name and a product citation")
-    return Variant("FALLBACK", name, citation)
+    return Variant("FALLBACK", name, citation, difference)
 
 
 def REFUSED(error_type: str) -> Variant:  # noqa: N802 - table vocabulary

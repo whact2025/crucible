@@ -69,7 +69,14 @@ class Driver(Protocol):
     fidelity: Literal["wire", "worker_protocol"]
     bypassed_layers: tuple[str, ...]
     private_seams: tuple[str, ...]
-    inexpressible: Mapping[str, str]
+
+    @property
+    def inexpressible(self) -> Mapping[str, str]:
+        """Script steps the kind's wire cannot carry: the inventory's rows."""
+
+    @property
+    def envelopes(self) -> tuple[str, ...]:
+        """Every envelope the driver's dialect renders from, by name."""
 
     def preflight(self) -> None: ...
 

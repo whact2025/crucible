@@ -45,10 +45,13 @@ PRODUCTS: Mapping[str, Any] = {
 }
 COLUMN_PRODUCT = "deepswe"
 
+HOSTED_GATEWAY_KIND = "openai_compat:hosted"
+LOCAL_GATEWAY_KIND = "openai_compat:local"
+
 # (routing backend, adapter transport) of a catalog lane -> driver kind.
 KIND_TABLE: Mapping[tuple[str, str], str] = {
-    ("openai_compat", "openai_compatible_http"): "openai_compat:hosted",
-    ("local", "openai_compatible_http"): "openai_compat:local",
+    ("openai_compat", "openai_compatible_http"): HOSTED_GATEWAY_KIND,
+    ("local", "openai_compatible_http"): LOCAL_GATEWAY_KIND,
     ("deepseek", "deepseek_responses_worker"): "deepseek",
     ("kimi", "kimi_agent_sdk_worker"): "kimi",
     ("claude", "claude_agent_sdk"): "claude",
@@ -92,6 +95,14 @@ SCRIPTED_ENV: Mapping[str, str] = {
     "CRUCIBLE_LOCAL_URL": "http://127.0.0.1:9/v1",
 }
 
+# The ``${VAR}`` a kind's shipped route takes its endpoint from, for the kinds
+# whose driver needs to know it: the hosted gateway answers that origin on
+# loopback, the local kind points it at the scripted provider.
+ENDPOINT_ENV: Mapping[str, str] = {
+    HOSTED_GATEWAY_KIND: "INFER_BASE_URL",
+    LOCAL_GATEWAY_KIND: "CRUCIBLE_LOCAL_URL",
+}
+
 # Credential and configuration variables a developer machine may hold. No cell
 # may see one: the per-test environment deletes each. They are kept apart from
 # ``SCRIPTED_ENV``, which must equal the ``${VAR}`` references of the routing
@@ -114,6 +125,16 @@ CLEARED_ENV: tuple[str, ...] = (
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
+    # An HTTP client that trusts its environment would route a cell through a
+    # developer machine's proxy.
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
 )
 
 # Worker sub-project (``backends/<name>_worker``) -> the kind it serves. Static
@@ -290,7 +311,9 @@ def toy_columns(
     return tuple(columns[values] for values in sorted(columns))
 
 
-def _matrix_rate(model: str) -> ModelPricing:
+def matrix_rate(model: str) -> ModelPricing:
+    """The one matrix rate, in the shape pricing accepts for ``model``."""
+
     built_in = DEFAULT_PRICING.get(model)
     if built_in is None or built_in.long_context_threshold_tokens is None:
         return MATRIX_RATE
@@ -307,10 +330,18 @@ def _matrix_rate(model: str) -> ModelPricing:
 
 
 def rate_card() -> dict[str, ModelPricing]:
-    """The matrix rate for the toy model and for every catalog model."""
+    """The matrix rate for the toy model and every model a shipped route names.
 
-    models = {TOY_MODEL} | {column.model for column in real_columns()}
-    return {model: _matrix_rate(model) for model in sorted(models)}
+    A lane's roles are separate routes and may name another model than its
+    default route; a cell is priced at the model of the route of its role.
+    """
+
+    models = {TOY_MODEL}
+    for product in PRODUCTS:
+        for lane in catalog_lanes(product):
+            models.add(lane.default_route.model)
+            models.update(route.model for route in lane.role_routes)
+    return {model: matrix_rate(model) for model in sorted(models)}
 
 
 def write_rate_card(path: Path) -> Path:
@@ -329,11 +360,18 @@ def write_rate_card(path: Path) -> Path:
 
 
 @contextlib.contextmanager
-def scripted_environment() -> Iterator[None]:
-    """Expand the routing files' ``${VAR}`` references to their scripted values."""
+def scripted_environment(**endpoints: str) -> Iterator[None]:
+    """Expand the routing files' ``${VAR}`` references to their scripted values.
 
+    ``endpoints`` replaces the value of a scripted variable for the block: the
+    address of the scripted provider where a route's endpoint is loopback.
+    """
+
+    unknown = sorted(set(endpoints) - set(SCRIPTED_ENV))
+    if unknown:
+        raise MatrixSetupError(f"{unknown} are not scripted route variables")
     previous = {name: os.environ.get(name) for name in SCRIPTED_ENV}
-    os.environ.update(SCRIPTED_ENV)
+    os.environ.update({**SCRIPTED_ENV, **endpoints})
     try:
         yield
     finally:

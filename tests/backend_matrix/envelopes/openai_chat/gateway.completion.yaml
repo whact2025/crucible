@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A chat completion that ends cleanly with visible text, as the hosted
+# gateway answers a plain request.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: gateway
+behaviour: completion
+
+provenance:
+  grade: documented
+  sources:
+    - source: >-
+        port note open-weight-live-facts.md, lines 23-27 and 34 ("One request
+        per id", the rows of the production hub)
+      retrieved: "2026-11-18"
+      states: >-
+        One plain chat-completions request per id against the production hub
+        was answered with HTTP 200; the response named the model that was
+        asked for; usage came in the OpenAI shape. No body was stored.
+  notes: >-
+    Only the facts above were observed. The keys they do not name (id,
+    object, created, choices[].index, message.role, finish_reason "stop",
+    usage.total_tokens) are the required fields of
+    openai.types.chat.ChatCompletion in the root SDK (2.44.0), which is what
+    "the OpenAI shape" refers to. Optional fields seen in the same run
+    (reasoning content, token details) are left out on purpose: they belong
+    to the scenario about documented optional fields.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices:
+    - index: 0
+      message:
+        role: assistant
+        content: {slot: text}
+      finish_reason: stop
+  usage:
+    prompt_tokens: {slot: input_tokens}
+    completion_tokens: {slot: output_tokens}
+    total_tokens: {slot: total_tokens}

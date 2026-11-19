@@ -19,7 +19,7 @@ from .base import (
 def load() -> frozenset[str]:
     """Import every driver module, which registers its driver; return the kinds."""
 
-    from . import toy  # noqa: F401,PLC0415 - registration on import
+    from . import openai_compat, toy  # noqa: F401,PLC0415 - registration on import
 
     return registered_kinds()
 

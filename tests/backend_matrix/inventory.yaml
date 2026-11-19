@@ -4,8 +4,10 @@
 # The pinned inventory of the backend conformance matrix.
 #
 # cell_counts: behaviour cells per driver kind. Static cell H03 compares them
-#   with what the generator yields, so a cell cannot vanish unnoticed. A real
-#   kind has no behaviour cell until its driver lands.
+#   with what the generator yields, so a cell cannot vanish unnoticed, and
+#   the verifier (`python -m tests.backend_matrix.verify`) compares them with
+#   the JUnit files of a run. A real kind has no behaviour cell until its
+#   driver lands.
 # not_evaluated: (cell, clause) pairs a cell cannot evaluate for a reason of
 #   its driver. An unpinned pair fails the cell, and so does a pinned pair
 #   whose clause was evaluated. Which clauses apply to a cell is computed from
@@ -31,8 +33,9 @@ cell_counts:
   "codex:official": 0
   deepseek: 0
   kimi: 0
-  "openai_compat:hosted": 0
-  "openai_compat:local": 0
+  # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
+  "openai_compat:hosted": 14
+  "openai_compat:local": 7
 
 not_evaluated:
   - scenario: S00

@@ -14,8 +14,14 @@ A cell computes its deviation codes; ``ledger.yaml`` says what is expected.
   declared values it was observed under and must close under, so a fix that
   deletes its entry leaves the passing cell pinned, and a declaration cannot
   be weakened to close a gap unless the record names that change.
-- ``integrity_problems`` is static cell H03: registry, entries, inventory and
-  oracle rules, over a :class:`World` that tests may build synthetically.
+- A *declared difference* is a named alternative contract with a product
+  citation, an owner and a date. Either a variant of a difference table
+  asserts it (a declared value selects it), or a scenario defines it and the
+  entry lists the cells on which it is in force. It is counted apart from
+  the known gaps and replaces no contract clause.
+- ``integrity_problems`` is static cell H03: registry, entries, declared
+  differences, inventory and oracle rules, over a :class:`World` that tests
+  may build synthetically.
 - Only real-kind behaviour cells and the static cells H01 and H02 may be known
   gaps. The other static cells are the matrix's own integrity checks:
   ``judge_static`` never consults the ledger for them, and H03 rejects an
@@ -120,6 +126,8 @@ class DeclaredDifference:
     owner: str
     date: str
     alternative: str
+    # The cells it is in force on, when no declared value selects it.
+    cells: tuple[str, ...] = ()
     ruling: str | None = None
 
 
@@ -137,6 +145,11 @@ class Ledger:
             if item.cell == cell:
                 return item
         return None
+
+    def differences_for(self, cell: str) -> tuple[str, ...]:
+        """The declared differences in force on ``cell``, in ledger order."""
+
+        return tuple(item.id for item in self.differences if cell in item.cells)
 
 
 # -- loading ---------------------------------------------------------------
@@ -266,8 +279,13 @@ def parse(document: Any) -> Ledger:
             raw,
             "declared_differences[]",
             {"id", "citation", "owner", "date", "alternative"},
-            {"ruling"},
+            {"cells", "ruling"},
         )
+        scoped = item.get("cells") or ()
+        if not isinstance(scoped, (list, tuple)):
+            raise MatrixSetupError("ledger: declared difference cells must be a list")
+        for scoped_cell in scoped:
+            parse_cell_id(_text(scoped_cell, "declared difference cell"))
         differences.append(
             DeclaredDifference(
                 id=_text(item["id"], "declared difference id"),
@@ -276,6 +294,7 @@ def parse(document: Any) -> Ledger:
                 date=_text(str(item["date"]), "declared difference date"),
                 # A difference without an alternative contract asserts nothing.
                 alternative=_text(item["alternative"], "declared difference alternative"),
+                cells=tuple(scoped),
                 ruling=item.get("ruling"),
             )
         )
@@ -321,19 +340,26 @@ def compare(
     *,
     current: Mapping[str, str],
     evaluated: frozenset[str] = frozenset(),
+    unasked: frozenset[str] = frozenset(),
     report: str = "",
 ) -> None:
     """Pass, report an expected failure, or fail: the three-way rule.
 
     ``current`` holds the cell's governing declared values now; ``evaluated``
-    the clauses the cell evaluated (a column-wide code is owed only there).
+    the clauses the cell evaluated and ``unasked`` the codes whose check the
+    result's own flags switched off there. A column-wide code is owed where
+    its clause was evaluated and its check was asked, and nowhere else.
     """
 
     kind = parse_cell_id(cell)[0]
     remaining = set(codes)
     gaps: list[str] = []
     for scope in ledger.column_wide:
-        if scope.kind != kind or clause_of(scope.code) not in evaluated:
+        if (
+            scope.kind != kind
+            or clause_of(scope.code) not in evaluated
+            or scope.code in unasked
+        ):
             continue
         if scope.code not in remaining:
             _fail(
@@ -429,6 +455,11 @@ class World:
     liar_clauses: frozenset[str] = frozenset()
     snapshot_values: Mapping[str, frozenset[str]] = field(default_factory=dict)
     toy_values: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Declared differences the scenarios assert: through a variant of a
+    # difference table, or as an alternative in force on listed cells
+    # (id -> the scenarios that define it).
+    difference_variants: frozenset[str] = frozenset()
+    difference_alternatives: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 def _pack(world: World, scenario: str) -> str:
@@ -664,6 +695,67 @@ def _entry_problems(ledger: Ledger, world: World) -> list[Deviation]:
     return out
 
 
+def _difference_problems(ledger: Ledger, world: World) -> list[Deviation]:
+    """A declared difference is asserted by a scenario, and only where listed."""
+
+    out: list[Deviation] = []
+    declared = [item.id for item in ledger.differences]
+    asserted = world.difference_variants | set(world.difference_alternatives)
+    for name in sorted(asserted - set(declared)):
+        out.append(
+            Deviation(
+                "static:difference_undeclared",
+                f"a scenario asserts the alternative of {name}, which the ledger "
+                "does not declare",
+            )
+        )
+    for name in sorted({name for name in declared if declared.count(name) > 1}):
+        out.append(Deviation("static:difference_duplicate", f"{name} is declared twice"))
+    for item in ledger.differences:
+        where = f"declared difference {item.id}"
+        if item.id not in asserted:
+            out.append(
+                Deviation(
+                    "static:difference_unused",
+                    f"{where}: no scenario asserts its alternative contract",
+                )
+            )
+            continue
+        scenarios = world.difference_alternatives.get(item.id)
+        if scenarios is None:
+            # A declared value selects it; it has no cell list of its own.
+            if item.cells:
+                out.append(
+                    Deviation(
+                        "static:difference_cell_invalid",
+                        f"{where} is selected by a declared value and lists cells",
+                    )
+                )
+            continue
+        if not item.cells:
+            out.append(
+                Deviation("static:difference_unused", f"{where} is in force on no cell")
+            )
+        for cell in item.cells:
+            kind, scenario, _role, _lens = parse_cell_id(cell)
+            if (
+                item.cells.count(cell) > 1
+                or cell not in world.generated
+                or kind == world.toy_kind
+                or scenario in world.canary_scenarios
+                or scenario not in scenarios
+            ):
+                out.append(
+                    Deviation(
+                        "static:difference_cell_invalid",
+                        f"{where} lists {cell}: it must be listed once, be a "
+                        "generated cell of a real kind, not the canary, and its "
+                        "scenario must define the alternative",
+                    )
+                )
+    return out
+
+
 def _inventory_problems(world: World) -> list[Deviation]:
     out: list[Deviation] = []
     for kind in sorted(set(world.cell_counts) | set(world.pinned_counts)):
@@ -745,6 +837,7 @@ def integrity_problems(ledger: Ledger, world: World) -> list[Deviation]:
     return [
         *_registry_problems(ledger, world),
         *_entry_problems(ledger, world),
+        *_difference_problems(ledger, world),
         *_inventory_problems(world),
         *_oracle_problems(world),
     ]

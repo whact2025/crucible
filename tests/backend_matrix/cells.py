@@ -14,6 +14,10 @@ cannot be withdrawn from one kind. The only per-scenario exception is the
 not-expressible list pinned in ``inventory.yaml``, applied before any declared
 value is read.
 
+The *item inventory* names the pytest item that judges each cell: the test
+module of its driver family and the test's name. The verifier compares it
+with the JUnit files of a run, and the outcome recorder reads it back.
+
 Everything here is computable without a driver's ``preflight()`` and without a
 worker environment.
 """
@@ -34,7 +38,15 @@ from .columns import REAL_KINDS, TOY_KIND, Column
 from .contract import CLAUSES
 from .drivers import toy
 from .drivers.base import MatrixSetupError
-from .scenarios import PACK_A, SCENARIOS, STARTER, Scenario, governing_fields
+from .scenarios import (
+    PACK_A,
+    SCENARIOS,
+    STARTER,
+    Scenario,
+    difference_alternatives,
+    difference_variants,
+    governing_fields,
+)
 
 INVENTORY_PATH = Path(__file__).with_name("inventory.yaml")
 INVENTORY_SCHEMA = "crucible.backend-matrix.inventory.v1"
@@ -44,11 +56,38 @@ INVENTORY_SCHEMA = "crucible.backend-matrix.inventory.v1"
 ENABLEMENT: Mapping[str, tuple[str, ...]] = {
     TOY_KIND: (STARTER, PACK_A),
     **{kind: () for kind in REAL_KINDS},
+    matrix_columns.HOSTED_GATEWAY_KIND: (STARTER,),
+    matrix_columns.LOCAL_GATEWAY_KIND: (STARTER,),
 }
 # A secondary column runs these sets; a blocked column these scenarios.
 SECONDARY_SETS: tuple[str, ...] = (STARTER, PACK_A)
 BLOCKED_SCENARIOS: tuple[str, ...] = ("S00", "S01", "S51")
 STATIC_SCENARIOS: tuple[str, ...] = ("P01", "P02", "P04", "H01", "H02", "H03", "H04")
+
+# Where each cell is judged. One test module per driver family, because the
+# shard planner places whole files; a module may hold two kinds.
+PACKAGE_MODULE = "tests.backend_matrix"
+BEHAVIOUR_TEST = "test_cell"
+MODULE_BY_KIND: Mapping[str, str] = {
+    TOY_KIND: "test_matrix_self",
+    matrix_columns.HOSTED_GATEWAY_KIND: "test_matrix_openai_compat",
+    matrix_columns.LOCAL_GATEWAY_KIND: "test_matrix_openai_compat",
+}
+STATIC_MODULE = "test_matrix_static"
+# Static scenario -> its test, and whether the test is parametrised by cell id.
+STATIC_TESTS: Mapping[str, tuple[str, bool]] = {
+    "P01": ("test_p01_protocol_surface", True),
+    "P02": ("test_p02_profile_binding", True),
+    "P04": ("test_p04_declared_profile_snapshot", False),
+    "H01": ("test_h01_no_test_skips_on_a_missing_worker_runtime", True),
+    "H02": ("test_h02_every_backend_is_driven", True),
+    "H03": ("test_h03_ledger_and_oracle_integrity", False),
+    "H04": ("test_h04_worker_environments_only_behind_the_guard", False),
+}
+# The last test of each module: it fails when a cell the module relies on
+# did not pass, so it must have run too.
+CANARY_CHECK = "test_canary_passed_for_every_column"
+STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
 
 
 @dataclass(frozen=True)
@@ -62,6 +101,15 @@ class Cell:
     @property
     def id(self) -> str:
         return ledger.cell_id(self.column.kind, self.scenario, self.column.role, self.lens)
+
+
+@dataclass(frozen=True)
+class Item:
+    """One expected pytest item: where a cell is judged, or a closing check."""
+
+    module: str
+    name: str
+    cell: str | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +319,53 @@ def inventory() -> dict[str, Any]:
     return {"behaviour": by_kind, "static": list(static_cell_ids())}
 
 
+def module_of(kind: str) -> str:
+    """The test module that holds the cells of a driven kind."""
+
+    try:
+        return MODULE_BY_KIND[kind]
+    except KeyError as exc:
+        raise MatrixSetupError(
+            f"kind {kind!r} is driven but no test module is named for it"
+        ) from exc
+
+
+@functools.cache
+def expected_items() -> tuple[Item, ...]:
+    """Every pytest item a complete run of the package holds a verdict in."""
+
+    items: list[Item] = []
+    modules: list[str] = []
+    for cell in behaviour_cells():
+        module = module_of(cell.column.kind)
+        if module not in modules:
+            modules.append(module)
+        items.append(Item(module, f"{BEHAVIOUR_TEST}[{cell.id}]", cell.id))
+    for cell_id in static_cell_ids():
+        test, parametrised = STATIC_TESTS[ledger.parse_cell_id(cell_id)[1]]
+        items.append(
+            Item(STATIC_MODULE, f"{test}[{cell_id}]" if parametrised else test, cell_id)
+        )
+    items.extend(Item(module, CANARY_CHECK) for module in modules)
+    items.append(Item(STATIC_MODULE, STATIC_CHECK))
+    return tuple(items)
+
+
+@functools.cache
+def _cell_by_item() -> Mapping[tuple[str, str], str]:
+    return {
+        (item.module, item.name): item.cell
+        for item in expected_items()
+        if item.cell is not None
+    }
+
+
+def cell_of_item(module: str, name: str) -> str | None:
+    """The cell a pytest item judges, by its module and test name."""
+
+    return _cell_by_item().get((module, name))
+
+
 def refuse_skip_markers(items: Sequence[Any], root: Path) -> None:
     """Refuse every item under ``root`` that carries a skip or xfail marker.
 
@@ -339,4 +434,6 @@ def world() -> ledger.World:
             name: frozenset(str(getattr(c.features, name)) for c in toy_columns())
             for name in fields
         },
+        difference_variants=difference_variants(),
+        difference_alternatives=difference_alternatives(),
     )

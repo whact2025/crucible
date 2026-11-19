@@ -116,6 +116,7 @@ IGNORE_CONTEXT_BUDGET = "ignore_context_budget"
 REFUSAL_AS_TRANSPORT = "refusal_as_transport"
 WRITE_AROUND_WRAPPER = "write_around_wrapper"
 SUBSTITUTE_WIRE_MODEL = "substitute_wire_model"
+SUBSTITUTE_SECOND_REQUEST_MODEL = "substitute_second_request_model"
 TWO_REQUEST_EVENTS = "two_request_events"
 GET_BEFORE_TURN = "get_before_turn"
 FOREIGN_USER_AGENT = "foreign_user_agent"
@@ -135,6 +136,11 @@ SECOND_CALL_RAISES = "second_call_raises"
 SCHEMA_ANSWER_INVALID = "schema_answer_invalid"
 NO_LIMIT_EVENT = "no_limit_event"
 DISPATCH_STOP_MISNAMED = "dispatch_stop_misnamed"
+# Not a fault but a trait: after a tool loop with a response schema the
+# adapter sends one further request without tools that carries the schema, as
+# the declared difference D-OAI-SCHEMA-FINAL describes. Honest where that
+# difference is in force, an extra request anywhere else.
+FINAL_SCHEMA_REQUEST = "final_schema_request"
 # Faults of the driver, not of the adapter: the limit guard is bound to
 # another profile than the one routing computes for the column, or the adapter
 # is built for another model than the column's route names.
@@ -237,15 +243,27 @@ class HonestBackend:
         return [str(item["name"]) for item in self._toolset.to_anthropic_tools()]
 
     def _body(
-        self, run: _Run, turn: int, results: list[dict[str, str]], tools: list[str]
+        self,
+        run: _Run,
+        turn: int,
+        results: list[dict[str, str]],
+        tools: list[str],
+        *,
+        finalize: bool = False,
     ) -> dict[str, Any]:
         invocation = run.invocation
         system = invocation.system
         model = self.model
         if SUBSTITUTE_WIRE_MODEL in self._faults:
             model += "-fallback"
+        if SUBSTITUTE_SECOND_REQUEST_MODEL in self._faults and run.rounds == 1:
+            # ``rounds`` counts the requests already sent: this is the second.
+            model += "-fallback"
         body: dict[str, Any] = {"model": model, "user": invocation.user, "turn": turn}
         placement = self._profile.structured_output
+        if FINAL_SCHEMA_REQUEST in self._faults:
+            # The schema travels in the one final request only, as a field.
+            placement = "native" if finalize else "unsupported"
         if SCHEMA_MISPLACED in self._faults:
             placement = "prompt_only" if placement == "native" else "native"
         if invocation.response_schema is not None:
@@ -356,7 +374,17 @@ class HonestBackend:
             if isinstance(reply, InvocationResult):
                 return reply
             if reply["type"] != "tool_calls":
-                return self._answer(run, str(reply.get("text", "")))
+                text = str(reply.get("text", ""))
+                if (
+                    FINAL_SCHEMA_REQUEST in self._faults
+                    and self._toolset is not None
+                    and invocation.response_schema is not None
+                ):
+                    final = self._exchange(run, turn + 1, [], [], timeout, finalize=True)
+                    if isinstance(final, InvocationResult):
+                        return final
+                    text = str(final.get("text", ""))
+                return self._answer(run, text)
             limited = self._profile.turn_limit != "unsupported"
             at_limit = limited and turn >= invocation.max_turns
             if at_limit and self._profile.turn_limit != "round_boundary":
@@ -383,10 +411,12 @@ class HonestBackend:
         results: list[dict[str, str]],
         tools: list[str],
         timeout: float,
+        *,
+        finalize: bool = False,
     ) -> dict[str, Any] | InvocationResult:
         """One provider round: a reply to continue with, or the typed terminal."""
 
-        body = self._body(run, turn, results, tools)
+        body = self._body(run, turn, results, tools, finalize=finalize)
         self._dump({"turn": turn, "request": body})
         run.rounds += 1
         if REQUEST_EVENT_PER_ROUND in self._faults:
@@ -698,6 +728,7 @@ class ToyDriver:
     )
     private_seams: tuple[str, ...] = ()
     inexpressible: Mapping[str, str] = {}
+    envelopes: tuple[str, ...] = ()  # the toy dialect renders its own replies
 
     def __init__(self, faults: frozenset[str] = frozenset()) -> None:
         self.faults = faults
@@ -882,6 +913,10 @@ LIARS: tuple[Liar, ...] = (
     _liar("S03", DISPATCH_UNATTACHED, (f"dispatch.extra:{_UNATTACHED_TOOL}",), ("C10",)),
     # A tool cell runs through another routing role than a text cell.
     _liar("S03", SUBSTITUTE_WIRE_MODEL, _SUBSTITUTED, ("C7",)),
+    # Another model on one later round only (a retry on a fallback, a cheaper
+    # model for one request): every scripted request is read, not the first.
+    # The last reply is served under the route's model, so only the wire shows it.
+    _liar("S03", SUBSTITUTE_SECOND_REQUEST_MODEL, ("request.content:model",), ("C7",)),
     _liar(
         "S03",
         REQUEST_EVENT_PER_ROUND,

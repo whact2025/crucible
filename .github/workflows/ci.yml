@@ -238,6 +238,8 @@ jobs:
         run: >-
           uv run --frozen python -c
           "from pathlib import Path; from scripts.test_shard import verify_shard_evidence; verify_shard_evidence(Path('.'))"
+      - name: Require every backend matrix cell in the shard reports
+        run: uv run --frozen python -m tests.backend_matrix.verify
       - name: Combine complete coverage and enforce the floor
         run: |
           uv run --frozen python -m coverage combine --keep

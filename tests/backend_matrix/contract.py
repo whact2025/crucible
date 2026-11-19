@@ -49,6 +49,8 @@ SCENARIO = "S"
 # _incomplete_limit_evidence_result).
 GUARD_STOP_REASONS = frozenset({"limit_contract_violated", "limit_evidence_incomplete"})
 MAX_ERROR_TEXT = 2000
+# What C6 asks only of a result that flags its cost complete.
+PRICING_CODES = frozenset({"pricing:none", "pricing:unreconciled"})
 
 # The closed deviation vocabulary: every code a cell may emit, with the clause
 # it is booked under ("S" is the scenario contract, "D" the declaration lock).
@@ -222,6 +224,9 @@ class Report:
 
     outcomes: Mapping[str, ClauseOutcome]
     seam_problems: tuple[str, ...] = ()
+    # Codes whose check the result's own flags switched off inside a clause
+    # that was evaluated. A column-wide known gap is not owed there.
+    unasked: frozenset[str] = frozenset()
 
     @property
     def codes(self) -> frozenset[str]:
@@ -541,6 +546,19 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
                 )
             )
     return out
+
+
+def _unasked(obs: Observation) -> frozenset[str]:
+    """Checks a result's own flags switch off inside a clause that is evaluated.
+
+    C6 requires pricing evidence of a result that flags its cost complete; a
+    result that flags it incomplete owes a lower bound and no evidence.
+    """
+
+    result = obs.result
+    if result is not None and not result.completeness.cost_complete:
+        return PRICING_CODES
+    return frozenset()
 
 
 def _c7(obs: Observation, ref: Reference, *, toolset: bool) -> list[Deviation]:
@@ -895,4 +913,4 @@ def evaluate(
         outcomes[SCENARIO] = ClauseOutcome("stood_for", reason=raised.code)
     else:
         outcomes[SCENARIO] = ClauseOutcome("ok")
-    return Report(outcomes, tuple(obs.provider.seam_problems))
+    return Report(outcomes, tuple(obs.provider.seam_problems), _unasked(obs))

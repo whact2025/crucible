@@ -101,14 +101,45 @@ feature field), teach `HonestBackend` in `backend_matrix/drivers/toy.py` to
 play it, and add at least one liar there with the exact codes its cell must
 yield. Static cell H03 rejects a scenario without a liar.
 
+A real column is driven by replacing the network, never the adapter: the
+backend is built with `resolve_for_role` on its shipped routing file and
+answered by a scripted provider on loopback. The hosted gateway route keeps
+its production URL and [an origin redirect](backend_matrix/tap.py) answers
+that origin on loopback; the local route points at the scripted provider.
+The seam canary `S00` of each column fails unless the request is the SDK's own
+(path, user agent, credential, the host the client addressed), and every
+matrix module ends with a check that the canaries of its columns passed.
+
+A scripted reply is an envelope under `backend_matrix/envelopes/<dialect>/`
+with only its slots filled, and each envelope states where its shape comes
+from: `recorded` from the provider, `documented` by the vendor or a live
+observation, or `constructed` to satisfy the SDK's types. The weakest envelope
+a cell used is its grade. A difference that no feature field expresses is a
+declared difference of the ledger, with a product citation and the alternative
+contract that is asserted instead; it replaces no contract clause.
+
 ```bash
 uv run python -m pytest -q tests/backend_matrix
 ```
 
 The run proves the oracle on the toy driver (honest cells pass, every liar
-yields exactly its codes) and runs the static cells. It needs Linux, no
-network and no credentials; a network guard fails any test of the package that
-reaches beyond loopback.
+yields exactly its codes), runs the driven columns and the static cells. It
+needs Linux, no network and no credentials; a network guard fails any test of
+the package that reaches beyond loopback.
+
+After the CI shards, the coverage job runs the cell-inventory verifier on
+their JUnit files:
+
+```bash
+uv run python -m tests.backend_matrix.verify
+```
+
+It fails when an expected cell is missing or ran twice, when an item of the
+package was skipped, when an expected failure has no ledger entry or a
+ledgered cell passed, and when the cell count of a kind differs from the
+pinned one. A run that writes a JUnit file also writes
+`matrix-report-<n>.json` beside it: the codes, gaps, declared values, clause
+outcomes and grade of every cell the process judged.
 
 ## Live tests
 

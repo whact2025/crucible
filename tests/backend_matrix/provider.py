@@ -14,8 +14,13 @@ scenario that is about it, never used to pick a reply.
 
 A dialect turns a script step into one provider's reply and reads a request
 back into the neutral :class:`SeenRequest`. This module holds the toy dialect,
-the minimal one the toy driver speaks; the vendor dialects arrive with their
-drivers.
+the minimal one the toy driver speaks; a vendor dialect lives with its driver
+and renders its replies from envelopes (:mod:`.envelopes`).
+
+A dialect may name a served model that differs from the requested one only
+for a ``ServedAs`` step. Anything else is a seam problem: a dialect that
+answers under a fixed id would switch off the "served equals requested"
+check for its whole kind.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import json
 import socketserver
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from .drivers.base import MatrixSetupError
 from .script import (
@@ -63,6 +68,9 @@ class SeenRequest:
     budget_control: float | None
     schema_field: bool
     matched: bool = False
+    # The Host header as the provider received it: the address the client
+    # believed it was talking to.
+    host: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,8 @@ class ProviderLedger:
     billed: list[TokenUsage] = field(default_factory=list)
     served_models: list[str] = field(default_factory=list)
     sent_calls: list[SentCall] = field(default_factory=list)
+    # The envelope each matched reply was rendered from (vendor dialects).
+    envelopes: list[str] = field(default_factory=list)
     extra: int = 0
     unconsumed: int = 0
     probe_requests: int = 0
@@ -109,6 +119,28 @@ class Reply:
     usage: TokenUsage | None = None
     served_model: str | None = None
     call: tuple[str, str, Mapping[str, Any]] | None = None  # slot, call id, arguments
+    envelope: str | None = None  # the envelope the body was rendered from
+
+
+class Dialect(Protocol):
+    """One provider's wire: how a request reads and how a step is answered."""
+
+    name: str
+    path: str
+
+    def parse(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        credential: str,
+    ) -> SeenRequest: ...
+
+    def seam_problems(self, seen: SeenRequest) -> list[str]: ...
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply: ...
 
 
 class ToyDialect:
@@ -150,6 +182,7 @@ class ToyDialect:
             turn_control=payload.get("max_turns"),
             budget_control=payload.get("budget_usd"),
             schema_field="response_schema" in payload,
+            host=headers.get("Host", ""),
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -256,10 +289,10 @@ class LoopbackProvider:
         script: ProviderScript,
         *,
         credential: str,
-        dialect: ToyDialect | None = None,
+        dialect: Dialect | None = None,
     ) -> None:
         self._script = script
-        self._dialect = dialect or ToyDialect()
+        self._dialect: Dialect = dialect or ToyDialect()
         self._credential = credential
         self._lock = threading.Lock()
         self._ledger = ProviderLedger()
@@ -270,6 +303,7 @@ class LoopbackProvider:
         self._calls = 0
         self._probing = False
         self._closed_for_cell = False
+        self._served_seam_reported = False
         self._frozen: ProviderLedger | None = None
         # A step the dialect cannot render is a setup error here, in the test's
         # thread, not a dropped connection inside the server's.
@@ -381,10 +415,24 @@ class LoopbackProvider:
                 self._ledger.seam_problems.extend(self._dialect.seam_problems(seen))
             self._calls += 1
             reply = self._dialect.render(step, seen, f"call-{self._calls}")
+            if (
+                reply.served_model is not None
+                and reply.served_model != seen.model
+                and not isinstance(step, ServedAs)
+                and not self._served_seam_reported
+            ):
+                self._served_seam_reported = True
+                self._ledger.seam_problems.append(
+                    f"the {self._dialect.name} dialect answered under model "
+                    f"{reply.served_model!r} a request for {seen.model!r} although "
+                    "the script has no ServedAs step there"
+                )
             if reply.usage is not None:
                 self._ledger.billed.append(reply.usage)
             if reply.served_model is not None:
                 self._ledger.served_models.append(reply.served_model)
+            if reply.envelope is not None:
+                self._ledger.envelopes.append(reply.envelope)
             if reply.call is None:
                 self._pending_call_ids = ()
             else:
@@ -425,6 +473,7 @@ class LoopbackProvider:
                     billed=list(self._ledger.billed),
                     served_models=list(self._ledger.served_models),
                     sent_calls=list(self._ledger.sent_calls),
+                    envelopes=list(self._ledger.envelopes),
                     seam_problems=list(self._ledger.seam_problems),
                 )
             return self._frozen

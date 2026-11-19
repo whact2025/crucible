@@ -11,6 +11,12 @@ by the governing declared field selects ``BASE``, a named ``FALLBACK`` or
 ``REFUSED``; the table is total over the field's vocabulary. No scenario asks
 which backend it runs on.
 
+A difference that no feature field expresses is a *declared difference* of
+the ledger: the scenario defines its alternative contract under the id of the
+difference, and the ledger says on which cells it is in force. An alternative
+may add the optional tail of the script and change the assertions the
+scenario itself makes, nothing else: it never stands in for a contract clause.
+
 Every scenario lands with a lying counterpart on the toy driver
 (:mod:`.drivers.toy`); a scenario without a liar cannot be enabled anywhere.
 """
@@ -91,6 +97,9 @@ class Scenario:
     fallbacks: Mapping[str, Callable[[Plan], Plan]] = field(default_factory=dict)
     policy: BackendPolicy = BASE_POLICY
     canary: bool = False
+    # Alternative contracts of declared differences no feature field selects,
+    # by difference id. The ledger says on which cells one is in force.
+    alternatives: Mapping[str, Callable[[Plan], Plan]] = field(default_factory=dict)
 
     @property
     def capability(self) -> str:
@@ -101,8 +110,18 @@ class Scenario:
         return tuple(self.differences)
 
 
-def plan_for(scenario: Scenario, variants: Mapping[str, Variant]) -> Plan:
-    """Apply the selected variant of every governing field to the base plan."""
+def plan_for(
+    scenario: Scenario,
+    variants: Mapping[str, Variant],
+    differences: Sequence[str] = (),
+) -> Plan:
+    """Apply the selected variants, then the declared differences in force.
+
+    ``differences`` are the ids the ledger lists for the cell. Each must have
+    an alternative here, and an alternative may only add the optional tail of
+    the script and change the assertions of the scenario: the expected result,
+    the scripted steps and every limit stay, so no clause is replaced.
+    """
 
     plan = scenario.plan()
     for variant in variants.values():
@@ -115,6 +134,24 @@ def plan_for(scenario: Scenario, variants: Mapping[str, Variant]) -> Plan:
                 expect=Expectation(outcome="refused", refused_type=variant.name),
                 checks=(),
             )
+    for name in differences:
+        alternative = scenario.alternatives.get(name)
+        if alternative is None:
+            raise MatrixSetupError(
+                f"scenario {scenario.id} defines no alternative for the declared "
+                f"difference {name}"
+            )
+        changed = alternative(plan)
+        if (
+            replace(changed, script=plan.script, checks=plan.checks) != plan
+            or changed.script.steps != plan.script.steps
+        ):
+            raise MatrixSetupError(
+                f"the alternative of {name} on {scenario.id} changes more than "
+                "the tail of the script and the assertions of the scenario; a "
+                "declared difference never stands in for a contract clause"
+            )
+        plan = changed
     return plan
 
 
@@ -263,6 +300,25 @@ def schema_in_prompt(obs: Observation, _ref: Reference) -> list[Deviation]:
     ]
 
 
+def schema_in_final_request(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The schema travels in exactly one request, the last, which has no tools."""
+
+    requests = _matched(obs)
+    if not requests:
+        return []  # nothing reached the provider: C0 reports it
+    carrying = [request for request in requests if request.schema_field]
+    if len(carrying) == 1 and carrying[0] is requests[-1] and not carrying[0].tools:
+        return []
+    return [
+        Deviation(
+            "request.content:schema",
+            f"{len(carrying)} of {len(requests)} request(s) carry the schema in "
+            "the schema field of the provider; exactly one must, the last, and "
+            "it must advertise no tools",
+        )
+    ]
+
+
 def no_turn_control(obs: Observation, _ref: Reference) -> list[Deviation]:
     if all(request.turn_control is None for request in obs.provider.requests):
         return []
@@ -391,6 +447,24 @@ def _no_turn_control(plan: Plan) -> Plan:
 
 def _cost_reported_only(plan: Plan) -> Plan:
     return replace(plan, expect=CLEAN)
+
+
+# Declared differences (the ledger holds their citation, owner and scope).
+D_STRUCT_UNQUALIFIED = "D-STRUCT-UNQUALIFIED"
+D_OAI_SCHEMA_FINAL = "D-OAI-SCHEMA-FINAL"
+
+
+def _schema_in_one_final_request(plan: Plan) -> Plan:
+    """One further no-tools request carries the schema and answers with it."""
+
+    kept = tuple(
+        check for check in plan.checks if check not in (schema_in_field, schema_in_prompt)
+    )
+    return replace(
+        plan,
+        script=replace(plan.script, tail=Say(SCHEMA_ANSWER)),
+        checks=(*kept, schema_in_final_request),
+    )
 
 
 # -- the catalogue -----------------------------------------------------------
@@ -530,6 +604,7 @@ _ALL: tuple[Scenario, ...] = (
                     "schema_unclaimed",
                     "crucible/backends/features.py:79-81 (no native-schema "
                     "conformance claim)",
+                    difference=D_STRUCT_UNQUALIFIED,
                 ),
             }
         },
@@ -539,6 +614,7 @@ _ALL: tuple[Scenario, ...] = (
             ),
             "schema_unclaimed": lambda plan: _swap_check(plan, schema_in_field, None),
         },
+        alternatives={D_OAI_SCHEMA_FINAL: _schema_in_one_final_request},
     ),
     Scenario(
         id="S10a",
@@ -716,6 +792,30 @@ def governing_fields(scenarios: Sequence[Scenario] = _ALL) -> tuple[str, ...]:
     for scenario in scenarios:
         fields.extend(name for name in scenario.governing if name not in fields)
     return tuple(fields)
+
+
+def difference_variants(scenarios: Sequence[Scenario] = _ALL) -> frozenset[str]:
+    """Declared differences that a variant of a difference table asserts."""
+
+    return frozenset(
+        variant.difference
+        for scenario in scenarios
+        for table in scenario.differences.values()
+        for variant in table.values()
+        if variant.difference
+    )
+
+
+def difference_alternatives(
+    scenarios: Sequence[Scenario] = _ALL,
+) -> dict[str, frozenset[str]]:
+    """Declared differences in force per cell: id -> the scenarios defining one."""
+
+    found: dict[str, set[str]] = {}
+    for scenario in scenarios:
+        for name in scenario.alternatives:
+            found.setdefault(name, set()).add(scenario.id)
+    return {name: frozenset(ids) for name, ids in sorted(found.items())}
 
 
 def _validate() -> None:

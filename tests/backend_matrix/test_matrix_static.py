@@ -27,8 +27,9 @@ import assay
 from assay import BackendFeatureSet
 from crucible.backends import BACKEND_NAMES
 
-from . import cells, contract, declarations, drivers, ledger, runner
+from . import cells, contract, declarations, drivers, envelopes, ledger, runner
 from . import columns as matrix_columns
+from . import report as matrix_report
 from .columns import REAL_KINDS, TOY_KIND, WORKER_KINDS, Column
 from .contract import Deviation
 from .drivers import toy
@@ -54,6 +55,7 @@ def _verdict(cell: str, problems: Sequence[Deviation]) -> None:
 
     assert cell in cells.static_cell_ids(), f"{cell} is not in the inventory"
     _JUDGED.add(cell)
+    matrix_report.note_static(cell, problems, LEDGER)
     ledger.judge_static(LEDGER, cell, problems)
 
 
@@ -314,14 +316,43 @@ def test_h03_ledger_and_oracle_integrity() -> None:
         _static_id(ledger.ALL_KINDS, "H03"),
         ledger.integrity_problems(LEDGER, cells.world()),
     )
-    # Part 1: exactly eight expected failures, each on a cell its record lists.
-    assert sorted(entry.cell for entry in LEDGER.entries) == sorted(
+    # The static gaps: the Kimi worker skips, and H02 for every kind (no
+    # driver yet, or driven without pack A).
+    gateway = (matrix_columns.HOSTED_GATEWAY_KIND, matrix_columns.LOCAL_GATEWAY_KIND)
+    static = [entry for entry in LEDGER.entries if entry.cell.endswith(ledger.STATIC_LENS)]
+    assert sorted(entry.cell for entry in static) == sorted(
         [
             _static_id(WORKER_KINDS["kimi"], "H01"),
             *(_static_id(kind, "H02") for kind in REAL_KINDS),
         ]
     )
-    assert not LEDGER.column_wide and not LEDGER.differences
+    assert {
+        kind: set(LEDGER.entry(_static_id(kind, "H02")).codes)  # type: ignore[union-attr]
+        for kind in REAL_KINDS
+    } == {
+        kind: {"static:pack_a_not_enabled" if kind in gateway else "static:no_driven_column"}
+        for kind in REAL_KINDS
+    }
+    # Part 2, the gateway columns on the starter set: G28 on the guarded tool
+    # loops, G29 where a schema finalisation follows a tool loop, and G32
+    # wherever the adapter flags its cost complete.
+    behaviour = {
+        entry.cell: set(entry.codes.values()) for entry in LEDGER.entries if entry not in static
+    }
+    columns = [(gateway[0], "primary"), (gateway[0], "secondary"), (gateway[1], "primary")]
+    assert behaviour == {
+        ledger.cell_id(kind, scenario, role, lens): gaps
+        for kind, role in columns
+        for scenario, lens, gaps in (
+            ("S03", "guarded", {"G28"}),
+            ("S04", "raw", {"G29"}),
+            ("S04", "guarded", {"G28", "G29"}),
+        )
+    }
+    assert {(scope.kind, scope.code, scope.gap) for scope in LEDGER.column_wide} == {
+        (kind, "pricing:none", "G32") for kind in gateway
+    }
+    assert all(entry.observed_under for entry in LEDGER.entries if entry not in static)
 
 
 def worker_environment_problems(ci_text: str, tests_root: Path) -> list[Deviation]:
@@ -487,6 +518,73 @@ def test_rule_modules_import_only_the_public_contract_surface(module: str) -> No
     assert _import_problems(_tree(module)) == []
 
 
+def test_gateway_drivers_patch_no_product_name() -> None:
+    tree = _tree("drivers/openai_compat.py")
+    imported = [
+        (node.module or "", alias.name)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and not node.level
+        for alias in node.names
+        if (node.module or "").startswith(("crucible", "assay"))
+    ]
+
+    # Routing is the boundary: the driver calls what a workflow calls.
+    assert imported == [
+        ("crucible.backends.config", "load_routing"),
+        ("crucible.backends.config", "resolve_for_role"),
+    ]
+    for kind in (matrix_columns.HOSTED_GATEWAY_KIND, matrix_columns.LOCAL_GATEWAY_KIND):
+        driver = drivers.get(kind)
+        assert driver.private_seams == () and driver.fidelity == "wire"
+        assert driver.bypassed_layers and driver.inexpressible == {}
+    # The redirect and the guard are loadable by path inside a worker later.
+    for name, allowed in (("tap.py", {"httpx"}), ("netguard.py", set())):
+        assert _import_problems(_tree(name)) == sorted(allowed)
+
+
+def test_every_envelope_is_rendered_by_a_dialect_and_exists() -> None:
+    rendered = {
+        name for kind in sorted(drivers.load()) for name in drivers.get(kind).envelopes
+    }
+    stored = envelopes.all_envelopes()
+
+    # An envelope no dialect refers to is dead weight with a grade; a dialect
+    # that refers to a missing one cannot answer.
+    assert rendered == set(stored) != set()
+    assert {path.suffix for path in envelopes.ROOT.rglob("*") if path.is_file()} <= {
+        ".py",
+        ".yaml",
+        ".pyc",
+    }
+    assert drivers.get(TOY_KIND).envelopes == ()
+    # Every stored envelope states its grade and the evidence the grade needs
+    # (parsing refuses anything else), and stores nothing credential-shaped.
+    for name, envelope in stored.items():
+        path = envelopes.ROOT / f"{name}.yaml"
+        assert envelope.grade in envelopes.GRADES and envelope.slots() <= envelopes.SLOTS
+        assert envelopes.hygiene_problems(path.read_text(encoding="utf-8")) == []
+
+
+def test_every_driven_kind_names_its_test_module() -> None:
+    driven = drivers.load()
+
+    assert set(cells.MODULE_BY_KIND) == driven
+    for module in {*cells.MODULE_BY_KIND.values(), cells.STATIC_MODULE}:
+        source = (PACKAGE / f"{module}.py").read_text(encoding="utf-8")
+        closing = cells.STATIC_CHECK if module == cells.STATIC_MODULE else cells.CANARY_CHECK
+        # Each module ends with its closing check.
+        last = [
+            node.name
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+        ][-1]
+        assert last == closing, module
+    assert set(cells.STATIC_TESTS) == set(cells.STATIC_SCENARIOS)
+    static_source = ast.parse((PACKAGE / f"{cells.STATIC_MODULE}.py").read_text(encoding="utf-8"))
+    defined = {node.name for node in static_source.body if isinstance(node, ast.FunctionDef)}
+    assert {test for test, _parametrised in cells.STATIC_TESTS.values()} <= defined
+
+
 def test_toy_driver_touches_no_private_product_name() -> None:
     tree = _tree("drivers/toy.py")
     crucible_imports = [
@@ -592,6 +690,7 @@ def test_every_scenario_passes_the_complete_base_policy() -> None:
 def test_every_recorded_code_is_in_the_closed_vocabulary() -> None:
     recorded = {code for liar in toy.LIARS for code in liar.codes}
     recorded.update(code for entry in LEDGER.entries for code in entry.codes)
+    recorded.update(scope.code for scope in LEDGER.column_wide)
     recorded.update(
         code
         for record in LEDGER.registry.values()

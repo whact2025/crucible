@@ -16,6 +16,17 @@
 #   names the `declaration_change` (field, from, to, citation) that is the
 #   gap's listed resolution. `predicted` holds the codes expected of the cell
 #   before the first run of its column; the first run corrects them.
+#   A `column_wide` entry is one clause code that shows on every cell of a
+#   kind where its clause was evaluated and its check was asked (C6 asks for
+#   pricing evidence only of a result that flags its cost complete). It is
+#   owed there and tolerated nowhere else.
+# declared_differences: differences no feature field expresses. Each has a
+#   product citation, an owner, a date and the alternative contract asserted
+#   instead; a cell passes only if the alternative holds. Either a variant of
+#   a scenario's difference table asserts it (a declared value selects it), or
+#   the scenario defines it and `cells` lists where it is in force. A declared
+#   difference replaces no contract clause and is counted apart from the
+#   known gaps.
 # ceilings: counts may not exceed them. They rise while entries land and are
 #   frozen at the gate (pack A) and at the end of pack B; after that they only
 #   fall.
@@ -26,9 +37,9 @@ schema_version: crucible.backend-matrix.ledger.v1
 
 ceilings:
   max_known_gaps:
-    pack_a: 8
+    pack_a: 19
     pack_b: 0
-  max_declared_differences: 0
+  max_declared_differences: 2
 
 registry:
   G02:
@@ -188,6 +199,15 @@ registry:
         observed_under: {structured_output: unsupported}
         closes_under: {structured_output: unsupported}
         predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      # Observed at the first run of the secondary column (part 2).
+      - cell: openai_compat:hosted/S03/secondary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:hosted/S04/secondary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
 
   G29:
     title: The gateway adapter clears the accounting flags after a forced finalisation
@@ -218,20 +238,41 @@ registry:
         observed_under: {turn_limit: round_boundary}
         closes_under: {turn_limit: round_boundary}
         predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      # Observed at the first run of the secondary column (part 2).
+      - cell: openai_compat:hosted/S04/secondary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S04/secondary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
 
   G30:
     title: Every gateway test stubs the client and the local route has no test; the columns are not driven
     origin: gap list
     severity: high
     cells:
+      # static:no_driven_column until the drivers landed (part 2); the cells
+      # stay red until pack A runs on the columns.
       - cell: openai_compat:hosted/H02/-/static
         observed_under: {}
         closes_under: {}
-        predicted: ["static:no_driven_column"]
+        predicted: ["static:pack_a_not_enabled"]
       - cell: openai_compat:local/H02/-/static
         observed_under: {}
         closes_under: {}
-        predicted: ["static:no_driven_column"]
+        predicted: ["static:pack_a_not_enabled"]
+
+  G32:
+    title: The gateway adapter returns no pricing evidence on any path
+    origin: gap list
+    severity: medium
+    # Wherever the adapter flags its cost complete. A result it flags
+    # incomplete (a forced finalisation today, G29) owes no evidence.
+    column_wide:
+      - {kind: "openai_compat:hosted", code: "pricing:none"}
+      - {kind: "openai_compat:local", code: "pricing:none"}
 
   M01:
     title: The Claude columns are not driven by the matrix yet
@@ -269,10 +310,10 @@ known_gaps:
     codes: {"static:worker_skip": G04}
   - cell: openai_compat:hosted/H02/-/static
     observed_under: {}
-    codes: {"static:no_driven_column": G30}
+    codes: {"static:pack_a_not_enabled": G30}
   - cell: openai_compat:local/H02/-/static
     observed_under: {}
-    codes: {"static:no_driven_column": G30}
+    codes: {"static:pack_a_not_enabled": G30}
   - cell: deepseek/H02/-/static
     observed_under: {}
     codes: {"static:no_driven_column": G20}
@@ -289,4 +330,98 @@ known_gaps:
     observed_under: {}
     codes: {"static:no_driven_column": M03}
 
-declared_differences: []
+  # The gateway columns, first run of part 2 (starter set). On S04 guarded the
+  # guard codes are G28's today; once G28 is fixed the guard reports the
+  # incomplete accounting of G29 instead, and that fix edits the entry.
+  - cell: openai_compat:hosted/S03/primary/guarded
+    observed_under: {event_detail: usage}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+  - cell: openai_compat:hosted/S04/primary/raw
+    observed_under: {structured_output: prompt_only}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S04/primary/guarded
+    observed_under: {structured_output: prompt_only}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S03/secondary/guarded
+    observed_under: {event_detail: usage}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+  - cell: openai_compat:hosted/S04/secondary/raw
+    observed_under: {structured_output: prompt_only}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S04/secondary/guarded
+    observed_under: {structured_output: prompt_only}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:local/S03/primary/guarded
+    observed_under: {event_detail: usage}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+  - cell: openai_compat:local/S04/primary/raw
+    observed_under: {structured_output: unsupported}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:local/S04/primary/guarded
+    observed_under: {structured_output: unsupported}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - column_wide: {kind: "openai_compat:hosted", code: "pricing:none", gap: G32}
+  - column_wide: {kind: "openai_compat:local", code: "pricing:none", gap: G32}
+
+declared_differences:
+  - id: D-STRUCT-UNQUALIFIED
+    citation: >-
+      crucible/backends/features.py:78-81 (the generic gateway profile: the
+      adapter sends response_format when requested, but an arbitrary
+      compatible gateway has not earned a native-schema conformance claim)
+    owner: release owner (design section 15, decisions taken at their defaults)
+    date: "2026-11-19"
+    alternative: >-
+      A route that declares structured_output=unsupported makes no claim about
+      where the schema travels, so a scenario with a response schema asserts
+      no placement there: neither the schema field of the provider nor schema
+      text in the prompt. The final message must still validate against the
+      schema and every contract clause applies unchanged. Selected by the
+      declared value (the `unsupported` variant of the scenario).
+  - id: D-OAI-SCHEMA-FINAL
+    citation: >-
+      crucible/backends/openai_compat.py:1619-1646 (tool-enabled turns run
+      without the response schema; once exploration ends naturally, one
+      no-tools completion turns the draft into the schema-constrained answer)
+    owner: release owner (design section 15, decisions taken at their defaults)
+    date: "2026-11-19"
+    alternative: >-
+      After a tool loop that ends naturally the adapter sends exactly one
+      further request, which advertises no tools and carries the schema in the
+      schema field of the provider; no tool-bearing request carries it. The
+      answer to that request is the final message and must validate against
+      the schema. Its usage is counted and the accounting flags stay complete
+      (C6 applies unchanged, as does every other clause). On the listed cells
+      this is asserted instead of the placement that the declared
+      structured_output value selects.
+    cells:
+      - openai_compat:hosted/S04/primary/raw
+      - openai_compat:hosted/S04/primary/guarded
+      - openai_compat:hosted/S04/secondary/raw
+      - openai_compat:hosted/S04/secondary/guarded
+      - openai_compat:local/S04/primary/raw
+      - openai_compat:local/S04/primary/guarded
