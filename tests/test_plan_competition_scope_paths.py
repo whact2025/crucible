@@ -674,7 +674,9 @@ def test_empty_canonical_synthesis_scope_exhausts_the_bounded_response_repair(
     pool, outcome, report = _compete(repo, pool=harness.Pool(synthesis=True))
 
     assert not outcome.accepted and outcome.spec.tier_dag is None
-    assert outcome.status == "plan_competition_inconclusive"
+    # Three accepted drafts had no ruling against them: the comparison
+    # reviewer failed its response contract, which is not a refusal.
+    assert outcome.status == "judge_protocol_failure"
     labels = [label for label, _ in pool.order]
     assert labels.count("comparison") == 3
     assert not any(label.startswith("synthesis") for label in labels)

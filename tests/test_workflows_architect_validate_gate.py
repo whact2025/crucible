@@ -416,10 +416,11 @@ def test_gate_replan_without_a_ruling_keeps_its_status(
         ("rejected", "judge_rejected"),
         # In no table: an unknown status is never read as "no ruling".
         ("inconclusive", "accounting_incomplete"),
-        # The terminal of the default three-planner competition is in no
-        # status table today either, so such a re-plan stays
-        # ``replan_validate_failed``. This pins today's behaviour; the class
-        # of the status is an open decision (outcome-taxonomy/O3-P3).
+        # The three-planner competition keeps this status when a ruling ended
+        # the run (the comparison selected nothing, or every candidate was
+        # refused) and when the records do not prove a lost call. It is in no
+        # status table on purpose, so such a re-plan stays
+        # ``replan_validate_failed``.
         ("inconclusive", "plan_competition_inconclusive"),
     ],
 )

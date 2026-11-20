@@ -123,6 +123,20 @@ partial result.
 
 A validation-repair re-plan that nobody ruled on keeps its own typed status
 under exit `2` (for example `planner_infrastructure_failure` when the Planner
-backend was lost) instead of `replan_validate_failed`. Planning with one
-planner reports the same status when the Planner backend returned no reply
-by the end of the round budget; `outcome.json` files it as `inconclusive`.
+backend was lost) instead of `replan_validate_failed`. Planning reports the
+same status when no Planner backend returned a reply: by the end of the round
+budget with one planner, when no independent draft came back with several. It
+reports `critic_`/`judge_infrastructure_failure` or
+`critic_`/`judge_protocol_failure` when a draft reviewer or the comparison
+reviewer gave no verdict while a candidate had no ruling against it;
+`outcome.json` files these as `inconclusive`. When such a call stopped on its
+budget instead, the status is `budget_exhausted` under exit `1`.
+`plan_competition_inconclusive` under exit `2` is kept when a ruling ended the
+run (the comparison selected nothing, or every candidate was refused) and when
+the records do not prove that a lost call ended it, for example when every
+planner stopped on its turn limit or a content rejection, or a draft's
+deterministic gate could not run. A planner that stopped on its budget does
+not change this while every draft that came back was refused: that run stays
+under exit `2`. A lost call that reported incomplete usage stays an accounting
+terminal at every planner count; the [plan reference](plan.md) lists the cases
+that still differ from one planner.

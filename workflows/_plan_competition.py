@@ -39,6 +39,7 @@ from assay import (
 )
 from assay.canonical import hash_record, serialize
 from assay.primitives.plan import (
+    _planner_backend_error_status,
     _planner_system_prompt,
     _planner_user_message,
     _tier_dag_response_schema,
@@ -52,7 +53,12 @@ from crucible.common.read_only_sources import SourceReferenceError, _read_file
 from crucible.tools._builder import ToolSetBuilder
 from crucible.tools.source import build_source_tools
 
-from ._outcome import workspace_state_digest
+from ._outcome import (
+    UNJUDGED_TERMINAL_CLASSES,
+    TerminalClass,
+    classify_terminal_status,
+    workspace_state_digest,
+)
 from ._backends import BackendCleanupError
 from ._plan_provenance import _workspace_head_identity
 from ._readonly_scheduler import (
@@ -62,6 +68,7 @@ from ._readonly_scheduler import (
     _ManagedBackend,
     run_read_only_fanout,
 )
+from ._review import is_review_infrastructure_failure
 from ._run import exec_ctx_now
 from ._run_policy import OrchestrationPolicy
 
@@ -180,6 +187,174 @@ class _DraftBackend:
         return getattr(self._backend, name)
 
 
+def _draft_ends(
+    children: Any,
+    rows: list[dict[str, Any]],
+    outcomes: dict[str, PlanOutcome],
+    compared: set[str],
+    corpus: Any,
+    review_status: Callable[[str, Any, Any], str],
+) -> list[tuple[str, str, str | None]]:
+    """Say how each draft ended: ``(id, kind, loss)`` in request order.
+
+    ``no_reply``: the planner returned a typed backend error, so no candidate
+    exists. ``refused``: the size limit, the decoder, a deterministic gate or
+    the candidate's own review ruled against it; a Critic ``reject`` is such a
+    ruling whatever became of the Judge. ``open``: a candidate exists and
+    nothing ruled against it. ``unknown``: the records prove none of these.
+
+    ``loss`` is the status single-track planning gives a lost call of the
+    draft's planner or reviewers, else ``None``.
+    """
+
+    ends: list[tuple[str, str, str | None]] = []
+    for child, row in zip(children, rows, strict=True):
+        outcome = outcomes.get(child.child_id)
+        if outcome is None:
+            error = child.result.error if child.result is not None else None
+            if error is not None:
+                ends.append(
+                    (child.child_id, "no_reply", _planner_backend_error_status(error))
+                )
+            elif (
+                child.error_kind == "ChildOutputLimitExceeded"
+                or row["status"] == "invalid_candidate"
+            ):
+                # The planner answered; the size limit or the decoder refused it.
+                ends.append((child.child_id, "refused", None))
+            else:
+                ends.append((child.child_id, "unknown", None))
+            continue
+        loss = None
+        if child.child_id in compared:
+            # Read the verdicts, not the review status: the rule-set recheck
+            # may have overwritten the status of a draft whose Judge was lost.
+            lost = next(
+                (
+                    verdict
+                    for verdict in (
+                        corpus.get_record(ref, as_type=Verdict)
+                        for ref in row["verdict_refs"]
+                    )
+                    if verdict.kind in {"critic", "judge"}
+                    and is_review_infrastructure_failure(verdict)
+                ),
+                None,
+            )
+            if lost is not None:
+                loss = review_status(lost.kind, lost, corpus)
+        elif outcome.decision == "inconclusive":
+            loss = outcome.status
+        if outcome.decision == "rejected" or outcome.final_critic_decision == "reject":
+            ends.append((child.child_id, "refused", loss))
+        elif outcome.decision in ("accepted", "inconclusive"):
+            ends.append((child.child_id, "open", loss))
+        else:
+            ends.append((child.child_id, "unknown", None))
+    return ends
+
+
+def _first_loss(losses: list[tuple[str, str | None]]) -> tuple[str, str] | None:
+    """Choose the loss that names a run nothing ruled on, or ``None``.
+
+    A budget stop first. Otherwise only a status the outcome table files as
+    not a ruling can name the run, and a lost planner call names it only when
+    no other loss does. A permanent or unregistered status never names a run.
+    """
+
+    classed = [
+        (name, status, classify_terminal_status(status))
+        for name, status in losses
+        if status is not None
+    ]
+    for name, status, terminal in classed:
+        if terminal is TerminalClass.BUDGET_EXHAUSTED:
+            return name, status
+    named = [
+        (name, status)
+        for name, status, terminal in classed
+        if terminal in UNJUDGED_TERMINAL_CLASSES
+    ]
+    return next(
+        (loss for loss in named if loss[1] != "planner_infrastructure_failure"),
+        named[0] if named else None,
+    )
+
+
+def _terminal_without_ruling(
+    ends: list[tuple[str, str, str | None]],
+    compared: set[str],
+    selection: Any,
+    cancelled: bool,
+    corpus: Any,
+    review_status: Callable[[str, Any, Any], str],
+) -> tuple[str, str] | None:
+    """Name a run that ended without a plan and without a ruling against it.
+
+    Returns ``None`` when a ruling ended the run (the comparison answered, or
+    every candidate that existed was ruled against) and when the records do
+    not prove lost work; the caller then keeps its status. Otherwise returns
+    ``(status, reason)`` with the status single-track planning gives the loss.
+    """
+
+    if any(kind == "unknown" for _name, kind, _loss in ends):
+        return None
+    if selection is None and compared:
+        # Reviewed drafts were waiting and the comparison was never asked.
+        return ("cancelled", "cancelled before comparison") if cancelled else None
+    if selection is not None and selection.error is None:
+        if (
+            cancelled
+            and selection.mode == "synthesize"
+            and selection.candidate_dag is not None
+        ):
+            return "cancelled", "cancelled before synthesis review"
+        return None
+    candidates = [end for end in ends if end[1] != "no_reply"]
+    if candidates and all(kind == "refused" for _name, kind, _loss in candidates):
+        return None
+    if selection is not None:
+        waiting = _first_loss(
+            [(name, loss) for name, _kind, loss in ends if name in compared]
+        )
+        if waiting is not None:
+            name, status = waiting
+            return (
+                status,
+                f"the comparison was not asked: a reviewer of candidate {name!r} "
+                f"gave no verdict ({status}); {selection.error}",
+            )
+        if is_review_infrastructure_failure(selection.verdict):
+            answer = _first_loss(
+                [("comparison", review_status("judge", selection.verdict, corpus))]
+            )
+            if answer is not None:
+                return (
+                    answer[1],
+                    f"the comparison gave no answer ({answer[1]}); {selection.error}",
+                )
+        return None
+    named = _first_loss(
+        [(name, loss) for name, kind, loss in ends if kind == "open"]
+        if candidates
+        else [(name, loss) for name, _kind, loss in ends]
+    )
+    if named is None:
+        return None
+    name, status = named
+    if candidates:
+        return (
+            status,
+            f"candidate {name!r} was not reviewed ({status}) and no candidate "
+            "reached the comparison",
+        )
+    return (
+        status,
+        "no planner returned a draft: "
+        + ", ".join(f"{name} {loss}" for name, _kind, loss in ends),
+    )
+
+
 def run_plan_competition(
     spec: Any,
     *,
@@ -212,6 +387,12 @@ def run_plan_competition(
     Each draft and each proposed synthesis is decoded with canonical scope
     paths against ``cwd`` before any caller transform, gate, review, comparison
     or record sees it; the raw draft stays stored as written.
+
+    A run that ends without a plan and without a typed stop keeps
+    ``plan_competition_inconclusive`` when a ruling ended it, and when the
+    records do not prove that a lost call ended it. When a call was lost while
+    a candidate had no ruling against it, or no planner returned a draft, it
+    returns the status single-track planning gives that loss.
     """
     from . import plan as plan_workflow
     from ._plan_selection import (
@@ -330,6 +511,7 @@ def run_plan_competition(
     diagnostic_dag = None
     diagnostic_ref = None
     winner: PlanOutcome | None = None
+    selection: Any = None
     owned_reviewers: list[tuple[str, _ManagedBackend]] = []
     reason = "no independently reviewed candidate was selected"
     status = "plan_competition_inconclusive"
@@ -916,6 +1098,28 @@ def run_plan_competition(
             status, reason = winner.status, winner.reason
             diagnostic_dag, diagnostic_ref = winner.candidate_dag, winner.candidate_ref
             winner = None
+        if winner is None and status == "plan_competition_inconclusive":
+            # No typed stop fired and nothing was selected: name the lost call
+            # when the records prove that one ended the run without a ruling,
+            # else keep the status.
+            compared = {candidate.id for candidate in eligible}
+            named = _terminal_without_ruling(
+                _draft_ends(
+                    drafted.children,
+                    report["candidates"],
+                    outcomes,
+                    compared,
+                    corpus,
+                    plan_workflow._review_control_failure_status,
+                ),
+                compared,
+                selection,
+                cancelled(),
+                corpus,
+                plan_workflow._review_control_failure_status,
+            )
+            if named is not None:
+                status, reason = named
     except _CompetitionCancelled as exc:
         status, reason, winner = "cancelled", str(exc), None
     except BackendCleanupError:
