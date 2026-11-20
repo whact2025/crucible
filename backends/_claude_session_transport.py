@@ -3,7 +3,7 @@
 
 """Fail-closed Claude Code transport for organization-session routes.
 
-``claude-agent-sdk==0.2.110`` merges the complete parent environment into
+``claude-agent-sdk==0.2.121`` merges the complete parent environment into
 both its normal Claude Code child and its preliminary version-check child.
 That is appropriate for its general-purpose transport, but it is not an
 acceptable credential boundary for Crucible's organization-session route.
@@ -36,7 +36,24 @@ from claude_agent_sdk.types import ClaudeAgentOptions
 
 logger = logging.getLogger(__name__)
 
-REVIEWED_CLAUDE_AGENT_SDK_VERSION = "0.2.110"
+# Reviewed on 2026-11-20 by an offline source comparison of the 0.2.110 and
+# 0.2.121 releases. The live check of an organization session on 0.2.121 is
+# still owed. Everything this module replaces (``connect``,
+# ``_check_claude_version``), copies, or reads from ``SubprocessCLITransport``
+# is the same text in both releases. Four inherited behaviors differ and are
+# part of what this version admits:
+# - ``--resume`` and ``--session-id`` reach the CLI as one ``--flag=value``
+#   token, so a value that begins with a dash is no longer read as a flag
+#   of its own (the fix for CVE-2026-96620);
+# - the stderr callback receives complete lines instead of raw read chunks,
+#   so the adapter's 200-entry stderr bound now counts lines: only the first
+#   200 lines are kept, and a rejected-resume reason the CLI writes after
+#   them is not seen and is not reported as ``stale_conversation``;
+# - ``close()`` is shielded against cancellation, bounds every wait, and
+#   keeps a child it could not reap tracked for the exit-time reaper;
+# - stdout is framed by line: a large frame no longer loses whitespace at a
+#   read boundary, and a malformed JSON line fails the turn at once.
+REVIEWED_CLAUDE_AGENT_SDK_VERSION = "0.2.121"
 REVIEWED_CLAUDE_LEGACY_CODE_VERSION = "2.1.220"
 REVIEWED_CLAUDE_CODE_VERSION = "2.1.261"
 REVIEWED_CLAUDE_FABLE_CODE_VERSION = "2.1.263"
@@ -210,7 +227,7 @@ class FrozenClaudeSessionOptions:
     dataclass exposes a writable ``__dict__``. The exact reviewed SDK treats
     its options structurally and reads only named fields on the admitted
     organization-session path. List and dict fields retain their concrete
-    runtime types because SDK 0.2.110 checks them with ``isinstance``.
+    runtime types because SDK 0.2.121 checks them with ``isinstance``.
 
     Opaque values such as the in-process MCP server and stderr callback retain
     identity by design; the read-only guarantee covers the option control

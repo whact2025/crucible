@@ -53,6 +53,15 @@ thread would stall the HTTP transport. We submit each
 ``ThreadPoolExecutor``: CPython joins that executor's workers during
 interpreter shutdown, so a timed-out tool that never returns would
 otherwise keep the parent process alive forever.
+
+Session lifetime
+----------------
+One MCP session belongs to one backend attempt. The session manager closes
+a session that has had no HTTP request in flight for the server's idle
+limit: ``SESSION_IDLE_TIMEOUT_S``, or the time left to the invocation
+deadline plus a margin when the server was given a later deadline. A
+closed session answers 404 and is not revived. The limit is always finite,
+so a client that leaves without ending its session cannot keep one open.
 """
 
 from __future__ import annotations
@@ -85,6 +94,29 @@ logger = logging.getLogger(__name__)
 #   minutes; those names get the long-running timeout in ``_handler``.
 TOOL_TIMEOUT_S: float = 300.0
 BUILD_TOOL_TIMEOUT_S: float = 1800.0
+
+# Idle limit of one streamable-HTTP session. The mcp session manager closes
+# a session that has had no HTTP request in flight for this long (library
+# default: 1800 s). Its id then answers 404 and the server does not revive
+# it, so the tools of the attempt that owned it are gone. One session belongs
+# to one backend attempt, so the limit must exceed
+# - the default wall time of an invocation: 2700 s for Codex
+#   (``backends.codex._DEFAULT_POLICY`` and the ``timeout_seconds`` default of
+#   ``CodexBackend``) and for Claude (``backends.claude._DEFAULT_POLICY``;
+#   Claude's tools run in process and hold no HTTP session), 600 s for Kimi
+#   (``backends.kimi._DEFAULT_TIMEOUT_SECONDS``); and
+# - the longest wait for one tool call, ``BUILD_TOOL_TIMEOUT_S`` above and
+#   Kimi's client-side ``backends.kimi._MCP_TOOL_TIMEOUT_MS``, so that a call
+#   whose client went away still ends by its own dispatch timeout, which is
+#   what records an indeterminate mutation, and not by session expiry.
+# It stays finite so that abandoned sessions are reclaimed. Those defaults
+# are not ceilings: a route or the command line may admit a longer turn. A
+# server constructed with ``invocation_deadline`` therefore raises its limit
+# to the time left to that deadline plus ``_SESSION_IDLE_MARGIN_S``; a server
+# constructed without one keeps this constant.
+# ``tests/test_mcp_http_server.py`` ties the constant to the defaults above.
+SESSION_IDLE_TIMEOUT_S: float = 3600.0
+_SESSION_IDLE_MARGIN_S: float = 900.0
 
 # Same long-running set as ``_mcp_bridge._LONG_RUNNING_TOOL_NAMES``.
 # Kept in sync intentionally — both bridges dispatch the same ToolSet
@@ -119,6 +151,34 @@ def _validate_auth_token(token: str) -> str:
             "characters"
         )
     return token
+
+
+def _session_idle_timeout(invocation_deadline: float | None) -> float:
+    """Return the finite idle limit for the sessions of one server.
+
+    ``invocation_deadline`` is the validated monotonic deadline of the one
+    invocation a server serves, or ``None`` for a server without one. mcp
+    reads ``None`` as "never expire", so the limit is refused here unless
+    it is a finite positive number.
+    """
+    base = SESSION_IDLE_TIMEOUT_S
+    if (
+        isinstance(base, bool)
+        or not isinstance(base, (int, float))
+        or not math.isfinite(base)
+        or base <= 0
+    ):
+        raise ValueError(
+            "SESSION_IDLE_TIMEOUT_S must be a finite positive number of "
+            "seconds"
+        )
+    limit = float(base)
+    if invocation_deadline is not None:
+        limit = max(
+            limit,
+            invocation_deadline - time.monotonic() + _SESSION_IDLE_MARGIN_S,
+        )
+    return limit
 
 
 class _BearerAuthMiddleware:
@@ -397,6 +457,9 @@ class CrucibleHttpMcpServer:
             if invocation_deadline is None
             else float(invocation_deadline)
         )
+        self._session_idle_timeout = _session_idle_timeout(
+            self._invocation_deadline
+        )
 
         self._lock = threading.Lock()
         self._started = False
@@ -633,8 +696,12 @@ class CrucibleHttpMcpServer:
         # from ``toolset.to_anthropic_tools()`` instead of having
         # FastMCP synthesize a pydantic arg model from a Python
         # function signature (which can't represent the toolset's
-        # JSON Schema faithfully).
-        mcp = FastMCP(self._name)
+        # JSON Schema faithfully). The idle limit is always passed: the
+        # library default is shorter than a default invocation.
+        mcp = FastMCP(
+            self._name,
+            session_idle_timeout=self._session_idle_timeout,
+        )
         self._register_tools(mcp)
 
         app: Any = mcp.streamable_http_app()
@@ -790,7 +857,7 @@ class CrucibleHttpMcpServer:
 
         # FastMCP's __init__ already registers its own list_tools and
         # call_tool handlers on the lowlevel server's request_handlers
-        # dict (see fastmcp/server.py:304-308). Re-registering replaces
+        # dict (see ``FastMCP._setup_handlers``). Re-registering replaces
         # them — last write wins.
         server = mcp._mcp_server  # noqa: SLF001
 
