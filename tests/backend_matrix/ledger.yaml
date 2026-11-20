@@ -275,14 +275,16 @@ registry:
       - {kind: "openai_compat:local", code: "pricing:none"}
 
   M01:
-    title: The Claude columns are not driven by the matrix yet
+    title: The Claude columns do not run the whole matrix yet
     origin: matrix
     severity: medium
     cells:
+      # static:no_driven_column until the driver landed (part 3); the cell
+      # stays red until pack A runs on the columns.
       - cell: claude/H02/-/static
         observed_under: {}
         closes_under: {}
-        predicted: ["static:no_driven_column"]
+        predicted: ["static:pack_a_not_enabled"]
 
   M02:
     title: The Codex app-server column is not driven by the matrix yet
@@ -360,7 +362,7 @@ known_gaps:
     codes: {"static:no_driven_column": G04}
   - cell: claude/H02/-/static
     observed_under: {}
-    codes: {"static:no_driven_column": M01}
+    codes: {"static:pack_a_not_enabled": M01}
   - cell: codex:legacy/H02/-/static
     observed_under: {}
     codes: {"static:no_driven_column": M02}

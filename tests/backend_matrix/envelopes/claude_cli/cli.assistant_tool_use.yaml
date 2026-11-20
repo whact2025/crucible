@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# One model turn that calls a tool, as the command-line tool relays it.
+# Nothing was observed of the real tool (see cli.init).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: assistant_tool_use
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.AssistantMessage with one ToolUseBlock, as parsed
+    by claude_agent_sdk._internal.message_parser.parse_message (case
+    "assistant"); the inner message validates as anthropic.types.Message with
+    an anthropic.types.ToolUseBlock
+  sdk_version: claude-agent-sdk 0.2.110, anthropic 0.112.0
+  reason: >-
+    The outer frame holds exactly the keys the pinned SDK reads for an
+    assistant frame, without its optional error key. The inner message is the
+    message object of the provider, which the tool passes on: its required
+    fields are those of anthropic.types.Message, and the usage record names
+    the four counters of anthropic.types.Usage that the accounting of the
+    tool adds up (the two cache counters are optional there and written as
+    zero here). Whether the real tool fills the stop reason of a relayed
+    frame is not known. The tool name is filled as mcp__<server>__<tool>. No
+    SDK source in reach states that form: it is the one in which the adapter
+    itself names the tools of its server in the allowed-tools list it puts on
+    the command line (crucible/backends/claude.py, where the names of the
+    server's tools are built), so the name is written to the adapter. The
+    input is the decoded argument object, as ToolUseBlock.input is typed.
+
+status: 200
+
+body:
+  type: assistant
+  message:
+    id: {slot: response_id}
+    type: message
+    role: assistant
+    model: {slot: served_model}
+    content:
+      - type: tool_use
+        id: {slot: call_id}
+        name: {slot: tool_name}
+        input: {slot: tool_input}
+    stop_reason: tool_use
+    stop_sequence: null
+    usage:
+      input_tokens: {slot: input_tokens}
+      output_tokens: {slot: output_tokens}
+      cache_creation_input_tokens: 0
+      cache_read_input_tokens: 0
+  parent_tool_use_id: null
+  session_id: {slot: session_id}
+  uuid: {slot: frame_id}

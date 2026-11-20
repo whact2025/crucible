@@ -9,6 +9,11 @@ ids, a timestamp, the echoed model id) in an envelope: one file per provider
 and behaviour class under ``envelopes/<dialect>/``. Everything else in a reply
 is the envelope's, and the envelope says where its shape comes from.
 
+A slot is a node ``{slot: <name>}`` that stands for a whole value. Where the
+wire keys a mapping by a run-time value (usage per served model), the key is
+written ``${slot:<name>}`` and is filled with a string. Nothing else in an
+envelope can change.
+
 Three grades, strongest first:
 
 - ``recorded``: captured from the real provider through the adapter's own
@@ -52,8 +57,22 @@ SLOTS: frozenset[str] = frozenset(
         "input_tokens",
         "output_tokens",
         "total_tokens",
+        # Frames of a session-oriented wire (a vendor command-line tool that
+        # owns the tool loop): the session and frame ids, a tool call's
+        # decoded arguments, the tool result it echoes, and the session
+        # totals of its terminal frame.
+        "session_id",
+        "frame_id",
+        "tool_input",
+        "tool_result",
+        "tool_is_error",
+        "turns",
+        "cost_usd",
+        "structured_output",
     }
 )
+# A mapping key that is a slot: the whole key, filled with a string.
+_KEY_SLOT = re.compile(r"\$\{slot:([a-z][a-z0-9_]*)\}")
 _FIELDS = {
     "schema_version",
     "dialect",
@@ -128,21 +147,44 @@ def _is_slot(node: Any) -> bool:
     return isinstance(node, dict) and set(node) == {"slot"}
 
 
+def _key_slot(key: Any) -> str | None:
+    """The slot a mapping key stands for, when the whole key is one."""
+
+    match = _KEY_SLOT.fullmatch(key) if isinstance(key, str) else None
+    return None if match is None else match.group(1)
+
+
 def _slots(node: Any) -> list[str]:
     if _is_slot(node):
         return [str(node["slot"])]
     if isinstance(node, dict):
-        return [name for value in node.values() for name in _slots(value)]
+        keys = [name for name in map(_key_slot, node) if name is not None]
+        return keys + [name for value in node.values() for name in _slots(value)]
     if isinstance(node, list):
         return [name for value in node for name in _slots(value)]
     return []
+
+
+def _filled_key(key: Any, values: Mapping[str, Any]) -> Any:
+    name = _key_slot(key)
+    if name is None:
+        return key
+    if not isinstance(values[name], str):
+        raise MatrixSetupError(
+            f"slot {name!r} fills a mapping key and must be a string, not "
+            f"{type(values[name]).__name__}"
+        )
+    return values[name]
 
 
 def _filled(node: Any, values: Mapping[str, Any]) -> Any:
     if _is_slot(node):
         return values[node["slot"]]
     if isinstance(node, dict):
-        return {key: _filled(value, values) for key, value in node.items()}
+        return {
+            _filled_key(key, values): _filled(value, values)
+            for key, value in node.items()
+        }
     if isinstance(node, list):
         return [_filled(value, values) for value in node]
     return node

@@ -23,6 +23,7 @@ from typing import Any, Iterator, Mapping, Sequence
 import yaml  # type: ignore[import-untyped]
 
 from assay import BackendFeatureSet
+from crucible.backends.config import BackendRouting
 from crucible.backends.pricing import DEFAULT_PRICING, ModelPricing
 from crucible.products.deepswe.backend_convergence import (
     load_deepswe_backend_profile_catalog,
@@ -47,6 +48,7 @@ COLUMN_PRODUCT = "deepswe"
 
 HOSTED_GATEWAY_KIND = "openai_compat:hosted"
 LOCAL_GATEWAY_KIND = "openai_compat:local"
+CLAUDE_KIND = "claude"
 
 # (routing backend, adapter transport) of a catalog lane -> driver kind.
 KIND_TABLE: Mapping[tuple[str, str], str] = {
@@ -54,12 +56,12 @@ KIND_TABLE: Mapping[tuple[str, str], str] = {
     ("local", "openai_compatible_http"): LOCAL_GATEWAY_KIND,
     ("deepseek", "deepseek_responses_worker"): "deepseek",
     ("kimi", "kimi_agent_sdk_worker"): "kimi",
-    ("claude", "claude_agent_sdk"): "claude",
+    ("claude", "claude_agent_sdk"): CLAUDE_KIND,
     ("codex", "legacy_app_server"): "codex:legacy",
     ("codex", "official_sdk"): "codex:official",
 }
 REAL_KINDS: tuple[str, ...] = tuple(sorted(set(KIND_TABLE.values())))
-REFERENCE_KINDS: frozenset[str] = frozenset({"claude", "codex:legacy", "codex:official"})
+REFERENCE_KINDS: frozenset[str] = frozenset({CLAUDE_KIND, "codex:legacy", "codex:official"})
 OPEN_WEIGHT_KINDS: frozenset[str] = frozenset(REAL_KINDS) - REFERENCE_KINDS
 
 # Catalog profile -> role within its kind. The primary of a kind is written
@@ -120,6 +122,9 @@ CLEARED_ENV: tuple[str, ...] = (
     "CRUCIBLE_CODEX_WORKER_PYTHON",
     "CRUCIBLE_DEEPSEEK_WORKER_PYTHON",
     "CRUCIBLE_KIMI_WORKER_PYTHON",
+    # The pinned Agent SDK reads this one in the parent process, and the
+    # session route refuses to run while it is set.
+    "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT",
     "CODEX_HOME",
     "KIMI_SHARE_DIR",
     "XDG_CACHE_HOME",
@@ -148,7 +153,7 @@ WORKER_KINDS: Mapping[str, str] = {
 # The closed routing overlay: the only routing fields a driver may add, by
 # kind. A ``base_url`` is never among them.
 ALLOWED_OVERLAY: Mapping[str, tuple[str, ...]] = {
-    "claude": ("extra.cli_path",),
+    CLAUDE_KIND: ("extra.cli_path",),
     "codex:legacy": ("extra.cli_path",),
     "deepseek": ("extra.expected_worker_runtime_fingerprint",),
 }
@@ -380,6 +385,39 @@ def scripted_environment(**endpoints: str) -> Iterator[None]:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+def overlaid_routing(
+    routing: BackendRouting, fields: Mapping[str, Any], *, kind: str, backend: str
+) -> BackendRouting:
+    """``routing`` with a driver's overlay on every route of ``backend``.
+
+    Only the fields the closed list allows for ``kind``, all of them route
+    extras. Everything else of the shipped route stays: the overlay adds no
+    endpoint, no credential and no model.
+    """
+
+    allowed = ALLOWED_OVERLAY.get(kind, ())
+    refused = sorted(set(fields) - set(allowed))
+    if refused:
+        raise MatrixSetupError(
+            f"kind {kind} may overlay {list(allowed)} on its shipped route, not {refused}"
+        )
+    extras = {name.removeprefix("extra."): value for name, value in fields.items()}
+
+    def overlaid(config: Any, effective_backend: str | None) -> Any:
+        if effective_backend != backend:
+            return config  # a route of another backend family is left alone
+        return dataclasses.replace(config, extra={**config.extra, **extras})
+
+    return dataclasses.replace(
+        routing,
+        default=overlaid(routing.default, routing.default.backend),
+        roles={
+            name: overlaid(config, routing.for_role(name).backend)
+            for name, config in routing.roles.items()
+        },
+    )
 
 
 def catalog_literals() -> frozenset[str]:

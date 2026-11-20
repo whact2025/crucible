@@ -534,6 +534,42 @@ def test_gateway_drivers_patch_no_product_name() -> None:
         assert _import_problems(_tree(name)) == sorted(allowed)
 
 
+def test_claude_driver_reads_one_private_name_and_patches_none() -> None:
+    tree = _tree("drivers/claude.py")
+    imported = sorted(
+        f"{node.module}.{alias.name}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and not node.level
+        for alias in node.names
+        if (node.module or "").startswith(("crucible", "assay"))
+    )
+    driver = drivers.get(matrix_columns.CLAUDE_KIND)
+
+    # Routing is the boundary: the driver calls what a workflow calls. The one
+    # private name is the adapter's table of reviewed tool versions, read for
+    # the answer of the peer to the version probe.
+    assert imported == [
+        "crucible.backends._claude_session_transport."
+        "CLAUDE_SESSION_REVIEWED_CLI_VERSIONS_BY_MODEL",
+        "crucible.backends.config.load_routing",
+        "crucible.backends.config.resolve_for_role",
+    ]
+    assert list(driver.private_seams) == [
+        name for name in imported if any(part.startswith("_") for part in name.split("."))
+    ]
+    assert driver.fidelity == "wire" and driver.dialect == "claude_cli"
+    assert len(driver.bypassed_layers) == 2 and driver.inexpressible == {}
+    # Nothing of the product is replaced: the driver sets no attribute and
+    # uses no patching helper.
+    called = {
+        ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)
+    }
+    assert not {name for name in called if "setattr" in name or "patch" in name}
+    # The peer runs outside the test environment, on the standard library alone.
+    assert _import_problems(_tree("peers/claude_cli.py")) == []
+    assert _import_problems(_tree("peers/__init__.py")) == []
+
+
 def test_every_envelope_is_rendered_by_a_dialect_and_exists() -> None:
     rendered = {
         name for kind in sorted(drivers.load()) for name in drivers.get(kind).envelopes

@@ -71,6 +71,11 @@ class SeenRequest:
     # The Host header as the provider received it: the address the client
     # believed it was talking to.
     host: str = ""
+    # What the dialect knows about how the request came to be sent: the
+    # process that sent it and the exchange that preceded it. Read by the
+    # dialect's own seam check and by the proof of a column's canary; never
+    # used to pick a reply.
+    evidence: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -122,6 +127,8 @@ class Reply:
     served_model: str | None = None
     call: tuple[str, str, Mapping[str, Any]] | None = None  # slot, call id, arguments
     envelope: str | None = None  # the envelope the body was rendered from
+    # Every envelope of a body that holds several frames, in the order sent.
+    envelopes: tuple[str, ...] = ()
 
 
 class Dialect(Protocol):
@@ -435,6 +442,7 @@ class LoopbackProvider:
                 self._ledger.served_models.append(reply.served_model)
             if reply.envelope is not None:
                 self._ledger.envelopes.append(reply.envelope)
+            self._ledger.envelopes.extend(reply.envelopes)
             if reply.call is None:
                 self._pending_call_ids = ()
             else:

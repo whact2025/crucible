@@ -67,7 +67,7 @@ from crucible.tools import ToolDispatchBudgetExceeded
 from .. import columns as matrix_columns
 from ..columns import CANARY_CREDENTIAL, TOY_ADAPTER, TOY_KIND, Column
 from ..provider import POLICY_ERROR_CODE, LoopbackProvider, ToyDialect
-from ..scenarios import D_OAI_SCHEMA_FINAL
+from ..scenarios import D_OAI_SCHEMA_FINAL, SCHEMA_KEY
 from ..script import READ_A, READ_B, ProviderScript
 from .base import Lens, MatrixSetupError, bind_as_routing, register
 
@@ -142,6 +142,7 @@ NO_LIMIT_EVENT = "no_limit_event"
 DISPATCH_STOP_MISNAMED = "dispatch_stop_misnamed"
 SCHEMA_NOT_IN_PROMPT = "schema_not_in_prompt"
 RETURN_SCHEMA_DRAFT = "return_schema_draft"
+SCHEMA_ANSWER_REPLACED = "schema_answer_replaced"
 TRACE_OTHER_ENDPOINT = "trace_other_endpoint"
 # Not a fault but a trait: after a tool loop with a response schema the
 # adapter sends one further request without tools that carries the schema in
@@ -520,6 +521,10 @@ class HonestBackend:
             text = text.upper()
         if SCHEMA_ANSWER_INVALID in self._faults and invocation.response_schema is not None:
             text = "Here is the answer: " + text
+        if SCHEMA_ANSWER_REPLACED in self._faults and invocation.response_schema is not None:
+            # Another object of the schema: it validates, and the provider
+            # never sent it.
+            text = json.dumps({SCHEMA_KEY: "an answer the provider never gave"})
         spent = math.fsum(segment.cost_usd for segment in run.segments)
         over = invocation.budget_usd is not None and spent > invocation.budget_usd
         if over and IGNORE_USD_BUDGET not in self._faults:
@@ -959,6 +964,9 @@ LIARS: tuple[Liar, ...] = (
     ),
     _liar("S04", CLEAR_ACCOUNTING_FLAGS, _UNTOLD, ("C6",), rehearses=("G29",)),
     _liar("S04", SCHEMA_ANSWER_INVALID, ("text:mismatch",), ("S",)),
+    # Valid is not enough: an object of the schema that the provider never
+    # sent is not the answer.
+    _liar("S04", SCHEMA_ANSWER_REPLACED, ("text:mismatch",), ("S",)),
     _liar(
         "S04",
         SCHEMA_MISPLACED,

@@ -259,7 +259,17 @@ def tool_events_paired(obs: Observation, ref: Reference) -> list[Deviation]:
     return out
 
 
-def schema_answer_valid(obs: Observation, _ref: Reference) -> list[Deviation]:
+def schema_answer_returned(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The final message is the schema answer the provider gave.
+
+    Valid is not enough: an object of the schema that the provider never sent
+    passes any check of the shape. The answer is compared as the JSON value
+    it is, not as text, because an adapter may serialise the object again.
+    Where the optional tail of a declared difference was asked for and
+    answered, the answer is the tail's, and the alternative's own check
+    (:func:`finalisation_is_the_answer`) compares it.
+    """
+
     assert obs.result is not None
     if obs.result.error is not None:
         return []  # an error result promises no answer
@@ -267,13 +277,23 @@ def schema_answer_valid(obs: Observation, _ref: Reference) -> list[Deviation]:
         answer = json.loads(obs.result.final_message)
     except json.JSONDecodeError:
         answer = None
-    if (
+    if not (
         isinstance(answer, dict)
         and set(answer) == {SCHEMA_KEY}
         and isinstance(answer[SCHEMA_KEY], str)
     ):
+        return [
+            Deviation("text:mismatch", "final_message does not validate against the schema")
+        ]
+    if obs.provider.tail_served or answer == json.loads(SCHEMA_ANSWER):
         return []
-    return [Deviation("text:mismatch", "final_message does not validate against the schema")]
+    return [
+        Deviation(
+            "text:mismatch",
+            "final_message validates against the schema and is not the answer "
+            "the provider gave",
+        )
+    ]
 
 
 def schema_in_field(obs: Observation, _ref: Reference) -> list[Deviation]:
@@ -650,9 +670,11 @@ _ALL: tuple[Scenario, ...] = (
         lenses=LENSES,
         plan=lambda: Plan(
             ProviderScript((Call(READ_A), Say(SCHEMA_ANSWER))),
+            # No verbatim text: an adapter may serialise the object again.
+            # The answer is compared as a JSON value by the first check.
             expect=replace(CLEAN, final_text=None, dispatch=(READ_A,)),
             response_schema=SCHEMA,
-            checks=(schema_answer_valid, schema_in_field),
+            checks=(schema_answer_returned, schema_in_field),
         ),
         differences={
             "structured_output": {

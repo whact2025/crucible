@@ -43,8 +43,11 @@ from assay import (
     UsagePricingSegment,
 )
 
+from crucible.backends.config import BackendRouting, RoleConfig, load_routing
+
 from . import cells, contract, declarations, ledger, netguard, runner
 from . import columns as matrix_columns
+from . import envelopes as matrix_envelopes
 from .cells import Cell
 from .columns import TOY_KIND, Column
 from .contract import (
@@ -1051,6 +1054,116 @@ def test_provider_matches_on_method_path_call_ids_and_advertised_tools() -> None
     assert (seen.extra, seen.unconsumed) == (1, 2)
 
 
+class _TwoFrames(ToyDialect):
+    """Renders one reply from two envelopes, as a wire of several frames does."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        return dataclasses.replace(
+            super().render(step, seen, call_id),
+            envelopes=("openai_chat/gateway.completion", "openai_chat/local.completion"),
+        )
+
+
+def test_a_reply_of_several_frames_records_every_envelope_it_was_rendered_from() -> None:
+    script = ProviderScript((Say("one"),))
+    with LoopbackProvider(script, credential="c", dialect=_TwoFrames()) as provider:
+        assert _ask(provider, {})[1]["text"] == "one"
+        seen = provider.freeze()
+
+    assert seen.envelopes == ["openai_chat/gateway.completion", "openai_chat/local.completion"]
+    # The grade of a cell is the weakest of every envelope it used, not of
+    # the first of each reply.
+    assert matrix_envelopes.weakest(seen.envelopes[:1]) == "documented"
+    assert matrix_envelopes.weakest(seen.envelopes) == "constructed"
+    # A dialect that knows nothing about how a request was sent says nothing.
+    assert seen.requests[0].evidence == {}
+
+
+def test_an_envelope_key_slot_is_a_whole_key_filled_with_a_string() -> None:
+    document = {
+        "schema_version": matrix_envelopes.ENVELOPE_SCHEMA,
+        "dialect": "standin",
+        "provider": "standin",
+        "behaviour": "usage",
+        "provenance": {"grade": "constructed", "reason": "synthetic"},
+        "status": 200,
+        "body": {
+            "per_model": {"${slot:served_model}": {"tokens": {"slot": "input_tokens"}}},
+            "about ${slot:served_model}": "a key that only contains the notation is a key",
+        },
+    }
+    envelope = matrix_envelopes.parse(document, where="x")
+    filled = envelope.fill({"served_model": "the-model", "input_tokens": 7})
+
+    assert envelope.slots() == {"served_model", "input_tokens"}
+    assert filled == {
+        "per_model": {"the-model": {"tokens": 7}},
+        "about ${slot:served_model}": "a key that only contains the notation is a key",
+    }
+    # Filling copies: the envelope keeps its slots.
+    assert list(envelope.body["per_model"]) == ["${slot:served_model}"]
+    # A key is a string, every slot is supplied, and a key slot is held to
+    # the closed slot list like any other.
+    with pytest.raises(MatrixSetupError, match="fills a mapping key and must be a string"):
+        envelope.fill({"served_model": 3, "input_tokens": 7})
+    with pytest.raises(MatrixSetupError, match="has the slots"):
+        envelope.fill({"input_tokens": 7})
+    with pytest.raises(MatrixSetupError, match=r"slots \['price'\]"):
+        matrix_envelopes.parse({**document, "body": {"${slot:price}": 1}}, where="x")
+
+
+def test_a_routing_overlay_adds_the_closed_extras_of_its_kind_and_nothing_else() -> None:
+    kind = matrix_columns.CLAUDE_KIND
+    column = next(
+        item
+        for item in matrix_columns.real_columns()
+        if (item.kind, item.role) == (kind, "primary")
+    )
+    shipped = load_routing(config_path=column.routing_path(matrix_columns.COLUMN_PRODUCT))
+    (field,) = matrix_columns.ALLOWED_OVERLAY[kind]
+    name = field.removeprefix("extra.")
+    overlaid = matrix_columns.overlaid_routing(
+        shipped, {field: "/a/peer"}, kind=kind, backend=column.backend
+    )
+
+    # Every route of the file gains the one extra and keeps everything else.
+    assert shipped.roles and set(overlaid.roles) == set(shipped.roles)
+    for role in (None, *shipped.roles):
+        before = shipped.default if role is None else shipped.for_role(role)
+        after = overlaid.default if role is None else overlaid.for_role(role)
+        assert name not in before.extra and after.extra == {**before.extra, name: "/a/peer"}
+        assert dataclasses.replace(after, extra=before.extra) == before
+        assert (after.base_url, after.api_key) == (before.base_url, before.api_key)
+    assert (overlaid.schema_version, overlaid.source_sha256) == (
+        shipped.schema_version,
+        shipped.source_sha256,
+    )
+    # Anything outside the closed list is refused: an endpoint, a credential,
+    # a model, another extra; and a kind without an overlay may add nothing.
+    for refused in ("base_url", "api_key", "model", "extra.credential_source"):
+        with pytest.raises(MatrixSetupError, match="may overlay"):
+            matrix_columns.overlaid_routing(
+                shipped, {refused: "x"}, kind=kind, backend=column.backend
+            )
+    with pytest.raises(MatrixSetupError, match="may overlay"):
+        matrix_columns.overlaid_routing(
+            shipped,
+            {field: "x"},
+            kind=matrix_columns.HOSTED_GATEWAY_KIND,
+            backend=column.backend,
+        )
+    # A route of another backend family is left alone.
+    mixed = BackendRouting(
+        default=RoleConfig(backend=column.backend, model="one"),
+        roles={"implementer": RoleConfig(backend="codex", model="another")},
+    )
+    partly = matrix_columns.overlaid_routing(
+        mixed, {field: "/a/peer"}, kind=kind, backend=column.backend
+    )
+    assert partly.default.extra == {name: "/a/peer"}
+    assert partly.roles == mixed.roles
+
+
 class _FixedServedId(ToyDialect):
     """Answers every request under one id, whatever model was asked for."""
 
@@ -1315,6 +1428,7 @@ def test_kinds_without_a_driver_yield_no_cell_and_no_error() -> None:
     assert driven == registered_kinds() - {TOY_KIND} == {
         matrix_columns.HOSTED_GATEWAY_KIND,
         matrix_columns.LOCAL_GATEWAY_KIND,
+        matrix_columns.CLAUDE_KIND,
     }
     assert [cell for cell in cells.behaviour_cells() if cell.column.kind == TOY_KIND] == list(
         generated
@@ -1912,6 +2026,16 @@ def test_h03_entry_rules() -> None:
         {"cell": "claude/S01/primary/raw", "observed_under": {}, "codes": {"secret:leak": "M01"}}
     )
     assert "static:entry_ruling_missing" in _problem_codes(reference)
+    # A column-wide entry on a reference kind needs the owner's ruling too.
+    wide = _document()
+    wide["ceilings"]["max_known_gaps"]["pack_a"] += 1
+    wide["registry"]["M01"]["column_wide"] = [{"kind": "claude", "code": "pricing:none"}]
+    wide["known_gaps"].append(
+        {"column_wide": {"kind": "claude", "code": "pricing:none", "gap": "M01"}}
+    )
+    assert _problem_codes(wide) == {"static:entry_ruling_missing"}
+    wide["known_gaps"][-1]["ruling"] = "the owner accepts it as a gap of the reference"
+    assert _problem_codes(wide) == set()
 
     duplicate = _document()
     duplicate["known_gaps"].append(copy.deepcopy(duplicate["known_gaps"][0]))
@@ -2029,6 +2153,12 @@ def test_an_alternative_is_asserted_positively_and_replaces_no_clause(tmp_path: 
     # and so does one that carries the schema on its tool-bearing requests
     # (and, with that fault, no schema text in the prompt: the other code).
     assert codes("absent") == {"request.content:schema"}
+    # Where no finalisation was sent, the answer is still the draft's: an
+    # adapter that returns another valid object instead is told that too.
+    assert codes("absent and replaced", toy.SCHEMA_ANSWER_REPLACED) == {
+        "request.content:schema",
+        "text:mismatch",
+    }
     assert codes("misplaced", toy.FINAL_SCHEMA_REQUEST, toy.SCHEMA_MISPLACED) == {
         "request.content:schema",
         "request.content:schema_prompt",
@@ -2230,7 +2360,14 @@ def test_h03_a_column_wide_pin_names_a_cell_that_could_owe_the_gap() -> None:
     document = _document()
     document["ceilings"]["max_known_gaps"]["pack_a"] += 1
     document["registry"]["G02"]["column_wide"] = [{"kind": kind, "code": code}]
-    document["known_gaps"].append({"column_wide": {"kind": kind, "code": code, "gap": "G02"}})
+    document["known_gaps"].append(
+        {
+            "column_wide": {"kind": kind, "code": code, "gap": "G02"},
+            # Whichever kind is driven first: on a reference kind an entry
+            # needs the owner's ruling.
+            "ruling": "synthetic",
+        }
+    )
 
     def pinned(*rows: tuple[str, str]) -> set[str]:
         return _problem_codes(

@@ -623,6 +623,75 @@ def test_the_verifier_runs_as_the_ci_step_runs_it(tmp_path: Path) -> None:
     assert verify.main(["--root", str(tmp_path / "partial")]) == 1
 
 
+def test_a_reference_column_and_the_open_weight_columns_are_held_to_the_same_scenarios(
+    tmp_path: Path,
+) -> None:
+    def behaviour(kinds: frozenset[str]) -> dict[str, tuple[str, str]]:
+        """Scenario and lens of every behaviour cell of these kinds, by cell."""
+
+        found: dict[str, tuple[str, str]] = {}
+        for item in REAL:
+            if item.cell is None:
+                continue
+            kind, scenario, _role, lens = ledger.parse_cell_id(item.cell)
+            if kind in kinds and lens != ledger.STATIC_LENS:
+                found[item.cell] = (scenario, lens)
+        return found
+
+    def found(name: str, cases: Sequence[Seen]) -> list[str]:
+        paths = sorted(_write(tmp_path / name, cases).glob(verify.JUNIT_GLOB))
+        return verify.problems(
+            verify.read_junit(paths),
+            expected=REAL,
+            known=REAL_LEDGER,
+            pinned_counts=REAL_INVENTORY.cell_counts,
+            not_expressible=REAL_INVENTORY.not_expressible,
+            not_owed=REAL_INVENTORY.column_wide_not_owed,
+        )
+
+    def item_of(cell: str) -> str:
+        return next(item.name for item in REAL if item.cell == cell)
+
+    reference = behaviour(matrix_columns.REFERENCE_KINDS)
+    open_weight = behaviour(matrix_columns.OPEN_WEIGHT_KINDS)
+    complete = _real_complete_run()
+
+    # A reference column is driven, and whatever it plays, in whichever lens,
+    # an open-weight column plays too: the same scenario judged on both.
+    assert reference and set(reference.values()) <= set(open_weight.values())
+    # A reference cell is expected to pass unless the owner ruled on its gap:
+    # an entry on one records the ruling, cell by cell or column-wide.
+    for cell in reference:
+        entry = REAL_LEDGER.entry(cell)
+        assert entry is None or entry.ruling, cell
+    assert all(
+        scope.ruling
+        for scope in REAL_LEDGER.column_wide
+        if scope.kind in matrix_columns.REFERENCE_KINDS
+    )
+    # The verifier holds a run to both sets. Complete, it is accepted ...
+    assert found("complete", complete) == []
+    # ... a cell of either side that did not run is missed ...
+    same = [cell for cell, played in open_weight.items() if played in set(reference.values())]
+    for side, cell in (("reference", min(reference)), ("open-weight", min(same))):
+        missing = [case for case in complete if case.name != item_of(cell)]
+        assert any(
+            f"{item_of(cell)} did not run" in line for line in found(f"no-{side}", missing)
+        ), cell
+    # ... and a reference cell cannot be red on the quiet: an expected failure
+    # that no entry stands for is rejected, whatever gap it names.
+    quiet = min(cell for cell in reference if not _real_owed(cell))
+    red = [
+        dataclasses.replace(case, outcome=EXPECTED_FAILURE, message="G00: a gap")
+        if case.name == item_of(quiet)
+        else case
+        for case in complete
+    ]
+    assert any(
+        f"the ledger has no entry for cell {quiet}" in line for line in found("red", red)
+    )
+
+
 def test_ci_runs_the_verifier_after_the_shard_evidence_is_complete() -> None:
     jobs = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))["jobs"]
     steps = jobs["coverage"]["steps"]

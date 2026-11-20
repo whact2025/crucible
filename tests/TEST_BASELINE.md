@@ -110,6 +110,22 @@ The seam canary `S00` of each column fails unless the request is the SDK's own
 (path, user agent, credential, the host the client addressed), and every
 matrix module ends with a check that the canaries of its columns passed.
 
+A reference column is driven by replacing the vendor executable instead. The
+Claude session route keeps its shipped routing file and gets one overlay,
+`extra.cli_path`, which points at
+[a scripted peer](backend_matrix/peers/claude_cli.py). The adapter's Agent SDK
+starts the peer as it starts the vendor tool. The peer takes each model turn
+from the scripted provider and sends each tool call through the SDK's control
+channel to the real dispatch bridge. Its canary fails unless the SDK started
+it: the two probes of the session route ran first, the environment was
+sanitised, and the control handshake preceded the prompt. The peer's journal
+names the variables of its environment and keeps none of their values beyond
+the three the canary reads. Nothing was observed of the real tool, so every
+frame of the peer is `constructed` and its session accounting is an emulation.
+What the peer does not emulate ends the cell as a setup error, never as an
+observation. A known gap on a reference column needs the owner's ruling in its
+ledger entry.
+
 A scripted reply is an envelope under `backend_matrix/envelopes/<dialect>/`
 with only its slots filled, and each envelope states where its shape comes
 from: `recorded` from the provider, `documented` by the vendor or a live
@@ -125,7 +141,10 @@ uv run python -m pytest -q tests/backend_matrix
 The run proves the oracle on the toy driver (honest cells pass, every liar
 yields exactly its codes), runs the driven columns and the static cells. It
 needs Linux, no network and no credentials; a network guard fails any test of
-the package that reaches beyond loopback.
+the package that reaches beyond loopback. The scripted peer of a reference
+column runs in processes of its own, and its launcher installs the same guard
+there: a peer that reaches beyond loopback crashes, which ends its cell as a
+setup error.
 
 After the CI shards, the coverage job runs the cell-inventory verifier on
 their JUnit files:

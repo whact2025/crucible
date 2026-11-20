@@ -39,7 +39,8 @@ schema_version: crucible.backend-matrix.inventory.v1
 
 cell_counts:
   toy: 68
-  claude: 0
+  # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
+  claude: 14
   "codex:legacy": 0
   "codex:official": 0
   deepseek: 0

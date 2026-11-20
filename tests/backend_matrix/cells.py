@@ -58,6 +58,7 @@ ENABLEMENT: Mapping[str, tuple[str, ...]] = {
     **{kind: () for kind in REAL_KINDS},
     matrix_columns.HOSTED_GATEWAY_KIND: (STARTER,),
     matrix_columns.LOCAL_GATEWAY_KIND: (STARTER,),
+    matrix_columns.CLAUDE_KIND: (STARTER,),
 }
 # A secondary column runs these sets; a blocked column these scenarios.
 SECONDARY_SETS: tuple[str, ...] = (STARTER, PACK_A)
@@ -72,6 +73,7 @@ MODULE_BY_KIND: Mapping[str, str] = {
     TOY_KIND: "test_matrix_self",
     matrix_columns.HOSTED_GATEWAY_KIND: "test_matrix_openai_compat",
     matrix_columns.LOCAL_GATEWAY_KIND: "test_matrix_openai_compat",
+    matrix_columns.CLAUDE_KIND: "test_matrix_claude",
 }
 STATIC_MODULE = "test_matrix_static"
 # Static scenario -> its test, and whether the test is parametrised by cell id.

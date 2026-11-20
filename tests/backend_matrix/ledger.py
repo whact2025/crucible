@@ -669,6 +669,14 @@ def _entry_problems(ledger: Ledger, world: World) -> list[Deviation]:
                     f"column-wide {scope.code}: the toy kind is never ledgered",
                 )
             )
+        if scope.kind in world.reference_kinds and not scope.ruling:
+            out.append(
+                Deviation(
+                    "static:entry_ruling_missing",
+                    f"column-wide {scope.code} is on the reference kind "
+                    f"{scope.kind} and records no owner ruling",
+                )
+            )
         record = ledger.registry.get(scope.gap)
         if record is None or (scope.kind, scope.code) not in record.column_wide:
             out.append(
