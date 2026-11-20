@@ -1,0 +1,472 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The ledger of the backend conformance matrix.
+#
+# known_gaps: a cell listed here is an expected failure only while it fails
+#   with exactly these codes. If it passes, the run fails with "gap fixed,
+#   delete the entry"; if it fails in another way, with "different deviation".
+#   A fix deletes its entry in the same change and edits nothing else here.
+#   Only a behaviour cell of a real kind and the static cells H01 and H02 may
+#   be listed: a toy cell and the other static cells (P01, P02, P04, H03, H04)
+#   check the matrix itself and are never expected failures.
+# registry: permanent. A record stays when its gap is fixed, so the passing
+#   cell stays pinned. `observed_under` and `closes_under` hold the governing
+#   declared values of the cell's scenario; they are equal unless the record
+#   names the `declaration_change` (field, from, to, citation) that is the
+#   gap's listed resolution. `predicted` holds the codes expected of the cell
+#   before the first run of its column; the first run corrects them.
+#   A `column_wide` entry is one clause code that shows on every cell of a
+#   kind where its clause was evaluated and its check was asked (C6 asks for
+#   pricing evidence only of a result that flags its cost complete). It is
+#   owed there and tolerated nowhere else.
+# declared_differences: differences no feature field expresses. Each has a
+#   product citation, an owner, a date and the alternative contract asserted
+#   instead; a cell passes only if the alternative holds. Either a variant of
+#   a scenario's difference table asserts it (a declared value selects it), or
+#   the scenario defines it and `cells` lists where it is in force. A declared
+#   difference replaces no contract clause and is counted apart from the
+#   known gaps.
+# ceilings: counts may not exceed them. They rise while entries land and are
+#   frozen at the gate (pack A) and at the end of pack B; after that they only
+#   fall.
+#
+# Cell ids read <kind>/<scenario>/<role>/<lens>.
+
+schema_version: crucible.backend-matrix.ledger.v1
+
+ceilings:
+  max_known_gaps:
+    pack_a: 19
+    pack_b: 0
+  max_declared_differences: 2
+
+registry:
+  G02:
+    title: Kimi labels a tool-budget stop a transport error and records no limit event
+    origin: gap list
+    severity: high
+    cells:
+      - cell: kimi/S12/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted:
+          - "kind:transport!=max_turns"
+          - "event.missing:limit/tool_dispatch_budget"
+
+  G03:
+    title: Kimi does not credit a write as progress (frozen wrapper handed to the mutation host)
+    origin: gap list
+    severity: high
+    cells:
+      - cell: kimi/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+        # While G02 is open the denied read ends as a transport error; the
+        # kind code becomes kind:max_turns!=none once G02 is fixed.
+        predicted:
+          - "progress:write_not_credited"
+          - "kind:transport!=none"
+          - "stop:tool_budget_exhausted!=end_turn"
+          - "dispatch.missing:read_a"
+          - "request.unconsumed"
+
+  G04:
+    title: Kimi worker tests skip without the worker runtime, and the column is not driven
+    origin: gap list
+    severity: high
+    cells:
+      # The skip markers sit in the test files inventory.yaml lists for the
+      # Kimi worker; a marker anywhere else is static:worker_skip_unpinned.
+      - cell: kimi/H01/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:worker_skip"]
+      - cell: kimi/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  G14:
+    title: DeepSeek appends a limit event after the terminal event, so invoke raises
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S10a/primary/raw
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+        predicted: ["raise:ValueError@after_request/assay.types.invocation"]
+      - cell: deepseek/S13/primary/raw
+        observed_under: {usd_limit: post_hoc}
+        closes_under: {usd_limit: post_hoc}
+        predicted: ["raise:ValueError@after_request/assay.types.invocation"]
+      - cell: deepseek/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+        # The call ends at the first result over the budget, so the rest of
+        # the script is never requested.
+        predicted:
+          - "raise:ValueError@after_request/assay.types.invocation"
+          - "request.unconsumed"
+
+  G15:
+    title: DeepSeek raises before transport for max_turns above 64
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S11/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted:
+          - "raise:ValueError@before_request/crucible.backends.deepseek"
+          - "request.unconsumed"
+
+  G16:
+    title: DeepSeek records one request event per provider round, which the limit guard rejects
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S03/primary/guarded
+        observed_under: {event_detail: tool_calls}
+        closes_under: {event_detail: tool_calls}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: deepseek/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+
+  G17:
+    title: DeepSeek does not credit a write as progress (frozen wrapper handed to the mutation host)
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted:
+          - "progress:write_not_credited"
+          - "kind:max_turns!=none"
+          - "stop:tool_budget_exhausted!=end_turn"
+          - "dispatch.missing:read_a"
+          - "request.unconsumed"
+
+  G18:
+    title: DeepSeek has no content-rejected path
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/S23a/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["kind:transport!=content_rejected"]
+      - cell: deepseek/S23b/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["kind:transport!=content_rejected"]
+      - cell: deepseek/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["kind:transport!=content_rejected"]
+
+  G20:
+    title: No DeepSeek test runs a protocol exchange; the column is not driven
+    origin: gap list
+    severity: high
+    cells:
+      - cell: deepseek/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  G28:
+    title: The gateway adapter records one request event per completion, which the limit guard rejects
+    origin: gap list
+    severity: high
+    cells:
+      - cell: openai_compat:hosted/S03/primary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:hosted/S04/primary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:local/S03/primary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:local/S04/primary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      # Observed at the first run of the secondary column (part 2).
+      - cell: openai_compat:hosted/S03/secondary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:hosted/S04/secondary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+
+  G29:
+    title: The gateway adapter clears the accounting flags after a forced finalisation
+    origin: gap list
+    severity: high
+    cells:
+      - cell: openai_compat:hosted/S04/primary/raw
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S04/primary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S10a/primary/raw
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:local/S04/primary/raw
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:local/S04/primary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:local/S10a/primary/raw
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      # Observed at the first run of the secondary column (part 2).
+      - cell: openai_compat:hosted/S04/secondary/raw
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S04/secondary/guarded
+        observed_under: {structured_output: unsupported}
+        closes_under: {structured_output: unsupported}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+
+  G30:
+    title: Every gateway test stubs the client and the local route has no test; the columns are not driven
+    origin: gap list
+    severity: high
+    cells:
+      # static:no_driven_column until the drivers landed (part 2); the cells
+      # stay red until pack A runs on the columns.
+      - cell: openai_compat:hosted/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:pack_a_not_enabled"]
+      - cell: openai_compat:local/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:pack_a_not_enabled"]
+
+  G32:
+    title: The gateway adapter returns no pricing evidence on any path
+    origin: gap list
+    severity: medium
+    # Wherever the adapter flags its cost complete. A result it flags
+    # incomplete (a forced finalisation today, G29) owes no evidence.
+    column_wide:
+      - {kind: "openai_compat:hosted", code: "pricing:none"}
+      - {kind: "openai_compat:local", code: "pricing:none"}
+
+  M01:
+    title: The Claude columns are not driven by the matrix yet
+    origin: matrix
+    severity: medium
+    cells:
+      - cell: claude/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  M02:
+    title: The Codex app-server column is not driven by the matrix yet
+    origin: matrix
+    severity: medium
+    cells:
+      - cell: codex:legacy/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  M03:
+    title: The Codex official-SDK column is not driven by the matrix yet
+    origin: matrix
+    severity: medium
+    cells:
+      - cell: codex:official/H02/-/static
+        observed_under: {}
+        closes_under: {}
+        predicted: ["static:no_driven_column"]
+
+  M04:
+    title: The gateway adapter writes no schema text into the prompt of a prompt_only route
+    origin: matrix
+    severity: medium
+    # Not predicted: design section 9.2 expected the hosted routes to confirm
+    # their declaration. Seen at the first run of the columns (part 2): at a
+    # bare invocation the adapter sends the schema as response_format on the
+    # finalisation request and writes no schema text into the system prompt,
+    # while the two other adapters that declare prompt_only bind the schema
+    # into the prompt themselves (crucible/backends/deepseek.py:1803-1830,
+    # crucible/backends/kimi.py:2041-2064). Reported for the gap list.
+    # The prompt half of the placement has a code of its own, so this gap
+    # covers nothing a wrong finalisation request would show
+    # (request.content:schema).
+    declaration_change:
+      field: structured_output
+      from: prompt_only
+      to: unsupported
+      citation: >-
+        Owner decision OD-7 of the open-weight model update, taken at its
+        default: the two route-qualified hub profiles
+        (crucible/backends/features.py:103-115) are removed and both hub
+        routes carry the generic gateway profile (features.py:78-81), which
+        claims no schema placement.
+    cells:
+      - cell: openai_compat:hosted/S04/primary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+      - cell: openai_compat:hosted/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+      - cell: openai_compat:hosted/S04/secondary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+      - cell: openai_compat:hosted/S04/secondary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+
+known_gaps:
+  - cell: kimi/H01/-/static
+    observed_under: {}
+    codes: {"static:worker_skip": G04}
+  - cell: openai_compat:hosted/H02/-/static
+    observed_under: {}
+    codes: {"static:pack_a_not_enabled": G30}
+  - cell: openai_compat:local/H02/-/static
+    observed_under: {}
+    codes: {"static:pack_a_not_enabled": G30}
+  - cell: deepseek/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": G20}
+  - cell: kimi/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": G04}
+  - cell: claude/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": M01}
+  - cell: codex:legacy/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": M02}
+  - cell: codex:official/H02/-/static
+    observed_under: {}
+    codes: {"static:no_driven_column": M03}
+
+  # The gateway columns, first run of part 2 (starter set). On S04 guarded the
+  # guard codes are G28's today; once G28 is fixed the guard reports the
+  # incomplete accounting of G29 instead, and that fix edits the entry. On
+  # the hosted S04 cells the code for the schema text in the prompt is M04's:
+  # it leaves with the declaration change that record names, not with the G28
+  # or G29 fix.
+  - cell: openai_compat:hosted/S03/primary/guarded
+    observed_under: {event_detail: usage}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+  - cell: openai_compat:hosted/S04/primary/raw
+    observed_under: {structured_output: unsupported}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S04/primary/guarded
+    observed_under: {structured_output: unsupported}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S03/secondary/guarded
+    observed_under: {event_detail: usage}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+  - cell: openai_compat:hosted/S04/secondary/raw
+    observed_under: {structured_output: unsupported}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S04/secondary/guarded
+    observed_under: {structured_output: unsupported}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:local/S03/primary/guarded
+    observed_under: {event_detail: usage}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+  - cell: openai_compat:local/S04/primary/raw
+    observed_under: {structured_output: unsupported}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:local/S04/primary/guarded
+    observed_under: {structured_output: unsupported}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - column_wide: {kind: "openai_compat:hosted", code: "pricing:none", gap: G32}
+  - column_wide: {kind: "openai_compat:local", code: "pricing:none", gap: G32}
+
+declared_differences:
+  - id: D-STRUCT-UNQUALIFIED
+    citation: >-
+      crucible/backends/features.py:78-81 (the generic gateway profile: the
+      adapter sends response_format when requested, but an arbitrary
+      compatible gateway has not earned a native-schema conformance claim)
+    owner: release owner (design section 15, decisions taken at their defaults)
+    date: "2026-11-19"
+    alternative: >-
+      A route that declares structured_output=unsupported makes no claim about
+      where the schema travels, so a scenario with a response schema asserts
+      no placement there: neither the schema field of the provider nor schema
+      text in the prompt. The final message must still validate against the
+      schema and every contract clause applies unchanged. Selected by the
+      declared value (the `unsupported` variant of the scenario).
+  - id: D-OAI-SCHEMA-FINAL
+    citation: >-
+      crucible/backends/openai_compat.py:1619-1646 (tool-enabled turns run
+      without the response schema; once exploration ends naturally, one
+      no-tools completion turns the draft into the schema-constrained answer)
+    owner: release owner (design section 15, decisions taken at their defaults)
+    date: "2026-11-19"
+    alternative: >-
+      After a tool loop that ends naturally the adapter sends exactly one
+      further request, which advertises no tools and carries the schema in the
+      schema field of the provider; no tool-bearing request carries it. The
+      answer to that request is the final message (the script answers it with
+      another valid text than the draft of the last tool round, and the cell
+      requires that one) and must validate against the schema. Its usage is
+      counted and the accounting flags stay complete (C6 applies unchanged,
+      as does every other clause). On the listed cells this restates where
+      the schema field travels and nothing else: what the declared
+      structured_output value says about the prompt is still asserted, so a
+      route that declares prompt_only owes the schema text once in the system
+      prompt (known gap M04 on the hosted cells).
+    cells:
+      - openai_compat:hosted/S04/primary/raw
+      - openai_compat:hosted/S04/primary/guarded
+      - openai_compat:hosted/S04/secondary/raw
+      - openai_compat:hosted/S04/secondary/guarded
+      - openai_compat:local/S04/primary/raw
+      - openai_compat:local/S04/primary/guarded

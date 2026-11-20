@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A chat completion that asks for one function tool call, in the hosted
+# gateway's dialect.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: gateway
+behaviour: tool_call
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletion whose message.tool_calls holds one
+    ChatCompletionMessageFunctionToolCall
+  sdk_version: "2.44.0"
+  notes: >-
+    Nothing was observed: the live requests of 2026-11-18 were plain
+    completions and exercised no tool call (port note
+    open-weight-live-facts.md, line 34). The public catalog page of the model
+    family says that its tool calls are OpenAI-compatible (port note
+    open-weight-research.json, topic "catalogs", api_changes[7], primary
+    source, read 2026-11-18); that page is not this gateway and shows no
+    body. So this envelope proves that the reply parses through the SDK, not
+    that the gateway sends it.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - id: {slot: call_id}
+            type: function
+            function:
+              name: {slot: tool_name}
+              arguments: {slot: tool_arguments}
+      finish_reason: tool_calls
+  usage:
+    prompt_tokens: {slot: input_tokens}
+    completion_tokens: {slot: output_tokens}
+    total_tokens: {slot: total_tokens}
