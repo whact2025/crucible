@@ -100,29 +100,20 @@ _OPENAI_COMPAT_FEATURES = BackendFeatureSet(
     native_delegation="none",
 )
 
-_NVIDIA_K26_OPENAI_FEATURES = dataclasses.replace(
-    _OPENAI_COMPAT_FEATURES,
-    # The configured-inference route is a diagnostic control. Its current
-    # schema behavior remains route-qualified rather than assumed native.
-    structured_output="prompt_only",
-)
-
-_NVIDIA_GLM52_OPENAI_FEATURES = dataclasses.replace(
-    _OPENAI_COMPAT_FEATURES,
-    # The exact NVIDIA GLM-5.2 route has a qualified constrained-finalization
-    # compatibility path, followed by Assay's deterministic schema validation.
-    structured_output="prompt_only",
-)
-
 _KIMI_SDK_FEATURES = BackendFeatureSet(
     structured_output="prompt_only",
     tool_loop="sdk_owned",
     session_continuity="none",
     event_detail="tool_calls",
     turn_limit="hard",
-    # The pinned native Kimi provider receives the model-specific response
-    # cap through its qualified generation-kwargs shape (max_tokens for
-    # K2.7, max_completion_tokens for K3).
+    # The pinned native Kimi provider receives the response cap through its
+    # qualified generation-kwargs shape, as ``max_completion_tokens`` (the
+    # K3-series field; the deprecated ``max_tokens`` is never sent).
+    # Observed once through this adapter on 2026-11-19 (UTC), kimi-k3.1-pro
+    # with a cap of 16 on a prompt that asks for a long answer: Moonshot
+    # ended the response with the length finish reason at exactly 16 output
+    # tokens and no visible text, and the adapter returned the typed
+    # ``max_tokens`` terminal.
     response_token_limit="provider_stop",
     context_byte_limit="unsupported",
     usd_limit="post_hoc",
@@ -179,27 +170,13 @@ def feature_profile_for_route(
     if canonical == "claude":
         return _CLAUDE_AGENT_FEATURES
     if canonical == "deepseek":
-        if model == "deepseek-v4-flash" and base_url is None:
+        if model == "deepseek-flash" and base_url is None:
             return _DEEPSEEK_RESPONSES_CONSTRUCTION_FEATURES
         return CONSERVATIVE_BACKEND_FEATURES
     if canonical in {"local", "openai_compat"}:
-        try:
-            route_host = (
-                urlsplit(base_url).hostname.lower()
-                if base_url is not None
-                and urlsplit(base_url).hostname is not None
-                else None
-            )
-        except (TypeError, ValueError):
-            route_host = None
-        if route_host in {
-            "inference-api.nvidia.com",
-            "inference-api-dev.nvidia.com",
-        }:
-            if model == "nvidia/moonshotai/kimi-k2.6":
-                return _NVIDIA_K26_OPENAI_FEATURES
-            if model == "nvidia/zai-org/glm-5.2":
-                return _NVIDIA_GLM52_OPENAI_FEATURES
+        # No hosted or local OpenAI-compatible route has a recorded
+        # structured-output qualification.  An exact route profile is added
+        # here only together with that observation.
         return _OPENAI_COMPAT_FEATURES
     if canonical == "kimi":
         try:
@@ -218,7 +195,7 @@ def feature_profile_for_route(
             )
         except (TypeError, ValueError):
             exact_moonshot_route = False
-        if model in {"kimi-k2.7-code-highspeed", "kimi-k3"} and exact_moonshot_route:
+        if model == "kimi-k3.1-pro" and exact_moonshot_route:
             return _KIMI_SDK_FEATURES
         return CONSERVATIVE_BACKEND_FEATURES
     return CONSERVATIVE_BACKEND_FEATURES

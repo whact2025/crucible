@@ -20,7 +20,9 @@ The command authenticates the installed worker once, pins that same runtime
 fingerprint into every route, publishes exact bytes exclusively, and writes a
 secret-free receipt. The output must be a new absolute path. Supply that file
 to the suite with `--backend-config` and credentials only at authorized dispatch.
-The resulting route remains diagnostic and non-promotable.
+The resulting route remains diagnostic and non-promotable. Its runs record
+DeepSeek cost at the published peak rate, an upper bound: it equals the charge
+at peak and is twice the charge off-peak.
 
 ## Options
 

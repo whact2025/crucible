@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-"""Offline diagnostic K3 bounds never become complete billing or old authority."""
+"""Offline diagnostic K3-series bounds never become complete billing or old authority."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ from .test_backend_limits import (
 
 def _profile():
     return feature_profile_for_route(
-        "kimi", model="kimi-k3", base_url="https://api.moonshot.ai/v1",
+        "kimi", model="kimi-k3.1-pro", base_url="https://api.moonshot.ai/v1",
     )
 
 
@@ -65,14 +65,15 @@ def _resolution(*, budget: float = 1.0):
             "diagnostic", 3, budget, 10,
             diagnostic_cost_policy=DIAGNOSTIC_COST_POLICY,
         ),
-        route="kimi/kimi-k3 for role 'implementer'",
+        route="kimi/kimi-k3.1-pro for role 'implementer'",
     )
 
 
 def _bound_result(*, known_read: bool = False) -> InvocationResult:
     read = 20 if known_read else None
-    lower = (106 * 3 + 20 * .3 + 74 * 15) / 1e6 if known_read else .0011478
-    upper = lower if known_read else .001488
+    # kimi-k3.1-pro card: $2 input, $0.20 cached input, $10 output per MTok.
+    lower = (106 * 2 + 20 * .2 + 74 * 10) / 1e6 if known_read else .0007652
+    upper = lower if known_read else .000992
     bounds = UsageCostBounds(
         segments=(UsageCostBoundSegment(
             input_tokens=126, output_tokens=74, cache_creation_tokens=0,
@@ -92,7 +93,7 @@ def _bound_result(*, known_read: bool = False) -> InvocationResult:
             terminal_complete=True, trace_complete=True,
         ),
         execution_trace=BackendExecutionTrace(
-            backend="kimi", requested_model="kimi-k3", served_model="kimi-k3",
+            backend="kimi", requested_model="kimi-k3.1-pro", served_model="kimi-k3.1-pro",
             requested_effort="max", endpoint="https://api.moonshot.ai/v1",
             feature_profile_digest=_resolution().feature_profile_digest,
             events=(
@@ -104,14 +105,14 @@ def _bound_result(*, known_read: bool = False) -> InvocationResult:
 
 
 def _backend(result: InvocationResult | None = None):
-    backend = _FakeBackend(result or _bound_result(), name="kimi", model="kimi-k3")
+    backend = _FakeBackend(result or _bound_result(), name="kimi", model="kimi-k3.1-pro")
     backend.effort = "max"
     backend.diagnostic_cost_upper_bound = True
     return backend
 
 
 def _kimi_identity():
-    return InvocationLimitIdentity("implementer", "kimi", "kimi-k3")
+    return InvocationLimitIdentity("implementer", "kimi", "kimi-k3.1-pro")
 
 
 def _bind(backend, ledger, *, budget: float = 1.0):
@@ -181,7 +182,8 @@ def test_bound_mode_requires_durable_ledger_before_transport() -> None:
 @pytest.mark.parametrize("field,value", [
     ("diagnostic_cost_upper_bound", False),
     ("diagnostic_cost_upper_bound", 1),
-    ("model", "kimi-k2.7-code-highspeed"),
+    # Another Kimi id: the policy names one exact route.
+    ("model", "kimi-k3.1-pro-highspeed"),
     ("effort", "high"),
     ("name", "openai_compat"),
 ])
@@ -270,26 +272,26 @@ def test_other_incomplete_or_failed_evidence_revokes_bound_authority(
 def test_upper_bound_not_actual_lower_bound_enforces_usd_cap(tmp_path) -> None:
     ledger = InvocationLimitLedger(tmp_path / INVOCATION_LIMIT_LEDGER_LEAF)
     backend = _backend()
-    _bind(backend, ledger, budget=.0012)
-    result = backend.invoke(_invocation(budget_usd=.0012))
+    _bind(backend, ledger, budget=.0008)
+    result = backend.invoke(_invocation(budget_usd=.0008))
     assert result.error.kind == "budget_exhausted"
-    assert result.error.spent_usd == .001488
+    assert result.error.spent_usd == .000992
     assert "diagnostic cost upper bound" in result.error.message
-    assert result.usage.cost_usd == .0011478
+    assert result.usage.cost_usd == .0007652
     assert result.completeness.cost_complete is False
     terminal = invocation_limit_terminal(backend)
     assert terminal.overshoots == ("usd",)
-    assert terminal.cost_bounds.upper_bound_usd == .001488
+    assert terminal.cost_bounds.upper_bound_usd == .000992
     assert terminal.revokes_diagnostic_authority
     with pytest.raises(InvocationLimitContractError):
-        backend.invoke(_invocation(budget_usd=.0012))
+        backend.invoke(_invocation(budget_usd=.0008))
 
 
 def test_exact_upper_bound_at_cap_is_still_diagnostic(tmp_path) -> None:
     ledger = InvocationLimitLedger(tmp_path / INVOCATION_LIMIT_LEDGER_LEAF)
     backend = _backend()
-    _bind(backend, ledger, budget=.001488)
-    assert backend.invoke(_invocation(budget_usd=.001488)).error is None
+    _bind(backend, ledger, budget=.000992)
+    assert backend.invoke(_invocation(budget_usd=.000992)).error is None
     terminal = invocation_limit_terminal(backend)
     assert terminal.diagnostic_cost_authority and not terminal.rankable
 

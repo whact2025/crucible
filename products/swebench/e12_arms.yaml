@@ -46,9 +46,9 @@ arms:
 
   C:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
-    effort: null
-    quality_setting: high
+    model: kimi-k3.1-pro
+    effort: max
+    quality_setting: max
     routing: backends_kimi_sdk.yaml
     promotion_gate: blocked
     gate_ticket: KIM-03

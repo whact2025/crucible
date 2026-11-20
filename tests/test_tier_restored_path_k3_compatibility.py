@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-"""Restored-path handoff cannot upgrade K3 diagnostic recovery authority."""
+"""Restored-path handoff cannot upgrade K3-series diagnostic recovery authority."""
 
 from __future__ import annotations
 
@@ -62,10 +62,10 @@ def test_same_path_restore_cannot_override_k3_terminal_revocation(
     def resolve(role, **kwargs):
         bind_invocation_limit_policy(
             backend,
-            feature_profile_for_route("kimi", model="kimi-k3", base_url="https://api.moonshot.ai/v1"),
-            kwargs["limit_policy"], route=f"kimi/kimi-k3 for role '{role}'",
+            feature_profile_for_route("kimi", model="kimi-k3.1-pro", base_url="https://api.moonshot.ai/v1"),
+            kwargs["limit_policy"], route=f"kimi/kimi-k3.1-pro for role '{role}'",
             shared_state=kwargs["limit_state"], evidence_ledger=kwargs["limit_ledger"],
-            identity=InvocationLimitIdentity(role=role, backend="kimi", model="kimi-k3"),
+            identity=InvocationLimitIdentity(role=role, backend="kimi", model="kimi-k3.1-pro"),
         )
         return backend
 
@@ -142,10 +142,10 @@ def test_clean_k3_scope_repair_rewrites_only_admitted_restored_paths(
     def resolve(role, **kwargs):
         bind_invocation_limit_policy(
             backend,
-            feature_profile_for_route("kimi", model="kimi-k3", base_url="https://api.moonshot.ai/v1"),
-            kwargs["limit_policy"], route=f"kimi/kimi-k3 for role '{role}'",
+            feature_profile_for_route("kimi", model="kimi-k3.1-pro", base_url="https://api.moonshot.ai/v1"),
+            kwargs["limit_policy"], route=f"kimi/kimi-k3.1-pro for role '{role}'",
             shared_state=kwargs["limit_state"], evidence_ledger=kwargs["limit_ledger"],
-            identity=InvocationLimitIdentity(role=role, backend="kimi", model="kimi-k3"),
+            identity=InvocationLimitIdentity(role=role, backend="kimi", model="kimi-k3.1-pro"),
         )
         return backend
 

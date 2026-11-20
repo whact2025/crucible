@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-"""All-K3 product profiles are explicit, confined, and separate from old cohorts."""
+"""K3.1 Pro product profiles are explicit, confined, and bound to the cost policy."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from crucible.backends import config as config_module
+from crucible.backends import cost_bounds
 from crucible.backends.config import (
     DEFAULT_ROUTING,
     lint_routing_config,
@@ -21,6 +22,13 @@ from crucible.backends.config import (
     routing_fingerprint,
 )
 from crucible.backends.features import FeatureAdmissionError
+from crucible.backends.kimi import KimiBackend
+from crucible.backends.limits import (
+    INVOCATION_LIMIT_LEDGER_LEAF,
+    InvocationLimitContractError,
+    InvocationLimitLedger,
+    InvocationLimitPolicy,
+)
 from crucible.products.deepswe.backend_convergence import (
     load_deepswe_backend_profile_catalog,
 )
@@ -30,8 +38,15 @@ from crucible.products.swebench.backend_convergence import (
 
 
 ROOT = Path(__file__).parents[1]
-PROFILE = "kimi_k3_sdk_diagnostic"
+PROFILE = "kimi_k31_pro_sdk_diagnostic"
+MODEL = "kimi-k3.1-pro"
+POLICY = "kimi-k3.1-pro-cache-read-upper-bound-v1"
 WRITERS = {"implementer", "breach_defender"}
+# The two profiles with diagnostic admission; the E12 arm profile enforces.
+DIAGNOSTIC_PROFILES = (
+    "backends_kimi_sdk_diagnostic.yaml",
+    "backends_kimi_k31_pro_sdk_diagnostic.yaml",
+)
 LOADERS = {
     "swebench": load_swebench_backend_profile_catalog,
     "deepswe": load_deepswe_backend_profile_catalog,
@@ -39,7 +54,14 @@ LOADERS = {
 
 
 def _path(product: str) -> Path:
-    return ROOT / "products" / product / "backends_kimi_k3_sdk_diagnostic.yaml"
+    return ROOT / "products" / product / "backends_kimi_k31_pro_sdk_diagnostic.yaml"
+
+
+def _effective_routes(routing: Any) -> list[tuple[str, Any]]:
+    return [
+        ("default", routing.default),
+        *((role, routing.for_role(role)) for role in routing.roles),
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +83,7 @@ def test_k3_profiles_pin_every_role_and_limit_writer_opt_in(product: str) -> Non
 
     for role, route in {"default": raw["default"], **raw["roles"]}.items():
         assert route["backend"] == "kimi"
-        assert route["model"] == "kimi-k3"
+        assert route["model"] == MODEL
         assert route["effort"] == "max"
         assert route["feature_admission"] == "diagnostic"
         assert route["base_url"] == "${KIMI_BASE_URL}"
@@ -69,6 +91,7 @@ def test_k3_profiles_pin_every_role_and_limit_writer_opt_in(product: str) -> Non
         expected_extra: dict[str, Any] = {
             "worker_source": "project_locked",
             "max_response_tokens": 32_768,
+            "diagnostic_cost_upper_bound": True,
         }
         if role in WRITERS:
             expected_extra["diagnostic_workspace_write"] = True
@@ -83,20 +106,28 @@ def test_k3_profiles_pin_every_role_and_limit_writer_opt_in(product: str) -> Non
 def test_k3_catalog_lane_is_new_non_promotional_identity(product: str) -> None:
     catalog = LOADERS[product]()
     lane = catalog.lane(PROFILE)
-    old_lane = catalog.lane("kimi_sdk_diagnostic")
+    writer_lane = catalog.lane("kimi_sdk_diagnostic")
     assert lane.routing_path == _path(product).resolve()
     assert lane.evidence_status == "diagnostic"
     assert lane.promotion_eligible is False
     assert lane.promotion_authority_digest is None
     for route in (lane.default_route, *lane.role_routes):
-        assert route.model == "kimi-k3"
+        assert route.model == MODEL
         assert route.effort == "max"
-    assert lane.routing_digest != old_lane.routing_digest
-    assert lane.routing_fingerprint != old_lane.routing_fingerprint
+    # Same model, separate route identities: the all-role writer profile
+    # differs in writer scope and response caps.
+    assert lane.routing_digest != writer_lane.routing_digest
+    assert lane.routing_fingerprint != writer_lane.routing_fingerprint
     assert lane.routing_fingerprint == routing_fingerprint(
         lint_routing_config(_path(product))
     )
-    assert old_lane.default_route.model == "kimi-k2.7-code-highspeed"
+    for route in (writer_lane.default_route, *writer_lane.role_routes):
+        assert route.model == MODEL
+        assert route.effort == "max"
+    assert writer_lane.promotion_eligible is False
+    assert not (
+        ROOT / "products" / product / "backends_kimi_k3_sdk_diagnostic.yaml"
+    ).exists()
     assert DEFAULT_ROUTING.default.backend == "codex"
 
 
@@ -132,10 +163,11 @@ def test_k3_product_route_resolves_exact_bounded_kwargs_without_credentials(
         )
         name, kwargs = calls[-1]
         assert name == "kimi"
-        assert kwargs["model"] == "kimi-k3"
+        assert kwargs["model"] == MODEL
         assert kwargs["effort"] == "max"
         assert kwargs["max_response_tokens"] == 32_768
         assert kwargs["worker_source"] == "project_locked"
+        assert kwargs["diagnostic_cost_upper_bound"] is True
         assert kwargs["expected_base_url"] == "https://api.moonshot.ai/v1"
         assert kwargs["capability"] == capability
         assert kwargs["cwd"] == str(tmp_path.resolve())
@@ -180,20 +212,126 @@ def test_k3_writer_cannot_inherit_authority_from_default(
         )
 
 
+@pytest.mark.parametrize("product", LOADERS)
+@pytest.mark.parametrize("filename", DIAGNOSTIC_PROFILES)
+def test_diagnostic_profiles_carry_what_the_cost_bound_policy_requires(
+    product: str,
+    filename: str,
+) -> None:
+    # Routing validation admits extra.diagnostic_cost_upper_bound only with
+    # the policy's exact model, effort max, diagnostic admission, the public
+    # Moonshot endpoint and the project-locked worker. Every effective route
+    # of both diagnostic profiles carries exactly that.
+    path = ROOT / "products" / product / filename
+    linted = lint_routing_config(path)
+    loaded = load_routing(config_path=path)
+    assert MODEL == cost_bounds.DIAGNOSTIC_COST_MODEL
+    assert POLICY == cost_bounds.DIAGNOSTIC_COST_POLICY
+    for routing, endpoint in (
+        (linted, "${KIMI_BASE_URL}"),
+        (loaded, "https://api.moonshot.ai/v1"),
+    ):
+        for role, route in _effective_routes(routing):
+            assert route.backend == "kimi", role
+            assert route.model == MODEL, role
+            assert route.effort == "max", role
+            assert route.feature_admission == "diagnostic", role
+            assert route.base_url == endpoint, role
+            assert route.extra["worker_source"] == "project_locked", role
+            assert route.extra["diagnostic_cost_upper_bound"] is True, role
+
+
+@pytest.mark.parametrize("product", LOADERS)
+def test_enforcing_arm_profile_cannot_carry_the_cost_bound_opt_in(product: str) -> None:
+    # E12 Arm C must enforce feature admission, and routing validation admits
+    # the cost-bound opt-in only under diagnostic admission. The arm profile
+    # stays strict; neither check is relaxed for it.
+    path = ROOT / "products" / product / "backends_kimi_sdk.yaml"
+    for role, route in _effective_routes(lint_routing_config(path)):
+        assert route.model == MODEL, role
+        assert route.effort == "max", role
+        assert route.feature_admission == "enforce", role
+        assert "diagnostic_cost_upper_bound" not in route.extra, role
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["default"]["extra"]["diagnostic_cost_upper_bound"] = True
+    with pytest.raises(ValueError, match="diagnostic_cost_upper_bound requires exact"):
+        lint_routing_config(yaml.safe_dump(raw).encode("utf-8"))
+
+
+@pytest.mark.parametrize("product", LOADERS)
+@pytest.mark.parametrize("filename", DIAGNOSTIC_PROFILES)
+def test_diagnostic_profile_without_the_cost_policy_is_refused_before_transport(
+    product: str,
+    filename: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The profile's adapter flag and the run's --diagnostic-cost-policy must
+    # agree. A run with diagnostic limits but without the policy is refused
+    # when the backend is bound: no worker starts and no request is paid.
+    dispatched: list[Any] = []
+    constructed: list[KimiBackend] = []
+
+    def real_adapter(name: str, **kwargs: Any) -> KimiBackend:
+        assert name == "kimi"
+        assert kwargs["worker_source"] == "project_locked"
+        backend = KimiBackend(
+            model=kwargs["model"],
+            effort=kwargs["effort"],
+            capability=kwargs["capability"],
+            expected_base_url=kwargs["expected_base_url"],
+            diagnostic_cost_upper_bound=kwargs["diagnostic_cost_upper_bound"],
+            _worker_runner=lambda *args, **_kwargs: dispatched.append(args),
+        )
+        constructed.append(backend)
+        return backend
+
+    monkeypatch.setattr(config_module, "_resolve_backend", real_adapter)
+    routing = load_routing(config_path=ROOT / "products" / product / filename)
+
+    def resolve(policy: InvocationLimitPolicy, run: str) -> Any:
+        run_dir = tmp_path / run
+        run_dir.mkdir()
+        return resolve_for_role(
+            "architect_planner",
+            routing=routing,
+            capability="read_only",
+            native_shell=False,
+            allow_trusted_project_instructions=False,
+            cwd=str(tmp_path.resolve()),
+            limit_policy=policy,
+            limit_ledger=InvocationLimitLedger(run_dir / INVOCATION_LIMIT_LEDGER_LEAF),
+        )
+
+    try:
+        with pytest.raises(InvocationLimitContractError, match="explicit opt-in"):
+            resolve(InvocationLimitPolicy("diagnostic", 600, True), "without-policy")
+        backend = resolve(
+            InvocationLimitPolicy("diagnostic", 600, True, POLICY), "with-policy",
+        )
+        assert backend.diagnostic_cost_upper_bound is True
+        assert (backend.name, backend.model, backend.effort) == ("kimi", MODEL, "max")
+    finally:
+        for item in constructed:
+            item.close()
+    assert len(constructed) == 2
+    assert dispatched == []
+
+
 @pytest.mark.parametrize(
     ("path", "digest"),
     [
         (
             "swebench/backends_kimi_sdk.yaml",
-            "14a820c0ca07db86c5bdbbc5d475bfb790e5d1df7e91e46d1590004773465e5b",
+            "3a866437e9976748dbc8b02a7fcf3f1d56ac9003369fdf19d5c54768ae811c79",
         ),
         (
             "swebench/backends_kimi_sdk_diagnostic.yaml",
-            "2dbe69473697fb4925db607bad605d307bb289728ea8174bfc2b4bcaa2c5efef",
+            "3dcedeca5c2bf88798ce67006427b1e94260f29c5313f5473fc7ef7bc14c0342",
         ),
         (
             "swebench/e12_arms.yaml",
-            "80adc4a4fb1e108b801e7c1ab40684a22ea3fbf666a1baecd9911f41ec609bc2",
+            "f6279cb9a4950852f295139b43ca684afba19278f72ddc3786804fbb6319cd27",
         ),
         (
             "swebench/backend_convergence_matrix.yaml",
@@ -205,19 +343,19 @@ def test_k3_writer_cannot_inherit_authority_from_default(
         ),
         (
             "deepswe/backends_kimi_sdk.yaml",
-            "91e7e0a040180e1def994a730bbe89fa69021cc2b890d38956541cb15536c7a4",
+            "283fcc6df73525667d9b50b405acb4ed7a6faca96866b7fea20aa202374c6c53",
         ),
         (
             "deepswe/backends_kimi_sdk_diagnostic.yaml",
-            "0e772e66620c898592eb6ea48cbaf976a6de561363cfca8f370db01bf81a2c4b",
+            "847a868cffcfcef12aacff8b0a709ef990c61cd2fe8175b271dc1a104c4a6c65",
         ),
         (
             "deepswe/e12_arms.yaml",
-            "5808b716c412db89501b08f285072b3daf66925c5703278bd359fddfbaeb58f6",
+            "4a12e6d8f1ec27e3650434daaf3df897ed822f4460866aedb81769096dc3a1f0",
         ),
         (
             "deepswe/backend_convergence_matrix.yaml",
-            "26323f98a6510e0a24626adf3b0aea08ea481e9484252712aea92880faf0082d",
+            "cc66a06a628013da307f5e703a207f4c3e9da0df7465c4ec9a94ae4372dfa9bd",
         ),
     ],
 )

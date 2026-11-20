@@ -472,7 +472,7 @@ class _DynamicJudgeChunkBackend(_ChunkProtocolBackend):
     """Adjudicate the exact material-prior ledger in terminal reduction."""
 
     name = "openai_compat"
-    model = "nvidia/zai-org/glm-5.2"
+    model = "nvidia/zai-org/glm-5.3"
 
     def __init__(self) -> None:
         super().__init__()

@@ -224,11 +224,11 @@ def add_backend_limit_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--diagnostic-cost-policy",
-        choices=("kimi-k3-cache-read-upper-bound-v1",),
+        choices=("kimi-k3.1-pro-cache-read-upper-bound-v1",),
         default=None,
         help=(
-            "Explicit diagnostic-only budget accounting for validated K3 "
-            "cache-read upper bounds. Requires diagnostic backend limits "
+            "Explicit diagnostic-only budget accounting for validated Kimi "
+            "K3.1 Pro cache-read upper bounds. Requires diagnostic backend limits "
             "and a finite USD budget; exact cost remains incomplete and "
             "results are not promotable or rankable."
         ),

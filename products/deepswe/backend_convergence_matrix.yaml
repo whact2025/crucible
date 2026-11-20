@@ -10,7 +10,7 @@
 
 schema_version: crucible.deepswe-backend-convergence-matrix.v1
 workflow: deepswe
-cohort_id: deepswe-astra-mythos51-kimi-quality-pilot-20260914-v1
+cohort_id: deepswe-astra-mythos51-kimi-quality-pilot-20261118-v2
 
 authority:
   provider_calls: false
@@ -34,6 +34,7 @@ corpus:
 
 selection:
   algorithm: exact-audited-list-sha256-counterbalanced-v1
+  # The audited selection of the predecessor cohort is carried unchanged.
   seed: deepswe-astra-mythos51-kimi-quality-pilot-20260914-v1
   languages: [go, javascript, python, rust, typescript]
   per_language: 2
@@ -133,18 +134,28 @@ arms:
     routing: backends_claude_mythos51_org.yaml
     routing_sha256: sha256:cd0f24b34a8fd8ada2a4feb7b5e8489986b3f641711e815ffd71dc14f0f02d74
     static_routing_fingerprint: sha256:7182ce19381b6660b75f0c36f6fe309650c2d97f3aa20a2d7813a4fc8c4fab32
+  # Arm C routes kimi-k3.1-pro through backends_kimi_sdk_diagnostic.yaml,
+  # whose roles carry extra.diagnostic_cost_upper_bound. Observed on
+  # 2026-11-18: Moonshot's streamed final usage omits
+  # prompt_tokens_details.cached_tokens when nothing was read from cache and
+  # sends it on a cache hit. No acceptance follows from that observation: a
+  # reply without the counter is settled only as a cost interval under
+  # --diagnostic-cost-policy kimi-k3.1-pro-cache-read-upper-bound-v1, which
+  # crucible deepswe accepts only with --planner-count 1 and one fresh task.
+  # This plan passes no cost policy and fixes planner_count: 3, so its Arm C
+  # cells are refused when the backend is bound, before any provider request.
   C:
-    id: kimi-k2.7-highspeed-diagnostic
+    id: kimi-k3.1-pro-diagnostic
     backend: kimi
     runtime_backend: kimi
     transport: kimi_agent_sdk_worker
-    model: kimi-k2.7-code-highspeed
-    effort: null
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: diagnostic
     evidence_status: diagnostic
     routing: backends_kimi_sdk_diagnostic.yaml
-    routing_sha256: sha256:0e772e66620c898592eb6ea48cbaf976a6de561363cfca8f370db01bf81a2c4b
-    static_routing_fingerprint: sha256:1f8d11259eceefe784a77ac87a1b7287dc474c92bc1c3a861c248170f40914b4
+    routing_sha256: sha256:847a868cffcfcef12aacff8b0a709ef990c61cd2fe8175b271dc1a104c4a6c65
+    static_routing_fingerprint: sha256:129d284cb5d0777e8a0ca275a23a248b1cb93335d092250ceca4886bf4e29fa4
 
 execution:
   phase: quality_pilot

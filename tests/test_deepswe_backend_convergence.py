@@ -169,14 +169,31 @@ def test_checked_in_matrix_binds_exact_diagnostic_pilot() -> None:
     assert matrix.execution.first_block_serial is True
     assert matrix.arms["A"].model == "gpt-6-astra"
     assert matrix.arms["B"].model == "claude-mythos-5-1"
-    assert matrix.arms["C"].model == "kimi-k2.7-code-highspeed"
+    assert matrix.arms["C"].model == "kimi-k3.1-pro"
+    assert matrix.arms["C"].arm_id == "kimi-k3.1-pro-diagnostic"
+    assert matrix.arms["C"].effort == "max"
     assert matrix.arms["C"].feature_admission == "diagnostic"
     assert matrix.arms["C"].static_routing_fingerprint == (
-        "sha256:1f8d11259eceefe784a77ac87a1b7287dc474c92bc1c3a861c248170f40914b4"
+        "sha256:129d284cb5d0777e8a0ca275a23a248b1cb93335d092250ceca4886bf4e29fa4"
     )
     assert matrix.analysis.implementation_digest == (
         "sha256:1629b326ada7c7f375b148a9254ae979636a4eacc1264bc6f191a2bd503feeef"
     )
+
+
+def test_quality_pilot_successor_cohort_keeps_the_audited_selection_seed() -> None:
+    # The Arm C route identity changed, so the cohort has a successor id. The
+    # ten-task selection was audited under the predecessor id and is carried
+    # unchanged: its seed stays that id.
+    predecessor = "deepswe-astra-mythos51-kimi-quality-pilot-20260914-v1"
+    successor = "deepswe-astra-mythos51-kimi-quality-pilot-20261118-v2"
+    assert convergence.COHORT_ID == successor
+    assert convergence.SELECTION_SEED == predecessor
+    document = yaml.safe_load(_MATRIX_PATH.read_text(encoding="utf-8"))
+    assert document["cohort_id"] == successor
+    assert document["selection"]["seed"] == predecessor
+    matrix = load_quality_cohort_matrix(_MATRIX_PATH)
+    assert tuple(task.task_id for task in matrix.tasks) == QUALITY_PILOT_TASK_IDS
 
 
 @pytest.mark.parametrize(

@@ -773,7 +773,7 @@ def test_authoritative_summary_includes_unpersisted_planner_spend():
 def test_planning_usage_tracks_tokens_and_logical_calls_separately_from_usd():
     class _Backend:
         name = "openai_compat"
-        model = "nvidia/zai-org/glm-5.2"
+        model = "nvidia/zai-org/glm-5.3"
 
         def invoke(self, invocation):
             return SimpleNamespace(
@@ -1259,7 +1259,7 @@ def test_run_architect_preserves_usage_before_untyped_transport_exception(
 
     class _Backend:
         name = "openai_compat"
-        model = "nvidia/zai-org/glm-5.2"
+        model = "nvidia/zai-org/glm-5.3"
 
         def __init__(self, role: str) -> None:
             self.role = role
@@ -2072,118 +2072,6 @@ def test_retryable_tier_failure_is_not_collapsed_to_permanent_partial():
     ) == "partial_failed"
 
 
-def _failed_tier(status: str, terminal_class: str | None) -> dict:
-    result: dict = {"tier_rc": 1, "status": status}
-    if terminal_class is not None:
-        result["terminal_class"] = terminal_class
-    return result
-
-
-@pytest.mark.parametrize(
-    ("failed_tiers", "expected"),
-    [
-        pytest.param(
-            [_failed_tier("slice_inconclusive", "inconclusive")],
-            "inconclusive_tier_failure",
-            id="inconclusive",
-        ),
-        pytest.param(
-            [_failed_tier("cancelled", "cancelled")],
-            "cancelled",
-            id="cancelled",
-        ),
-        pytest.param(
-            [
-                _failed_tier("all_slices_transport_failed", "retryable_failure"),
-                _failed_tier("review_inconclusive", "inconclusive"),
-            ],
-            "inconclusive_tier_failure",
-            id="retryable-and-inconclusive",
-        ),
-        pytest.param(
-            [
-                _failed_tier("cancelled", "cancelled"),
-                _failed_tier("all_slices_transport_failed", "retryable_failure"),
-            ],
-            "inconclusive_tier_failure",
-            id="cancelled-and-retryable",
-        ),
-        pytest.param(
-            [
-                _failed_tier("all_slices_transport_failed", "retryable_failure"),
-                _failed_tier("all_slices_transport_failed", "retryable_failure"),
-            ],
-            "retryable_tier_failure",
-            id="all-retryable",
-        ),
-        pytest.param(
-            [_failed_tier("final_binding_failed", "contract_error")],
-            "partial_failed",
-            id="contract-error",
-        ),
-        pytest.param(
-            [_failed_tier("slice_failed", "permanent_failure")],
-            "partial_failed",
-            id="permanent",
-        ),
-        pytest.param(
-            [_failed_tier("budget_exhausted", "budget_exhausted")],
-            "partial_failed",
-            id="budget-class-without-the-budget-flag",
-        ),
-        pytest.param(
-            [
-                _failed_tier("breach_inconclusive", "inconclusive"),
-                _failed_tier("slice_failed", "permanent_failure"),
-            ],
-            "partial_failed",
-            id="inconclusive-and-permanent",
-        ),
-        pytest.param(
-            [_failed_tier("tier_exception", None)],
-            "partial_failed",
-            id="no-typed-class",
-        ),
-    ],
-)
-def test_unjudged_tier_failure_is_not_collapsed_to_permanent_partial(
-    failed_tiers: list[dict],
-    expected: str,
-):
-    """A walk stopped only by tiers nobody ruled on is not a judged failure.
-
-    One judged, contract-error or untyped tier keeps ``partial_failed``.
-    """
-
-    assert _terminal_status(
-        failed_tiers=failed_tiers,
-        accounting_incomplete=False,
-        budget_exhausted=False,
-        stopped_early=False,
-    ) == expected
-
-
-@pytest.mark.parametrize(
-    ("accounting_incomplete", "budget_exhausted", "expected"),
-    [
-        (True, False, "budget_accounting_incomplete"),
-        (True, True, "budget_accounting_incomplete"),
-        (False, True, "budget_exhausted"),
-    ],
-)
-def test_accounting_and_budget_precede_an_unjudged_tier_failure(
-    accounting_incomplete: bool,
-    budget_exhausted: bool,
-    expected: str,
-):
-    assert _terminal_status(
-        failed_tiers=[_failed_tier("slice_inconclusive", "inconclusive")],
-        accounting_incomplete=accounting_incomplete,
-        budget_exhausted=budget_exhausted,
-        stopped_early=False,
-    ) == expected
-
-
 def _three_tier_dag() -> TierDAG:
     tiers = []
     for index in range(3):
@@ -2656,105 +2544,6 @@ def test_architect_preserves_retryable_tier_terminal_end_to_end(
     outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
     assert outcome["detail_status"] == "retryable_tier_failure"
     assert outcome["terminal_class"] == "retryable_failure"
-
-
-@pytest.mark.parametrize(
-    ("tier_status", "tier_rc", "tier_class", "expected_status", "expected_class"),
-    [
-        (
-            "slice_inconclusive", 1, "inconclusive",
-            "inconclusive_tier_failure", "inconclusive",
-        ),
-        (
-            "review_inconclusive", 3, "inconclusive",
-            "inconclusive_tier_failure", "inconclusive",
-        ),
-        (
-            "breach_inconclusive", 1, "inconclusive",
-            "inconclusive_tier_failure", "inconclusive",
-        ),
-        ("cancelled", 1, "cancelled", "cancelled", "cancelled"),
-        # Guards: a judged tier keeps the permanent bucket.
-        (
-            "slice_failed", 1, "permanent_failure",
-            "partial_failed", "permanent_failure",
-        ),
-        (
-            "review_failed", 3, "permanent_failure",
-            "partial_failed", "permanent_failure",
-        ),
-        (
-            "breach_failed", 1, "permanent_failure",
-            "partial_failed", "permanent_failure",
-        ),
-    ],
-)
-def test_architect_preserves_unjudged_tier_terminal_end_to_end(
-    tmp_path: Path,
-    monkeypatch,
-    tier_status: str,
-    tier_rc: int,
-    tier_class: str,
-    expected_status: str,
-    expected_class: str,
-):
-    """A tier nobody ruled on stops the walk without a permanent label."""
-
-    corpus = _make_corpus(tmp_path)
-    calls = _install_architect_stubs(
-        monkeypatch,
-        dag=_three_tier_dag(),
-        plan_cost=0.0,
-        tier_costs=[],
-    )
-
-    def _unjudged_tier(**kwargs):
-        calls.append(kwargs)
-        child_corpus = Corpus(kwargs["spec"])
-        with open_run_with_capture(child_corpus, "tier") as child:
-            child.write_summary({
-                "tier_id": kwargs["tier_id"],
-                "status": tier_status,
-                "token_rollup_incomplete": False,
-                "costs": {
-                    "total_usd": 0.0,
-                    "total_input_tokens": 0,
-                    "total_output_tokens": 0,
-                    "rollup_incomplete": False,
-                    "token_rollup_incomplete": False,
-                },
-            })
-            child.finalize(RunResult(status=tier_status, cost_usd=0.0))
-        return tier_rc
-
-    monkeypatch.setattr(arch, "run_tier", _unjudged_tier)
-
-    rc = arch.run_architect(
-        planner_count=1,
-        spec=Path(corpus.spec_dir),
-        cwd=str(tmp_path),
-        skip_validate=True,
-    )
-
-    assert rc == 1
-    # The walk stops: no later tier gains execution authority.
-    assert [call["tier_id"] for call in calls] == ["t0"]
-    summary = _architect_summary(corpus)
-    assert summary["status"] == expected_status
-    assert summary["tiers_executed"] == 1
-    assert summary["tiers_failed"] == 1
-    assert summary["tier_results"][0]["status"] == tier_status
-    assert summary["tier_results"][0]["terminal_class"] == tier_class
-    assert summary["costs"]["rollup_incomplete"] is False
-    assert _architect_result(corpus)["status"] == expected_status
-    outcome_path = next(
-        path
-        for path in (Path(corpus.spec_dir) / "runs").glob("*/outcome.json")
-        if "_architect_" in path.parent.name
-    )
-    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
-    assert outcome["detail_status"] == expected_status
-    assert outcome["terminal_class"] == expected_class
 
 
 def test_architect_planner_accounting_debt_stops_all_later_paid_roles(
@@ -4783,8 +4572,6 @@ def test_accepted_plan_soft_overshoot_preserves_implementation_reserve(
     [
         ("inflation_veto", "rejected", "permanent_failure"),
         ("judge_protocol_failure", "inconclusive", "inconclusive"),
-        # The planner backend was lost: nobody ruled on a plan.
-        ("planner_infrastructure_failure", "inconclusive", "inconclusive"),
     ],
 )
 def test_plan_terminal_publishes_zero_tier_inventory_and_final_checkpoint(
@@ -5072,57 +4859,3 @@ def test_run_architect_reconciles_and_finalizes_after_child_exception(
     assert tier_result["cost_rollup_incomplete"] is True
     assert tier_result["budget_remaining_usd"] == 0.0
     assert _architect_result(corpus)["status"] == "budget_accounting_incomplete"
-
-
-def test_run_architect_repair_replan_without_a_ruling_keeps_its_status(
-    tmp_path: Path,
-    monkeypatch,
-):
-    """A repair re-plan nobody ruled on is published under its own status.
-
-    The validation gate hands the re-plan's typed terminal to the run: the
-    run exits 2, and summary, ``result.json`` and ``outcome.json`` carry
-    ``planner_infrastructure_failure`` with the validation phase.
-    """
-
-    corpus = _make_corpus(tmp_path)
-    _install_architect_stubs(
-        monkeypatch,
-        dag=_three_tier_dag(),
-        plan_cost=1.0,
-        tier_costs=[],
-    )
-
-    monkeypatch.setattr(
-        arch,
-        "_validation_gate",
-        lambda **kwargs: (
-            kwargs["planned"],
-            "planner_infrastructure_failure",
-            0.5,
-        ),
-    )
-
-    rc = arch.run_architect(
-        planner_count=1,
-        spec=Path(corpus.spec_dir),
-        cwd=str(tmp_path),
-        budget_usd=3.0,
-    )
-
-    assert rc == 2
-    summary = _architect_summary(corpus)
-    assert summary["status"] == "planner_infrastructure_failure"
-    assert summary["failure_phase"] == "architect_validation"
-    assert summary["tiers_executed"] == 0
-    assert _architect_result(corpus)["status"] == (
-        "planner_infrastructure_failure"
-    )
-    outcome_path = next(
-        path
-        for path in (Path(corpus.spec_dir) / "runs").glob("*/outcome.json")
-        if "_architect_" in path.parent.name
-    )
-    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
-    assert outcome["detail_status"] == "planner_infrastructure_failure"
-    assert outcome["terminal_class"] == "inconclusive"

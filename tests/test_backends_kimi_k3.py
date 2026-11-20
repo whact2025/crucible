@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-"""Provider-free K3 qualification, including the actual isolated SDK worker."""
+"""Provider-free K3-series qualification, including the actual isolated SDK worker."""
 
 from __future__ import annotations
 
@@ -22,12 +22,13 @@ from crucible.backends.kimi import KimiBackend
 from crucible.tests import test_backends_kimi as fixtures
 
 worker = fixtures.worker_mod
-K3 = "kimi-k3"
-K27 = "kimi-k2.7-code-highspeed"
+PRO = "kimi-k3.1-pro"
+# A current Moonshot id that the dedicated route does not admit.
+HIGHSPEED = "kimi-k3.1-pro-highspeed"
 
 
-@pytest.mark.parametrize("model,effort", [(K27, None), (K3, "max")])
-def test_explicit_model_effort_round_trips_v6(model, effort):
+def test_explicit_model_effort_round_trips_v7():
+    model, effort = PRO, "max"
     request = parent._WorkerRequest(
         system="system", user="user", model=model, reasoning_effort=effort,
         base_url=fixtures._BASE_URL, auth_token=fixtures._TOKEN,
@@ -36,26 +37,30 @@ def test_explicit_model_effort_round_trips_v6(model, effort):
     decoded = worker._Request.from_wire(payload)
     assert decoded.model == model
     assert decoded.reasoning_effort == effort
-    assert payload["protocol"] == worker._PROTOCOL == "crucible.kimi-worker.v6"
+    assert payload["protocol"] == worker._PROTOCOL == "crucible.kimi-worker.v7"
 
 
 @pytest.mark.parametrize("override", [
-    {"protocol": "crucible.kimi-worker.v4"},
-    {"model": "kimi-k3-preview"},
-    {"model": K27, "reasoning_effort": "max"},
+    {"protocol": "crucible.kimi-worker.v6"},
+    # Retired route ids: no alias survives the move to K3.1 Pro.
+    {"model": "kimi-k3"},
+    {"model": "kimi-k2.7-code-highspeed", "reasoning_effort": None},
+    # A current id outside the admitted set.
+    {"model": HIGHSPEED},
+    {"model": "kimi-k3.1-pro-preview"},
     {"reasoning_effort": None}, {"reasoning_effort": "high"},
     {"reasoning_effort": "low"}, {"model": None},
     {"prompt_cache_options": {"mode": "implicit", "ttl": "1h"}},
 ])
 def test_worker_rejects_unqualified_model_effort_or_old_protocol(override):
-    payload = fixtures._worker_request_payload(model=K3, reasoning_effort="max")
+    payload = fixtures._worker_request_payload(model=PRO, reasoning_effort="max")
     payload.update(override)
     with pytest.raises(worker.WorkerQualificationError):
         worker._Request.from_wire(payload)
 
 
 @pytest.mark.parametrize("missing", ["model", "reasoning_effort"])
-def test_worker_requires_explicit_v6_identity_fields(missing):
+def test_worker_requires_explicit_v7_identity_fields(missing):
     payload = fixtures._worker_request_payload()
     del payload[missing]
     with pytest.raises(worker.WorkerQualificationError):
@@ -63,12 +68,8 @@ def test_worker_requires_explicit_v6_identity_fields(missing):
 
 
 @pytest.mark.parametrize("module", [parent, worker], ids=["parent", "worker"])
-@pytest.mark.parametrize("model,effort,context", [
-    (K27, None, 262_144), (K3, "max", 1_048_576),
-])
-def test_sdk_config_and_qualified_generation_are_model_bound(
-    monkeypatch, module, model, effort, context,
-):
+def test_sdk_config_and_qualified_generation_are_model_bound(monkeypatch, module):
+    model, effort, context = PRO, "max", 1_048_576
     session = fixtures._FakeSession([])
     installs = []
     monkeypatch.setattr(
@@ -80,17 +81,15 @@ def test_sdk_config_and_qualified_generation_are_model_bound(
     )
     options = session.provider._generation_kwargs
     assert installs == [{"model": model, "cost_bounds": None}]
-    if model == K3:
-        assert options == {
-            "prompt_cache_key": session.id,
-            "max_completion_tokens": 32_768,
-            "reasoning_effort": "max",
-            "extra_body": {
-                "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
-            },
-        }
-    else:
-        assert options == {"prompt_cache_key": session.id, "max_tokens": 32_768}
+    # The K3-series request contract of the admitted id.
+    assert options == {
+        "prompt_cache_key": session.id,
+        "max_completion_tokens": 32_768,
+        "reasoning_effort": "max",
+        "extra_body": {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
+        },
+    }
     request_type = parent._WorkerRequest if module is parent else worker._Request
     args = {} if module is parent else {"root": Path("/tmp/private")}
     request = request_type(
@@ -109,11 +108,12 @@ def test_sdk_config_and_qualified_generation_are_model_bound(
 @pytest.mark.parametrize("effort", ["low", "high", "", "MAX", True])
 def test_parent_rejects_unqualified_k3_effort(effort):
     with pytest.raises(ValueError, match="model/effort"):
-        KimiBackend(model=K3, effort=effort)
+        KimiBackend(model=PRO, effort=effort)
 
 
 def test_k3_context_bound_is_explicit_without_widening_default_response_cap():
-    backend = KimiBackend(model=K3)
+    model = PRO
+    backend = KimiBackend(model=model)
     try:
         assert backend._max_context_size == 1_048_576
         assert backend._max_response_tokens == 32_768
@@ -121,11 +121,11 @@ def test_k3_context_bound_is_explicit_without_widening_default_response_cap():
     finally:
         backend.close()
     payload = fixtures._worker_request_payload(
-        model=K3, reasoning_effort="max", max_response_tokens=1_048_576,
+        model=model, reasoning_effort="max", max_response_tokens=1_048_576,
     )
     assert worker._Request.from_wire(payload).max_response_tokens == 1_048_576
     with pytest.raises(ValueError, match="1048576"):
-        KimiBackend(model=K3, max_response_tokens=1_048_577)
+        KimiBackend(model=model, max_response_tokens=1_048_577)
     with pytest.raises(worker.WorkerQualificationError, match="response_tokens"):
         worker._Request.from_wire({**payload, "max_response_tokens": 1_048_577})
 
@@ -139,15 +139,15 @@ import asyncio, sys
 from kosong.chat_provider.kimi import Kimi
 from crucible_kimi_worker import __main__ as worker
 async def main():
-    provider = Kimi(model="kimi-k3", api_key="not-a-real-token", base_url="http://127.0.0.1:1/v1")
+    provider = Kimi(model="kimi-k3.1-pro", api_key="not-a-real-token", base_url="http://127.0.0.1:1/v1")
     provider._generation_kwargs = {
         "max_completion_tokens": 32768,
         "reasoning_effort": "max",
         "extra_body": {"prompt_cache_options": {"mode": "implicit", "ttl": "5m"}},
     }
-    worker._install_moonshot_stream_compat(provider, model="kimi-k3")
+    worker._install_moonshot_stream_compat(provider, model="kimi-k3.1-pro")
     if sys.argv[1] == "model":
-        provider.model = "kimi-k2.7-code-highspeed"
+        provider.model = "kimi-k3.1-pro-highspeed"
     elif sys.argv[1] == "effort":
         provider._generation_kwargs["reasoning_effort"] = "high"
     elif sys.argv[1] == "cache-ttl":
@@ -172,10 +172,9 @@ asyncio.run(main())
     assert "Kimi provider changed" in completed.stdout
 
 
-@pytest.mark.parametrize("requested,served", [(K3, K27), (K27, K3)])
-def test_parent_rejects_cross_model_terminal_even_when_both_are_supported(
-    monkeypatch, requested, served,
-):
+@pytest.mark.parametrize("served", [HIGHSPEED, "kimi-k3"])
+def test_parent_rejects_a_terminal_that_names_another_kimi_model(monkeypatch, served):
+    requested = PRO
     monkeypatch.setenv("KIMI_BASE_URL", fixtures._BASE_URL)
     monkeypatch.setenv("MOONSHOT_API_KEY", fixtures._TOKEN)
     captured = []
@@ -191,7 +190,7 @@ def test_parent_rejects_cross_model_terminal_even_when_both_are_supported(
         backend.close()
     assert len(captured) == 1
     assert captured[0].model == requested
-    assert captured[0].reasoning_effort == ("max" if requested == K3 else None)
+    assert captured[0].reasoning_effort == "max"
     assert result.final_message == ""
     assert result.error is not None
     assert not result.completeness.cost_complete
@@ -199,7 +198,9 @@ def test_parent_rejects_cross_model_terminal_even_when_both_are_supported(
     assert result.execution_trace.served_effort is None
 
 
-def test_parent_prices_each_k3_checkpoint_with_k3_rates():
+def test_parent_prices_each_checkpoint_with_the_requested_model_rates():
+    model, cost = PRO, 0.000292
+    # 10 uncached + 30 written + 60 read input tokens and 20 output tokens.
     payload = {
         "protocol": parent._WORKER_PROTOCOL, "type": "usage",
         "input_tokens": 100, "output_tokens": 20,
@@ -208,15 +209,15 @@ def test_parent_prices_each_k3_checkpoint_with_k3_rates():
     }
     outcome, terminal = parent._consume_worker_line(
         json.dumps(payload).encode(), latest_usage=parent._WorkerOutcome(steps_used=1),
-        max_steps=1, model=K3,
+        max_steps=1, model=model,
     )
     assert terminal is None
     assert outcome.input_tokens == 100
-    assert outcome.pricing_segments[0].cost_usd == pytest.approx(0.000438)
+    assert outcome.pricing_segments[0].cost_usd == pytest.approx(cost)
     assert outcome.physical_usage_responses[0].reported_cache_write_tokens == 30
 
 
-def _k3_chunks(*, tool=False):
+def _k3_chunks(*, tool=False, model=PRO):
     delta = {"content": "qualified K3 answer"}
     if tool:
         delta = {"tool_calls": [{
@@ -224,11 +225,11 @@ def _k3_chunks(*, tool=False):
             "function": {"name": "echo", "arguments": '{"value":"nonce"}'},
         }]}
     return [
-        fixtures._native_chunk(model=K3, delta=delta),
-        fixtures._native_chunk(model=K3, finish_reason="tool_calls" if tool else "stop"),
+        fixtures._native_chunk(model=model, delta=delta),
+        fixtures._native_chunk(model=model, finish_reason="tool_calls" if tool else "stop"),
         {
             "id": "chatcmpl-native-qualification", "object": "chat.completion.chunk",
-            "created": 1, "model": K3, "choices": [],
+            "created": 1, "model": model, "choices": [],
             "usage": {
                 "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
                 "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
@@ -270,7 +271,7 @@ def test_raw_k3_billing_counters_reject_coercible_noninteger_json(module, field,
 
 def _invoke_real_worker(
     monkeypatch, chunks, *, tool=False, write_root=None, second_chunks=None,
-    diagnostic_cost_upper_bound=False, budget_usd=None,
+    diagnostic_cost_upper_bound=False, budget_usd=None, model=PRO,
 ):
     class Endpoint(fixtures._NativeStreamEndpoint):
         def do_POST(self):  # noqa: N802 - HTTP handler API
@@ -288,7 +289,7 @@ def _invoke_real_worker(
     monkeypatch.setenv("KIMI_BASE_URL", base_url)
     monkeypatch.setenv("MOONSHOT_API_KEY", fixtures._TOKEN)
     backend = KimiBackend(
-        model=K3, effort="max", expected_base_url=base_url,
+        model=model, effort="max", expected_base_url=base_url,
         capability=("workspace_write" if write_root is not None else "read_only")
         if tool else "text",
         worker_source="project_locked",
@@ -332,7 +333,7 @@ def test_real_k3_multi_step_replay_preserves_reasoning_and_each_priced_step(monk
     assert len(requests) == 2
     assert toolset.calls == [("echo", {"value": "nonce"})]
     for request in requests:
-        assert request["model"] == K3
+        assert request["model"] == PRO
         assert request["reasoning_effort"] == "max"
         assert request["prompt_cache_options"] == {"mode": "implicit", "ttl": "5m"}
         assert "max_tokens" not in request
@@ -342,7 +343,7 @@ def test_real_k3_multi_step_replay_preserves_reasoning_and_each_priced_step(monk
     assert result.usage.cache_creation_tokens == 60
     assert result.usage.cache_read_tokens == 120
     assert result.usage.output_tokens == 40
-    assert result.usage.cost_usd == pytest.approx(0.000876)
+    assert result.usage.cost_usd == pytest.approx(0.000584)
     assert len(result.pricing_evidence.segments) == 2
     assert result.pricing_evidence.complete
     assert result.completeness.terminal_complete
@@ -396,25 +397,34 @@ def test_real_k3_coding_worker_preserves_scoped_mutation_authority(
 @pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
 @pytest.mark.parametrize("tool", [False, True], ids=["text-terminal", "settled-max-turns"])
 def test_real_k3_worker_preserves_exact_request_usage_and_cost(monkeypatch, tool):
-    result, requests, toolset = _invoke_real_worker(monkeypatch, _k3_chunks(tool=tool), tool=tool)
+    model, cost = PRO, 0.000292
+    result, requests, toolset = _invoke_real_worker(
+        monkeypatch, _k3_chunks(tool=tool, model=model), tool=tool, model=model,
+    )
     assert len(requests) == 1
     request = requests[0]
-    assert request["model"] == K3
+    assert request["model"] == model
     assert request["reasoning_effort"] == "max"
     assert request["max_completion_tokens"] == 32_768
     assert request["prompt_cache_options"] == {"mode": "implicit", "ttl": "5m"}
     assert request["stream_options"] == {"include_usage": True}
-    assert not {"max_tokens", "temperature", "top_p", "thinking"} & request.keys()
+    assert isinstance(request["prompt_cache_key"], str) and request["prompt_cache_key"]
+    # K3-series rules: the deprecated cap, ``thinking`` and every fixed
+    # sampling parameter must be absent from what the pinned SDK sends.
+    assert not {
+        "max_tokens", "temperature", "top_p", "thinking", "n",
+        "presence_penalty", "frequency_penalty",
+    } & request.keys()
     assert result.usage.input_tokens == 100
     assert result.usage.cache_creation_tokens == 30
     assert result.usage.cache_read_tokens == 60
     assert result.usage.output_tokens == 20
-    assert result.usage.cost_usd == pytest.approx(0.000438)
+    assert result.usage.cost_usd == pytest.approx(cost)
     assert result.completeness.token_usage_complete
     assert result.completeness.cost_complete
     assert result.pricing_evidence.complete
-    assert result.pricing_evidence.segments[0].cost_usd == pytest.approx(0.000438)
-    assert result.execution_trace.requested_model == result.execution_trace.served_model == K3
+    assert result.pricing_evidence.segments[0].cost_usd == pytest.approx(cost)
+    assert result.execution_trace.requested_model == result.execution_trace.served_model == model
     assert result.execution_trace.requested_effort == "max"
     assert result.execution_trace.served_effort is None
     assert result.completeness.terminal_complete is not tool
@@ -460,7 +470,7 @@ def test_real_k3_worker_rejects_unproven_final_usage(monkeypatch, malformation):
         chunks.pop()
     elif malformation == "wrong-model":
         for chunk in chunks:
-            chunk["model"] = K27
+            chunk["model"] = HIGHSPEED
     elif malformation == "conflicting-cache":
         usage["cached_tokens"] = 61
     result, requests, _ = _invoke_real_worker(monkeypatch, chunks)

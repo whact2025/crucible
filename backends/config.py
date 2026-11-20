@@ -74,6 +74,7 @@ from crucible.common.workspace import workspace_root
 from crucible.common.authority_io import AuthorityIOError, read_exact_regular
 
 from . import resolve as _resolve_backend
+from .cost_bounds import DIAGNOSTIC_COST_MODEL
 from .features import (
     FEATURE_ADMISSION_MODES,
     FeatureAdmissionError,
@@ -124,13 +125,13 @@ _CLAUDE_SESSION_MODELS = frozenset({
 _CODEX_CREDENTIAL_SOURCES = frozenset({"environment", "chatgpt_session"})
 _CODEX_CHATGPT_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra"})
 _KIMI_DIAGNOSTIC_WRITE_OPTION = "diagnostic_workspace_write"
-_KIMI_DIAGNOSTIC_MODELS = frozenset({"kimi-k2.7-code-highspeed", "kimi-k3"})
+_KIMI_DIAGNOSTIC_MODELS = frozenset({"kimi-k3.1-pro"})
 _KIMI_DIAGNOSTIC_ENDPOINT = "https://api.moonshot.ai/v1"
 _KIMI_DIAGNOSTIC_ENDPOINT_REF = "${KIMI_BASE_URL}"
 _KIMI_WORKER_SOURCES = frozenset({"environment", "project_locked"})
 _KIMI_RUNTIME_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_KIMI_MAX_CONTEXT_SIZES = {"kimi-k2.7-code-highspeed": 262_144, "kimi-k3": 1_048_576}
-_DEEPSEEK_MODEL = "deepseek-v4-flash"
+_KIMI_MAX_CONTEXT_SIZES = {"kimi-k3.1-pro": 1_048_576}
+_DEEPSEEK_MODEL = "deepseek-flash"
 _DEEPSEEK_MAX_RESPONSE_TOKENS = 32_000
 _DEEPSEEK_RUNTIME_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DEEPSEEK_DIAGNOSTIC_WRITE_OPTION = "diagnostic_workspace_write"
@@ -598,7 +599,9 @@ def _validate_routing(routing: BackendRouting) -> None:
             "claude",
             "codex",
             "openai_compat",
-        } and not (config.backend == "kimi" and config.model == "kimi-k3"):
+        } and not (
+            config.backend == "kimi" and config.model in _KIMI_MAX_CONTEXT_SIZES
+        ):
             raise ValueError(
                 f"{name} config supplies effort to backend "
                 f"{config.backend!r}, which does not support that setting; "
@@ -816,13 +819,14 @@ def _validate_routing(routing: BackendRouting) -> None:
                 if type(cost_bound) is not bool:
                     raise ValueError(f"{name}.extra.diagnostic_cost_upper_bound must be a bool")
                 if cost_bound and (
-                    config.model != "kimi-k3" or config.effort != "max"
+                    config.model != DIAGNOSTIC_COST_MODEL or config.effort != "max"
                     or config.feature_admission != "diagnostic"
                     or config.base_url not in {_KIMI_DIAGNOSTIC_ENDPOINT, _KIMI_DIAGNOSTIC_ENDPOINT_REF}
                     or config.extra.get("worker_source") != "project_locked"
                 ):
                     raise ValueError(
-                        f"{name}.extra.diagnostic_cost_upper_bound requires exact K3/max, "
+                        f"{name}.extra.diagnostic_cost_upper_bound requires exact "
+                        f"{DIAGNOSTIC_COST_MODEL}/max, "
                         "diagnostic admission, public Moonshot endpoint and project_locked worker"
                     )
             if config.model not in _KIMI_MAX_CONTEXT_SIZES:
@@ -830,11 +834,10 @@ def _validate_routing(routing: BackendRouting) -> None:
                     f"{name} requires an exact admitted Kimi model: "
                     f"{sorted(_KIMI_MAX_CONTEXT_SIZES)}"
                 )
-            if config.effort is not None and (
-                config.model != "kimi-k3" or config.effort != "max"
-            ):
+            if config.effort is not None and config.effort != "max":
                 raise ValueError(
-                    f"{name}.effort is supported only as 'max' for kimi-k3"
+                    f"{name}.effort is supported only as 'max' for the "
+                    "admitted Kimi model"
                 )
             max_context_size = _KIMI_MAX_CONTEXT_SIZES[config.model]
             max_response_tokens = config.extra.get("max_response_tokens")
@@ -1098,7 +1101,7 @@ def resolve_for_role(
         )
     if cfg.backend == "kimi" and capability == "workspace_write":
         # The dedicated SDK route has a qualified local mutation/lifecycle
-        # core, but its released dependency tuple predates K2.7, Moonshot's
+        # core, but its released dependency tuple predates K3.1 Pro, Moonshot's
         # catalogue exposes no immutable deployment revision, and exact-route
         # write/cancellation/cost qualification remains incomplete. Static
         # feature support is therefore insufficient authorization for

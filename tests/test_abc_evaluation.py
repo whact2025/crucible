@@ -258,8 +258,10 @@ def test_checked_in_arm_sets_are_exact_and_kimi_is_preflight_blocked():
         assert "INFER_" not in route
         assert "base_url:" not in route
         assert "api_key:" not in route
-    assert deep.lanes["C"].model == "kimi-k2.7-code-highspeed"
     for arm_set in (swe, deep):
+        assert arm_set.lanes["C"].model == "kimi-k3.1-pro"
+        assert arm_set.lanes["C"].effort == "max"
+        assert arm_set.lanes["C"].quality_setting == "max"
         route_text = arm_set.lanes["C"].routing_path.read_text(encoding="utf-8")
         assert "base_url: ${KIMI_BASE_URL}" in route_text
         assert "api_key: ${MOONSHOT_API_KEY}" in route_text
@@ -285,6 +287,29 @@ def test_checked_in_arm_sets_are_exact_and_kimi_is_preflight_blocked():
         assert arm_set.lanes["C"].promotion_gate == "blocked"
     with pytest.raises(E12PreflightError, match="CDX-01-MAX"):
         preflight_e12(swe, _qualifications(swe))
+
+
+@pytest.mark.parametrize("product", ["swebench", "deepswe"])
+def test_checked_in_arm_c_is_refused_by_e12_preflight_whatever_is_qualified(
+    product: str,
+):
+    # Arm C routes the strict Kimi profile. Inside E12 its gate refuses the
+    # lane before a cohort can be frozen, even when a complete, promotable
+    # qualification is supplied, so no E12 attempt reaches that route.
+    arm_set = (
+        swebench.load_e12_arm_set_for_swebench()
+        if product == "swebench"
+        else deepswe.load_e12_arm_set_for_deepswe()
+    )
+    lane = arm_set.lanes["C"]
+    assert (lane.backend, lane.model, lane.effort) == ("kimi", "kimi-k3.1-pro", "max")
+    assert (lane.promotion_gate, lane.gate_ticket) == ("blocked", "KIM-03")
+    with pytest.raises(E12PreflightError) as refused:
+        preflight_e12(arm_set, _qualifications(arm_set))
+    assert "KIM-03 has not promoted this lane" in refused.value.blockers["C"]
+    with pytest.raises(E12PreflightError) as unqualified:
+        preflight_e12(arm_set, {})
+    assert "KIM-03 has not promoted this lane" in unqualified.value.blockers["C"]
 
 
 def test_deepswe_claude_role_effort_overlay_is_exact_and_drift_closed(
@@ -742,13 +767,13 @@ def test_preflight_rejects_claude_model_drift_and_adversarial_prefix(
         preflight_e12(arm_set, qualifications)
 
 
-def test_preflight_rejects_standard_kimi_as_highspeed_fallback(
+def test_preflight_rejects_highspeed_kimi_as_arm_c_fallback(
     qualified_arm_set: E12ArmSet,
 ):
     qualifications = _qualifications(qualified_arm_set)
     qualifications["C"] = dataclasses.replace(
         qualifications["C"],
-        served_model="kimi-k2.7-code",
+        served_model="kimi-k3.1-pro-highspeed",
     )
 
     with pytest.raises(E12PreflightError, match="served model"):
@@ -1049,7 +1074,7 @@ def test_freeze_binds_identity_and_materializes_disjoint_roots(
     )
     assert (
         payload["arms"]["C"]["qualification"]["served_model"]
-        == "kimi-k2.7-code-highspeed"
+        == "kimi-k3.1-pro"
     )
     roots = [
         root

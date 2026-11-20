@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-"""Documented K3 progress/final stream shapes, without provider calls."""
+"""Documented K3-series progress/final stream shapes, without provider calls."""
 
 from __future__ import annotations
 
@@ -21,6 +21,40 @@ def _progress():
         "prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10,
         "prompt_tokens_details": {"cached_tokens": None, "cache_write_tokens": None},
     }
+
+
+# Final statistics recorded for kimi-k3.1-pro on 2026-11-18 by a raw streamed
+# request without the adapter: key names and counters only, no provider text,
+# identifier or credential. Moonshot omitted ``cached_tokens`` when nothing
+# was read from cache, with and without a cache write, and sent it under
+# ``prompt_tokens_details`` and as an equal top-level alias on a cache hit.
+# The finish choice repeated the same counters in each of the three streams.
+_K31_PRO_RECORDED_USAGE = {
+    "miss": {
+        "prompt_tokens": 106, "completion_tokens": 52, "total_tokens": 158,
+        "prompt_tokens_details": {"cache_write_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 36},
+    },
+    "miss-with-write": {
+        "prompt_tokens": 4533, "completion_tokens": 68, "total_tokens": 4601,
+        "prompt_tokens_details": {"cache_write_tokens": 4352},
+        "completion_tokens_details": {"reasoning_tokens": 52},
+    },
+    "hit": {
+        "prompt_tokens": 4533, "completion_tokens": 42, "total_tokens": 4575,
+        "cached_tokens": 4352,
+        "prompt_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 4352},
+        "completion_tokens_details": {"reasoning_tokens": 26},
+    },
+}
+
+
+def _recorded_k31_pro_chunks(shape):
+    usage = copy.deepcopy(_K31_PRO_RECORDED_USAGE[shape])
+    chunks = fixtures._k3_chunks()
+    chunks[-2]["choices"][0]["usage"] = copy.deepcopy(usage)
+    chunks[-1]["usage"] = usage
+    return chunks
 
 
 def _run(monkeypatch, chunks, *, tool=False, done="[DONE]", **kwargs):
@@ -82,7 +116,7 @@ def test_real_worker_admits_documented_final_usage_once(monkeypatch, shape):
     assert result.usage.cache_creation_tokens == 30
     assert result.usage.cache_read_tokens == 60
     assert result.usage.output_tokens == 20
-    assert result.usage.cost_usd == pytest.approx(0.000438)
+    assert result.usage.cost_usd == pytest.approx(0.000292)
 
 
 @pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
@@ -127,7 +161,7 @@ def test_real_worker_rejects_incomplete_or_ambiguous_final_before_tools(
         chunks[-1]["usage"].update(prompt_tokens=101, total_tokens=121)
     elif shape == "choice-after-finish":
         chunks.insert(-1, fixtures.fixtures._native_chunk(
-            model=fixtures.K3, delta={"content": "unexpected trailing content"},
+            model=fixtures.PRO, delta={"content": "unexpected trailing content"},
         ))
     result, requests, toolset = _run(monkeypatch, chunks, tool=True, done=done)
     assert len(requests) == 1
@@ -143,8 +177,11 @@ def test_real_worker_rejects_incomplete_or_ambiguous_final_before_tools(
 @pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
 @pytest.mark.parametrize("tool", [False, True], ids=["observed-stop", "tool-dispatch-denied"])
 def test_real_worker_rejects_observed_missing_cache_read(monkeypatch, tool):
-    # Numeric-only shape observed on 2026-09-24: both the finish choice and
-    # final statistics omit cache reads. Explicit W=0 does not establish R=0.
+    # Numeric-only shape observed with kimi-k3 on 2026-09-24 and again with
+    # kimi-k3.1-pro on 2026-11-18: both the finish choice and final statistics
+    # omit cache reads. Explicit W=0 does not establish R=0. The counters
+    # below are the kimi-k3 recording, replayed against the current request
+    # id; the kimi-k3.1-pro counters are _K31_PRO_RECORDED_USAGE above.
     # No live output, provider identifiers, or credentials enter this fixture.
     usage = {
         "prompt_tokens": 126,
@@ -160,7 +197,7 @@ def test_real_worker_rejects_observed_missing_cache_read(monkeypatch, tool):
     result, requests, toolset = _run(monkeypatch, chunks, tool=tool, done="[DONE]")
 
     assert len(requests) == 1
-    assert requests[0]["model"] == fixtures.K3
+    assert requests[0]["model"] == fixtures.PRO
     assert toolset.calls == []
     assert result.error is not None
     assert result.error.message == (
@@ -173,6 +210,97 @@ def test_real_worker_rejects_observed_missing_cache_read(monkeypatch, tool):
     assert not result.completeness.cost_complete
     assert not result.completeness.terminal_complete
     assert not result.pricing_evidence.complete
+
+
+@pytest.mark.parametrize("module", [parent, worker], ids=["parent", "worker"])
+@pytest.mark.parametrize("shape,exact", [
+    ("miss", None),
+    ("miss-with-write", None),
+    ("hit", (4533, 42, 4575, 4352, 0)),
+], ids=["miss", "miss-with-write", "hit"])
+def test_recorded_k31_pro_final_usage_is_exact_only_with_a_read_count(module, shape, exact):
+    # Needs no worker environment: the validator and the stream state of the
+    # parent and of the worker source are called directly.
+    usage = _K31_PRO_RECORDED_USAGE[shape]
+    prompt, output, total = (
+        usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"],
+    )
+    write = usage["prompt_tokens_details"]["cache_write_tokens"]
+    missing_read = (
+        "Kimi K3 usage has invalid raw billing counters; "
+        "code=counter_missing; field=R; state=missing"
+    )
+    if exact is None:
+        # Strict accounting never reads the missing counter as zero.
+        with pytest.raises(RuntimeError) as error:
+            module._validate_k3_raw_usage(copy.deepcopy(usage))
+        assert str(error.value) == missing_read
+        bounded = (prompt, output, total, None, write)
+    else:
+        # The only recorded shape strict accounting accepts: the nested
+        # counter and an equal top-level alias.
+        assert module._validate_k3_raw_usage(copy.deepcopy(usage)) == exact
+        bounded = exact
+    assert module._validate_k3_raw_usage(
+        copy.deepcopy(usage), diagnostic_cost_upper_bound=True,
+    ) == bounded
+
+    chunks = _recorded_k31_pro_chunks(shape)
+    for bound in (False, True):
+        state = module._K3StreamUsageState(diagnostic_cost_upper_bound=bound)
+        state.observe(copy.deepcopy(chunks[0]))
+        state.observe(copy.deepcopy(chunks[1]))
+        # Choice-local usage on the finish chunk is never billing authority.
+        assert state.finish_seen and state.counters is None
+        if exact is None and not bound:
+            with pytest.raises(RuntimeError) as error:
+                state.observe(copy.deepcopy(chunks[2]))
+            assert str(error.value) == missing_read
+            assert state.counters is None and not state.final_stats_seen
+            continue
+        state.observe(copy.deepcopy(chunks[2]))
+        assert state.counters == bounded
+        state.done = True
+        assert state.canonical_usage() == {
+            "prompt_tokens": prompt, "completion_tokens": output,
+            "total_tokens": total,
+            "prompt_tokens_details": {
+                "cached_tokens": bounded[3], "cache_write_tokens": write,
+            },
+        }
+
+
+@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+def test_real_worker_accepts_recorded_cache_hit_with_equal_alias(monkeypatch):
+    # The hit shape through the pinned SDK and its SSE parser, under strict
+    # accounting: nested read count, equal top-level alias, W=0.
+    result, requests, _ = _run(monkeypatch, _recorded_k31_pro_chunks("hit"))
+
+    assert len(requests) == 1
+    assert requests[0]["model"] == fixtures.PRO
+    assert result.error is None
+    assert result.stop_reason == "end_turn"
+    assert result.final_message == "qualified K3 answer"
+    assert result.usage.input_tokens == 4533
+    assert result.usage.cache_creation_tokens == 0
+    assert result.usage.cache_read_tokens == 4352
+    assert result.usage.output_tokens == 42
+    # (181 x 2.00 + 4352 x 0.20 + 42 x 10.00) / 1e6
+    assert result.usage.cost_usd == pytest.approx(0.0016524)
+    assert result.usage.cost_bounds is None
+    assert result.completeness.token_usage_complete
+    assert result.completeness.cost_complete
+    assert result.completeness.terminal_complete
+    assert result.pricing_evidence.complete
+    assert len(result.pricing_evidence.segments) == 1
+    segment = result.pricing_evidence.segments[0]
+    assert (
+        segment.input_tokens, segment.output_tokens,
+        segment.cache_creation_tokens, segment.cache_read_tokens,
+    ) == (4533, 42, 0, 4352)
+    assert segment.cost_usd == pytest.approx(0.0016524)
+    assert result.execution_trace.requested_model == fixtures.PRO
+    assert result.execution_trace.served_model == fixtures.PRO
 
 
 @pytest.mark.parametrize("module", [parent, worker], ids=["parent", "worker"])

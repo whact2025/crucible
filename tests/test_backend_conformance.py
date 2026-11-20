@@ -31,13 +31,7 @@ from crucible.backends.roles import role_feature_requirements
             "unsupported",
             "adapter_owned",
         ),
-        (
-            "kimi",
-            "kimi-k2.7-code-highspeed",
-            "prompt_only",
-            "sdk_owned",
-        ),
-        ("kimi", "kimi-k3", "prompt_only", "sdk_owned"),
+        ("kimi", "kimi-k3.1-pro", "prompt_only", "sdk_owned"),
     ],
 )
 def test_declared_features_match_observed_behavior(
@@ -87,11 +81,11 @@ def test_unknown_backend_resolves_to_conservative_profile():
     )
 
 
-def test_standard_kimi_model_does_not_inherit_highspeed_qualification():
+def test_retired_kimi_model_does_not_inherit_qualification():
     assert (
         feature_profile_for_route(
             "kimi",
-            model="kimi-k2.7-code",
+            model="kimi-k3",
             base_url="https://api.moonshot.ai/v1",
         )
         == CONSERVATIVE_BACKEND_FEATURES
@@ -101,7 +95,7 @@ def test_standard_kimi_model_does_not_inherit_highspeed_qualification():
 def test_required_unsupported_feature_rejected_before_transport():
     profile = feature_profile_for_route(
         "kimi",
-        model="kimi-k2.7-code-highspeed",
+        model="kimi-k3.1-pro",
         base_url="https://api.moonshot.ai/v1",
     )
     decision = evaluate_feature_requirements(
@@ -260,48 +254,61 @@ def test_feature_profile_digest_is_stable_and_version_bound():
     )
 
 
-def test_nvidia_k26_control_is_route_specific_and_prompt_only():
-    profile = feature_profile_for_route(
-        "openai_compat",
-        model="nvidia/moonshotai/kimi-k2.6",
-        base_url="https://inference-api.nvidia.com",
-    )
+@pytest.mark.parametrize(
+    "model",
+    ["nvidia/zai-org/glm-5.3", "nvidia/moonshotai/kimi-k3.1-pro"],
+)
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://inference-api.nvidia.com/v1",
+        "https://inference-api-dev.nvidia.com/v1",
+    ],
+)
+def test_inference_hub_successor_routes_carry_the_generic_profile(model, base_url):
+    # Structured output has not been observed on either successor route, so
+    # neither has an exact-route profile. A row is added only together with
+    # that observation, and this test then changes with it.
     generic = feature_profile_for_route(
         "openai_compat",
-        model="nvidia/moonshotai/kimi-k2.6",
+        model=model,
         base_url="https://example.invalid/v1",
     )
-    assert profile.structured_output == "prompt_only"
-    assert generic.structured_output == "unsupported"
-
-
-def test_nvidia_glm52_route_is_qualified_prompt_only():
-    qualified = feature_profile_for_route(
+    hub = feature_profile_for_route(
         "openai_compat",
-        model="nvidia/zai-org/glm-5.2",
-        base_url="https://inference-api.nvidia.com",
+        model=model,
+        base_url=base_url,
     )
-    spoofed = feature_profile_for_route(
-        "openai_compat",
-        model="nvidia/zai-org/glm-5.2",
-        base_url="https://inference-api.nvidia.com.attacker.invalid",
+    local = feature_profile_for_route(
+        "local",
+        model=model,
+        base_url="http://127.0.0.1:8000/v1",
     )
 
-    assert qualified.structured_output == "prompt_only"
-    assert spoofed.structured_output == "unsupported"
-
-
-def test_nvidia_k26_profile_rejects_hostname_suffix_spoofing():
-    spoofed = feature_profile_for_route(
-        "openai_compat",
-        model="nvidia/moonshotai/kimi-k2.6",
-        base_url="https://inference-api.nvidia.com.attacker.invalid/v1",
+    assert hub == generic == local
+    assert hub.structured_output == "unsupported"
+    decision = evaluate_feature_requirements(
+        hub,
+        role_feature_requirements("architect_planner"),
     )
-    development = feature_profile_for_route(
-        "openai_compat",
-        model="nvidia/moonshotai/kimi-k2.6",
-        base_url="https://inference-api-dev.nvidia.com/v1",
+    assert decision.allowed is False
+    assert decision.reasons == (
+        "structured_output='unsupported' is not one of "
+        "['native', 'prompt_only']",
     )
 
-    assert spoofed.structured_output == "unsupported"
-    assert development.structured_output == "prompt_only"
+
+@pytest.mark.parametrize(
+    "model",
+    ["nvidia/zai-org/glm-5.2", "nvidia/moonshotai/kimi-k2.6"],
+)
+def test_retired_inference_hub_ids_do_not_keep_a_qualification(model):
+    assert feature_profile_for_route(
+        "openai_compat",
+        model=model,
+        base_url="https://inference-api.nvidia.com/v1",
+    ) == feature_profile_for_route(
+        "openai_compat",
+        model=model,
+        base_url="https://example.invalid/v1",
+    )

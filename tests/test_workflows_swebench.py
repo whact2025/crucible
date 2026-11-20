@@ -1389,7 +1389,7 @@ def test_accounting_halt_reports_usage_transport_and_unreached_reason(
             role=outcome.instance_id,
             usage=outcome,
             backend_name="openai_compat",
-            model="nvidia/zai-org/glm-5.2",
+            model="nvidia/zai-org/glm-5.3",
         )
         return [outcome], 0.0, False, True
 

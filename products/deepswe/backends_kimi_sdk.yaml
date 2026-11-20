@@ -4,8 +4,21 @@
 # DeepSWE A/B/C Arm C — dedicated Moonshot Kimi Agent SDK backend.
 #
 # Source ~/.config/crucible/env first. Missing SDK qualification,
-# Moonshot authentication, or exact K2.7 Code access fails before task
-# execution. This route is separate from the NVIDIA K2.6 diagnostic control.
+# Moonshot authentication, or exact K3.1 Pro access fails before
+# task execution. This route is separate from the NVIDIA gateway Kimi
+# diagnostic control.
+#
+# Accounting on this route is strict. Observed on 2026-11-18 for
+# kimi-k3.1-pro: Moonshot's streamed final usage omits
+# prompt_tokens_details.cached_tokens when nothing was read from cache, with
+# or without a cache write, and sends it on a cache hit. No acceptance
+# follows from that observation: a reply without the counter is rejected
+# after it was billed (counter_missing, field R), and a missing counter is
+# never read as zero. The cost upper-bound opt-in
+# (extra.diagnostic_cost_upper_bound) is admitted only under
+# feature_admission: diagnostic, and E12 requires this arm to enforce feature
+# admission. This profile therefore cannot carry it, and such a reply returns
+# no result on this route. The two diagnostic profiles carry the opt-in.
 
 schema_version: crucible.backend-routing.v1
 
@@ -13,15 +26,16 @@ default:
   backend: kimi
   base_url: ${KIMI_BASE_URL}
   api_key: ${MOONSHOT_API_KEY}
-  model: kimi-k2.7-code-highspeed
+  model: kimi-k3.1-pro
+  effort: max
   feature_admission: enforce
   extra:
     worker_source: project_locked
 
 roles:
-  # K2.7 counts private reasoning inside max_tokens. Keep a cautious 16K
-  # planner allowance while leaving non-planner routes at the qualified 32K
-  # adapter default.
+  # K3.1 Pro counts reasoning inside max_completion_tokens. Keep a cautious
+  # 16K planner allowance while leaving non-planner routes at the qualified
+  # 32K adapter default.
   plan_planner:
     extra:
       max_response_tokens: 16384
@@ -29,7 +43,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -38,7 +53,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -47,7 +63,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -55,7 +72,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -63,7 +81,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -71,7 +90,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -79,7 +99,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -87,7 +108,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -95,7 +117,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -103,7 +126,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked
@@ -111,7 +135,8 @@ roles:
     backend: kimi
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     feature_admission: enforce
     extra:
       worker_source: project_locked

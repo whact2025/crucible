@@ -15,28 +15,28 @@ from crucible.common.cost import CostAccumulator, CostLimitExceeded
 def bounded_usage():
     bounds = UsageCostBounds((UsageCostBoundSegment(
         input_tokens=126, output_tokens=74, cache_creation_tokens=0,
-        cache_read_tokens=None, lower_bound_usd=0.0011478, upper_bound_usd=0.001488,
+        cache_read_tokens=None, lower_bound_usd=0.0007652, upper_bound_usd=0.000992,
         policy=DIAGNOSTIC_COST_POLICY,
     ),), coverage_complete=True)
     return Usage(126, 74, bounds.lower_bound_usd, cost_bounds=bounds)
 
 
 def record(costs, value=None):
-    costs.record(role="planner", backend_name="kimi", model="kimi-k3", usage=value or bounded_usage())
+    costs.record(role="planner", backend_name="kimi", model="kimi-k3.1-pro", usage=value or bounded_usage())
 
 
 def test_explicit_policy_debits_upper_bound_and_retains_lower_bound_and_debt():
     costs = CostAccumulator(max_cost_usd=1.0, diagnostic_cost_policy=DIAGNOSTIC_COST_POLICY)
     record(costs)
-    assert costs.total_cost_usd == pytest.approx(0.0011478)
-    assert costs.budget_cost_usd == pytest.approx(0.001488)
-    assert costs.remaining() == pytest.approx(1.0 - 0.001488)
+    assert costs.total_cost_usd == pytest.approx(0.0007652)
+    assert costs.budget_cost_usd == pytest.approx(0.000992)
+    assert costs.remaining() == pytest.approx(1.0 - 0.000992)
     assert costs.diagnostic_budget_covered
     summary = costs.to_dict()
     assert summary["accounting_debt"] is True
     assert summary["rollup_incomplete"] is True
     assert summary["promotion_evidence"] is False
-    assert summary["cost_upper_bound_usd"] == pytest.approx(0.001488)
+    assert summary["cost_upper_bound_usd"] == pytest.approx(0.000992)
     assert summary["total_usd"] == costs.total_cost_usd
     assert summary["remaining_usd"] == costs.remaining()
     assert costs.cost_bounds == bounded_usage().cost_bounds
@@ -70,15 +70,15 @@ def test_later_bounds_cannot_clear_uncovered_history(before, gap):
 
 
 def test_upper_bound_overshoot_halts_even_when_lower_bound_fits():
-    costs = CostAccumulator(max_cost_usd=0.0012, diagnostic_cost_policy=DIAGNOSTIC_COST_POLICY)
+    costs = CostAccumulator(max_cost_usd=0.0008, diagnostic_cost_policy=DIAGNOSTIC_COST_POLICY)
     with pytest.raises(CostLimitExceeded):
         record(costs)
     assert costs.remaining() == 0.0
-    assert costs.total_cost_usd < 0.0012 < costs.budget_cost_usd
+    assert costs.total_cost_usd < 0.0008 < costs.budget_cost_usd
 
 
 @pytest.mark.parametrize("change", [
-    {"policy": "unapproved"}, {"lower_bound_usd": 0.0}, {"upper_bound_usd": 0.0014},
+    {"policy": "unapproved"}, {"lower_bound_usd": 0.0}, {"upper_bound_usd": 0.0009},
 ])
 def test_formula_or_policy_drift_is_not_coverage(change):
     value = bounded_usage()
@@ -99,7 +99,7 @@ def test_policy_without_cap_never_returns_uncapped_authority():
 
 @pytest.mark.parametrize("field,value", [
     ("input_tokens", 126.0), ("output_tokens", "74"),
-    ("cache_creation_tokens", False), ("cost_usd", "0.0011478"),
+    ("cache_creation_tokens", False), ("cost_usd", "0.0007652"),
 ])
 def test_legacy_numeric_coercion_cannot_grant_diagnostic_budget_authority(field, value):
     malformed = replace(bounded_usage(), **{field: value})
