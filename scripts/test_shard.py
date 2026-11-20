@@ -29,6 +29,8 @@ _DEDICATED_SHARDS = {
 # test_workflows_tier_unjudged_outcomes.py, and the raised hint for
 # test_workflows_tier_budget_terminal.py (18 to 34 cases), are estimates from
 # a local eight-shard run, not from a hosted run.
+# The hint for test_plan_competition_scope_paths.py is an estimate from a
+# local run of that file alone.
 _DEFAULT_WEIGHT_SECONDS = 30
 _RUNTIME_WEIGHT_SECONDS = {
     'tests/test_deepswe_gate_residue.py': 450,
@@ -38,6 +40,7 @@ _RUNTIME_WEIGHT_SECONDS = {
     'tests/test_mutation_journal_git_admin_adversarial.py': 210,
     'tests/test_mutation_journal_restore_confinement.py': 210,
     'tests/test_mutation_journal_writer_epoch_integration.py': 120,
+    'tests/test_plan_competition_scope_paths.py': 90,
     'tests/test_reaper.py': 600,
     'tests/test_tier_build_progress_retry.py': 120,
     'tests/test_tier_restored_path_k3_compatibility.py': 150,

@@ -208,9 +208,17 @@ def run_plan_competition(
     USD shares are disjoint declarations, not a promise of a provider hard
     stop. Every overrun/incomplete call stops later transport and acceptance.
     Failed branches retain their incurred usage, transcripts and diagnostics.
+
+    Each draft and each proposed synthesis is decoded with canonical scope
+    paths against ``cwd`` before any caller transform, gate, review, comparison
+    or record sees it; the raw draft stays stored as written.
     """
     from . import plan as plan_workflow
-    from ._plan_selection import PlanSelectionCandidate, select_plan_candidate
+    from ._plan_selection import (
+        PlanSelectionCandidate,
+        _decode_authored_dag,
+        select_plan_candidate,
+    )
     from ._plan_source_snapshot import create_plan_source_snapshot
 
     validate_competition_admission(planner_count, budget_usd)
@@ -717,8 +725,8 @@ def run_plan_competition(
                 )
                 row["raw_ref"] = str(raw_ref)
                 try:
-                    dag = plan_workflow._decode_review_candidate(
-                        child.result.final_message.encode("utf-8")
+                    dag = _decode_authored_dag(
+                        child.result.final_message.encode("utf-8"), spec, str(root)
                     )
                 except ValueError as exc:
                     row.update(status="invalid_candidate", reason=str(exc))
@@ -794,6 +802,7 @@ def run_plan_competition(
                                 corpus=corpus,
                                 budget_usd=cap,
                                 max_turns=max_turns,
+                                project_root=str(root),
                             )
                         verdict = selection.verdict
                         add_refs((selection.verdict_ref,))
