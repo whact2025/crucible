@@ -95,6 +95,8 @@ class ProviderLedger:
     envelopes: list[str] = field(default_factory=list)
     extra: int = 0
     unconsumed: int = 0
+    # Whether the optional tail of the script was asked for and answered.
+    tail_served: bool = False
     probe_requests: int = 0
     late_requests: int = 0
     seam_problems: list[str] = field(default_factory=list)
@@ -384,7 +386,7 @@ class LoopbackProvider:
                 return self._next_step(seen)
             return None
         if self._script.tail is not None and not self._tail_served and not seen.tools:
-            self._tail_served = True
+            self._tail_served = self._ledger.tail_served = True
             return self._script.tail
         return None
 

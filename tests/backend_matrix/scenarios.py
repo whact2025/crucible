@@ -55,6 +55,9 @@ SCHEMA: Mapping[str, Any] = {
     "additionalProperties": False,
 }
 SCHEMA_ANSWER = json.dumps({SCHEMA_KEY: "forty-two"})
+# The answer to a schema finalisation: valid like the draft of the last tool
+# round, and another text, so a cell can tell which of the two was returned.
+SCHEMA_FINAL_ANSWER = json.dumps({SCHEMA_KEY: "forty-two, as finalised"})
 TURN_LIMIT = 2
 CONTEXT_BUDGET = 64
 BUDGET_USD = 0.001
@@ -300,6 +303,28 @@ def schema_in_prompt(obs: Observation, _ref: Reference) -> list[Deviation]:
     ]
 
 
+def schema_text_in_prompt(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The prompt half of ``prompt_only``: the schema text, once, in the system prompt.
+
+    Where the schema *field* travels is another check's business.
+    """
+
+    requests = _matched(obs)
+    if not requests:
+        return []  # nothing reached the provider: C0 reports it
+    in_prompt = requests[0].system.count(SCHEMA_TITLE)
+    if in_prompt == 1:
+        return []
+    return [
+        Deviation(
+            "request.content:schema",
+            f"the schema text appears {in_prompt} time(s) in the system prompt and "
+            "must appear once: the route declares that the schema travels in the "
+            "prompt",
+        )
+    ]
+
+
 def schema_in_final_request(obs: Observation, _ref: Reference) -> list[Deviation]:
     """The schema travels in exactly one request, the last, which has no tools."""
 
@@ -315,6 +340,34 @@ def schema_in_final_request(obs: Observation, _ref: Reference) -> list[Deviation
             f"{len(carrying)} of {len(requests)} request(s) carry the schema in "
             "the schema field of the provider; exactly one must, the last, and "
             "it must advertise no tools",
+        )
+    ]
+
+
+def finalisation_is_the_answer(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The answer to the schema finalisation is what the call returns.
+
+    The script gives the finalisation another valid answer than the draft of
+    the last tool round, so an adapter that pays for the finalisation and
+    returns the draft is told apart. Compared as the JSON values they are.
+    """
+
+    assert obs.result is not None
+    if obs.result.error is not None or not obs.provider.tail_served:
+        # An error result promises no answer; a finalisation that was never
+        # sent has none, and ``schema_in_final_request`` reports that.
+        return []
+    try:
+        answer = json.loads(obs.result.final_message)
+    except json.JSONDecodeError:
+        answer = None
+    if answer == json.loads(SCHEMA_FINAL_ANSWER):
+        return []
+    return [
+        Deviation(
+            "text:mismatch",
+            "final_message is not the answer the provider gave to the schema "
+            "finalisation request",
         )
     ]
 
@@ -455,15 +508,21 @@ D_OAI_SCHEMA_FINAL = "D-OAI-SCHEMA-FINAL"
 
 
 def _schema_in_one_final_request(plan: Plan) -> Plan:
-    """One further no-tools request carries the schema and answers with it."""
+    """One further no-tools request carries the schema and answers with it.
+
+    The alternative restates where the schema *field* travels and whose answer
+    is returned. What the declared value says about the prompt stays: a route
+    that declares the schema in the prompt still owes the schema text there.
+    """
 
     kept = tuple(
         check for check in plan.checks if check not in (schema_in_field, schema_in_prompt)
     )
+    prompt_half = (schema_text_in_prompt,) if schema_in_prompt in plan.checks else ()
     return replace(
         plan,
-        script=replace(plan.script, tail=Say(SCHEMA_ANSWER)),
-        checks=(*kept, schema_in_final_request),
+        script=replace(plan.script, tail=Say(SCHEMA_FINAL_ANSWER)),
+        checks=(*kept, *prompt_half, schema_in_final_request, finalisation_is_the_answer),
     )
 
 

@@ -71,6 +71,9 @@ from .scenarios import (
     D_STRUCT_UNQUALIFIED,
     PACK_A,
     SCENARIOS,
+    SCHEMA_ANSWER,
+    SCHEMA_FINAL_ANSWER,
+    SCHEMA_TITLE,
     STARTER,
     budget_in_request,
     governing_fields,
@@ -118,7 +121,7 @@ def test_liar_yields_exactly_its_codes(liar: toy.Liar, tmp_path: Path) -> None:
         assert {item.code for item in found} == liar.codes
         return
 
-    execution = runner.execute(cell, tmp_path, driver=driver)
+    execution = runner.execute(cell, tmp_path, driver=driver, differences=liar.differences)
     report = execution.report
 
     assert report.codes == liar.codes, f"liar {liar.id} on {cell.id}:\n{report.describe()}"
@@ -343,6 +346,7 @@ def _reference() -> contract.Reference:
     return contract.Reference(
         routed=CONSERVATIVE_BACKEND_FEATURES,
         model=matrix_columns.TOY_MODEL,
+        endpoint=None,
         pricing=matrix_columns.MATRIX_RATE,
         secrets=(matrix_columns.CANARY_CREDENTIAL,),
         tool_authority_digest=None,
@@ -444,6 +448,7 @@ def _judge(execution: runner.Execution, **changes: Any) -> frozenset[str]:
 
     expect = changes.pop("expect", execution.plan.expect)
     checks = changes.pop("checks", execution.plan.checks)
+    reference = changes.pop("reference", execution.reference)
     observation = execution.observation
     result_changes = {
         name: changes.pop(name)
@@ -459,7 +464,7 @@ def _judge(execution: runner.Execution, **changes: Any) -> frozenset[str]:
     return contract.evaluate(
         observation,
         expect,
-        execution.reference,
+        reference,
         lens=execution.cell.lens,
         toolset=scenario.toolset is not None,
         checks=checks,
@@ -475,6 +480,20 @@ def test_c7_names_each_identity_field_that_is_missing_or_wrong(tmp_path: Path) -
         return _judge(execution, execution_trace=dataclasses.replace(trace, **fields))
 
     assert changed(backend="other") == {"digest.mismatch:backend"}
+    # The endpoint of the route, where the route names one: it is what tells
+    # two routes of one adapter apart. The reference is the provider the toy
+    # was built for, not what its trace says.
+    addressed = execution.observation.provider.requests[0].host
+    assert execution.reference.endpoint == f"http://{addressed}" == trace.endpoint
+    assert changed(endpoint="http://127.0.0.1:9/elsewhere") == {"digest.mismatch:endpoint"}
+    assert changed(endpoint=None) == {"digest.missing:endpoint"}
+    unnamed = dataclasses.replace(execution.reference, endpoint=None)
+    for recorded in (None, "http://127.0.0.1:9/elsewhere"):
+        assert _judge(
+            execution,
+            reference=unnamed,
+            execution_trace=dataclasses.replace(trace, endpoint=recorded),
+        ) == frozenset()
     # A requested model that is not the adapter's is not the one the provider
     # was asked for and served either: two statements, both reported.
     assert changed(requested_model="other") == {
@@ -627,8 +646,15 @@ def test_c8_c9_and_c10_report_what_the_cell_left_and_dispatched(tmp_path: Path) 
     leaked = {"secret:leak"}
     assert _judge(execution, final_message=f"key {canary}", expect=unasserted) == leaked
     assert _judge(execution, transcript=(Message("assistant", canary),)) == leaked
-    in_trace = dataclasses.replace(trace, endpoint=f"http://127.0.0.1/?key={canary}")
-    assert _judge(execution, execution_trace=in_trace) == leaked
+    # An endpoint that carries a credential in its query is a leak, and it is
+    # not the endpoint the route names either: two statements, both reported.
+    in_trace = dataclasses.replace(trace, endpoint=f"{trace.endpoint}?key={canary}")
+    assert _judge(execution, execution_trace=in_trace) == leaked | {"digest.mismatch:endpoint"}
+    # The reference carries no user-info part and no query: a trace must not.
+    carrying = f"https://user:{canary}@host.example:8443/v1?key=x#f"
+    assert declarations.endpoint_identity(carrying) == "https://host.example:8443/v1"
+    with pytest.raises(MatrixSetupError, match="not an absolute URL"):
+        declarations.endpoint_identity("host.example/v1")
     told = TransportError(message=f"refused {canary}", retriable=False)
     assert _judge(execution, error=told, expect=failing) == leaked
     in_close = dataclasses.replace(closed, message=f"close failed for {canary}")
@@ -1133,6 +1159,28 @@ def test_inventory_and_snapshot_files_have_closed_shapes() -> None:
         with pytest.raises(MatrixSetupError, match="worker_skip_files"):
             cells.parse_inventory({**inventory, "worker_skip_files": files})
     assert cells.parse_inventory({**inventory, "worker_skip_files": None}).worker_skip_files == {}
+    # A pin that a column-wide gap is not owed states the cell, the code and
+    # the reason, and nothing else.
+    owed = {"cell": "kimi/S23c/primary/raw", "code": "pricing:none", "reason": "no flag asks"}
+    for rows, parsed in (([owed], (owed,)), (None, ())):
+        pins = cells.parse_inventory({**inventory, "column_wide_not_owed": rows})
+        assert pins.column_wide_not_owed == parsed
+    malformed: tuple[Any, ...] = (
+        {name: value for name, value in owed.items() if name != "reason"},
+        {**owed, "reason": " "},
+        {**owed, "code": 6},
+        {**owed, "lens": "raw"},
+        owed["cell"],
+    )
+    for row in malformed:
+        with pytest.raises(MatrixSetupError, match="must state a cell, a code and the reason"):
+            cells.parse_inventory({**inventory, "column_wide_not_owed": [row]})
+    with pytest.raises(MatrixSetupError, match="cell id"):
+        cells.parse_inventory({**inventory, "column_wide_not_owed": [{**owed, "cell": "S23c"}]})
+    with pytest.raises(MatrixSetupError, match="unknown shape"):
+        cells.parse_inventory(
+            {name: value for name, value in inventory.items() if name != "column_wide_not_owed"}
+        )
 
     snapshot = yaml.safe_load(declarations.SNAPSHOT_PATH.read_text(encoding="utf-8"))
     kind = sorted(snapshot["columns"])[0]
@@ -1773,6 +1821,8 @@ def test_h03_registry_rules() -> None:
 def test_h03_entry_rules() -> None:
     on_canary = _document()
     canary = next(cell.id for cell in TOY_CELLS if SCENARIOS[cell.scenario].canary)
+    # At its ceiling, whatever room the shipped ceiling leaves today.
+    on_canary["ceilings"]["max_known_gaps"]["pack_a"] = len(on_canary["known_gaps"])
     on_canary["known_gaps"].append(
         {"cell": canary, "observed_under": {}, "codes": {"request.unconsumed": "G02"}}
     )
@@ -1928,6 +1978,38 @@ def test_an_alternative_is_asserted_positively_and_replaces_no_clause(tmp_path: 
     assert codes("untold", toy.FINAL_SCHEMA_REQUEST, toy.CLEAR_ACCOUNTING_FLAGS) == untold
     # Where the ledger does not put it in force, the same request is extra.
     assert "request.extra" in codes("elsewhere", toy.FINAL_SCHEMA_REQUEST, differences=())
+    # It restates where the schema field travels and whose answer is returned,
+    # nothing else: the prompt half of the declared value stays (this column
+    # declares the schema in the prompt), and the answer is the finalisation's.
+    assert codes("no schema text", toy.FINAL_SCHEMA_REQUEST, toy.SCHEMA_NOT_IN_PROMPT) == {
+        "request.content:schema"
+    }
+    assert codes("the draft", toy.FINAL_SCHEMA_REQUEST, toy.RETURN_SCHEMA_DRAFT) == {
+        "text:mismatch"
+    }
+    plan = plan_for(
+        SCENARIOS["S04"],
+        declarations.select(SCENARIOS["S04"].differences, declarations.routed(column)),
+        in_force,
+    )
+    assert isinstance(plan.script.tail, Say) and plan.script.tail.text == SCHEMA_FINAL_ANSWER
+    assert json.loads(SCHEMA_FINAL_ANSWER) != json.loads(SCHEMA_ANSWER)
+    # A route that declares no schema text in the prompt owes none there: on
+    # those columns the honest play of the alternative sends none and passes.
+    for value in ("native", "unsupported"):
+        other = next(
+            item
+            for item in cells.toy_columns()
+            if item.features is not None and item.features.structured_output == value
+        )
+        played = runner.execute(
+            Cell(other, "S04", "raw"),
+            tmp_path / value,
+            driver=toy.ToyDriver(frozenset({toy.FINAL_SCHEMA_REQUEST})),
+            differences=in_force,
+        )
+        assert played.report.codes == frozenset(), value
+        assert SCHEMA_TITLE not in played.observation.provider.requests[0].system
 
     scenario = SCENARIOS["S04"]
     with pytest.raises(MatrixSetupError, match="defines no alternative"):
@@ -2023,6 +2105,45 @@ def test_h03_inventory_and_oracle_rules() -> None:
     )
     declared = {**real.snapshot_values, "usd_limit": frozenset({"post_hoc", "hard"})}
     assert "static:value_without_honest_pass" in _problem_codes(snapshot_values=declared)
+
+
+def test_h03_a_column_wide_pin_names_a_cell_that_could_owe_the_gap() -> None:
+    # A column-wide entry of this test's own, on a kind that is driven today,
+    # whatever the shipped ledger holds column-wide.
+    driven = [cell for cell in cells.behaviour_cells() if cell.column.kind != TOY_KIND]
+    kind = driven[0].column.kind
+    of_kind = [cell for cell in driven if cell.column.kind == kind]
+    plain = next(cell.id for cell in of_kind if not SCENARIOS[cell.scenario].canary)
+    canary = next(cell.id for cell in of_kind if SCENARIOS[cell.scenario].canary)
+    code = "secret:leak"
+    document = _document()
+    document["ceilings"]["max_known_gaps"]["pack_a"] += 1
+    document["registry"]["G02"]["column_wide"] = [{"kind": kind, "code": code}]
+    document["known_gaps"].append({"column_wide": {"kind": kind, "code": code, "gap": "G02"}})
+
+    def pinned(*rows: tuple[str, str]) -> set[str]:
+        return _problem_codes(
+            document,
+            column_wide_not_owed=tuple(
+                {"cell": cell, "code": pin, "reason": "synthetic"} for cell, pin in rows
+            ),
+        )
+
+    assert pinned() == pinned((plain, code)) == set()
+    invalid = {"static:column_wide_pin_invalid"}
+    # Listed once; a generated behaviour cell; not the canary; of a kind and
+    # for a code that a column-wide entry names.
+    assert pinned((plain, code), (plain, code)) == invalid
+    assert pinned((plain.replace("/S", "/S9"), code)) == invalid
+    static = ledger.cell_id(kind, "H02", ledger.NO_ROLE, ledger.STATIC_LENS)
+    assert pinned((static, code)) == invalid
+    assert pinned((canary, code)) == invalid
+    assert pinned((plain, "pricing:unreconciled")) == invalid
+    assert pinned((next(cell.id for cell in TOY_CELLS if cell.scenario == "S01"), code)) == invalid
+    # Without the column-wide entry the same pin has nothing to exempt.
+    assert _problem_codes(
+        column_wide_not_owed=({"cell": plain, "code": code, "reason": "synthetic"},)
+    ) == invalid
 
 
 def _p04(**changes: Any) -> set[str]:

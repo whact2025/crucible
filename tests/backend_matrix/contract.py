@@ -23,7 +23,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Mapping, NamedTuple, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, NamedTuple, Sequence
 
 import psutil
 
@@ -180,6 +180,9 @@ class Reference:
     routed: BackendFeatureSet
     # The model the route of the cell's role names: what the wire must carry.
     model: str
+    # The endpoint that route names, as a run record may carry it (no
+    # credential, no query); ``None`` where the route names none.
+    endpoint: str | None
     pricing: ModelPricing
     secrets: tuple[str, ...]
     tool_authority_digest: str | None
@@ -561,6 +564,42 @@ def _unasked(obs: Observation) -> frozenset[str]:
     return frozenset()
 
 
+_CALL_RAISE = re.compile(r"raise:\w+@(before|after)_request/[\w.]+")
+_COST_FLAG_CLEARED = "flag:cost_complete=False"
+# The two C5 codes that are about the second call, not about a rewrite.
+_SECOND_CALL_CODES = frozenset({"guard:revoked", "guard:second_call_failed"})
+
+
+def not_owed_given(code: str, cell_codes: Iterable[str]) -> bool:
+    """Whether a cell's own expected codes show that the check of ``code`` did not run.
+
+    The same three rules by which :func:`evaluate` leaves a check out, read
+    from the codes a cell is ledgered with instead of from an observation, so
+    that the verifier can tell without playing the cell where a column-wide
+    code is owed:
+
+    - a raise out of the call stands for the result clauses (a raise out of
+      ``close()`` does not: the result was there);
+    - a guard rewrite stands for the kind and stop reason it replaced;
+    - C6 asks for pricing evidence only of a result that flags its cost
+      complete.
+    """
+
+    clause = clause_of(code)
+    for own in cell_codes:
+        if clause in RESULT_CLAUSES and _CALL_RAISE.fullmatch(own):
+            return True
+        if (
+            clause in ("C2", "C3")
+            and own.startswith("guard:")
+            and own not in _SECOND_CALL_CODES
+        ):
+            return True
+        if code in PRICING_CODES and own == _COST_FLAG_CLEARED:
+            return True
+    return False
+
+
 def _c7(obs: Observation, ref: Reference, *, toolset: bool) -> list[Deviation]:
     assert obs.result is not None
     out: list[Deviation] = []
@@ -594,6 +633,25 @@ def _c7(obs: Observation, ref: Reference, *, toolset: bool) -> list[Deviation]:
                 "trace.requested_model is not the routed model",
             )
         )
+    # Where one adapter serves two routes under one name, the endpoint is what
+    # tells their run records apart. A route that names none is not compared.
+    if ref.endpoint is not None:
+        if trace.endpoint is None:
+            out.append(
+                Deviation(
+                    "digest.missing:endpoint",
+                    f"the route names the endpoint {ref.endpoint!r} and the trace "
+                    "records none",
+                )
+            )
+        elif trace.endpoint != ref.endpoint:
+            out.append(
+                Deviation(
+                    "digest.mismatch:endpoint",
+                    f"the trace records the endpoint {trace.endpoint!r}; the route "
+                    f"names {ref.endpoint!r}",
+                )
+            )
     served = obs.provider.served_models[-1] if obs.provider.served_models else None
     if served is not None:
         if trace.served_model is None:

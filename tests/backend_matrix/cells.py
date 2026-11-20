@@ -118,6 +118,8 @@ class Inventory:
     not_evaluated: tuple[Mapping[str, Any], ...]
     not_expressible: tuple[Mapping[str, str], ...]
     worker_skip_files: Mapping[str, frozenset[str]]
+    # (cell, code) pairs on which a column-wide known gap is not owed.
+    column_wide_not_owed: tuple[Mapping[str, str], ...] = ()
 
 
 def parse_inventory(document: Any) -> Inventory:
@@ -127,6 +129,7 @@ def parse_inventory(document: Any) -> Inventory:
         "not_evaluated",
         "not_expressible",
         "worker_skip_files",
+        "column_wide_not_owed",
     }
     if (
         not isinstance(document, dict)
@@ -145,6 +148,17 @@ def parse_inventory(document: Any) -> Inventory:
         # No field for a declared value: a declaration cannot select this list.
         if set(row) != {"scenario", "kind", "step", "reason", "checklist"}:
             raise MatrixSetupError(f"not_expressible row {row!r} has unknown fields")
+    not_owed = tuple(document["column_wide_not_owed"] or ())
+    for row in not_owed:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"cell", "code", "reason"}
+            or not all(isinstance(value, str) and value.strip() for value in row.values())
+        ):
+            raise MatrixSetupError(
+                f"column_wide_not_owed row {row!r} must state a cell, a code and the reason"
+            )
+        ledger.parse_cell_id(row["cell"])
     skip_files = document["worker_skip_files"] or {}
     worker_kinds = set(matrix_columns.WORKER_KINDS.values())
     if not isinstance(skip_files, dict) or not all(
@@ -165,6 +179,7 @@ def parse_inventory(document: Any) -> Inventory:
         worker_skip_files={
             str(kind): frozenset(files) for kind, files in skip_files.items()
         },
+        column_wide_not_owed=not_owed,
     )
 
 
@@ -424,6 +439,7 @@ def world() -> ledger.World:
         open_weight_kinds=matrix_columns.OPEN_WEIGHT_KINDS,
         not_expressible=inventory_.not_expressible,
         not_evaluated=inventory_.not_evaluated,
+        column_wide_not_owed=inventory_.column_wide_not_owed,
         liar_scenarios=frozenset(liar.scenario for liar in single),
         liar_clauses=frozenset(clause for liar in single for clause in liar.trips),
         snapshot_values={

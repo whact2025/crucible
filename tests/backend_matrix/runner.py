@@ -113,6 +113,29 @@ def _second_call(bound: Bound, probe: Invocation) -> SecondCall:
     )
 
 
+def _route_endpoint(column: Column, role: str, bound: Bound) -> str | None:
+    """The endpoint the cell's route names, read while its backend is open.
+
+    A column that brings its own profile (a toy column) is built by its
+    driver, not by routing: its route is the scripted provider it was built
+    for. Any other column is asked through its shipped routing file, where a
+    loopback route names the provider only for as long as the driver holds
+    the backend open. Never taken from the adapter or from its trace.
+    """
+
+    if column.features is not None:
+        return bound.provider.url
+    try:
+        return declarations.routed_endpoint(column, role)
+    except drivers.MatrixSetupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the matrix's own failure, not an observation
+        raise drivers.MatrixSetupError(
+            f"column {column.id}: the endpoint of the route of role {role!r} cannot "
+            f"be read from its routing file: {exc}"
+        ) from exc
+
+
 def _require_lens(cell: Cell, bound: Bound, terminal: Any, second: SecondCall | None) -> None:
     """A driver that ignores ``lens`` makes a guarded cell a raw one, or the reverse.
 
@@ -158,9 +181,8 @@ def execute(
     played_by = driver if driver is not None else drivers.get(column.kind)
     routed = declarations.routed(column)
     # The route the cell runs through is the one of its capability's role.
-    routed_model = declarations.routed_model(
-        column, matrix_columns.ROLE_BY_CAPABILITY[scenario.capability]
-    )
+    role = matrix_columns.ROLE_BY_CAPABILITY[scenario.capability]
+    routed_model = declarations.routed_model(column, role)
     plan = plan_for(
         scenario, declarations.select(scenario.differences, routed), differences
     )
@@ -183,6 +205,7 @@ def execute(
     baseline = contract.settlement_baseline()
     started = time.monotonic()
     result = raised = terminal = second = declared = None
+    endpoint: str | None = None
     name = model = ""
     log_dirs: tuple[Path, ...] = ()
     secrets: tuple[str, ...] = ()
@@ -209,6 +232,7 @@ def execute(
                     )
                 )
                 backend = bound.backend
+                endpoint = _route_endpoint(column, role, bound)
                 declared = getattr(backend, "features", None)
                 name, model = str(backend.name), str(backend.model)
                 if fixture is not None:
@@ -271,6 +295,7 @@ def execute(
     reference = Reference(
         routed=routed,
         model=routed_model,
+        endpoint=endpoint,
         # The rate of the model the cell's route names, as its wire model is.
         pricing=matrix_columns.matrix_rate(routed_model),
         secrets=(matrix_columns.CANARY_CREDENTIAL, *secrets),

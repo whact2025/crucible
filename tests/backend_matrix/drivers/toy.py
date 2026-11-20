@@ -67,6 +67,7 @@ from crucible.tools import ToolDispatchBudgetExceeded
 from .. import columns as matrix_columns
 from ..columns import CANARY_CREDENTIAL, TOY_ADAPTER, TOY_KIND, Column
 from ..provider import POLICY_ERROR_CODE, LoopbackProvider, ToyDialect
+from ..scenarios import D_OAI_SCHEMA_FINAL
 from ..script import READ_A, READ_B, ProviderScript
 from .base import Lens, MatrixSetupError, bind_as_routing, register
 
@@ -80,6 +81,9 @@ SUPPORTED: Mapping[str, frozenset[str]] = {
 }
 _OWN_TURN_CEILING = 64
 _UNATTACHED_TOOL = "matrix_unattached"
+# What a trace names under the fault that records another endpoint than the
+# one the adapter was built for and called.
+_OTHER_ENDPOINT = "http://127.0.0.1:9/elsewhere"
 # A second secret the toy holds beside the canary credential, as a real
 # backend holds a bridge or session token. The driver declares it.
 TOY_SESSION_TOKEN = "matrix-toy-session-token-do-not-log-a94f27"
@@ -136,10 +140,15 @@ SECOND_CALL_RAISES = "second_call_raises"
 SCHEMA_ANSWER_INVALID = "schema_answer_invalid"
 NO_LIMIT_EVENT = "no_limit_event"
 DISPATCH_STOP_MISNAMED = "dispatch_stop_misnamed"
+SCHEMA_NOT_IN_PROMPT = "schema_not_in_prompt"
+RETURN_SCHEMA_DRAFT = "return_schema_draft"
+TRACE_OTHER_ENDPOINT = "trace_other_endpoint"
 # Not a fault but a trait: after a tool loop with a response schema the
-# adapter sends one further request without tools that carries the schema, as
-# the declared difference D-OAI-SCHEMA-FINAL describes. Honest where that
-# difference is in force, an extra request anywhere else.
+# adapter sends one further request without tools that carries the schema in
+# the provider's field, and returns the answer to it, as the declared
+# difference D-OAI-SCHEMA-FINAL describes. What the declared value says about
+# the prompt is unchanged. Honest where that difference is in force, an extra
+# request anywhere else.
 FINAL_SCHEMA_REQUEST = "final_schema_request"
 # Faults of the driver, not of the adapter: the limit guard is bound to
 # another profile than the one routing computes for the column, or the adapter
@@ -260,17 +269,21 @@ class HonestBackend:
             # ``rounds`` counts the requests already sent: this is the second.
             model += "-fallback"
         body: dict[str, Any] = {"model": model, "user": invocation.user, "turn": turn}
-        placement = self._profile.structured_output
+        declared = self._profile.structured_output
+        in_field, in_prompt = declared == "native", declared == "prompt_only"
         if FINAL_SCHEMA_REQUEST in self._faults:
-            # The schema travels in the one final request only, as a field.
-            placement = "native" if finalize else "unsupported"
+            # The field travels in the one final request only; the prompt half
+            # of the declared value stays.
+            in_field = finalize
         if SCHEMA_MISPLACED in self._faults:
-            placement = "prompt_only" if placement == "native" else "native"
+            in_field, in_prompt = not in_field, not in_prompt
+        if SCHEMA_NOT_IN_PROMPT in self._faults:
+            in_prompt = False
         if invocation.response_schema is not None:
             schema = json.loads(json.dumps(invocation.response_schema))
-            if placement == "native":
+            if in_field:
                 body["response_schema"] = schema
-            elif placement == "prompt_only":
+            if in_prompt:
                 system += "\n\nAnswer with JSON for this schema: " + json.dumps(
                     schema, sort_keys=True
                 )
@@ -383,7 +396,8 @@ class HonestBackend:
                     final = self._exchange(run, turn + 1, [], [], timeout, finalize=True)
                     if isinstance(final, InvocationResult):
                         return final
-                    text = str(final.get("text", ""))
+                    if RETURN_SCHEMA_DRAFT not in self._faults:
+                        text = str(final.get("text", ""))
                 return self._answer(run, text)
             limited = self._profile.turn_limit != "unsupported"
             at_limit = limited and turn >= invocation.max_turns
@@ -654,7 +668,7 @@ class HonestBackend:
             backend=self.name,
             requested_model=self.model,
             served_model=run.served_model,
-            endpoint=self._endpoint,
+            endpoint=_OTHER_ENDPOINT if TRACE_OTHER_ENDPOINT in faults else self._endpoint,
             feature_profile_digest=(
                 None
                 if NO_PROFILE_DIGEST in faults
@@ -831,6 +845,9 @@ class Liar:
     needs: Mapping[str, str] = field(default_factory=dict)
     composite: bool = False
     via: str = "cell"  # "cell", or "P02" for the static profile-binding check
+    # The declared differences in force on the liar's cell. The ledger lists
+    # them for a real cell; a liar names its own.
+    differences: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:
@@ -896,6 +913,8 @@ LIARS: tuple[Liar, ...] = (
     _liar("S01", SUBSTITUTE_WIRE_MODEL, _SUBSTITUTED, ("C7",)),
     # Consistent about a model that is not the route's: only the wire shows it.
     _liar("S01", BUILT_FOR_OTHER_MODEL, ("request.content:model",), ("C7",)),
+    # The request went where the route says; the run record names another place.
+    _liar("S01", TRACE_OTHER_ENDPOINT, ("digest.mismatch:endpoint",), ("C7",)),
     _liar("S01", GET_BEFORE_TURN, ("request.extra",), ("C0",)),
     _liar(
         "S01",
@@ -949,6 +968,27 @@ LIARS: tuple[Liar, ...] = (
             needs={"structured_output": placement},
         )
         for placement in ("native", "prompt_only")
+    ),
+    # With the declared difference of the schema finalisation in force the
+    # trait is the honest play, and a fault beside it breaks one line of the
+    # alternative: the finalisation is paid for and the draft of the last tool
+    # round is returned; or a route that declares the schema in the prompt
+    # sends no schema text there.
+    Liar(
+        "S04",
+        frozenset({FINAL_SCHEMA_REQUEST, RETURN_SCHEMA_DRAFT}),
+        frozenset({"text:mismatch"}),
+        ("S",),
+        differences=(D_OAI_SCHEMA_FINAL,),
+    ),
+    Liar(
+        "S04",
+        frozenset({FINAL_SCHEMA_REQUEST, SCHEMA_NOT_IN_PROMPT}),
+        frozenset({"request.content:schema"}),
+        ("S",),
+        rehearses=("M04",),
+        needs={"structured_output": "prompt_only"},
+        differences=(D_OAI_SCHEMA_FINAL,),
     ),
     _liar(
         "S10a",

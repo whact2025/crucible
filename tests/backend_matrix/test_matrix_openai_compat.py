@@ -31,7 +31,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 from openai.types.chat import ChatCompletion
 
-from . import cells, declarations, envelopes, ledger, netguard, runner, tap
+from . import cells, contract, declarations, envelopes, ledger, netguard, runner, tap
 from . import columns as matrix_columns
 from .cells import Cell
 from .columns import HOSTED_GATEWAY_KIND, LOCAL_GATEWAY_KIND, Column
@@ -46,7 +46,6 @@ KINDS = (HOSTED_GATEWAY_KIND, LOCAL_GATEWAY_KIND)
 CELLS = cells.cells_of(KINDS)
 COLUMNS = tuple(column for column in matrix_columns.real_columns() if column.kind in KINDS)
 PRODUCTION = matrix_columns.SCRIPTED_ENV[matrix_columns.ENDPOINT_ENV[HOSTED_GATEWAY_KIND]]
-_UNTOLD = {"flag:token_usage_complete=False", "flag:cost_complete=False"}
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=lambda cell: cell.id)
@@ -274,7 +273,10 @@ def test_redirect_answers_the_production_origin_on_loopback_and_refuses_others(
             {"host": urlsplit(PRODUCTION).netloc, "path": "/v1/async"},
         ]
         assert (record.redirected, record.passed, len(record.violations)) == (2, 1, 3)
-        assert all("example.invalid" in entry or "nvidia" in entry for entry in record.violations)
+        production = urlsplit(PRODUCTION).hostname or ""
+        assert production and all(
+            "example.invalid" in entry or production in entry for entry in record.violations
+        )
     # Nothing was resolved or connected beyond loopback, and nothing is left patched.
     assert netguard.take_violations() == ()
     assert not tap.installed()
@@ -365,6 +367,13 @@ def test_every_scripted_request_carries_the_model_of_its_route(
     assert SCENARIOS["S03"].capability == "read_only" and len(requests) == 3
     assert {request.model for request in requests} == {execution.reference.model}
     assert execution.reference.model == column.model
+    # The endpoint C7 compares the trace with is the route's own: production
+    # on the hosted kind, the scripted provider the client addressed on the
+    # local kind. It is read from the routing file, not from the adapter.
+    assert execution.reference.endpoint == (
+        PRODUCTION if column.kind == HOSTED_GATEWAY_KIND else f"http://{requests[0].host}/v1"
+    )
+    assert execution.report.outcomes["C7"].status == "ok"
     # Clause C9 read what the SDK and its HTTP client logged at every level
     # while the cell played, and found no credential there.
     dump = execution.observation.debug_dump_text
@@ -381,6 +390,41 @@ def test_c7_is_live_on_a_real_column_through_what_the_dialect_reads(tmp_path: Pa
     )
 
     assert "request.content:model" in blind.report.codes
+
+
+@pytest.mark.parametrize("column", COLUMNS, ids=lambda column: column.id)
+def test_a_trace_that_names_another_endpoint_fails_c7_on_a_real_column(
+    column: Column, tmp_path: Path
+) -> None:
+    execution = _played(column, "S01", tmp_path)
+    result = execution.observation.result
+    assert result is not None and result.execution_trace is not None
+    trace = result.execution_trace
+    shown = execution.report.codes
+
+    # The adapter is honest about where it sent the request ...
+    assert trace.endpoint == execution.reference.endpoint is not None
+    assert not any(code.endswith(":endpoint") for code in shown)
+    # ... and a run record that names another origin, or none, is a deviation
+    # of the cell: one adapter serves both kinds, the endpoint tells them apart.
+    for recorded, code in (
+        ("https://example.invalid/v1", "digest.mismatch:endpoint"),
+        (PRODUCTION + "/other", "digest.mismatch:endpoint"),
+        (None, "digest.missing:endpoint"),
+    ):
+        changed = dataclasses.replace(
+            result, execution_trace=dataclasses.replace(trace, endpoint=recorded)
+        )
+        judged = contract.evaluate(
+            dataclasses.replace(execution.observation, result=changed),
+            execution.plan.expect,
+            execution.reference,
+            lens="raw",
+            toolset=False,
+            checks=execution.plan.checks,
+        )
+        assert judged.codes - shown == {code}, recorded
+        assert "C7" in judged.tripped()
 
 
 def test_dialect_reads_the_replayed_history_and_the_schema_field() -> None:
@@ -519,32 +563,34 @@ def test_envelope_rules_refuse_what_a_renderer_or_a_recording_must_not_do() -> N
 # -- the declared difference of the schema finalisation -----------------------------
 
 
+@pytest.mark.parametrize("column", COLUMNS, ids=lambda column: column.id)
 def test_the_schema_finalisation_is_asserted_where_the_ledger_puts_it_in_force(
-    tmp_path: Path,
+    column: Column, tmp_path: Path
 ) -> None:
-    column = _column(HOSTED_GATEWAY_KIND)
     cell = Cell(column, "S04", "raw")
     in_force = LEDGER.differences_for(cell.id)
     execution = runner.execute(cell, tmp_path / "in-force", differences=in_force)
     requests = execution.observation.provider.requests
 
     assert in_force == (D_OAI_SCHEMA_FINAL,)
-    # One further request without tools carries the schema; no other does.
+    # The shape of the exchange, and only that; which codes the cell shows is
+    # between the cell and the ledger. One further request without tools
+    # carries the schema, no other does, and the provider answered it from the
+    # tail of the script. Asserted here on every column, apart from the cell:
+    # where a cell is ledgered with the schema code for another reason, the
+    # cell alone could not show a finalisation request that went wrong.
     assert [(bool(item.tools), item.schema_field) for item in requests] == [
         (True, False),
         (True, False),
         (False, True),
     ]
-    # The difference replaces no clause: the accounting gap still shows, and
-    # nothing else does.
-    assert execution.report.codes == _UNTOLD
-    # C6 asks for pricing evidence only of a result that flags its cost
-    # complete, so the column-wide gap is not owed on this cell.
-    assert "pricing:none" in execution.report.unasked
-    assert _played(column, "S01", tmp_path / "text").report.unasked == frozenset()
+    assert all(item.matched for item in requests)
+    assert execution.observation.provider.tail_served
+    assert execution.report.outcomes["C0"].status == "ok"
     # Where it is not in force the same request is an extra request.
     without = runner.execute(cell, tmp_path / "not-in-force")
     assert "request.extra" in without.report.codes
+    assert not without.observation.provider.tail_served
 
 
 # -- the module ends with the canary check --------------------------------------------

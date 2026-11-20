@@ -23,6 +23,17 @@
 #   file as static:worker_skip and a marker in any other file as
 #   static:worker_skip_unpinned, which no entry covers. The list is emptied
 #   by the fix that deletes the H01 entry.
+# column_wide_not_owed: (cell, code) pairs on which a column-wide known gap of
+#   the ledger is not owed for a reason of the cell's definition that the
+#   cell's own entry cannot show: its variant expects no result, or its
+#   scenario waives the flag that asks for the check. Each row states the
+#   reason. The verifier requires the column-wide gap on every other behaviour
+#   cell of the kind whose definition has the clause of its code (lens,
+#   ToolSet), the seam canary excepted, and refuses it on a pinned cell; a
+#   cell whose own entry shows that the check did not run (a raise, a guard
+#   rewrite, the cost flagged incomplete) needs no row. Static cell H03
+#   rejects a row that is listed twice or names a cell that could not owe the
+#   gap. Empty today.
 
 schema_version: crucible.backend-matrix.inventory.v1
 
@@ -48,6 +59,8 @@ not_evaluated:
       that it can pass on a column that has contract gaps.
 
 not_expressible: []
+
+column_wide_not_owed: []
 
 worker_skip_files:
   kimi:

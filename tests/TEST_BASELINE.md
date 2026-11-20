@@ -135,9 +135,15 @@ uv run python -m tests.backend_matrix.verify
 ```
 
 It fails when an expected cell is missing or ran twice, when an item of the
-package was skipped, when an expected failure has no ledger entry or a
-ledgered cell passed, and when the cell count of a kind differs from the
-pinned one. A run that writes a JUnit file also writes
+package was skipped, when an expected failure does not name exactly the gaps
+the ledger attributes to its cell, when a ledgered cell passed, and when the
+cell count of a kind differs from the pinned one. A cell is ledgered by an
+entry of its own or by a column-wide entry of its kind. A column-wide gap is
+owed on every behaviour cell of the kind whose definition has the clause of
+its code, except the seam canary, a cell whose own entry shows that the check
+did not run (a raise, a guard rewrite, the cost flagged incomplete) and a
+cell the inventory pins under `column_wide_not_owed` with its reason. A run
+that writes a JUnit file also writes
 `matrix-report-<n>.json` beside it: the codes, gaps, declared values, clause
 outcomes and grade of every cell the process judged.
 

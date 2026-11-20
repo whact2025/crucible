@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import re
 import sys
 from dataclasses import dataclass
@@ -166,6 +167,17 @@ def worker_skip_markers(tests_root: Path) -> list[WorkerSkip]:
     return found
 
 
+@functools.cache
+def suite_worker_skip_markers() -> tuple[WorkerSkip, ...]:
+    """The markers of the suite's own tests directory, scanned once per process.
+
+    Every H01 cell reads the same files; parsing each test module of the
+    suite once per cell is most of what the static module costs.
+    """
+
+    return tuple(worker_skip_markers(TESTS))
+
+
 def worker_skip_problems(
     markers: Sequence[WorkerSkip],
     worker: str,
@@ -214,7 +226,7 @@ def worker_skip_problems(
 def test_h01_no_test_skips_on_a_missing_worker_runtime(worker: str) -> None:
     kind = WORKER_KINDS[worker]
     problems = worker_skip_problems(
-        worker_skip_markers(TESTS),
+        suite_worker_skip_markers(),
         worker,
         workers=set(WORKER_KINDS),
         pinned=cells.load_inventory().worker_skip_files.get(kind, frozenset()),
@@ -316,43 +328,23 @@ def test_h03_ledger_and_oracle_integrity() -> None:
         _static_id(ledger.ALL_KINDS, "H03"),
         ledger.integrity_problems(LEDGER, cells.world()),
     )
-    # The static gaps: the Kimi worker skips, and H02 for every kind (no
-    # driver yet, or driven without pack A).
-    gateway = (matrix_columns.HOSTED_GATEWAY_KIND, matrix_columns.LOCAL_GATEWAY_KIND)
-    static = [entry for entry in LEDGER.entries if entry.cell.endswith(ledger.STATIC_LENS)]
-    assert sorted(entry.cell for entry in static) == sorted(
-        [
-            _static_id(WORKER_KINDS["kimi"], "H01"),
-            *(_static_id(kind, "H02") for kind in REAL_KINDS),
-        ]
-    )
-    assert {
-        kind: set(LEDGER.entry(_static_id(kind, "H02")).codes)  # type: ignore[union-attr]
-        for kind in REAL_KINDS
-    } == {
-        kind: {"static:pack_a_not_enabled" if kind in gateway else "static:no_driven_column"}
-        for kind in REAL_KINDS
-    }
-    # Part 2, the gateway columns on the starter set: G28 on the guarded tool
-    # loops, G29 where a schema finalisation follows a tool loop, and G32
-    # wherever the adapter flags its cost complete.
-    behaviour = {
-        entry.cell: set(entry.codes.values()) for entry in LEDGER.entries if entry not in static
-    }
-    columns = [(gateway[0], "primary"), (gateway[0], "secondary"), (gateway[1], "primary")]
-    assert behaviour == {
-        ledger.cell_id(kind, scenario, role, lens): gaps
-        for kind, role in columns
-        for scenario, lens, gaps in (
-            ("S03", "guarded", {"G28"}),
-            ("S04", "raw", {"G29"}),
-            ("S04", "guarded", {"G28", "G29"}),
-        )
-    }
-    assert {(scope.kind, scope.code, scope.gap) for scope in LEDGER.column_wide} == {
-        (kind, "pricing:none", "G32") for kind in gateway
-    }
-    assert all(entry.observed_under for entry in LEDGER.entries if entry not in static)
+    # Rules about the shipped ledger, never a table of today's gaps. Which
+    # cells are ledgered and with which codes is the ledger's own statement:
+    # the comparator holds each cell to it and the verifier holds a run to
+    # it, so a gap fix deletes its entries and edits no test.
+    for entry in LEDGER.entries:
+        _kind, scenario, _role, lens = ledger.parse_cell_id(entry.cell)
+        if lens == ledger.STATIC_LENS:
+            # A static cell has no governing declared value.
+            assert dict(entry.observed_under) == {}, entry.cell
+        else:
+            # A behaviour entry is locked to the value of every declared field
+            # that governs its scenario, and to nothing else.
+            assert set(entry.observed_under) == set(SCENARIOS[scenario].governing), entry.cell
+    # A column-wide entry names a code of a contract clause on a real kind.
+    for scope in LEDGER.column_wide:
+        assert scope.kind in REAL_KINDS, scope
+        assert contract.clause_of(scope.code) in contract.CLAUSES, scope
 
 
 def worker_environment_problems(ci_text: str, tests_root: Path) -> list[Deviation]:

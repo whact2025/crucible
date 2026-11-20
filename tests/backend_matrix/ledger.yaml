@@ -304,6 +304,44 @@ registry:
         closes_under: {}
         predicted: ["static:no_driven_column"]
 
+  M04:
+    title: The gateway adapter writes no schema text into the prompt of a prompt_only route
+    origin: matrix
+    severity: medium
+    # Not predicted: design section 9.2 expected the hosted routes to confirm
+    # their declaration. Seen at the first run of the columns (part 2): at a
+    # bare invocation the adapter sends the schema as response_format on the
+    # finalisation request and writes no schema text into the system prompt,
+    # while the two other adapters that declare prompt_only bind the schema
+    # into the prompt themselves (crucible/backends/deepseek.py:1803-1830,
+    # crucible/backends/kimi.py:2041-2064). Reported for the gap list.
+    # The code is also what a wrong finalisation request yields; on these
+    # cells the request shape is pinned by a test of its own until the entry
+    # is gone (test_matrix_openai_compat.py).
+    declaration_change:
+      field: structured_output
+      from: prompt_only
+      to: unsupported
+      citation: >-
+        Owner decision OD-7 of the open-weight model update, taken at its
+        default: the two route-qualified hub profiles
+        (crucible/backends/features.py:103-115) are removed and both hub
+        routes carry the generic gateway profile (features.py:78-81), which
+        claims no schema placement.
+    cells:
+      - cell: openai_compat:hosted/S04/primary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+      - cell: openai_compat:hosted/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+      - cell: openai_compat:hosted/S04/secondary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+      - cell: openai_compat:hosted/S04/secondary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: unsupported}
+
 known_gaps:
   - cell: kimi/H01/-/static
     observed_under: {}
@@ -332,7 +370,9 @@ known_gaps:
 
   # The gateway columns, first run of part 2 (starter set). On S04 guarded the
   # guard codes are G28's today; once G28 is fixed the guard reports the
-  # incomplete accounting of G29 instead, and that fix edits the entry.
+  # incomplete accounting of G29 instead, and that fix edits the entry. On
+  # the hosted S04 cells the schema code is M04's: it leaves with the
+  # declaration change that record names, not with the G28 or G29 fix.
   - cell: openai_compat:hosted/S03/primary/guarded
     observed_under: {event_detail: usage}
     codes:
@@ -343,6 +383,7 @@ known_gaps:
     codes:
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
+      "request.content:schema": M04
   - cell: openai_compat:hosted/S04/primary/guarded
     observed_under: {structured_output: prompt_only}
     codes:
@@ -350,6 +391,7 @@ known_gaps:
       "guard:revoked": G28
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
+      "request.content:schema": M04
   - cell: openai_compat:hosted/S03/secondary/guarded
     observed_under: {event_detail: usage}
     codes:
@@ -360,6 +402,7 @@ known_gaps:
     codes:
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
+      "request.content:schema": M04
   - cell: openai_compat:hosted/S04/secondary/guarded
     observed_under: {structured_output: prompt_only}
     codes:
@@ -367,6 +410,7 @@ known_gaps:
       "guard:revoked": G28
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
+      "request.content:schema": M04
   - cell: openai_compat:local/S03/primary/guarded
     observed_under: {event_detail: usage}
     codes:
@@ -413,11 +457,15 @@ declared_differences:
       After a tool loop that ends naturally the adapter sends exactly one
       further request, which advertises no tools and carries the schema in the
       schema field of the provider; no tool-bearing request carries it. The
-      answer to that request is the final message and must validate against
-      the schema. Its usage is counted and the accounting flags stay complete
-      (C6 applies unchanged, as does every other clause). On the listed cells
-      this is asserted instead of the placement that the declared
-      structured_output value selects.
+      answer to that request is the final message (the script answers it with
+      another valid text than the draft of the last tool round, and the cell
+      requires that one) and must validate against the schema. Its usage is
+      counted and the accounting flags stay complete (C6 applies unchanged,
+      as does every other clause). On the listed cells this restates where
+      the schema field travels and nothing else: what the declared
+      structured_output value says about the prompt is still asserted, so a
+      route that declares prompt_only owes the schema text once in the system
+      prompt (known gap M04 on the hosted cells).
     cells:
       - openai_compat:hosted/S04/primary/raw
       - openai_compat:hosted/S04/primary/guarded

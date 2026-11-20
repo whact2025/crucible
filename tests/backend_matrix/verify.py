@@ -18,10 +18,14 @@ it with ``test-results-*.xml`` in the repository root:
   static cell, and the closing check of every matrix module;
 - no item of the package has a ``pytest.skip`` record, and none is the
   ``[NOTSET]`` item pytest makes of an empty parameter set;
-- the items recorded as ``pytest.xfail`` are exactly the ledgered cells: a
-  cell with an entry is an expected failure that names the entry's gaps, a
-  cell of a kind with a column-wide entry may be one for that gap, and
-  nothing else is;
+- the items recorded as ``pytest.xfail`` are exactly the ledgered cells, each
+  naming exactly the gaps the ledger attributes to it: those of the cell's
+  own entry and every column-wide gap owed on the cell. A column-wide gap is
+  owed on every behaviour cell of its kind whose definition has the clause of
+  its code, except the seam canary, a cell whose own entry shows that the
+  check did not run (a raise, a guard rewrite, the cost flagged incomplete)
+  and a cell ``inventory.yaml`` pins as not owing it. A ledgered cell that
+  passed is rejected, and so is an expected failure on any other cell;
 - no pinned not-expressible cell has an item, and no cell item exists that
   the inventory does not hold;
 - the cell count of each kind equals the count pinned in ``inventory.yaml``.
@@ -41,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from . import cells, ledger
+from . import cells, contract, ledger
 from .cells import Item
 from .drivers.base import MatrixSetupError
 from .scenarios import SCENARIOS
@@ -108,18 +112,57 @@ def named_gaps(message: str) -> set[str]:
     return set(_GAP.findall(message))
 
 
-def ledgered(known: ledger.Ledger, cell: str) -> tuple[set[str], set[str]]:
-    """``(gaps the cell's entry names, gaps a column-wide entry may add)``."""
+def _pinned_not_owed(not_owed: Sequence[Mapping[str, str]], cell: str) -> set[str]:
+    """The codes ``inventory.yaml`` pins as not owed on ``cell``."""
+
+    return {row["code"] for row in not_owed if row["cell"] == cell}
+
+
+def _has_clause(code: str, scenario: str, lens: str) -> bool:
+    """Whether a cell of this scenario and lens has the clause ``code`` is booked under.
+
+    From the cell's definition, as the contract decides it. Whether the
+    selected variant expects a result at all depends on a declared value; a
+    cell whose variant expects none is pinned in the inventory.
+    """
+
+    clause = contract.clause_of(code)
+    defined = SCENARIOS.get(scenario)
+    if clause not in contract.CLAUSES or defined is None:
+        return True
+    return clause in contract.applicable(
+        lens=lens, toolset=defined.toolset is not None, expects_result=True
+    )
+
+
+def ledgered(
+    known: ledger.Ledger, cell: str, not_owed: Sequence[Mapping[str, str]] = ()
+) -> tuple[set[str], set[str]]:
+    """``(gaps the cell's own entry names, column-wide gaps owed on the cell)``.
+
+    Exact, and computed without playing the cell: the comparator owes a
+    column-wide code where its clause was evaluated and its check was asked,
+    and the cell's definition, its own entry and the inventory's pins say
+    where that is.
+    """
 
     kind, scenario, _role, lens = ledger.parse_cell_id(cell)
     entry = known.entry(cell)
-    owed = set() if entry is None else set(entry.codes.values())
+    own = {} if entry is None else entry.codes
+    owed = set(own.values())
     canary = scenario in SCENARIOS and SCENARIOS[scenario].canary
-    wide = (
-        set()
-        if lens == ledger.STATIC_LENS or canary
-        else {scope.gap for scope in known.column_wide if scope.kind == kind}
-    )
+    if lens == ledger.STATIC_LENS or canary:
+        # A static cell evaluates no clause; the canary checks the seam and C0.
+        return owed, set()
+    pinned = _pinned_not_owed(not_owed, cell)
+    wide = {
+        scope.gap
+        for scope in known.column_wide
+        if scope.kind == kind
+        and scope.code not in pinned
+        and _has_clause(scope.code, scenario, lens)
+        and not contract.not_owed_given(scope.code, own)
+    }
     return owed, wide
 
 
@@ -130,6 +173,7 @@ def problems(
     known: ledger.Ledger,
     pinned_counts: Mapping[str, int],
     not_expressible: Sequence[Mapping[str, str]] = (),
+    not_owed: Sequence[Mapping[str, str]] = (),
 ) -> list[str]:
     """Why the JUnit records are not a complete, honest run of the inventory."""
 
@@ -168,24 +212,33 @@ def problems(
             if case.outcome == EXPECTED_FAILURE:
                 out.append(f"{label} is a closing check and ended as an expected failure")
             continue
-        owed, wide = ledgered(known, item.cell)
+        owed, wide = ledgered(known, item.cell, not_owed)
         if case.outcome == EXPECTED_FAILURE:
             named = named_gaps(case.message)
             if not owed and not wide:
+                pins = sorted(_pinned_not_owed(not_owed, item.cell))
                 out.append(
                     f"{label} is an expected failure and the ledger has no entry "
                     f"for cell {item.cell}"
+                    + (f"; inventory.yaml pins {pins} as not owed on it" if pins else "")
                 )
-            elif not named or not owed <= named <= owed | wide:
+            elif named != owed | wide:
                 out.append(
                     f"{label} is an expected failure for {sorted(named)}; the "
                     f"ledger attributes {sorted(owed)} to cell {item.cell}"
-                    + (f" and may add {sorted(wide)} column-wide" if wide else "")
+                    + (f" and owes {sorted(wide)} column-wide on it" if wide else "")
                 )
         elif case.outcome == PASSED and owed:
             out.append(
                 f"{label} passed although the ledger has an entry for cell "
                 f"{item.cell} ({sorted(owed)}): delete the entry"
+            )
+        elif case.outcome == PASSED and wide:
+            out.append(
+                f"{label} passed although the ledger owes {sorted(wide)} "
+                f"column-wide on cell {item.cell}: delete the column-wide entry, "
+                "or pin the cell in inventory.yaml with the reason of its "
+                "definition for which the gap cannot show there"
             )
 
     counts: Counter[str] = Counter()
@@ -229,6 +282,7 @@ def verify(root: Path) -> tuple[list[str], int]:
         known=ledger.load(),
         pinned_counts=inventory.cell_counts,
         not_expressible=inventory.not_expressible,
+        not_owed=inventory.column_wide_not_owed,
     )
     return found, len(expected)
 

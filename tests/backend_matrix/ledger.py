@@ -451,6 +451,8 @@ class World:
     open_weight_kinds: frozenset[str]
     not_expressible: tuple[Mapping[str, str], ...] = ()
     not_evaluated: tuple[Mapping[str, str], ...] = ()
+    # The inventory's (cell, code) pairs on which a column-wide gap is not owed.
+    column_wide_not_owed: tuple[Mapping[str, str], ...] = ()
     liar_scenarios: frozenset[str] = frozenset()
     liar_clauses: frozenset[str] = frozenset()
     snapshot_values: Mapping[str, frozenset[str]] = field(default_factory=dict)
@@ -756,6 +758,34 @@ def _difference_problems(ledger: Ledger, world: World) -> list[Deviation]:
     return out
 
 
+def _column_wide_pin_problems(ledger: Ledger, world: World) -> list[Deviation]:
+    """A pin that a column-wide gap is not owed names a cell that could owe it."""
+
+    out: list[Deviation] = []
+    scopes = {(scope.kind, scope.code) for scope in ledger.column_wide}
+    seen: set[tuple[str, str]] = set()
+    for row in world.column_wide_not_owed:
+        cell, code = str(row.get("cell")), str(row.get("code"))
+        kind, scenario, _role, lens = parse_cell_id(cell)
+        if (
+            (cell, code) in seen
+            or cell not in world.generated
+            or lens == STATIC_LENS
+            or scenario in world.canary_scenarios
+            or (kind, code) not in scopes
+        ):
+            out.append(
+                Deviation(
+                    "static:column_wide_pin_invalid",
+                    f"inventory.yaml pins {code} as not owed on {cell}: a pin is "
+                    "listed once and names a generated behaviour cell, not the "
+                    "canary, of a kind that has a column-wide entry for that code",
+                )
+            )
+        seen.add((cell, code))
+    return out
+
+
 def _inventory_problems(world: World) -> list[Deviation]:
     out: list[Deviation] = []
     for kind in sorted(set(world.cell_counts) | set(world.pinned_counts)):
@@ -838,6 +868,7 @@ def integrity_problems(ledger: Ledger, world: World) -> list[Deviation]:
         *_registry_problems(ledger, world),
         *_entry_problems(ledger, world),
         *_difference_problems(ledger, world),
+        *_column_wide_pin_problems(ledger, world),
         *_inventory_problems(world),
         *_oracle_problems(world),
     ]

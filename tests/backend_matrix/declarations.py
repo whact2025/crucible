@@ -4,13 +4,13 @@
 """Declarations: they select a scenario's contract, so they are pinned.
 
 ``routed`` is the feature profile routing itself computes for a column, with
-the three arguments routing passes; ``routed_model`` is the model the route of
-a cell's role names. A scenario's difference table maps each
-value of its governing field to ``BASE``, ``FALLBACK`` or ``REFUSED``; the
-variant is selected from ``routed``, never from what a backend reports about
-itself. The checked-in snapshot pins every column's declared profile (static
-cell P04), so a declaration cannot be weakened to turn a cell green without an
-edit to a test file.
+the three arguments routing passes; ``routed_model`` and ``routed_endpoint``
+are the model and the endpoint the route of a cell's role names. A scenario's
+difference table maps each value of its governing field to ``BASE``,
+``FALLBACK`` or ``REFUSED``; the variant is selected from ``routed``, never
+from what a backend reports about itself. The checked-in snapshot pins every
+column's declared profile (static cell P04), so a declaration cannot be
+weakened to turn a cell green without an edit to a test file.
 
 Checking declarations against observed behaviour arrives with pack B.
 """
@@ -21,6 +21,7 @@ import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import yaml  # type: ignore[import-untyped]
 
@@ -121,6 +122,32 @@ def routed_model(column: Column, role: str, product: str = COLUMN_PRODUCT) -> st
     if not column.routing:
         return column.model
     return str(_routing(column, product).for_role(role).model)
+
+
+def endpoint_identity(url: str) -> str:
+    """``url`` as a run record may name it: scheme, host, port and path.
+
+    The user-info part and the query of an endpoint may hold a credential, so
+    a trace carries neither (clause C9), and neither does the reference.
+    """
+
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.hostname:
+        raise MatrixSetupError(f"route endpoint {url!r} is not an absolute URL")
+    return f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}{parts.path}"
+
+
+def routed_endpoint(column: Column, role: str, product: str = COLUMN_PRODUCT) -> str | None:
+    """The endpoint the route of ``role`` names: what the trace must record.
+
+    Read from the column's routing file as routing loads it, with the
+    ``${VAR}`` values in force at the moment of the call. A driver points a
+    loopback route at its scripted provider for the time the backend is open,
+    so the runner asks while it is. ``None`` when the route names no endpoint.
+    """
+
+    base_url = load_routing(config_path=column.routing_path(product)).for_role(role).base_url
+    return endpoint_identity(str(base_url)) if base_url else None
 
 
 def _routing(column: Column, product: str) -> BackendRouting:
