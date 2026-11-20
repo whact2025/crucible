@@ -315,9 +315,9 @@ registry:
     # while the two other adapters that declare prompt_only bind the schema
     # into the prompt themselves (crucible/backends/deepseek.py:1803-1830,
     # crucible/backends/kimi.py:2041-2064). Reported for the gap list.
-    # The code is also what a wrong finalisation request yields; on these
-    # cells the request shape is pinned by a test of its own until the entry
-    # is gone (test_matrix_openai_compat.py).
+    # The prompt half of the placement has a code of its own, so this gap
+    # covers nothing a wrong finalisation request would show
+    # (request.content:schema).
     declaration_change:
       field: structured_output
       from: prompt_only
@@ -371,8 +371,9 @@ known_gaps:
   # The gateway columns, first run of part 2 (starter set). On S04 guarded the
   # guard codes are G28's today; once G28 is fixed the guard reports the
   # incomplete accounting of G29 instead, and that fix edits the entry. On
-  # the hosted S04 cells the schema code is M04's: it leaves with the
-  # declaration change that record names, not with the G28 or G29 fix.
+  # the hosted S04 cells the code for the schema text in the prompt is M04's:
+  # it leaves with the declaration change that record names, not with the G28
+  # or G29 fix.
   - cell: openai_compat:hosted/S03/primary/guarded
     observed_under: {event_detail: usage}
     codes:
@@ -383,7 +384,7 @@ known_gaps:
     codes:
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
-      "request.content:schema": M04
+      "request.content:schema_prompt": M04
   - cell: openai_compat:hosted/S04/primary/guarded
     observed_under: {structured_output: prompt_only}
     codes:
@@ -391,7 +392,7 @@ known_gaps:
       "guard:revoked": G28
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
-      "request.content:schema": M04
+      "request.content:schema_prompt": M04
   - cell: openai_compat:hosted/S03/secondary/guarded
     observed_under: {event_detail: usage}
     codes:
@@ -402,7 +403,7 @@ known_gaps:
     codes:
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
-      "request.content:schema": M04
+      "request.content:schema_prompt": M04
   - cell: openai_compat:hosted/S04/secondary/guarded
     observed_under: {structured_output: prompt_only}
     codes:
@@ -410,7 +411,7 @@ known_gaps:
       "guard:revoked": G28
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
-      "request.content:schema": M04
+      "request.content:schema_prompt": M04
   - cell: openai_compat:local/S03/primary/guarded
     observed_under: {event_detail: usage}
     codes:

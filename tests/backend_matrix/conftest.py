@@ -8,8 +8,9 @@
 - every test gets the scripted route environment, the matrix rate card and a
   private home directory;
 - an item with a skip or xfail marker is refused at collection;
-- an expected failure is a failure unless the item is the cell of a ledger
-  entry, so a self-test cannot pass by reaching the comparator's verdict;
+- an expected failure is a failure unless the item is the test item of a
+  cell the ledger expects to fail (an entry of its own, or a column-wide gap
+  it owes), so a self-test cannot pass by reaching the comparator's verdict;
 - the outcome of every cell is recorded, so that a matrix module can require
   that the seam canary of each of its columns passed in this process;
 - when the run writes a JUnit file, the cell report of this process is

@@ -39,6 +39,7 @@ from . import cells as matrix_cells
 from . import columns as matrix_columns
 from . import contract, declarations, drivers, envelopes, ledger, netguard, toolsets
 from . import report as matrix_report
+from . import verify as matrix_verify
 from .cells import Cell
 from .columns import Column
 from .contract import Deviation, Observation, Raised, Reference, Report, SecondCall
@@ -497,24 +498,41 @@ def isolate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     )
 
 
+def _expected_to_fail(known: ledger.Ledger, cell: str) -> bool:
+    """Whether ``cell`` is the id of a cell the ledger expects to fail.
+
+    The verifier's rule, so that an expected failure this process lets stand
+    is one the verifier accepts: the cell has an entry of its own, or owes a
+    column-wide gap of its kind (never the seam canary, never a static cell).
+    """
+
+    try:
+        owed, wide = matrix_verify.ledgered(
+            known, cell, matrix_cells.load_inventory().column_wide_not_owed
+        )
+    except drivers.MatrixSetupError:
+        return False  # not a cell id at all
+    return bool(owed or wide)
+
+
 def refuse_stray_expected_failure(item: Any, report: Any, known: ledger.Ledger) -> None:
     """Only the test item of a ledgered cell may end as an expected failure.
 
     A self-test that reaches the comparator's expected failure by mistake
-    would otherwise be reported as one itself, and pass unnoticed.
+    would otherwise be reported as one itself, and pass unnoticed. The item of
+    a cell is parametrised by the cell, so its id is the cell's id; an id that
+    merely starts with the kind of a column-wide entry (a proof parametrised
+    by a column, the canary) is no such item.
     """
 
     if report.when != "call" or not hasattr(report, "wasxfail"):
         return
     callspec = getattr(item, "callspec", None)
-    cell = "" if callspec is None else str(callspec.id)
-    if known.entry(cell) is not None or any(
-        cell.startswith(f"{scope.kind}/") for scope in known.column_wide
-    ):
+    if callspec is not None and _expected_to_fail(known, str(callspec.id)):
         return
     report.longrepr = (
         f"{item.nodeid} ended as an expected failure ({report.wasxfail}) but is "
-        "not the test item of a cell with a ledger entry"
+        "not the test item of a cell the ledger expects to fail"
     )
     report.outcome = "failed"
     del report.wasxfail

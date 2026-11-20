@@ -959,15 +959,28 @@ LIARS: tuple[Liar, ...] = (
     ),
     _liar("S04", CLEAR_ACCOUNTING_FLAGS, _UNTOLD, ("C6",), rehearses=("G29",)),
     _liar("S04", SCHEMA_ANSWER_INVALID, ("text:mismatch",), ("S",)),
-    *(
-        _liar(
-            "S04",
-            SCHEMA_MISPLACED,
-            ("request.content:schema",),
-            ("S",),
-            needs={"structured_output": placement},
-        )
-        for placement in ("native", "prompt_only")
+    _liar(
+        "S04",
+        SCHEMA_MISPLACED,
+        ("request.content:schema",),
+        ("S",),
+        needs={"structured_output": "native"},
+    ),
+    # A route that declares the schema in the prompt owes two things, each with
+    # its code: the schema text there, and no provider field.
+    _liar(
+        "S04",
+        SCHEMA_MISPLACED,
+        ("request.content:schema", "request.content:schema_prompt"),
+        ("S",),
+        needs={"structured_output": "prompt_only"},
+    ),
+    _liar(
+        "S04",
+        SCHEMA_NOT_IN_PROMPT,
+        ("request.content:schema_prompt",),
+        ("S",),
+        needs={"structured_output": "prompt_only"},
     ),
     # With the declared difference of the schema finalisation in force the
     # trait is the honest play, and a fault beside it breaks one line of the
@@ -984,7 +997,7 @@ LIARS: tuple[Liar, ...] = (
     Liar(
         "S04",
         frozenset({FINAL_SCHEMA_REQUEST, SCHEMA_NOT_IN_PROMPT}),
-        frozenset({"request.content:schema"}),
+        frozenset({"request.content:schema_prompt"}),
         ("S",),
         rehearses=("M04",),
         needs={"structured_output": "prompt_only"},

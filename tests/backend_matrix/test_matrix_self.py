@@ -26,7 +26,7 @@ import sys
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -173,6 +173,26 @@ def test_each_behavioural_high_gap_is_rehearsed_as_predicted(gap: str) -> None:
     assert all(liar.composite == (gap == "G03") for liar in rehearsals)
 
 
+def test_a_rehearsed_gap_of_the_matrix_is_a_registry_record() -> None:
+    # A gap of the gap list (G..) may be rehearsed before any cell of it is
+    # recorded. A gap the matrix found itself exists in the registry only, so
+    # a liar that names one names a record, and yields what the ledger
+    # attributes to that gap wherever an entry still does.
+    own = [
+        (liar, gap)
+        for liar in toy.LIARS
+        for gap in liar.rehearses
+        if not gap.startswith("G")
+    ]
+    assert own, "no liar rehearses a gap of origin matrix"
+    for liar, gap in own:
+        record = LEDGER.registry.get(gap)
+        assert record is not None and record.origin == "matrix", (liar.id, gap)
+        for entry in LEDGER.entries:
+            attributed = {code for code, owner in entry.codes.items() if owner == gap}
+            assert not attributed or attributed == set(liar.codes), (liar.id, entry.cell)
+
+
 # -- the comparator: the three-way rule ----------------------------------------
 
 _CELL = "standin/S13/primary/raw"
@@ -287,20 +307,23 @@ def test_comparator_column_wide_code_is_owed_where_its_clause_ran() -> None:
         )
 
 
-@pytest.mark.parametrize("entry", LEDGER.entries, ids=lambda entry: entry.cell)
-def test_each_shipped_entry_is_strict(entry: ledger.Entry) -> None:
-    without = dataclasses.replace(
-        LEDGER, entries=tuple(item for item in LEDGER.entries if item is not entry)
-    )
-    current = dict(entry.observed_under)
+def test_each_shipped_entry_is_strict() -> None:
+    # One test over whatever entries the ledger holds today, not one item per
+    # entry: the fix that deletes the last entry would otherwise leave an empty
+    # parameter set, which the package refuses at collection.
+    for entry in LEDGER.entries:
+        without = dataclasses.replace(
+            LEDGER, entries=tuple(item for item in LEDGER.entries if item is not entry)
+        )
+        current = dict(entry.observed_under)
 
-    # Without its entry the cell fails; with it, a passing cell fails too.
-    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation"):
-        ledger.compare(without, entry.cell, set(entry.codes), current=current)
-    with pytest.raises(ledger.LedgerMismatch, match="gap fixed, delete the entry"):
-        ledger.compare(LEDGER, entry.cell, set(), current=current)
-    with pytest.raises(XFAILED):
-        ledger.compare(LEDGER, entry.cell, set(entry.codes), current=current)
+        # Without its entry the cell fails; with it, a passing cell fails too.
+        with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation"):
+            ledger.compare(without, entry.cell, set(entry.codes), current=current)
+        with pytest.raises(ledger.LedgerMismatch, match="gap fixed, delete the entry"):
+            ledger.compare(LEDGER, entry.cell, set(), current=current)
+        with pytest.raises(XFAILED):
+            ledger.compare(LEDGER, entry.cell, set(entry.codes), current=current)
 
 
 def test_ledger_rejects_a_declared_difference_without_an_alternative() -> None:
@@ -1449,20 +1472,30 @@ from crucible.tests.backend_matrix import ledger
 
 CELL = "kimi/H01/-/static"
 CODES = {"static:worker_skip"}
+# A kind with a column-wide entry, and what a cell of it shows.
+WIDE_KIND = "standin"
+WIDE_CELL = "standin/S01/primary/raw"
+WIDE_CODES = {"pricing:none"}
+WIDE_EVALUATED = frozenset({"C6"})
 KNOWN = ledger.parse(
     {
         "schema_version": ledger.LEDGER_SCHEMA,
-        "ceilings": {"max_known_gaps": {"pack_a": 1}, "max_declared_differences": 0},
+        "ceilings": {"max_known_gaps": {"pack_a": 2}, "max_declared_differences": 0},
         "registry": {
             "G99": {
                 "title": "a known gap",
                 "origin": "gap list",
                 "severity": "medium",
                 "cells": [{"cell": CELL, "observed_under": {}, "closes_under": {}}],
+                "column_wide": [{"kind": WIDE_KIND, "code": code} for code in WIDE_CODES],
             }
         },
         "known_gaps": [
-            {"cell": CELL, "observed_under": {}, "codes": {code: "G99" for code in CODES}}
+            {"cell": CELL, "observed_under": {}, "codes": {code: "G99" for code in CODES}},
+            *(
+                {"column_wide": {"kind": WIDE_KIND, "code": code, "gap": "G99"}}
+                for code in WIDE_CODES
+            ),
         ],
         "declared_differences": [],
     }
@@ -1522,9 +1555,13 @@ def test_known_gap(cell):
 """
 _INNER_STRAY = """
 import pytest
-from inner_known import CELL, CODES, KNOWN
+from inner_known import CELL, CODES, KNOWN, WIDE_CELL, WIDE_CODES, WIDE_EVALUATED, WIDE_KIND
 
 from crucible.tests.backend_matrix import ledger
+
+
+def _column_wide_verdict():
+    ledger.compare(KNOWN, WIDE_CELL, WIDE_CODES, current={}, evaluated=WIDE_EVALUATED)
 
 
 def test_a_self_test_that_reaches_the_comparators_verdict():
@@ -1534,6 +1571,22 @@ def test_a_self_test_that_reaches_the_comparators_verdict():
 @pytest.mark.parametrize("cell", ["kimi/H02/-/static"], ids=str)
 def test_a_cell_without_an_entry(cell):
     ledger.compare(KNOWN, CELL, CODES, current={})
+
+
+@pytest.mark.parametrize("cell", [WIDE_CELL], ids=str)
+def test_a_cell_that_owes_a_column_wide_gap(cell):
+    _column_wide_verdict()
+
+
+# Of a kind with a column-wide entry, and still no cell that owes it: a proof
+# parametrised by the column, the seam canary, a static cell.
+@pytest.mark.parametrize(
+    "name",
+    [f"{WIDE_KIND}/primary", f"{WIDE_KIND}/S00/primary/raw", f"{WIDE_KIND}/H02/-/static"],
+    ids=str,
+)
+def test_an_item_of_a_kind_with_a_column_wide_entry_that_is_no_cell_owing_it(name):
+    _column_wide_verdict()
 """
 _INNER_MARKED = """
 import pytest
@@ -1647,11 +1700,15 @@ def test_an_expected_failure_outside_a_ledgered_cell_is_a_failure(tmp_path: Path
 
     run = _inner_pytest(root, "test_inner_ledger.py", "test_inner_stray.py")
 
-    # The ledgered cell's own item is the expected failure; a self-test and a
-    # cell without an entry that reach the same verdict fail.
+    # The item of a cell the ledger expects to fail is the expected failure:
+    # the cell with an entry, and a cell that owes a column-wide gap. A
+    # self-test and a cell without an entry that reach the same verdict fail,
+    # and so does an item whose id merely starts with a kind that has a
+    # column-wide entry: a proof parametrised by the column, the seam canary,
+    # a static cell.
     assert run.returncode == 1, run.stdout + run.stderr
-    assert "2 failed, 1 xfailed" in run.stdout
-    assert run.stdout.count("is not the test item of a cell with a ledger entry") >= 2
+    assert "5 failed, 2 xfailed" in run.stdout
+    assert run.stdout.count("is not the test item of a cell the ledger expects to fail") >= 5
 
 
 def test_skip_and_xfail_markers_are_a_collection_error(tmp_path: Path) -> None:
@@ -1969,10 +2026,12 @@ def test_an_alternative_is_asserted_positively_and_replaces_no_clause(tmp_path: 
     # schema, its answer is the final message, its usage is counted.
     assert codes("honest", toy.FINAL_SCHEMA_REQUEST) == frozenset()
     # It is asserted, not waived: an adapter that does not behave so fails it,
-    # and so does one that carries the schema on its tool-bearing requests.
+    # and so does one that carries the schema on its tool-bearing requests
+    # (and, with that fault, no schema text in the prompt: the other code).
     assert codes("absent") == {"request.content:schema"}
     assert codes("misplaced", toy.FINAL_SCHEMA_REQUEST, toy.SCHEMA_MISPLACED) == {
-        "request.content:schema"
+        "request.content:schema",
+        "request.content:schema_prompt",
     }
     # It replaces no clause: the accounting of the further request is owed.
     assert codes("untold", toy.FINAL_SCHEMA_REQUEST, toy.CLEAR_ACCOUNTING_FLAGS) == untold
@@ -1982,7 +2041,7 @@ def test_an_alternative_is_asserted_positively_and_replaces_no_clause(tmp_path: 
     # nothing else: the prompt half of the declared value stays (this column
     # declares the schema in the prompt), and the answer is the finalisation's.
     assert codes("no schema text", toy.FINAL_SCHEMA_REQUEST, toy.SCHEMA_NOT_IN_PROMPT) == {
-        "request.content:schema"
+        "request.content:schema_prompt"
     }
     assert codes("the draft", toy.FINAL_SCHEMA_REQUEST, toy.RETURN_SCHEMA_DRAFT) == {
         "text:mismatch"
@@ -2029,19 +2088,71 @@ def test_an_alternative_is_asserted_positively_and_replaces_no_clause(tmp_path: 
             plan_for(wider, {}, ("D-WIDER",))
 
 
-def _single_entry_ledger(cell: str, code: str) -> ledger.Ledger:
+def test_a_known_gap_on_the_prompt_half_does_not_hide_a_wrong_finalisation_request(
+    tmp_path: Path,
+) -> None:
+    column = next(
+        item
+        for item in cells.toy_columns()
+        if item.features is not None and item.features.structured_output == "prompt_only"
+    )
+    cell = Cell(column, "S04", "raw")
+
+    def played(name: str, fault: str) -> runner.Execution:
+        return runner.execute(
+            cell,
+            tmp_path / name,
+            driver=toy.ToyDriver(frozenset({toy.FINAL_SCHEMA_REQUEST, fault})),
+            differences=(D_OAI_SCHEMA_FINAL,),
+        )
+
+    def shape(execution: runner.Execution) -> list[tuple[bool, bool]]:
+        requests = execution.observation.provider.requests
+        assert SCHEMA_TITLE not in requests[0].system
+        return [(bool(item.tools), item.schema_field) for item in requests]
+
+    # The gap as a column shows it: the finalisation request is right, and the
+    # schema text the route declares is missing from the prompt. A ledger that
+    # records exactly that makes the cell an expected failure ...
+    gap = played("the gap", toy.SCHEMA_NOT_IN_PROMPT)
+    assert shape(gap) == [(True, False), (True, False), (False, True)]
+    assert gap.report.codes
+    known = _single_entry_ledger(cell.id, *sorted(gap.report.codes), observed=gap.current)
+    with pytest.raises(XFAILED):
+        ledger.compare(known, cell.id, gap.report.codes, current=gap.current)
+    # ... and covers nothing else. With the same gap, an adapter that carries
+    # the schema field on its tool-bearing requests and not on the final one
+    # shows another set of codes: the two halves of the placement have a code
+    # each, so an entry for the one cannot stand in for the other.
+    wrong = played("the gap and a wrong request", toy.SCHEMA_MISPLACED)
+    assert shape(wrong) == [(True, True), (True, True), (False, False)]
+    assert wrong.report.codes > gap.report.codes
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation"):
+        ledger.compare(known, cell.id, wrong.report.codes, current=wrong.current)
+
+
+def _single_entry_ledger(
+    cell: str, *codes: str, observed: Mapping[str, str] | None = None
+) -> ledger.Ledger:
+    under = dict(observed or {})
     record = {
         "title": "a known gap",
         "origin": "gap list",
         "severity": "medium",
-        "cells": [{"cell": cell, "observed_under": {}, "closes_under": {}}],
+        "cells": [{"cell": cell, "observed_under": under, "closes_under": under}],
     }
     return ledger.parse(
         {
             "schema_version": ledger.LEDGER_SCHEMA,
             "ceilings": {"max_known_gaps": {"pack_a": 1}, "max_declared_differences": 0},
             "registry": {"G99": record},
-            "known_gaps": [{"cell": cell, "observed_under": {}, "codes": {code: "G99"}}],
+            "known_gaps": [
+                {
+                    "cell": cell,
+                    "observed_under": under,
+                    "codes": {code: "G99" for code in codes},
+                }
+            ],
             "declared_differences": [],
         }
     )

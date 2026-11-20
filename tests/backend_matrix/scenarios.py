@@ -287,26 +287,12 @@ def schema_in_field(obs: Observation, _ref: Reference) -> list[Deviation]:
     ]
 
 
-def schema_in_prompt(obs: Observation, _ref: Reference) -> list[Deviation]:
-    requests = _matched(obs)
-    if not requests:
-        return []
-    in_prompt = requests[0].system.count(SCHEMA_TITLE)
-    if in_prompt == 1 and not any(request.schema_field for request in requests):
-        return []
-    return [
-        Deviation(
-            "request.content:schema",
-            f"the schema text appears {in_prompt} time(s) in the system prompt and "
-            "must appear once, with no provider schema field",
-        )
-    ]
-
-
 def schema_text_in_prompt(obs: Observation, _ref: Reference) -> list[Deviation]:
     """The prompt half of ``prompt_only``: the schema text, once, in the system prompt.
 
-    Where the schema *field* travels is another check's business.
+    It has a code of its own. Where the schema *field* travels is another
+    check's business and another code, so a known gap on the one half never
+    covers a deviation on the other.
     """
 
     requests = _matched(obs)
@@ -317,12 +303,29 @@ def schema_text_in_prompt(obs: Observation, _ref: Reference) -> list[Deviation]:
         return []
     return [
         Deviation(
-            "request.content:schema",
+            "request.content:schema_prompt",
             f"the schema text appears {in_prompt} time(s) in the system prompt and "
             "must appear once: the route declares that the schema travels in the "
             "prompt",
         )
     ]
+
+
+def schema_in_prompt(obs: Observation, ref: Reference) -> list[Deviation]:
+    """``prompt_only``: the schema text once in the prompt, and no provider field."""
+
+    out = list(schema_text_in_prompt(obs, ref))
+    carrying = sum(request.schema_field for request in _matched(obs))
+    if carrying:
+        out.append(
+            Deviation(
+                "request.content:schema",
+                f"{carrying} request(s) carry the schema in the schema field of the "
+                "provider; the route declares that the schema travels in the "
+                "prompt only",
+            )
+        )
+    return out
 
 
 def schema_in_final_request(obs: Observation, _ref: Reference) -> list[Deviation]:

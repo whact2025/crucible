@@ -38,7 +38,7 @@ from .columns import HOSTED_GATEWAY_KIND, LOCAL_GATEWAY_KIND, Column
 from .drivers import MatrixSetupError
 from .drivers import openai_compat as gateway
 from .provider import LoopbackProvider, Reply, SeenRequest
-from .scenarios import D_OAI_SCHEMA_FINAL, SCENARIOS
+from .scenarios import D_OAI_SCHEMA_FINAL, SCENARIOS, SCHEMA_ANSWER, SCHEMA_FINAL_ANSWER
 from .script import READ_A, Call, ProviderScript, Say, ServedAs, Step, TokenUsage
 
 LEDGER = ledger.load()
@@ -576,9 +576,7 @@ def test_the_schema_finalisation_is_asserted_where_the_ledger_puts_it_in_force(
     # The shape of the exchange, and only that; which codes the cell shows is
     # between the cell and the ledger. One further request without tools
     # carries the schema, no other does, and the provider answered it from the
-    # tail of the script. Asserted here on every column, apart from the cell:
-    # where a cell is ledgered with the schema code for another reason, the
-    # cell alone could not show a finalisation request that went wrong.
+    # tail of the script.
     assert [(bool(item.tools), item.schema_field) for item in requests] == [
         (True, False),
         (True, False),
@@ -591,6 +589,87 @@ def test_the_schema_finalisation_is_asserted_where_the_ledger_puts_it_in_force(
     without = runner.execute(cell, tmp_path / "not-in-force")
     assert "request.extra" in without.report.codes
     assert not without.observation.provider.tail_served
+
+
+class _ReturnsTheDraft:
+    """The real adapter, except that its call returns the draft of the last tool round.
+
+    It still sends the finalisation request and accounts for it as the adapter
+    does: only the message it hands back is the earlier one.
+    """
+
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._backend, name)
+
+    def invoke(self, invocation: Any) -> Any:
+        result = self._backend.invoke(invocation)
+        return dataclasses.replace(result, final_message=SCHEMA_ANSWER)
+
+
+@pytest.mark.parametrize("column", COLUMNS, ids=lambda column: column.id)
+def test_an_adapter_that_returns_the_draft_fails_the_cell_whatever_its_entry(
+    column: Column, tmp_path: Path
+) -> None:
+    class Driver(type(gateway_driver(column))):  # type: ignore[misc]
+        @contextlib.contextmanager
+        def open(self, *arguments: Any, **named: Any) -> Iterator[Any]:
+            with super().open(*arguments, **named) as bound:
+                yield dataclasses.replace(bound, backend=_ReturnsTheDraft(bound.backend))
+
+    cell = Cell(column, "S04", "raw")
+    honest = _played(column, "S04", tmp_path / "honest")
+    result = honest.observation.result
+
+    # The adapter itself returns the answer to the finalisation request, which
+    # the script makes another valid text than the draft ...
+    assert result is not None and honest.observation.provider.tail_served
+    assert json.loads(result.final_message) == json.loads(SCHEMA_FINAL_ANSWER)
+    assert json.loads(SCHEMA_FINAL_ANSWER) != json.loads(SCHEMA_ANSWER)
+    assert "text:mismatch" not in honest.report.codes
+    # ... and one that paid for the finalisation and returned the draft is not
+    # covered by any entry of the cell: both texts validate, only one is owed.
+    with pytest.raises(ledger.LedgerMismatch, match=r"unexpected .*'text:mismatch'"):
+        runner.run_cell(
+            cell,
+            tmp_path / "draft",
+            preflight={column.kind: None},
+            known=LEDGER,
+            driver=Driver(),
+        )
+
+
+class _SchemaOnEveryRequest(gateway.OpenAIChatDialect):
+    """Reads the schema field into every request.
+
+    What the provider would see of an adapter that carried the schema on its
+    tool-bearing requests as well as on the final one.
+    """
+
+    def parse(self, *arguments: Any, **named: Any) -> SeenRequest:
+        return dataclasses.replace(super().parse(*arguments, **named), schema_field=True)
+
+
+@pytest.mark.parametrize("lens", SCENARIOS["S04"].lenses)
+def test_a_finalisation_request_that_went_wrong_fails_the_cell_whatever_its_entry(
+    lens: str, tmp_path: Path
+) -> None:
+    cell = Cell(_column(HOSTED_GATEWAY_KIND), "S04", lens)
+
+    # The cell may be ledgered today for other reasons (the accounting of the
+    # finalisation, the schema text the route declares in the prompt). None of
+    # its entries covers the placement of the schema field: that code is
+    # reported as an unexpected one, with or without an entry.
+    with pytest.raises(ledger.LedgerMismatch, match=r"unexpected .*'request\.content:schema'"):
+        runner.run_cell(
+            cell,
+            tmp_path,
+            preflight={HOSTED_GATEWAY_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_SchemaOnEveryRequest),
+        )
 
 
 # -- the module ends with the canary check --------------------------------------------
