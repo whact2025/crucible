@@ -50,6 +50,42 @@ hard-stop guarantee. An overrun, missing pricing, or incomplete execution
 evidence stops later calls and approval. Cancellation closes and joins leases
 before a terminal is published. The configured route/model/effort is preserved.
 
+A competition that ends without a plan reports why.
+`plan_competition_inconclusive` is kept when a ruling ended the run: the
+comparison reviewer selected nothing, or every draft that came back was
+refused by the decoder, a deterministic gate, or its own reviewers. A Critic
+`reject` is such a refusal even when that draft's Judge gave no verdict. The
+status is also kept when the records do not prove that a lost call ended the
+run, for example when every planner stopped on its turn limit or a content
+rejection, or a draft's deterministic gate could not run. Otherwise the status
+is the one single-track planning reports for the lost call:
+`planner_infrastructure_failure` or `planner_protocol_failure` when no planner
+returned a draft; `critic_infrastructure_failure`, `critic_protocol_failure`,
+`judge_infrastructure_failure` or `judge_protocol_failure` when a draft
+reviewer or the comparison reviewer gave no verdict while a draft had no
+ruling against it; `budget_exhausted` when such a call stopped on its budget
+instead; and `cancelled` when a cancel request arrived before the comparison
+or before the review of a proposed synthesis. A lost draft is not retried, and
+no plan is published in any of these cases.
+
+These statuses name a lost call only when its backend reported complete usage
+and pricing evidence. A lost call with incomplete usage, which the
+OpenAI-compatible adapter returns for a connection or HTTP error, stays the
+accounting terminal `budget_accounting_incomplete`, as it stays
+`incomplete_accounting` with one planner.
+
+The status is not always the one single-track planning reports for the same
+events. A run in which every planner stopped on its turn limit or a content
+rejection keeps `plan_competition_inconclusive`, where one planner ends on
+`hard_fail_max_turns` or `hard_fail_content_rejected`. Lost planner calls
+beside such a stop are named by the lost call, where one planner ends on that
+stop. Lost planner calls beside a refused draft keep
+`plan_competition_inconclusive`, where one planner reports whichever came
+last. A planner that stopped on its budget beside drafts that were all refused
+keeps `plan_competition_inconclusive` too, where one planner reports
+`budget_exhausted`. A Critic `reject` followed by a lost Judge is a refusal
+here and the lost Judge with one planner.
+
 `--planner-count 1` selects the bounded single-track refinement loop and
 permits zero or one pre-review deterministic correction. Planner conversations,
 cooperative planner control, and diagnostic validation overrides require this
@@ -113,4 +149,4 @@ become canonical Spec versions. Source:
 | `0` | `PlanOutcome.decision="accepted"`; the enabled validation gate passed and an executable DAG was persisted. |
 | `1` | The accepted candidate failed the final deterministic TOCTOU recheck. |
 | `2` | `PlanOutcome.decision="rejected"` or a handled setup failure. |
-| `3` | `PlanOutcome.decision="inconclusive"`, including budget/round exhaustion, missing DAG, incomplete review coverage, or a Planner backend that returned no reply by the end of the round budget (`planner_infrastructure_failure`). |
+| `3` | `PlanOutcome.decision="inconclusive"`, including budget/round exhaustion, missing DAG, incomplete review coverage, or a Planner backend that returned no reply (`planner_infrastructure_failure`): by the end of the round budget with one planner, or when no independent draft came back with several. |

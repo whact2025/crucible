@@ -130,6 +130,9 @@ _NO_WORK = frozenset({
 _INCONCLUSIVE = frozenset({
     "breach_inconclusive",
     "budget_accounting_incomplete",
+    # A fixed plan candidate whose reviewer answered ``inconclusive`` itself
+    # while none rejected it: nothing ruled on the plan.
+    "candidate_review_inconclusive",
     "cost_incomplete",
     "critic_failures_exhausted",
     "critic_infrastructure_failure",
@@ -155,6 +158,11 @@ _INCONCLUSIVE = frozenset({
     "lifecycle_output_invalid",
     "no_mode_selected",
     "partial_stopped",
+    # Independent drafts shared provider state: a harness fault. The
+    # competition keeps ``plan_competition_inconclusive`` for a ruling and for
+    # a run whose records do not prove a lost call; that status stays in no
+    # table.
+    "plan_competition_isolation_failed",
     "planner_infrastructure_failure",
     "planner_protocol_failure",
     "review_inconclusive",

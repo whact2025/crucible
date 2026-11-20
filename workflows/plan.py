@@ -595,6 +595,14 @@ def _review_budget_terminal_stage(
     return None
 
 
+def _review_control_failure_status(role: str, verdict: Any, corpus: Corpus) -> str:
+    """Status of a Critic or Judge review that ended in a control-plane failure."""
+
+    if _review_budget_terminal_stage(verdict, corpus) is not None:
+        return "budget_exhausted"
+    return f"{role}_{review_failure_domain(verdict) or 'infrastructure'}_failure"
+
+
 def _plan_review_diagnostics(
     verdicts: Iterable[Verdict],
 ) -> dict[str, int | float | None | str | bool]:
@@ -1170,11 +1178,7 @@ def _review_control_failure_outcome(
     )
     budget_terminal = budget_terminal_stage is not None
     failure_domain = review_failure_domain(failure.verdict)
-    status = (
-        "budget_exhausted"
-        if budget_terminal
-        else f"{failure.role}_{failure_domain or 'infrastructure'}_failure"
-    )
+    status = _review_control_failure_status(failure.role, failure.verdict, corpus)
     if budget_terminal_stage == "response_repair":
         reason = (
             f"{failure.role} review exhausted the cumulative planning budget "

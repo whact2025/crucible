@@ -279,6 +279,28 @@ def test_unjudged_work_statuses_are_typed_and_not_permanent() -> None:
         assert classify_terminal_status(status) is TerminalClass.CANCELLED, status
 
 
+def test_plan_competition_statuses_separate_a_ruling_from_a_run_nothing_ruled_on() -> None:
+    """Registering a ruling would move a judged refusal for every caller."""
+
+    # The status the competition keeps for a ruling, and for a run whose
+    # records do not prove a lost call, is in no table; neither are the
+    # rulings on a fixed candidate.
+    for status in (
+        "plan_competition_inconclusive",
+        "candidate_rejected",
+        "candidate_revision_required",
+        "candidate_validation_rejected",
+    ):
+        assert classify_terminal_status(status) is TerminalClass.CONTRACT_ERROR, status
+    # Independent drafts that shared provider state, and a fixed candidate
+    # whose reviewer answered ``inconclusive`` itself: nothing ruled on a plan.
+    for status in (
+        "plan_competition_isolation_failed",
+        "candidate_review_inconclusive",
+    ):
+        assert classify_terminal_status(status) is TerminalClass.INCONCLUSIVE, status
+
+
 def test_tier_breach_failure_statuses_are_permanent() -> None:
     """The tier's two judged breach terminals are registered, not unknown."""
 

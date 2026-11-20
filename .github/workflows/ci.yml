@@ -53,7 +53,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: whact2025/assay
-          ref: 3018a4d64a0c42fa449e8708fd1beb5d957ff2a4
+          ref: 57296e1b9d57f9056a1110121130cefa840ab562
           path: assay
           persist-credentials: false
       - name: Set up uv
@@ -161,7 +161,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: whact2025/assay
-          ref: 3018a4d64a0c42fa449e8708fd1beb5d957ff2a4
+          ref: 57296e1b9d57f9056a1110121130cefa840ab562
           path: assay
           persist-credentials: false
       - name: Set up uv
@@ -217,7 +217,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: whact2025/assay
-          ref: 3018a4d64a0c42fa449e8708fd1beb5d957ff2a4
+          ref: 57296e1b9d57f9056a1110121130cefa840ab562
           path: assay
           persist-credentials: false
       - name: Set up uv
@@ -286,7 +286,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: whact2025/assay
-          ref: 3018a4d64a0c42fa449e8708fd1beb5d957ff2a4
+          ref: 57296e1b9d57f9056a1110121130cefa840ab562
           path: assay
           persist-credentials: false
       - name: Set up uv
