@@ -15,6 +15,11 @@ blocked call into a result a failure cell would accept. Because any broad
 ``except`` can still swallow it, the record is what decides: the fixture that
 installs the guard fails the test when the record is not empty at teardown.
 
+A process that cannot hand its record to a fixture (a worker that a test
+starts) passes ``install`` a callback instead: it is called with every
+violation as it is recorded, before the exception is raised, so the record
+survives a caller that swallows the exception and a process that is killed.
+
 The guard sees Python sockets only. A client that opens sockets below the
 ``socket`` module is not stopped by it.
 """
@@ -24,7 +29,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 _SOCKET_METHODS = ("connect", "connect_ex", "sendto", "sendmsg")
 _MODULE_FUNCTIONS = (
@@ -40,6 +45,7 @@ _ABSENT = object()
 _lock = threading.Lock()
 _record: list[str] = []
 _saved: dict[str, Any] | None = None
+_on_violation: Callable[[str], None] | None = None
 
 
 class NetworkGuardViolation(Exception):
@@ -73,6 +79,9 @@ def _refuse(operation: str, target: Any) -> None:
     entry = f"{operation} -> {target!r}"
     with _lock:
         _record.append(entry)
+        report = _on_violation
+    if report is not None:
+        report(entry)
     raise NetworkGuardViolation(
         f"network guard: {entry} is not a loopback target; the matrix and "
         "the tests it guards run without network access"
@@ -128,10 +137,13 @@ def _guard_function(name: str, original: Callable[..., Any]) -> Callable[..., An
     return guarded
 
 
-def install() -> None:
-    """Install the guard. Installing twice is an error, not a no-op."""
+def install(on_violation: Callable[[str], None] | None = None) -> None:
+    """Install the guard. Installing twice is an error, not a no-op.
 
-    global _saved
+    ``on_violation`` is called with every violation as it is recorded.
+    """
+
+    global _saved, _on_violation
     with _lock:
         if _saved is not None:
             raise RuntimeError("network guard is already installed")
@@ -148,12 +160,13 @@ def install() -> None:
             saved[name] = original
             setattr(socket, name, _guard_function(name, original))
         _saved = saved
+        _on_violation = on_violation
 
 
 def remove() -> None:
     """Remove the guard and restore exactly what :func:`install` replaced."""
 
-    global _saved
+    global _saved, _on_violation
     with _lock:
         if _saved is None:
             raise RuntimeError("network guard is not installed")
@@ -166,6 +179,7 @@ def remove() -> None:
         for name in _MODULE_FUNCTIONS:
             setattr(socket, name, _saved[name])
         _saved = None
+        _on_violation = None
 
 
 def installed() -> bool:
@@ -180,3 +194,24 @@ def take_violations() -> tuple[str, ...]:
         taken = tuple(_record)
         _record.clear()
     return taken
+
+
+def watch(fail: Callable[[str], None]) -> Iterator[None]:
+    """Fixture body: the guard is on for one test, and its record must be empty.
+
+    ``fail`` is called with the reason when the test reached beyond loopback,
+    whether or not the code under test swallowed the exception.
+    """
+
+    take_violations()
+    install()
+    try:
+        yield
+    finally:
+        remove()
+        violations = take_violations()
+        if violations:
+            fail(
+                "the test reached for the network (blocked by the matrix guard): "
+                + "; ".join(violations)
+            )

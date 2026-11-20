@@ -20,6 +20,10 @@ The seam canary of a column fails unless the request is the SDK's own: the
 documented path, the installed SDK's user agent, a bearer credential (the
 route's, where the route has one) and the host the client addressed
 (production behind the redirect, loopback for the local kind).
+
+Chat completions keeps no conversation, so the dialect states what each
+request must replay of the earlier rounds (:func:`replay_problems`), for the
+scenarios that attach a ToolSet.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ import importlib.util
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Mapping
+from typing import Any, Iterator, Literal, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from crucible.backends.config import load_routing, resolve_for_role
@@ -39,7 +43,7 @@ from .. import columns as matrix_columns
 from .. import envelopes as envelope_files
 from .. import netguard, tap
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
-from ..provider import LoopbackProvider, Reply, SeenRequest
+from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall
 from ..script import Call, ProviderScript, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
@@ -60,6 +64,24 @@ def _text(content: Any) -> str:
             if isinstance(part, dict) and part.get("type") == "text"
         )
     return ""
+
+
+def _shape(message: Mapping[str, Any]) -> dict[str, Any]:
+    """What one chat message is to the conversation: its role and its call ids."""
+
+    role = str(message.get("role", ""))
+    calls = message.get("tool_calls")
+    return {
+        "role": role,
+        # The calls an assistant turn asks for, in its order.
+        "asks": [
+            str(call.get("id", ""))
+            for call in (calls if isinstance(calls, list) else ())
+            if isinstance(call, dict)
+        ],
+        # The call a tool message answers.
+        "answers": str(message.get("tool_call_id", "")) if role == "tool" else None,
+    }
 
 
 class OpenAIChatDialect:
@@ -148,6 +170,9 @@ class OpenAIChatDialect:
                 and response_format.get("type") == "json_schema"
             ),
             host=lowered.get("host", ""),
+            # The shape of the conversation the request carries: roles and
+            # call ids, no text.
+            evidence={"messages": [_shape(item) for item in messages]},
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -176,6 +201,19 @@ class OpenAIChatDialect:
                 f"{self._host!r}: the request did not come through the redirect"
             )
         return problems
+
+    def replay_problems(
+        self, requests: Sequence[SeenRequest], calls: Sequence[SentCall]
+    ) -> list[str]:
+        """The stateless-replay rule of the wire, for the cells of both kinds.
+
+        The scripted provider answers on position and call ids alone, so it
+        answers a conversation that a real endpoint refuses. The provider
+        applies this rule to the scripted exchange when it ends, and the
+        scenarios with a ToolSet report what it names.
+        """
+
+        return replay_problems(requests, calls)
 
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
         served = seen.model
@@ -213,6 +251,98 @@ class OpenAIChatDialect:
         return Reply(
             envelope.status, envelope.fill(slots), usage, served, call, envelope.name
         )
+
+
+def conversation(seen: SeenRequest) -> list[str]:
+    """The conversation a request carries, one word per message.
+
+    The role of the message, with the call ids of an assistant turn that asks
+    for tools and of the tool message that answers one:
+    ``system, user, assistant[call-1], tool[call-1]``.
+    """
+
+    words: list[str] = []
+    for message in seen.evidence.get("messages") or ():
+        ids = [message["answers"]] if message["role"] == "tool" else message["asks"]
+        words.append(message["role"] + (f"[{', '.join(ids)}]" if ids else ""))
+    return words
+
+
+def replay_problems(
+    requests: Sequence[SeenRequest], calls: Sequence[SentCall]
+) -> list[str]:
+    """Why the requests of one call do not replay the conversation in full.
+
+    The wire keeps no conversation. The first request of a call carries the
+    opening messages, the prompts, and nothing of a tool round. Every later
+    request begins with the same opening and carries each earlier reply that
+    asked for a tool, in order, as the assistant turn that names the call
+    directly followed by the tool message that answers it (where one turn
+    names several calls, by one tool message for each). A real endpoint
+    refuses a tool message that answers no call of the assistant turn before
+    it, and an assistant turn whose calls are not all answered.
+
+    What else the client says is its own and the wire takes it: a user
+    message between two rounds or after the last one (the instruction of a
+    forced finalisation) and an assistant turn without a tool call (the draft
+    before a schema finalisation).
+
+    ``requests`` are all requests of the exchange in order, as the provider
+    ledger keeps them; a tool call names the request it answered by its index
+    there. A request that matched no scripted step is not judged: it is an
+    extra request, which clause C0 reports.
+    """
+
+    problems: list[str] = []
+    opening: list[str] | None = None
+    for index, request in enumerate(requests):
+        if not request.matched:
+            continue
+        messages = list(request.evidence.get("messages") or ())
+        roles = [message["role"] for message in messages]
+        why: list[str] = []
+        if opening is None:
+            # The prompts: what precedes the first turn of the model.
+            first_turn = next(
+                (place for place, role in enumerate(roles) if role in ("assistant", "tool")),
+                len(roles),
+            )
+            opening = roles[:first_turn]
+        elif roles[: len(opening)] != opening:
+            why.append(f"it does not begin with the opening messages ({', '.join(opening)})")
+        rounds: list[str] = []
+        at = 0
+        while at < len(messages):
+            message = messages[at]
+            at += 1
+            if message["role"] == "tool":
+                why.append(
+                    f"the tool message for {message['answers']} follows no assistant "
+                    "turn that asked for it"
+                )
+            elif message["role"] == "assistant" and message["asks"]:
+                results: list[str] = []
+                while at < len(messages) and messages[at]["role"] == "tool":
+                    results.append(messages[at]["answers"])
+                    at += 1
+                if sorted(results) != sorted(message["asks"]):
+                    why.append(
+                        f"the assistant turn that asked for {message['asks']} is "
+                        f"followed by the results of {results}"
+                    )
+                rounds.extend(message["asks"])
+        answered = [call.call_id for call in calls if call.request_index < index]
+        if rounds != answered:
+            why.append(
+                f"it replays the tool rounds {rounds} where the provider had asked "
+                f"for {answered}"
+            )
+        if why:
+            problems.append(
+                f"request {index + 1} carries {', '.join(conversation(request))}: "
+                + "; ".join(why)
+            )
+    return problems
 
 
 @dataclass

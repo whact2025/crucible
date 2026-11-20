@@ -66,6 +66,7 @@ from .provider import (
     ProviderLedger,
     Reply,
     SeenRequest,
+    StatelessDialect,
     ToyDialect,
 )
 from .scenarios import (
@@ -80,6 +81,7 @@ from .scenarios import (
     STARTER,
     budget_in_request,
     governing_fields,
+    history_replayed,
     no_overshoot,
     plan_for,
     tool_events_paired,
@@ -1054,6 +1056,126 @@ def test_provider_matches_on_method_path_call_ids_and_advertised_tools() -> None
     assert (seen.extra, seen.unconsumed) == (1, 2)
 
 
+class _NoReplayRule:
+    """The toy wire, read by a dialect that states no replay rule."""
+
+    name, path = ToyDialect.name, ToyDialect.path
+
+    def __init__(self) -> None:
+        self._toy = ToyDialect()
+
+    def parse(self, *arguments: Any, **named: Any) -> SeenRequest:
+        return self._toy.parse(*arguments, **named)
+
+    def seam_problems(self, seen: SeenRequest) -> list[str]:
+        return self._toy.seam_problems(seen)
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        return self._toy.render(step, seen, call_id)
+
+
+def test_a_stateless_dialect_states_what_a_request_replays_and_tool_scenarios_report_it(
+    tmp_path: Path,
+) -> None:
+    tools = {"tools": [BINDINGS[READ_A].name]}
+    script = ProviderScript((Call(READ_A), Call(READ_A), Say("three")))
+
+    def exchange(dialect: Any, *, forget: bool) -> ProviderLedger:
+        def results(call: dict[str, Any]) -> dict[str, Any]:
+            return {**tools, "tool_results": [{"id": call["id"], "text": "result"}]}
+
+        with LoopbackProvider(script, credential="c", dialect=dialect) as provider:
+            (first,) = _ask(provider, {**tools, "answered": []})[1]["calls"]
+            (second,) = _ask(provider, {**results(first), "answered": []})[1]["calls"]
+            # A request that matches no step is not judged: it is clause C0's.
+            assert _ask(provider, {**tools, "answered": ["x"]})[0] == UNSCRIPTED_STATUS
+            answered = [] if forget else [first["id"]]
+            final = _ask(provider, {**results(second), "answered": answered})
+            assert final[1]["text"] == "three"
+            return provider.freeze()
+
+    # The toy wire keeps no conversation: a request names the calls that
+    # earlier requests answered. The rule is the dialect's; the provider
+    # applies it when the exchange ends, and never picks a reply by it.
+    assert isinstance(ToyDialect(), StatelessDialect)
+    kept = exchange(ToyDialect(), forget=False)
+    assert (kept.replay_problems, kept.extra, kept.unconsumed) == ([], 1, 0)
+    forgotten = exchange(ToyDialect(), forget=True)
+    (problem,) = forgotten.replay_problems
+    assert problem.startswith("request 4 names [] as answered by earlier requests")
+    assert (forgotten.extra, forgotten.unconsumed) == (1, 0)
+    # A dialect that states no rule is asked nothing, whatever was sent.
+    assert not isinstance(_NoReplayRule(), StatelessDialect)
+    assert exchange(_NoReplayRule(), forget=True).replay_problems == []
+
+    # The scenario assertion reports what the ledger holds, under one code.
+    reference = _reference()
+    assert history_replayed(_observation(), reference) == []
+    named = _observation(provider=ProviderLedger(replay_problems=["one", "two"]))
+    assert history_replayed(named, reference) == [
+        Deviation("request.content:replay", "one; two")
+    ]
+    assert contract.clause_of("request.content:replay") == contract.SCENARIO
+    # Every scenario with a ToolSet asserts it and no other does, whatever
+    # variant a column selects and whatever declared difference is in force;
+    # a variant that expects a refusal sends nothing and asserts nothing.
+    for scenario in SCENARIOS.values():
+        assert (history_replayed in scenario.plan().checks) == (scenario.toolset is not None)
+    for cell in TOY_CELLS:
+        scenario = SCENARIOS[cell.scenario]
+        variants = declarations.select(scenario.differences, declarations.routed(cell.column))
+        for differences in ((), tuple(scenario.alternatives)):
+            plan = plan_for(scenario, variants, differences)
+            asserted = scenario.toolset is not None and plan.expect.outcome == "result"
+            assert (history_replayed in plan.checks) == asserted, cell.id
+    # On an honest cell the rule ran and named nothing.
+    honest = _honest(tmp_path, "S03")
+    assert len(honest.observation.provider.requests) == 3
+    assert honest.observation.provider.replay_problems == []
+    assert [item.evidence["answered"] for item in honest.observation.provider.requests] == [
+        [],
+        [],
+        [honest.observation.provider.sent_calls[0].call_id],
+    ]
+
+
+class _Stream(ToyDialect):
+    """Answers with bytes of its own under a content type of its own."""
+
+    raw = b"event: answer\ndata: {}\n\n"
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        return dataclasses.replace(
+            super().render(step, seen, call_id),
+            raw=self.raw,
+            content_type="text/event-stream",
+        )
+
+
+def test_a_reply_travels_as_the_bytes_and_the_content_type_its_dialect_gives() -> None:
+    def asked(provider: LoopbackProvider) -> tuple[str | None, bytes]:
+        connection = http.client.HTTPConnection("127.0.0.1", provider.port, timeout=5)
+        try:
+            connection.request("POST", ToyDialect.path, body=b"{}")
+            response = connection.getresponse()
+            return response.getheader("Content-Type"), response.read()
+        finally:
+            connection.close()
+
+    script = ProviderScript((Say("one"),))
+    # One JSON document, unless the dialect renders the bytes itself.
+    with LoopbackProvider(script, credential="c") as provider:
+        kind, body = asked(provider)
+    assert kind == "application/json" and json.loads(body)["text"] == "one"
+    with LoopbackProvider(script, credential="c", dialect=_Stream()) as provider:
+        kind, body = asked(provider)
+        seen = provider.freeze()
+    assert (kind, body) == ("text/event-stream", _Stream.raw)
+    # What the ledger keeps is the reply's, whatever its bytes are.
+    assert (seen.request_count, seen.unconsumed, seen.extra) == (1, 0, 0)
+    assert seen.billed == [Say("one").usage]
+
+
 class _TwoFrames(ToyDialect):
     """Renders one reply from two envelopes, as a wire of several frames does."""
 
@@ -1429,6 +1551,7 @@ def test_kinds_without_a_driver_yield_no_cell_and_no_error() -> None:
         matrix_columns.HOSTED_GATEWAY_KIND,
         matrix_columns.LOCAL_GATEWAY_KIND,
         matrix_columns.CLAUDE_KIND,
+        matrix_columns.DEEPSEEK_KIND,
     }
     assert [cell for cell in cells.behaviour_cells() if cell.column.kind == TOY_KIND] == list(
         generated

@@ -34,7 +34,7 @@ import ipaddress
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
 import httpx
@@ -62,6 +62,7 @@ class _State:
     record: TapRecord
     sync_handler: Any
     async_handler: Any
+    on_violation: Callable[[str], None] | None = None
 
 
 _lock = threading.Lock()
@@ -116,18 +117,28 @@ def _routed(request: httpx.Request) -> httpx.Request:
     entry = f"{request.method} {scheme}://{url.host}:{asked[2]}"
     with _lock:
         state.record.violations.append(entry)
+    if state.on_violation is not None:
+        state.on_violation(entry)
     raise TapViolation(
         f"origin redirect: {entry} is neither the route's production origin "
         f"({state.origin[0]}://{state.origin[1]}:{state.origin[2]}) nor loopback"
     )
 
 
-def install(origin: str, target: str, *, marker: str | os.PathLike[str] | None = None) -> None:
+def install(
+    origin: str,
+    target: str,
+    *,
+    marker: str | os.PathLike[str] | None = None,
+    on_violation: Callable[[str], None] | None = None,
+) -> None:
     """Install the redirect from ``origin`` to the loopback ``target``.
 
     ``marker`` names a file that is written once the redirect is in place, so
-    a parent process can tell that a worker ran behind it. Installing twice is
-    an error, not a no-op.
+    a parent process can tell that a worker ran behind it. ``on_violation`` is
+    called with every refused request as it is recorded: a worker process
+    cannot hand its record to whoever installed the redirect. Installing
+    twice is an error, not a no-op.
     """
 
     global _state
@@ -150,7 +161,14 @@ def install(origin: str, target: str, *, marker: str | os.PathLike[str] | None =
         httpx.AsyncHTTPTransport.handle_async_request = (  # type: ignore[method-assign]
             handle_async_request
         )
-        _state = _State(_origin(origin), target_origin, TapRecord(), sync_handler, async_handler)
+        _state = _State(
+            _origin(origin),
+            target_origin,
+            TapRecord(),
+            sync_handler,
+            async_handler,
+            on_violation,
+        )
     if marker is not None:
         with open(marker, "w", encoding="utf-8") as handle:
             handle.write(f"origin redirect installed in process {os.getpid()}\n")

@@ -105,6 +105,7 @@ NO_REQUEST_EVENT = "no_request_event"
 DISPATCH_UNATTACHED = "dispatch_unattached"
 REQUEST_EVENT_PER_ROUND = "request_event_per_round"
 EMPTY_TOOL_RESULTS = "empty_tool_results"
+FORGET_EARLIER_ROUNDS = "forget_earlier_rounds"
 NO_TOOL_EVENTS = "no_tool_events"
 CLEAR_ACCOUNTING_FLAGS = "clear_accounting_flags"
 SCHEMA_MISPLACED = "schema_misplaced"
@@ -169,6 +170,9 @@ class _Run:
     usage_known: bool = True
     context_used: int = 0
     rounds: int = 0
+    # The calls whose results earlier requests of this invocation carried:
+    # the toy wire keeps no conversation, so every request names them again.
+    answered: list[str] = field(default_factory=list)
 
 
 class HonestBackend:
@@ -294,7 +298,8 @@ class HonestBackend:
             body["max_turns"] = invocation.max_turns
         if EMPTY_TOOL_RESULTS in self._faults:
             results = [{"id": item["id"], "text": ""} for item in results]
-        body.update(system=system, tools=tools, tool_results=results)
+        answered = [] if FORGET_EARLIER_ROUNDS in self._faults else list(run.answered)
+        body.update(system=system, tools=tools, tool_results=results, answered=answered)
         return body
 
     def _post(self, body: Mapping[str, Any], timeout: float) -> tuple[int, dict[str, Any]]:
@@ -434,6 +439,7 @@ class HonestBackend:
         body = self._body(run, turn, results, tools, finalize=finalize)
         self._dump({"turn": turn, "request": body})
         run.rounds += 1
+        run.answered.extend(item["id"] for item in results)
         if REQUEST_EVENT_PER_ROUND in self._faults:
             run.events.append(("request", None))
         try:
@@ -950,6 +956,9 @@ LIARS: tuple[Liar, ...] = (
         rehearses=("G16", "G28"),
     ),
     _liar("S03", EMPTY_TOOL_RESULTS, ("request.content:tool_results",), ("S",)),
+    # The results of the last round arrive; the rounds before it are forgotten
+    # on a wire that keeps no conversation. Only the dialect's rule shows it.
+    _liar("S03", FORGET_EARLIER_ROUNDS, ("request.content:replay",), ("S",)),
     _liar(
         "S03",
         NO_TOOL_EVENTS,

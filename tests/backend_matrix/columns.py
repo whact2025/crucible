@@ -49,12 +49,13 @@ COLUMN_PRODUCT = "deepswe"
 HOSTED_GATEWAY_KIND = "openai_compat:hosted"
 LOCAL_GATEWAY_KIND = "openai_compat:local"
 CLAUDE_KIND = "claude"
+DEEPSEEK_KIND = "deepseek"
 
 # (routing backend, adapter transport) of a catalog lane -> driver kind.
 KIND_TABLE: Mapping[tuple[str, str], str] = {
     ("openai_compat", "openai_compatible_http"): HOSTED_GATEWAY_KIND,
     ("local", "openai_compatible_http"): LOCAL_GATEWAY_KIND,
-    ("deepseek", "deepseek_responses_worker"): "deepseek",
+    ("deepseek", "deepseek_responses_worker"): DEEPSEEK_KIND,
     ("kimi", "kimi_agent_sdk_worker"): "kimi",
     ("claude", "claude_agent_sdk"): CLAUDE_KIND,
     ("codex", "legacy_app_server"): "codex:legacy",
@@ -105,6 +106,19 @@ ENDPOINT_ENV: Mapping[str, str] = {
     LOCAL_GATEWAY_KIND: "CRUCIBLE_LOCAL_URL",
 }
 
+# A worker adapter names no endpoint in its route: its locked worker holds the
+# production origin. The origin a worker driver answers on loopback, by kind.
+WORKER_ORIGIN: Mapping[str, str] = {
+    DEEPSEEK_KIND: "https://api.deepseek.com",
+}
+
+# The credential variable an adapter reads from the environment itself, where
+# its routing file has no ``${VAR}`` for it. The driver of the kind gives it
+# the canary credential for as long as it holds a backend open.
+ADAPTER_CREDENTIAL_ENV: Mapping[str, str] = {
+    DEEPSEEK_KIND: "DEEPSEEK_API_KEY",
+}
+
 # Credential and configuration variables a developer machine may hold. No cell
 # may see one: the per-test environment deletes each. They are kept apart from
 # ``SCRIPTED_ENV``, which must equal the ``${VAR}`` references of the routing
@@ -146,7 +160,7 @@ CLEARED_ENV: tuple[str, ...] = (
 # cell H01 has one cell per worker.
 WORKER_KINDS: Mapping[str, str] = {
     "codex": "codex:official",
-    "deepseek": "deepseek",
+    "deepseek": DEEPSEEK_KIND,
     "kimi": "kimi",
 }
 
@@ -155,7 +169,7 @@ WORKER_KINDS: Mapping[str, str] = {
 ALLOWED_OVERLAY: Mapping[str, tuple[str, ...]] = {
     CLAUDE_KIND: ("extra.cli_path",),
     "codex:legacy": ("extra.cli_path",),
-    "deepseek": ("extra.expected_worker_runtime_fingerprint",),
+    DEEPSEEK_KIND: ("extra.expected_worker_runtime_fingerprint",),
 }
 
 # Routing role by the capability a cell asks for.
@@ -385,6 +399,32 @@ def scripted_environment(**endpoints: str) -> Iterator[None]:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+@contextlib.contextmanager
+def adapter_credential(kind: str) -> Iterator[None]:
+    """Give the adapter of ``kind`` the canary credential for the block.
+
+    For an adapter that reads its credential from the environment at each
+    dispatch. The variable is restored afterwards: no test outside the block
+    sees it, and a real one on a developer machine is never used.
+    """
+
+    try:
+        name = ADAPTER_CREDENTIAL_ENV[kind]
+    except KeyError as exc:
+        raise MatrixSetupError(
+            f"kind {kind} reads no credential from the environment itself"
+        ) from exc
+    previous = os.environ.get(name)
+    os.environ[name] = CANARY_CREDENTIAL
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 def overlaid_routing(

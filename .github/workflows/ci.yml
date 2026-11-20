@@ -169,9 +169,13 @@ jobs:
         with:
           version: "0.11.11"
           enable-cache: true
-          cache-dependency-glob: crucible/uv.lock
+          cache-dependency-glob: |
+            crucible/uv.lock
+            crucible/backends/*_worker/uv.lock
       - name: Install locked dependencies
         run: uv sync --frozen --group dev
+      - name: Install the locked DeepSeek worker environment
+        run: uv sync --frozen --reinstall --link-mode copy --project backends/deepseek_worker
       - name: Enable hosted-runner user namespaces for descriptor tests
         run: |
           test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns

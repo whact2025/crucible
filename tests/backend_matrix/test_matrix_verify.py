@@ -623,6 +623,51 @@ def test_the_verifier_runs_as_the_ci_step_runs_it(tmp_path: Path) -> None:
     assert verify.main(["--root", str(tmp_path / "partial")]) == 1
 
 
+def test_a_required_proof_is_held_by_name_like_a_closing_check() -> None:
+    closing = {cells.CANARY_CHECK, cells.STATIC_CHECK}
+    proofs = [item for item in REAL if item.cell is None and item.name not in closing]
+    complete = _real_complete_run()
+
+    def found(cases: Sequence[Seen]) -> list[str]:
+        return verify.problems(
+            cases,
+            expected=REAL,
+            known=REAL_LEDGER,
+            pinned_counts=REAL_INVENTORY.cell_counts,
+            not_expressible=REAL_INVENTORY.not_expressible,
+            not_owed=REAL_INVENTORY.column_wide_not_owed,
+        )
+
+    # What no cell's verdict shows is required by name, in a module of cells.
+    assert {(item.module, item.name) for item in proofs} == {
+        (module, name) for module, names in cells.REQUIRED_PROOFS.items() for name in names
+    }
+    assert proofs and set(cells.REQUIRED_PROOFS) <= set(cells.MODULE_BY_KIND.values())
+    assert found(complete) == []
+
+    def ended(index: int, outcome: str, message: str = "") -> list[str]:
+        changed = dataclasses.replace(complete[index], outcome=outcome, message=message)
+        return found([*complete[:index], changed, *complete[index + 1 :]])
+
+    for proof in proofs:
+        label = f"{proof.module}::{proof.name}"
+        at = next(
+            index
+            for index, case in enumerate(complete)
+            if (case.module, case.name) == (proof.module, proof.name)
+        )
+        # A run in which it was deselected, failed, was skipped or was let
+        # stand as an expected failure is not a complete run.
+        assert found([*complete[:at], *complete[at + 1 :]]) == [
+            f"{label} did not run: no shard recorded it"
+        ]
+        assert ended(at, "failed") == [f"{label} failed"]
+        assert ended(at, "skipped", "no runtime") == [f"{label} was skipped (no runtime)"]
+        soft = ended(at, EXPECTED_FAILURE, "G91: x")
+        assert len(soft) == 2 and all(line.startswith(label) for line in soft)
+        assert any("ended as an expected failure" in line for line in soft)
+
+
 def test_a_reference_column_and_the_open_weight_columns_are_held_to_the_same_scenarios(
     tmp_path: Path,
 ) -> None:

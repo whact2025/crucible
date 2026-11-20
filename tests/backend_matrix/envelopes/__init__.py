@@ -69,6 +69,13 @@ SLOTS: frozenset[str] = frozenset(
         "turns",
         "cost_usd",
         "structured_output",
+        # A stream of typed output items (a Responses route): the id of an
+        # output item, and the reasoning item that precedes a tool call with
+        # its id, its text and its share of the output tokens.
+        "item_id",
+        "reasoning_item_id",
+        "reasoning_text",
+        "reasoning_tokens",
     }
 )
 # A mapping key that is a slot: the whole key, filled with a string.

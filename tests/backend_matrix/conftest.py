@@ -42,7 +42,11 @@ def _matrix_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 
 @pytest.fixture(scope="session")
 def matrix_preflight() -> dict[str, str | None]:
-    """Each driver's preflight, once: a column that cannot run here is an error."""
+    """Each driver's preflight, once: a column that cannot run here is an error.
+
+    It runs before the per-test isolation of the environment, so the runner
+    clears the same variables around it.
+    """
 
     return runner.preflight_all()
 

@@ -211,6 +211,22 @@ def results_replayed(obs: Observation, ref: Reference) -> list[Deviation]:
     return []
 
 
+def history_replayed(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """On a wire that keeps no conversation, each request replays it in full.
+
+    What a request must carry of the earlier rounds is the wire's own rule:
+    the dialect of the column states it and the provider ledger keeps what it
+    found in the scripted exchange. A wire that holds the conversation itself
+    has no such rule and nothing to report. Asserted wherever a ToolSet is
+    attached: without a tool round nothing is replayed.
+    """
+
+    problems = obs.provider.replay_problems
+    if not problems:
+        return []
+    return [Deviation("request.content:replay", "; ".join(problems))]
+
+
 def _tool_event_counts(obs: Observation, name: str) -> tuple[int, int]:
     assert obs.result is not None
     trace = obs.result.execution_trace
@@ -646,7 +662,7 @@ _ALL: tuple[Scenario, ...] = (
         plan=lambda: Plan(
             ProviderScript((Call(READ_A), Call(READ_B), Say(TEXT))),
             expect=replace(CLEAN, dispatch=(READ_A, READ_B)),
-            checks=(results_replayed, tool_events_required),
+            checks=(results_replayed, history_replayed, tool_events_required),
         ),
         differences={
             "event_detail": {
@@ -674,7 +690,7 @@ _ALL: tuple[Scenario, ...] = (
             # The answer is compared as a JSON value by the first check.
             expect=replace(CLEAN, final_text=None, dispatch=(READ_A,)),
             response_schema=SCHEMA,
-            checks=(schema_answer_returned, schema_in_field),
+            checks=(schema_answer_returned, history_replayed, schema_in_field),
         ),
         differences={
             "structured_output": {
@@ -717,6 +733,7 @@ _ALL: tuple[Scenario, ...] = (
                 dispatch_optional=(READ_A,),
             ),
             max_turns=TURN_LIMIT,
+            checks=(history_replayed,),
         ),
         differences={
             "turn_limit": {
@@ -774,6 +791,7 @@ _ALL: tuple[Scenario, ...] = (
                 events=("limit/tool_dispatch_budget",),
                 dispatch=(READ_A,),
             ),
+            checks=(history_replayed,),
         ),
     ),
     Scenario(
@@ -833,7 +851,7 @@ _ALL: tuple[Scenario, ...] = (
             ProviderScript((Call(READ_A), Call(READ_B), Say(TEXT))),
             expect=replace(CLEAN, dispatch=(READ_A, READ_B)),
             context_budget=CONTEXT_BUDGET,
-            checks=(context_bounded, first_result_truncated_not_dropped),
+            checks=(context_bounded, first_result_truncated_not_dropped, history_replayed),
         ),
     ),
     _refusal("content_filter", "a", billed=True),
@@ -861,7 +879,7 @@ _ALL: tuple[Scenario, ...] = (
             # Six rounds stay below a third of max_turns, where one adapter
             # changes the advertised tools.
             max_turns=24,
-            checks=(write_is_progress,),
+            checks=(write_is_progress, history_replayed),
         ),
     ),
 )

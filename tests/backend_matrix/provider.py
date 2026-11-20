@@ -17,6 +17,13 @@ back into the neutral :class:`SeenRequest`. This module holds the toy dialect,
 the minimal one the toy driver speaks; a vendor dialect lives with its driver
 and renders its replies from envelopes (:mod:`.envelopes`).
 
+Because replay is loose in content, the provider answers a request that a
+real stateless route may refuse: one that drops an item of an earlier round.
+A dialect of such a wire states what each request must replay
+(:class:`StatelessDialect`); the provider applies the rule when the scripted
+exchange ends and the ledger keeps what it found, for the scenarios that
+attach a ToolSet.
+
 A dialect may name a served model that differs from the requested one only
 for a ``ServedAs`` step. Anything else is a seam problem: a dialect that
 answers under a fixed id would switch off the "served equals requested"
@@ -30,7 +37,7 @@ import json
 import socketserver
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from .drivers.base import MatrixSetupError
 from .script import (
@@ -105,6 +112,9 @@ class ProviderLedger:
     probe_requests: int = 0
     late_requests: int = 0
     seam_problems: list[str] = field(default_factory=list)
+    # What the replay rule of a stateless dialect says of the scripted
+    # requests (:class:`StatelessDialect`); empty where the dialect has none.
+    replay_problems: list[str] = field(default_factory=list)
 
     @property
     def request_count(self) -> int:
@@ -122,13 +132,19 @@ class Reply:
     """A rendered reply: status, JSON body, and what the provider bills."""
 
     status: int
-    body: Mapping[str, Any]
+    # The JSON document of the reply; for a stream, the events it holds.
+    body: Any
     usage: TokenUsage | None = None
     served_model: str | None = None
     call: tuple[str, str, Mapping[str, Any]] | None = None  # slot, call id, arguments
     envelope: str | None = None  # the envelope the body was rendered from
     # Every envelope of a body that holds several frames, in the order sent.
     envelopes: tuple[str, ...] = ()
+    # The bytes to send where the wire is not one JSON document (a stream of
+    # server-sent events), with their content type. ``body`` then holds what
+    # the bytes were rendered from.
+    raw: bytes | None = None
+    content_type: str = "application/json"
 
 
 class Dialect(Protocol):
@@ -150,6 +166,27 @@ class Dialect(Protocol):
     def seam_problems(self, seen: SeenRequest) -> list[str]: ...
 
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply: ...
+
+
+@runtime_checkable
+class StatelessDialect(Protocol):
+    """A dialect of a wire that keeps no conversation: the client replays it.
+
+    What a later request of a call must carry of the earlier rounds is the
+    wire's own rule, so the dialect states it. The provider applies the rule
+    to the scripted exchange when it ends and the ledger keeps what it found;
+    the scenarios with a ToolSet report it. Replies are still picked on
+    position and call ids alone.
+    """
+
+    def replay_problems(
+        self, requests: Sequence[SeenRequest], calls: Sequence[SentCall]
+    ) -> list[str]:
+        """Why the matched requests do not replay the earlier rounds in full.
+
+        ``requests`` are all requests of the scripted exchange, in order;
+        ``calls`` name the request each tool call answered by its index there.
+        """
 
 
 class ToyDialect:
@@ -192,6 +229,12 @@ class ToyDialect:
             budget_control=payload.get("budget_usd"),
             schema_field="response_schema" in payload,
             host=headers.get("Host", ""),
+            # The calls a request names as answered by earlier requests.
+            evidence=(
+                {"answered": [str(item) for item in payload["answered"]]}
+                if isinstance(payload.get("answered"), list)
+                else {}
+            ),
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -204,6 +247,34 @@ class ToyDialect:
             problems.append(f"user agent {seen.user_agent!r}, not {self.user_agent!r}")
         if not seen.credential_ok:
             problems.append("the canary credential is not in the Authorization header")
+        return problems
+
+    def replay_problems(
+        self, requests: Sequence[SeenRequest], calls: Sequence[SentCall]
+    ) -> list[str]:
+        """Why a request does not name every call that earlier requests answered.
+
+        The toy wire keeps no conversation. A request carries the results of
+        the calls of the last reply, and names, in order, the calls whose
+        results earlier requests of the call carried.
+        """
+
+        problems: list[str] = []
+        for index, request in enumerate(requests):
+            if not request.matched:
+                continue  # an unscripted request is clause C0's business
+            now = {call_id for call_id, _text in request.tool_results}
+            expected = [
+                call.call_id
+                for call in calls
+                if call.request_index < index and call.call_id not in now
+            ]
+            named = list(request.evidence.get("answered", ()))
+            if named != expected:
+                problems.append(
+                    f"request {index + 1} names {named} as answered by earlier "
+                    f"requests; {expected} were"
+                )
         return problems
 
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
@@ -333,9 +404,11 @@ class LoopbackProvider:
                 reply = provider._handle(
                     self.command, self.path, dict(self.headers), body
                 )
-                payload = json.dumps(reply.body).encode("utf-8")
+                payload = (
+                    json.dumps(reply.body).encode("utf-8") if reply.raw is None else reply.raw
+                )
                 self.send_response(reply.status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", reply.content_type)
                 self.send_header("Content-Length", str(len(payload)))
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -477,6 +550,13 @@ class LoopbackProvider:
         with self._lock:
             if self._frozen is None:
                 self._ledger.unconsumed = self._unconsumed()
+                if isinstance(self._dialect, StatelessDialect):
+                    # The exchange is over: every request of it can be judged.
+                    self._ledger.replay_problems = list(
+                        self._dialect.replay_problems(
+                            self._ledger.requests, self._ledger.sent_calls
+                        )
+                    )
                 self._frozen = replace(
                     self._ledger,
                     requests=list(self._ledger.requests),
@@ -485,6 +565,7 @@ class LoopbackProvider:
                     sent_calls=list(self._ledger.sent_calls),
                     envelopes=list(self._ledger.envelopes),
                     seam_problems=list(self._ledger.seam_problems),
+                    replay_problems=list(self._ledger.replay_problems),
                 )
             return self._frozen
 

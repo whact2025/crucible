@@ -137,6 +137,7 @@ markers = [
     "e2e: end-to-end tests; may require optional deps or running services",
     "llm_live: hits a live Anthropic API (cost + key required); skipped when ANTHROPIC_API_KEY is unset — opt in with -m llm_live",
     "live_docker: hits the local docker daemon + (potentially) pulls multi-GB harness images; skipped when docker is unavailable — opt in with -m live_docker",
+    "matrix_worker: runs a locked worker environment (backends/<name>_worker/.venv); a missing one is an error, never a skip — tests/TEST_BASELINE.md gives the complete -m expression that deselects these tests",
 ]
 filterwarnings = [
     "ignore:cannot collect test class:pytest.PytestCollectionWarning",

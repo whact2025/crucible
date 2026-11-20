@@ -463,19 +463,14 @@ def run_cell(
 def network_guard() -> Iterator[None]:
     """Fixture body: the guard is on for the test, and its record must be empty."""
 
-    netguard.take_violations()
-    netguard.install()
-    try:
-        yield
-    finally:
-        netguard.remove()
-        violations = netguard.take_violations()
-        if violations:
-            pytest.fail(
-                "the test reached for the network (blocked by the matrix guard): "
-                + "; ".join(violations),
-                pytrace=False,
-            )
+    yield from netguard.watch(lambda reason: pytest.fail(reason, pytrace=False))
+
+
+def clear_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delete every credential and configuration variable of the closed list."""
+
+    for name in matrix_columns.CLEARED_ENV:
+        monkeypatch.delenv(name, raising=False)
 
 
 def isolate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -485,8 +480,7 @@ def isolate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     so a real one on a developer machine never reaches a cell.
     """
 
-    for name in matrix_columns.CLEARED_ENV:
-        monkeypatch.delenv(name, raising=False)
+    clear_environment(monkeypatch)
     for name, value in matrix_columns.SCRIPTED_ENV.items():
         monkeypatch.setenv(name, value)
     home = tmp_path / "matrix-home"
@@ -581,15 +575,25 @@ def write_cell_report(config: Any) -> Path | None:
 
 
 def preflight_all() -> dict[str, str | None]:
-    """Run every registered driver's preflight once; keep the failure text."""
+    """Run every registered driver's preflight once; keep the failure text.
+
+    With the variables a cell never sees deleted for the time of the call, and
+    put back afterwards. The session fixture that keeps the answer runs before
+    the per-test isolation of the environment, and a preflight that read a
+    developer's variable there (an override of a worker interpreter, which an
+    adapter's pin refuses) would decide every cell of a column by something
+    the cells themselves never see.
+    """
 
     failures: dict[str, str | None] = {}
-    for kind in sorted(drivers.load()):
-        try:
-            drivers.get(kind).preflight()
-            failures[kind] = None
-        except drivers.MatrixSetupError as exc:
-            failures[kind] = str(exc)
+    with pytest.MonkeyPatch.context() as cleared:
+        clear_environment(cleared)
+        for kind in sorted(drivers.load()):
+            try:
+                drivers.get(kind).preflight()
+                failures[kind] = None
+            except drivers.MatrixSetupError as exc:
+                failures[kind] = str(exc)
     return failures
 
 

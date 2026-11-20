@@ -37,7 +37,7 @@ schema_version: crucible.backend-matrix.ledger.v1
 
 ceilings:
   max_known_gaps:
-    pack_a: 19
+    pack_a: 25
     pack_b: 0
   max_declared_differences: 2
 
@@ -91,6 +91,15 @@ registry:
     title: DeepSeek appends a limit event after the terminal event, so invoke raises
     origin: gap list
     severity: high
+    # The gap is the limit exits (turn limit, USD budget, tool-result byte
+    # budget), and its cells are of pack A. Their predictions were made for
+    # the release, where a limit event after the terminal made invoke raise.
+    # On the base the column was first driven on (part 4) that raise is gone:
+    # the open-weight model update gave each limit exit a terminal of its
+    # own, so no cell of the matrix has seen this gap red as predicted. The
+    # predictions stay as written until the first run of pack A on the column
+    # corrects them. What the starter set shows about the terminal of an exit
+    # without a limit is another record, M05.
     cells:
       - cell: deepseek/S10a/primary/raw
         observed_under: {turn_limit: hard}
@@ -173,10 +182,41 @@ registry:
     origin: gap list
     severity: high
     cells:
+      # static:no_driven_column until the driver landed (part 4); the cell
+      # stays red until pack A runs on the column.
       - cell: deepseek/H02/-/static
         observed_under: {}
         closes_under: {}
-        predicted: ["static:no_driven_column"]
+        predicted: ["static:pack_a_not_enabled"]
+
+  G24:
+    title: The DeepSeek trace binds no feature profile, and its tool-authority digest is not the shared one
+    origin: gap list
+    severity: medium
+    # Every result of the adapter carries a trace without the digest of the
+    # route's feature profile. With a ToolSet attached the trace binds a
+    # tool-authority digest built from bridge constants of the adapter's own,
+    # so it never equals the digest the workflows and the other backends
+    # compute for the same ToolSet.
+    column_wide:
+      - {kind: deepseek, code: "digest.missing:feature_profile"}
+    cells:
+      - cell: deepseek/S03/primary/raw
+        observed_under: {event_detail: tool_calls}
+        closes_under: {event_detail: tool_calls}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S03/primary/guarded
+        observed_under: {event_detail: tool_calls}
+        closes_under: {event_detail: tool_calls}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S04/primary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+        predicted: ["digest.mismatch:tool_authority"]
 
   G28:
     title: The gateway adapter records one request event per completion, which the limit guard rejects
@@ -344,6 +384,43 @@ registry:
         observed_under: {structured_output: prompt_only}
         closes_under: {structured_output: unsupported}
 
+  M05:
+    title: The DeepSeek trace names the terminal event of a clean finish after the provider's terminal type, not after stop_reason
+    origin: matrix
+    severity: low
+    # Not predicted: design section 9.2 expected the raw starter cells of the
+    # column to be red for G24 only. Seen at the first run of the column
+    # (part 4): on an exit without a limit the adapter names the terminal
+    # event of each provider response after the provider's terminal type and
+    # the result keeps the last of them (crucible/backends/deepseek.py), so a
+    # clean finish has stop_reason end_turn under a terminal event named
+    # response.completed. Clause C4 asks for a terminal named after
+    # stop_reason. The limit exits of the adapter end with a terminal of
+    # their own that is named so (they are G14's subject, not this record's),
+    # and in the guarded lens the limit guard renames the terminal itself
+    # (crucible/backends/limits.py), so the code shows in the raw lens only.
+    # Low: no product code reads the name of this adapter's terminal event
+    # today; the one reader of a terminal's name is the limit guard's cost
+    # check of another adapter.
+    # Open for the release owner, and no ruling is recorded here: whether the
+    # naming rule of C4 binds a raw result of this adapter. Until it is ruled
+    # the cells are carried under the rule as the contract states it (C4
+    # applies to every cell that expects a result, and no declared difference
+    # may replace it). If it binds, the fix names the one terminal after
+    # stop_reason and deletes the three codes below; if it does not, the
+    # contract changes first and this record goes with the codes. Reported
+    # for the gap list.
+    cells:
+      - cell: deepseek/S01/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: deepseek/S03/primary/raw
+        observed_under: {event_detail: tool_calls}
+        closes_under: {event_detail: tool_calls}
+      - cell: deepseek/S04/primary/raw
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+
 known_gaps:
   - cell: kimi/H01/-/static
     observed_under: {}
@@ -356,7 +433,7 @@ known_gaps:
     codes: {"static:pack_a_not_enabled": G30}
   - cell: deepseek/H02/-/static
     observed_under: {}
-    codes: {"static:no_driven_column": G20}
+    codes: {"static:pack_a_not_enabled": G20}
   - cell: kimi/H02/-/static
     observed_under: {}
     codes: {"static:no_driven_column": G04}
@@ -429,6 +506,41 @@ known_gaps:
       "flag:cost_complete=False": G29
   - column_wide: {kind: "openai_compat:hosted", code: "pricing:none", gap: G32}
   - column_wide: {kind: "openai_compat:local", code: "pricing:none", gap: G32}
+
+  # The DeepSeek column, first run of part 4 (starter set). The missing
+  # feature-profile digest is column-wide; the tool-authority digest shows on
+  # the cells that attach a ToolSet. In the raw lens the terminal event of a
+  # clean finish is named after the provider's terminal type (M05, found at
+  # this run, not G14: no cell here ends at a limit); in the guarded lens the
+  # guard renames it and rejects the tool loop for its one request event per
+  # provider round (G16).
+  - cell: deepseek/S01/primary/raw
+    observed_under: {}
+    codes:
+      "event.terminal:response.completed!=end_turn": M05
+  - cell: deepseek/S03/primary/raw
+    observed_under: {event_detail: tool_calls}
+    codes:
+      "event.terminal:response.completed!=end_turn": M05
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S03/primary/guarded
+    observed_under: {event_detail: tool_calls}
+    codes:
+      "guard:limit_contract_violated": G16
+      "guard:revoked": G16
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S04/primary/raw
+    observed_under: {structured_output: prompt_only}
+    codes:
+      "event.terminal:response.completed!=end_turn": M05
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S04/primary/guarded
+    observed_under: {structured_output: prompt_only}
+    codes:
+      "guard:limit_contract_violated": G16
+      "guard:revoked": G16
+      "digest.mismatch:tool_authority": G24
+  - column_wide: {kind: deepseek, code: "digest.missing:feature_profile", gap: G24}
 
 declared_differences:
   - id: D-STRUCT-UNQUALIFIED

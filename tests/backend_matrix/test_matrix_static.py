@@ -15,8 +15,10 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import importlib
 import re
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AbstractSet, Any, Iterator, Sequence
@@ -34,6 +36,7 @@ from . import report as matrix_report
 from .columns import REAL_KINDS, TOY_KIND, WORKER_KINDS, Column
 from .contract import Deviation
 from .drivers import toy
+from .peers import launch, worker_harness
 from .scenarios import PACK_A, SCENARIOS
 from .script import ProviderScript
 
@@ -42,6 +45,8 @@ PACKAGE = Path(__file__).resolve().parent
 TESTS = PACKAGE.parent
 REPOSITORY = TESTS.parent
 CI_WORKFLOW = REPOSITORY / ".github" / "workflows" / "ci.yml"
+PYPROJECT = REPOSITORY / "pyproject.toml"
+BASELINE = TESTS / "TEST_BASELINE.md"
 TOY_COLUMNS = cells.toy_columns()
 # Static cells that were judged in this process.
 _JUDGED: set[str] = set()
@@ -347,39 +352,121 @@ def test_h03_ledger_and_oracle_integrity() -> None:
         assert contract.clause_of(scope.code) in contract.CLAUSES, scope
 
 
-def worker_environment_problems(ci_text: str, tests_root: Path) -> list[Deviation]:
-    """H04: a worker environment may be installed in CI only behind the guard."""
+_LAUNCHERS = frozenset({"run", "Popen", "call", "check_call", "check_output"})
+
+
+def installed_worker_environments(ci_text: str) -> list[str]:
+    """The worker projects the tests job of the CI workflow names: ``<name>_worker``."""
 
     steps = yaml.safe_load(ci_text)["jobs"]["tests"]["steps"]
-    installed = sorted(
+    return sorted(
         {
             match.group(1)
             for step in steps
             for match in re.finditer(
-                r"--project\s+backends/(\w+)_worker", str(step.get("run", ""))
+                r"--project[=\s]+(?:\./)?backends/(\w+)_worker", str(step.get("run", ""))
             )
         }
     )
-    problems: list[Deviation] = []
-    suite_conftest = (tests_root / "conftest.py").read_text(encoding="utf-8")
+
+
+def _autouse_fixtures(tree: ast.Module) -> list[ast.FunctionDef]:
+    return [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(decorator, ast.Call)
+            and ast.unparse(decorator.func).endswith("fixture")
+            and any(
+                keyword.arg == "autouse"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in decorator.keywords
+            )
+            for decorator in node.decorator_list
+        )
+    ]
+
+
+def _calls(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(item, ast.Call) and ast.unparse(item.func).endswith(name)
+        for item in ast.walk(node)
+    )
+
+
+def _handed_interpreters(tests_root: Path, worker: str, workers: AbstractSet[str]) -> list[str]:
+    """Test modules that hand a worker interpreter to ``subprocess`` themselves.
+
+    A launch belongs to the worker that its file name or its argument names,
+    and to every worker when it names none.
+    """
+
+    found: set[str] = set()
+    for path in _python_files(tests_root):
+        if tests_root / "backend_matrix" in path.parents:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _LAUNCHERS
+                and node.args
+                and "WORKER_PYTHON" in ast.unparse(node.args[0]).upper()
+            ):
+                continue
+            text = f"{path.name} {ast.unparse(node.args[0])}".lower()
+            named = {name for name in workers if name in text}
+            if worker in named or not named:
+                found.add(path.relative_to(tests_root).as_posix())
+    return sorted(found)
+
+
+def worker_environment_problems(ci_text: str, tests_root: Path) -> list[Deviation]:
+    """H04: a worker environment may be installed in CI only behind the guard.
+
+    For each worker environment the tests job installs: the worker harness and
+    the launch interposer exist, ``tests/conftest.py`` holds the suite-wide
+    interposer fixture and the file-name rule names the worker, and no test
+    module hands that environment's interpreter to ``subprocess`` itself.
+    """
+
+    installed = installed_worker_environments(ci_text)
+    if not installed:
+        return []
     peers = tests_root / "backend_matrix" / "peers"
+    tree = ast.parse((tests_root / "conftest.py").read_text(encoding="utf-8"))
+    fixtures = _autouse_fixtures(tree)
+    adapters: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_WORKER_ADAPTERS"
+            for target in node.targets
+        ):
+            adapters = set(ast.literal_eval(node.value))
+    rule = any(
+        isinstance(node, ast.FunctionDef)
+        and node.name == "names_a_worker_adapter"
+        and "_WORKER_ADAPTERS" in ast.unparse(node)
+        for node in tree.body
+    ) and any(
+        _calls(fixture, "netguard.watch") and _calls(fixture, "names_a_worker_adapter")
+        for fixture in fixtures
+    )
     guard = {
         "the worker harness": (peers / "worker_harness.py").is_file(),
         "the launch interposer": (peers / "launch.py").is_file(),
-        "the suite-wide interposer fixture": "backend_matrix.peers" in suite_conftest,
+        "the suite-wide interposer fixture": any(
+            _calls(fixture, "launch.suite_guard") for fixture in fixtures
+        ),
     }
+    problems: list[Deviation] = []
     for worker in installed:
         missing = [name for name, present in guard.items() if not present]
-        handed = [
-            path.relative_to(tests_root).as_posix()
-            for path in _python_files(tests_root)
-            if PACKAGE not in path.parents
-            and worker in path.name
-            and re.search(
-                r"subprocess\.\w+\(\s*\[[^\]]*WORKER_PYTHON",
-                path.read_text(encoding="utf-8"),
-            )
-        ]
+        if not rule or worker not in adapters:
+            missing.append(f"the file-name rule for {worker!r}")
+        handed = _handed_interpreters(tests_root, worker, set(WORKER_KINDS))
         if missing or handed:
             problems.append(
                 Deviation(
@@ -392,22 +479,155 @@ def worker_environment_problems(ci_text: str, tests_root: Path) -> list[Deviatio
 
 
 def test_h04_worker_environments_only_behind_the_guard() -> None:
-    problems = worker_environment_problems(
-        CI_WORKFLOW.read_text(encoding="utf-8"), TESTS
-    )
+    ci_text = CI_WORKFLOW.read_text(encoding="utf-8")
+    problems = worker_environment_problems(ci_text, TESTS)
 
     _verdict(_static_id(ledger.ALL_KINDS, "H04"), problems)
+    # The cell is about something. CI installs exactly the worker environments
+    # that a registered driver runs its column in (such a driver names the
+    # interpreter of its environment), in every shard: a column that cannot
+    # run is an error, and an environment no driver needs is not installed.
+    driven = drivers.load()
+    needed = sorted(
+        worker
+        for worker, kind in WORKER_KINDS.items()
+        if kind in driven and hasattr(drivers.get(kind), "interpreter")
+    )
+    assert installed_worker_environments(ci_text) == needed != []
 
 
-def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard() -> None:
-    ci = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+def _guarded_tests_root(root: Path, conftest: str) -> Path:
+    """A tests directory with the guard's files and the given suite conftest."""
+
+    peers = root / "backend_matrix" / "peers"
+    peers.mkdir(parents=True)
+    for name in ("worker_harness.py", "launch.py"):
+        (peers / name).write_text("", encoding="utf-8")
+    (root / "conftest.py").write_text(conftest, encoding="utf-8")
+    return root
+
+
+def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
+    tmp_path: Path,
+) -> None:
+    ci_text = CI_WORKFLOW.read_text(encoding="utf-8")
+    conftest = (TESTS / "conftest.py").read_text(encoding="utf-8")
+
+    def problems(name: str, text: str = conftest, ci: str = ci_text) -> list[str]:
+        root = _guarded_tests_root(tmp_path / name, text)
+        found = worker_environment_problems(ci, root)
+        assert {item.code for item in found} <= {"static:worker_env_unguarded"}
+        return [item.detail for item in found]
+
+    # The guard as it stands, on a tree with no test that starts a worker.
+    assert problems("guarded") == []
+    # Without the suite-wide fixture.
+    assert conftest.count("launch.suite_guard(") == 1
+    (missing,) = problems("no-fixture", conftest.replace("launch.suite_guard(", "launch.other("))
+    assert "the suite-wide interposer fixture" in missing
+    # With the fixture defined and not autouse.
+    assert conftest.count("@pytest.fixture(autouse=True)\ndef locked_worker_launch") == 1
+    (opt_in,) = problems(
+        "not-autouse",
+        conftest.replace(
+            "@pytest.fixture(autouse=True)\ndef locked_worker_launch",
+            "@pytest.fixture()\ndef locked_worker_launch",
+        ),
+    )
+    assert "the suite-wide interposer fixture" in opt_in
+    # Without the file-name rule, or with one that does not name the worker.
+    (unruled,) = problems("no-rule", conftest.replace("netguard.watch(", "netguard.other("))
+    assert "the file-name rule for 'deepseek'" in unruled
+    (unnamed,) = problems("other-rule", conftest.replace('"kimi", "deepseek"', '"kimi",'))
+    assert "the file-name rule for 'deepseek'" in unnamed
+    # Without the harness.
+    root = _guarded_tests_root(tmp_path / "no-harness", conftest)
+    (root / "backend_matrix" / "peers" / "worker_harness.py").unlink()
+    (no_harness,) = worker_environment_problems(ci_text, root)
+    assert "the worker harness" in no_harness.detail
+    # With a test module that hands the interpreter to subprocess itself. The
+    # one of another worker is that worker's business.
+    root = _guarded_tests_root(tmp_path / "handed", conftest)
+    source = "import subprocess\n\nsubprocess.run([str({}._DEFAULT_WORKER_PYTHON), '-c', ''])\n"
+    (root / "test_backends_kimi_own.py").write_text(source.format("parent"), encoding="utf-8")
+    assert worker_environment_problems(ci_text, root) == []
+    (root / "test_other.py").write_text(source.format("deepseek_mod"), encoding="utf-8")
+    (handed,) = worker_environment_problems(ci_text, root)
+    assert "['test_other.py'] start its interpreter themselves" in handed.detail
+    # An install step for the Kimi worker on the real tree: its test modules
+    # still start the interpreter themselves, so the step cannot merge yet.
+    ci = yaml.safe_load(ci_text)
     ci["jobs"]["tests"]["steps"].append(
         {"run": "uv sync --frozen --project backends/kimi_worker"}
     )
+    (kimi,) = worker_environment_problems(yaml.safe_dump(ci), TESTS)
+    assert kimi.code == "static:worker_env_unguarded" and "the kimi worker" in kimi.detail
+    assert "test_backends_kimi.py" in kimi.detail and "test_backends_kimi_k3.py" in kimi.detail
+    # No install step, no demand.
+    ci = yaml.safe_load(ci_text)
+    ci["jobs"]["tests"]["steps"] = [
+        step for step in ci["jobs"]["tests"]["steps"] if "_worker" not in str(step.get("run"))
+    ]
+    assert worker_environment_problems(yaml.safe_dump(ci), tmp_path / "absent") == []
 
-    problems = worker_environment_problems(yaml.safe_dump(ci), TESTS)
 
-    assert [item.code for item in problems] == ["static:worker_env_unguarded"]
+def deselection_problems(pyproject: str, baseline: str) -> list[str]:
+    """The documented way to leave the worker tests out keeps the configured expression.
+
+    A ``-m`` on the command line replaces the one in ``addopts``. So the
+    command the test baseline documents must be the configured expression
+    with ``not matrix_worker and`` in front, or it would select the live
+    tests.
+    """
+
+    options = tomllib.loads(pyproject)["tool"]["pytest"]["ini_options"]
+    problems: list[str] = []
+    if not any(str(marker).startswith("matrix_worker:") for marker in options["markers"]):
+        problems.append("pyproject.toml does not register the matrix_worker marker")
+    configured = re.search(r"-m\s+(['\"])(.+?)\1", str(options.get("addopts", "")))
+    if configured is None:
+        return [*problems, "addopts carries no -m expression to keep"]
+    expected = f"not matrix_worker and {configured.group(2)}"
+    documented = re.findall(r'-m\s+"([^"\n]*)"', baseline)
+    commands = [expression for expression in documented if "matrix_worker" in expression]
+    if expected not in commands:
+        problems.append(
+            f'tests/TEST_BASELINE.md does not document -m "{expected}", the configured '
+            "expression with the worker tests left out"
+        )
+    for expression in commands:
+        if expression != expected and f'shorter `-m "{expression}"`' not in baseline:
+            problems.append(
+                f'tests/TEST_BASELINE.md documents -m "{expression}", which replaces the '
+                f"configured expression {configured.group(2)!r}"
+            )
+    return problems
+
+
+def test_the_documented_deselection_is_the_configured_expression_with_the_marker() -> None:
+    pyproject = PYPROJECT.read_text(encoding="utf-8")
+    baseline = BASELINE.read_text(encoding="utf-8")
+    full = "not matrix_worker and not live_docker and not llm_live"
+
+    assert deselection_problems(pyproject, baseline) == []
+    assert f'-m "{full}"' in baseline
+    # The short form, documented as the command to run.
+    (short,) = deselection_problems(pyproject, baseline.replace(full, "not matrix_worker"))
+    assert "does not document" in short
+    # A form that keeps only part of the configured expression.
+    partial = "not matrix_worker and not llm_live"
+    kept, replaced = deselection_problems(pyproject, baseline.replace(full, partial))
+    assert "does not document" in kept and "replaces the configured expression" in replaced
+    # The configured expression moved and the document did not.
+    assert pyproject.count("not live_docker and not llm_live") == 1
+    missing, stale = deselection_problems(
+        pyproject.replace("not live_docker and not llm_live", "not live_docker"), baseline
+    )
+    assert '-m "not matrix_worker and not live_docker"' in missing
+    assert "replaces the configured expression" in stale
+    # The marker is registered where the expression is configured.
+    (unregistered,) = deselection_problems(pyproject.replace("matrix_worker:", "worker:"), baseline)
+    assert "does not register" in unregistered
 
 
 # -- hygiene -------------------------------------------------------------------
@@ -568,6 +788,58 @@ def test_claude_driver_reads_one_private_name_and_patches_none() -> None:
     # The peer runs outside the test environment, on the standard library alone.
     assert _import_problems(_tree("peers/claude_cli.py")) == []
     assert _import_problems(_tree("peers/__init__.py")) == []
+
+
+def test_deepseek_driver_patches_one_private_name_through_the_launch_interposer() -> None:
+    tree = _tree("drivers/deepseek.py")
+    imported = sorted(
+        f"{node.module}.{alias.name}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and not node.level
+        for alias in node.names
+        if (node.module or "").startswith(("crucible", "assay"))
+    )
+    driver = drivers.get(matrix_columns.DEEPSEEK_KIND)
+
+    # Routing is the boundary: the driver calls what a workflow calls, and
+    # takes the adapter module for its public capture function, its two
+    # public error types and the launch seam.
+    assert imported == [
+        "crucible.backends.config.load_routing",
+        "crucible.backends.config.resolve_for_role",
+        "crucible.backends.deepseek",
+    ]
+    from crucible.backends import deepseek as adapter  # noqa: PLC0415
+
+    used = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "adapter"
+    }
+    assert used - {"__name__"} <= set(adapter.__all__)
+    # The one private name is the supervisor function, which the driver hands
+    # to the launch interposer by name and never sets itself.
+    (seam,) = driver.private_seams
+    module, _, name = seam.rpartition(".")
+    assert (module, name) in launch.SUPERVISOR_SEAMS and module == adapter.__name__
+    assert name.startswith("_") and callable(getattr(adapter, name))
+    called = {
+        ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)
+    }
+    assert not {item for item in called if "setattr" in item or "patch" in item}
+    assert "launch.at_supervisor" in called
+    assert driver.fidelity == "wire" and driver.dialect == "deepseek_responses"
+    assert len(driver.bypassed_layers) == 3 and driver.inexpressible == {}
+    # The harness runs in a locked interpreter, on the standard library alone,
+    # and the interposer is imported by the suite's conftest for every test.
+    assert _import_problems(_tree("peers/worker_harness.py")) == []
+    assert _import_problems(_tree("peers/launch.py")) == []
+    assert worker_harness.SETTINGS_ENV.startswith("CRUCIBLE_MATRIX_")
+    # The seams the suite fixture interposes at exist as the adapters name them.
+    for module, name in (*launch.SUPERVISOR_SEAMS, *launch.SUBPROCESS_SEAMS):
+        assert hasattr(importlib.import_module(module), name), (module, name)
 
 
 def test_every_envelope_is_rendered_by_a_dialect_and_exists() -> None:

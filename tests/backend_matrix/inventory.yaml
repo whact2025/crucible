@@ -43,7 +43,8 @@ cell_counts:
   claude: 14
   "codex:legacy": 0
   "codex:official": 0
-  deepseek: 0
+  # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
+  deepseek: 7
   kimi: 0
   # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
   "openai_compat:hosted": 14

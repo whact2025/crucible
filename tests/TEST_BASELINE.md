@@ -126,6 +126,41 @@ What the peer does not emulate ends the cell as a setup error, never as an
 observation. A known gap on a reference column needs the owner's ruling in its
 ledger entry.
 
+A column whose adapter runs a locked worker environment is driven inside
+that environment. The DeepSeek route keeps its shipped routing file and gets
+one overlay, `extra.expected_worker_runtime_fingerprint`, captured in the cell
+from the installed environment. The adapter's own supervisor starts the
+worker, under [the worker harness](backend_matrix/peers/worker_harness.py):
+the harness installs the network guard before anything of the environment is
+imported and, for the request launch, the origin redirect, so that the pinned
+SDK's request for the production origin is answered by the scripted provider.
+The canary fails unless the request came from that worker: the harness
+journalled a redirected launch of the locked interpreter before the worker
+ran, the request carries the pinned SDK's user agent, the credential and the
+production host, and the route was built with the fingerprint captured in the
+cell.
+
+The scripted provider picks a reply by position and tool-call ids, never by
+what a request contains. Where a wire keeps no conversation, the dialect of
+the column states what each request must replay of the earlier rounds, and
+every scenario with a ToolSet reports a request that does not as
+`request.content:replay`. For the DeepSeek route that is the reasoning item,
+the function call and its output, in order. For the gateway routes it is,
+after the opening messages, the assistant turn that asked for a tool directly
+followed by the tool message that answers it, round by round. A rule holds
+the shape of the conversation (kinds, order, call ids), not its text. The
+Claude session keeps its conversation itself, so its dialect states no rule.
+
+Every interpreter of a worker environment (`backends/<name>_worker/.venv`)
+that any test starts runs under the same harness. A suite-wide fixture in
+`tests/conftest.py` interposes where the two worker adapters start one,
+decides by the executable and passes every other launch through untouched. A
+worker that reaches beyond loopback fails the test that started it, whatever
+the worker did with the exception. A test that starts such an interpreter
+itself uses the fixture's `run` or `popen` in place of `subprocess`. Test
+modules named after a worker adapter (`kimi`, `deepseek`) also run with the
+network guard in the test process.
+
 A scripted reply is an envelope under `backend_matrix/envelopes/<dialect>/`
 with only its slots filled, and each envelope states where its shape comes
 from: `recorded` from the provider, `documented` by the vendor or a live
@@ -135,8 +170,40 @@ declared difference of the ledger, with a product citation and the alternative
 contract that is asserted instead; it replaces no contract clause.
 
 ```bash
+uv sync --frozen --reinstall --link-mode copy --project backends/deepseek_worker
 uv run python -m pytest -q tests/backend_matrix
 ```
+
+The first command installs the locked DeepSeek worker environment, which the
+DeepSeek column and the tests marked `matrix_worker` need. A missing or
+drifted environment is an error with that command in its message, never a
+skip. Whether a column can be driven is asked once per run, under the same
+cleared environment as its cells: a credential, a proxy or a
+`CRUCIBLE_*_WORKER_PYTHON` override of the machine decides nothing. Clone
+inside the Linux filesystem: the DeepSeek pin hashes its lock byte
+for byte and every installed file with its mode, so a checkout on a Windows
+filesystem reached through WSL can fail it. The pin also covers the worker's
+source directory with any bytecode in it, and it is checked again before
+every launch: a test that loads worker source in its own process loads it
+without writing bytecode (as `tests/test_backends_deepseek.py` does), or it
+would change the pin under the tests that run beside it in the same checkout.
+CI installs the environment in every test shard. The Kimi worker environment
+(`uv sync --frozen --project backends/kimi_worker`) is not installed in CI yet:
+the tests that need it still skip without it, which is the known gap of cell
+`kimi/H01/-/static`.
+
+On a machine without the worker environment, leave these tests out explicitly
+and keep the configured expression:
+
+```bash
+uv run python -m pytest -q -m "not matrix_worker and not live_docker and not llm_live"
+```
+
+A `-m` on the command line replaces the expression configured in
+`pyproject.toml`, so a shorter `-m "not matrix_worker"` would select the live
+tests, which call providers on a machine that holds credentials. pytest prints
+how many tests were deselected, and the verifier below fails a CI run in which
+a cell did not run.
 
 The run proves the oracle on the toy driver (honest cells pass, every liar
 yields exactly its codes), runs the driven columns and the static cells. It
@@ -153,7 +220,10 @@ their JUnit files:
 uv run python -m tests.backend_matrix.verify
 ```
 
-It fails when an expected cell is missing or ran twice, when an item of the
+It fails when an expected cell is missing or ran twice, when a proof that a
+module must hold by name (`REQUIRED_PROOFS` in `backend_matrix/cells.py`:
+product behaviour no clause states, so no cell shows when it stops) or the
+closing check of a module did not run or failed, when an item of the
 package was skipped, when an expected failure does not name exactly the gaps
 the ledger attributes to its cell, when a ledgered cell passed, and when the
 cell count of a kind differs from the pinned one. A cell is ledgered by an

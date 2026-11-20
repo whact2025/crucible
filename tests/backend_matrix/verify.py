@@ -15,7 +15,8 @@ and the ledger; no driver ``preflight()``, no worker environment) and compares
 it with ``test-results-*.xml`` in the repository root:
 
 - every expected item ran exactly once and did not fail: each behaviour and
-  static cell, and the closing check of every matrix module;
+  static cell, the proofs a module is required to hold by name, and the
+  closing check of every matrix module;
 - no item of the package has a ``pytest.skip`` record, and none is the
   ``[NOTSET]`` item pytest makes of an empty parameter set;
 - the items recorded as ``pytest.xfail`` are exactly the ledgered cells, each
@@ -210,7 +211,10 @@ def problems(
             out.append(f"{label} {case.outcome}")
         if item.cell is None:
             if case.outcome == EXPECTED_FAILURE:
-                out.append(f"{label} is a closing check and ended as an expected failure")
+                out.append(
+                    f"{label} is a required proof or a closing check and ended as an "
+                    "expected failure"
+                )
             continue
         owed, wide = ledgered(known, item.cell, not_owed)
         if case.outcome == EXPECTED_FAILURE:

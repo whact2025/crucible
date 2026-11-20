@@ -8,9 +8,10 @@ column through the real adapter, the root ``openai`` SDK and a loopback
 socket. The remaining tests show that the driver's seam can fail: a request
 that did not come through the redirect, a redirect that is missing, a request
 for a foreign origin, a dialect that answers under a fixed model id or does
-not read the model on the wire. They also pin the envelopes and their grades
-and show the declared difference of the schema finalisation asserted on the
-real column.
+not read the model on the wire. They show that the conversation is replayed
+as the wire needs and that a cell deviates when it is not. They also pin the
+envelopes and their grades and show the declared difference of the schema
+finalisation asserted on the real column.
 """
 
 from __future__ import annotations
@@ -23,12 +24,13 @@ import importlib.metadata
 import json
 import threading
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import urlsplit
 
 import httpx
 import pytest
 import yaml  # type: ignore[import-untyped]
+from openai.resources.chat.completions import Completions
 from openai.types.chat import ChatCompletion
 
 from . import cells, contract, declarations, envelopes, ledger, netguard, runner, tap
@@ -37,9 +39,15 @@ from .cells import Cell
 from .columns import HOSTED_GATEWAY_KIND, LOCAL_GATEWAY_KIND, Column
 from .drivers import MatrixSetupError
 from .drivers import openai_compat as gateway
-from .provider import LoopbackProvider, Reply, SeenRequest
-from .scenarios import D_OAI_SCHEMA_FINAL, SCENARIOS, SCHEMA_ANSWER, SCHEMA_FINAL_ANSWER
-from .script import READ_A, Call, ProviderScript, Say, ServedAs, Step, TokenUsage
+from .provider import LoopbackProvider, Reply, SeenRequest, SentCall, StatelessDialect
+from .scenarios import (
+    D_OAI_SCHEMA_FINAL,
+    SCENARIOS,
+    SCHEMA_ANSWER,
+    SCHEMA_FINAL_ANSWER,
+    history_replayed,
+)
+from .script import READ_A, READ_B, Call, ProviderScript, Say, ServedAs, Step, TokenUsage
 
 LEDGER = ledger.load()
 KINDS = (HOSTED_GATEWAY_KIND, LOCAL_GATEWAY_KIND)
@@ -454,6 +462,18 @@ def test_dialect_reads_the_replayed_history_and_the_schema_field() -> None:
     assert (seen.model, seen.system, seen.user) == ("m", "sys", "ask\nnudge")
     assert seen.tools == ("read_source",) and seen.schema_field
     assert seen.turn_control is None and seen.budget_control is None
+    # The conversation is kept by its shape, roles and call ids, without text.
+    assert gateway.conversation(seen) == [
+        "system",
+        "user",
+        "assistant[c1]",
+        "tool[c1]",
+        "assistant[c2, c3]",
+        "tool[c2]",
+        "tool[c3]",
+        "user",
+    ]
+    assert "first" not in json.dumps(seen.evidence)
     plain = dialect.parse(
         "POST",
         dialect.path,
@@ -462,6 +482,218 @@ def test_dialect_reads_the_replayed_history_and_the_schema_field() -> None:
         credential="",
     )
     assert not plain.schema_field
+
+
+# -- the conversation is replayed as the wire needs ---------------------------------
+
+_OPENING: list[dict[str, Any]] = [
+    {"role": "system", "content": "sys"},
+    {"role": "user", "content": "ask"},
+]
+_WORD = {"role": "user", "content": "go on"}
+_DRAFT = {"role": "assistant", "content": "a draft"}
+
+
+def _asking(*call_ids: str) -> dict[str, Any]:
+    """An assistant turn that asks for these tool calls."""
+
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": call_id, "type": "function"} for call_id in call_ids],
+    }
+
+
+def _answering(call_id: str) -> dict[str, Any]:
+    return {"role": "tool", "tool_call_id": call_id, "content": "result"}
+
+
+def _carrying(messages: Sequence[Mapping[str, Any]], *, matched: bool = True) -> SeenRequest:
+    """A request with these messages, as the dialect reads it off the wire."""
+
+    dialect = gateway.LocalGatewayDriver()._dialect()
+    body = json.dumps({"model": "m", "messages": list(messages)}).encode()
+    seen = dialect.parse("POST", dialect.path, {}, body, credential="")
+    return dataclasses.replace(seen, matched=matched)
+
+
+def test_a_conversation_that_drops_or_reorders_a_turn_is_named() -> None:
+    one = [_asking("call-1"), _answering("call-1")]
+    two = [_asking("call-2"), _answering("call-2")]
+    calls = [SentCall(READ_A, "call-1", 0, {}), SentCall(READ_B, "call-2", 1, {})]
+    first, second = _carrying(_OPENING), _carrying([*_OPENING, *one])
+
+    def named(third: Sequence[Mapping[str, Any]]) -> list[str]:
+        return gateway.replay_problems([first, second, _carrying(third)], calls)
+
+    # The wire keeps no conversation: after the opening messages a request
+    # carries every earlier round, the turn that asked and then its result.
+    assert named([*_OPENING, *one, *two]) == []
+    # What the client says beside the rounds is its own and the wire takes
+    # it: the draft and the instruction of a schema finalisation, the
+    # instruction after the last round of a turn limit, a word between rounds.
+    assert named([*_OPENING, *one, *two, _DRAFT, _WORD]) == []
+    assert named([*_OPENING, *one, *two, _WORD]) == []
+    assert named([*_OPENING, *one, _WORD, *two]) == []
+    # One turn may ask for several calls: one result for each follows it.
+    together = [SentCall(READ_A, "call-1", 0, {}), SentCall(READ_B, "call-2", 0, {})]
+    for results in (("call-1", "call-2"), ("call-2", "call-1")):
+        both = [_asking("call-1", "call-2"), *(_answering(call_id) for call_id in results)]
+        assert gateway.replay_problems([first, _carrying([*_OPENING, *both])], together) == []
+    for broken in (
+        [*_OPENING, *two],  # the earlier round is forgotten
+        [*_OPENING, *one, two[1]],  # a result that no turn asked for
+        [*_OPENING, *one, two[1], two[0]],  # the result before the turn that asked
+        [*_OPENING, *one, two[0], _answering("call-9")],  # the result of another call
+        [*_OPENING, *one, two[0]],  # the call has no result
+        [*_OPENING, *one, two[0], _WORD, two[1]],  # a word between the two
+        [*_OPENING, *one, *two, _WORD, two[1]],  # a result once more, after a word
+        [*_OPENING, *two, *one],  # the rounds in another order
+        [*_OPENING, *one, *one, *two],  # a round twice
+        [*_OPENING, *one, *two, _asking("call-7"), _answering("call-7")],  # never asked
+        [_OPENING[1], *one, *two],  # the system message is gone
+        [],  # nothing is carried
+    ):
+        (problem,) = named(broken)
+        assert problem.startswith("request 3 carries"), broken
+    # The first request of a call replays nothing.
+    (early,) = gateway.replay_problems([_carrying([*_OPENING, *one])], calls[:1])
+    assert early.startswith("request 1 carries")
+    # A request that matched no scripted step is an extra request, which
+    # clause C0 reports; the rule judges the scripted ones, by their place.
+    stray = _carrying([two[1]], matched=False)
+    later = [SentCall(READ_A, "call-1", 1, {})]
+    assert gateway.replay_problems([stray, first, second], later) == []
+    # The dialect of both kinds states this rule, which is how a cell comes
+    # to assert it.
+    for driver in (gateway.HostedGatewayDriver(), gateway.LocalGatewayDriver()):
+        dialect = driver._dialect()
+        assert isinstance(dialect, StatelessDialect)
+        assert dialect.replay_problems([first, second], calls[:1]) == []
+        (stated,) = dialect.replay_problems([first, _carrying([*_OPENING, one[1]])], calls[:1])
+        assert stated.startswith("request 2 carries")
+
+
+@pytest.mark.parametrize("column", COLUMNS, ids=lambda column: column.id)
+def test_a_tool_round_is_replayed_as_the_turn_that_asked_and_its_result(
+    column: Column, tmp_path: Path
+) -> None:
+    loop = _played(column, "S03", tmp_path / "loop")
+    first, second = (call.call_id for call in loop.observation.provider.sent_calls)
+    opening = ["system", "user"]
+    one = [f"assistant[{first}]", f"tool[{first}]"]
+    two = [f"assistant[{second}]", f"tool[{second}]"]
+
+    # The cell asserts it: the dialect states the rule, the provider applied
+    # it to the exchange and the scenario reports what it names.
+    assert history_replayed in loop.plan.checks
+    assert [gateway.conversation(item) for item in loop.observation.provider.requests] == [
+        opening,
+        [*opening, *one],
+        [*opening, *one, *two],
+    ]
+    assert loop.observation.provider.replay_problems == []
+    assert "request.content:replay" not in loop.report.codes
+    # The finalisation request of the planner shape carries the round too,
+    # then the draft and the instruction to finalise it.
+    planner = _played(column, "S04", tmp_path / "planner")
+    (call,) = (item.call_id for item in planner.observation.provider.sent_calls)
+    assert planner.observation.provider.tail_served
+    assert gateway.conversation(planner.observation.provider.requests[-1]) == [
+        *opening,
+        f"assistant[{call}]",
+        f"tool[{call}]",
+        "assistant",
+        "user",
+    ]
+    assert history_replayed in planner.plan.checks
+    assert planner.observation.provider.replay_problems == []
+    assert "request.content:replay" not in planner.report.codes
+
+
+_CREATE = Completions.create
+
+
+def _sending(
+    change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+) -> Callable[..., Any]:
+    """The SDK's own call, with the conversation of each request changed on its way.
+
+    What an adapter that built another conversation hands to the SDK. The
+    request that leaves is still the SDK's, so the seam holds.
+    """
+
+    def create(self: Any, *arguments: Any, **named: Any) -> Any:
+        named["messages"] = change([dict(item) for item in named["messages"]])
+        return _CREATE(self, *arguments, **named)
+
+    return create
+
+
+def _forgetting_earlier_rounds(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The opening messages, then the last turn that asked for a tool and what follows it."""
+
+    asking = [index for index, item in enumerate(messages) if item.get("tool_calls")]
+    if len(asking) < 2:
+        return messages
+    return [*messages[: asking[0]], *messages[asking[-1] :]]
+
+
+def _without_the_asking_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The tool results go back without the model turns that asked for them."""
+
+    return [item for item in messages if not item.get("tool_calls")]
+
+
+@pytest.mark.parametrize("column", COLUMNS, ids=lambda column: column.id)
+@pytest.mark.parametrize(
+    ("scenario", "change", "named"),
+    [
+        ("S03", _forgetting_earlier_rounds, "request 3 carries"),
+        ("S04", _without_the_asking_turns, "request 2 carries"),
+    ],
+    ids=["S03-earlier-rounds-forgotten", "S04-result-without-the-turn-that-asked"],
+)
+def test_a_conversation_that_is_not_replayed_in_full_is_a_deviation_of_the_cell(
+    column: Column,
+    scenario: str,
+    change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+    named: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cell = Cell(column, scenario, "raw")
+    honest = _played(column, scenario, tmp_path / "honest")
+    monkeypatch.setattr(Completions, "create", _sending(change))
+
+    lying = _played(column, scenario, tmp_path / "lying")
+
+    # The scripted provider answered all the same: it picks a reply on
+    # position and call ids, where a real endpoint refuses a tool message
+    # that no assistant turn asked for. Nothing else of the cell changed ...
+    told, seen = honest.observation.provider, lying.observation.provider
+    assert lying.report.seam_problems == ()
+    assert (seen.request_count, seen.extra, seen.unconsumed) == (told.request_count, 0, 0)
+    assert seen.tail_served == told.tail_served
+    # ... so the codes are those of the honest cell and the one of the replay
+    # rule, which names the request. As a test item the cell fails, with an
+    # entry or without: no entry covers the code.
+    assert told.replay_problems == []
+    assert lying.report.codes == honest.report.codes | {"request.content:replay"}
+    (problem, *_later) = seen.replay_problems
+    assert problem.startswith(named)
+    with pytest.raises(ledger.LedgerMismatch) as refused:
+        ledger.compare(
+            LEDGER,
+            cell.id,
+            lying.report.codes,
+            current=lying.current,
+            evaluated=lying.report.evaluated(),
+            unasked=lying.report.unasked,
+            report=lying.report.describe(),
+        )
+    assert "request.content:replay" in str(refused.value).splitlines()[0]
+    assert "unexpected" in str(refused.value).splitlines()[0]
 
 
 # -- envelopes and grades -----------------------------------------------------------

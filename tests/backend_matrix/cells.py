@@ -59,6 +59,7 @@ ENABLEMENT: Mapping[str, tuple[str, ...]] = {
     matrix_columns.HOSTED_GATEWAY_KIND: (STARTER,),
     matrix_columns.LOCAL_GATEWAY_KIND: (STARTER,),
     matrix_columns.CLAUDE_KIND: (STARTER,),
+    matrix_columns.DEEPSEEK_KIND: (STARTER,),
 }
 # A secondary column runs these sets; a blocked column these scenarios.
 SECONDARY_SETS: tuple[str, ...] = (STARTER, PACK_A)
@@ -74,6 +75,7 @@ MODULE_BY_KIND: Mapping[str, str] = {
     matrix_columns.HOSTED_GATEWAY_KIND: "test_matrix_openai_compat",
     matrix_columns.LOCAL_GATEWAY_KIND: "test_matrix_openai_compat",
     matrix_columns.CLAUDE_KIND: "test_matrix_claude",
+    matrix_columns.DEEPSEEK_KIND: "test_matrix_deepseek",
 }
 STATIC_MODULE = "test_matrix_static"
 # Static scenario -> its test, and whether the test is parametrised by cell id.
@@ -90,6 +92,15 @@ STATIC_TESTS: Mapping[str, tuple[str, bool]] = {
 # did not pass, so it must have run too.
 CANARY_CHECK = "test_canary_passed_for_every_column"
 STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
+# Proofs a module holds beside its cells, which the verifier requires by name:
+# product behaviour that no clause states, so no cell's verdict shows when it
+# stops. The DeepSeek adapter revalidates the pin of its worker before every
+# launch; only the launch journal of a tool round shows it.
+REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
+    MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND]: (
+        "test_the_probe_and_the_request_launch_run_under_the_harness",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -107,7 +118,7 @@ class Cell:
 
 @dataclass(frozen=True)
 class Item:
-    """One expected pytest item: where a cell is judged, or a closing check."""
+    """One expected pytest item: where a cell is judged, a required proof or a closing check."""
 
     module: str
     name: str
@@ -363,6 +374,8 @@ def expected_items() -> tuple[Item, ...]:
         items.append(
             Item(STATIC_MODULE, f"{test}[{cell_id}]" if parametrised else test, cell_id)
         )
+    for module in modules:
+        items.extend(Item(module, proof) for proof in REQUIRED_PROOFS.get(module, ()))
     items.extend(Item(module, CANARY_CHECK) for module in modules)
     items.append(Item(STATIC_MODULE, STATIC_CHECK))
     return tuple(items)
