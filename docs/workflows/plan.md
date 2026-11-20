@@ -15,9 +15,11 @@ uv run crucible plan --spec /path/to/corpus --cwd /path/to/context-root \
 ```
 
 When `project_context.submodule_path` is set, `--cwd` is the outer context root;
-source tools and validators compose the declared submodule once. Single-track
-Planner scope paths are canonicalized against that resolved project root, never
-the process working directory. Source access
+source tools and validators compose the declared submodule once. Scope paths in
+every model-authored plan (a single-track Planner reply, each independent
+draft, a proposed synthesis) are canonicalized against that resolved project
+root, never the process working directory; the scope paths of a
+`--review-candidate` file are not rewritten. Source access
 is explicit and read-only. Planner source-call and payload-byte ceilings are
 workflow-owned and apply across the shared operation.
 
@@ -30,7 +32,8 @@ source bytes and modes, including local edits, with limits of two MiB per
 file, 128 MiB total, and 20,000 files. Read-only citations must match admitted
 snapshot bytes and are independently checked against the original project.
 
-Each draft receives one fixed-candidate adjudication. A malformed or
+Each draft receives one fixed-candidate adjudication. A malformed draft,
+including one with a scope path that is empty after canonicalization, or a
 deterministically invalid draft stays diagnostic; valid siblings can continue.
 The separate comparison reviewer can choose an accepted candidate by exact
 id/digest, abstain, or propose a full synthesis. A synthesis must pass fresh
@@ -96,7 +99,10 @@ success. Normal Corpus runs retain manifest, saga, summary, result, and outcome
 files; events, traces, and domain artifacts are conditional. A competition also
 retains `plan_competition.json`, content-addressed physical call receipts and
 prompts, every candidate and review, the comparison packet/decision, synthesis
-gates, source identity, policy, and implementation digests. Losing drafts never
+gates, source identity, policy, and implementation digests. A draft's `raw_ref`
+and the comparison response keep the model's text as written; candidate
+artifacts, digests, reviews, the comparison packet, and the published DAG hold
+the plan that was judged, with canonical scope paths. Losing drafts never
 become canonical Spec versions. Source:
 [workflows/plan.py](../../workflows/plan.py).
 
