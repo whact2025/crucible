@@ -889,7 +889,7 @@ def test_claude_session_model_rejection_survives_disconnect_failure(monkeypatch)
             pass
 
         async def set_model(self, _model):
-            # Pinned SDK 0.2.110 represents a correlated control-response
+            # Pinned SDK 0.2.121 represents a correlated control-response
             # rejection as exactly the built-in Exception type.
             raise Exception("model excluded")
 

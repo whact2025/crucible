@@ -21,6 +21,9 @@ across invocations (operational regression).
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
+import math
 import socket
 import subprocess
 import sys
@@ -30,12 +33,15 @@ import textwrap
 
 import pytest
 
+from crucible.tools import _mcp_http_server as _server_module
 from crucible.tools._mcp_bridge import ContextBudgetTracker
 from crucible.tools._dispatch_budget import (
     ToolDispatchBudgetExceeded,
     ToolMutationIndeterminate,
 )
 from crucible.tools._mcp_http_server import (
+    BUILD_TOOL_TIMEOUT_S,
+    TOOL_TIMEOUT_S,
     CrucibleHttpMcpServer,
     McpServerLifecycleError,
 )
@@ -667,6 +673,350 @@ def test_dispatch_timeout_returns_timeout_message():
         srv.stop()
     assert "timed out" in text.lower()
     assert "slow" in text
+
+
+# ----------------------------------------------------------------------
+# Session idle limit
+# ----------------------------------------------------------------------
+
+# The margin the idle limit keeps above a turn. Stated here, independently of
+# the server module, so that shrinking the margin there fails these tests.
+_IDLE_MARGIN_S = 900.0
+
+_PLAIN_MCP_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+}
+
+
+class _HoldingToolset(_RecordingToolset):
+    """``slow`` holds its call for a chosen time instead of five seconds."""
+
+    def __init__(self, hold_seconds: float) -> None:
+        super().__init__()
+        self._hold_seconds = hold_seconds
+
+    def dispatch(self, name: str, arguments: dict) -> str:
+        if name != "slow":
+            return super().dispatch(name, arguments)
+        self.calls.append((name, dict(arguments)))
+        time.sleep(self._hold_seconds)
+        return "slow:done"
+
+
+def _sse_messages(response) -> list[dict]:
+    """Decode the JSON-RPC messages of one streamable-HTTP answer."""
+    return [
+        json.loads(line[len("data:"):])
+        for line in response.text.splitlines()
+        if line.startswith("data:") and line[len("data:"):].strip()
+    ]
+
+
+def _plain_open_session(client, url: str) -> dict[str, str]:
+    """Open one MCP session with plain POST requests.
+
+    mcp's own client opens a GET stream right after the handshake, and an
+    open GET stream alone holds a session. These requests open none, so
+    only the requests a test makes itself can hold the session.
+    """
+    opened = client.post(
+        url,
+        headers=_PLAIN_MCP_HEADERS,
+        json={
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "idle-limit-test", "version": "0"},
+            },
+        },
+    )
+    assert opened.status_code == 200
+    (handshake,) = _sse_messages(opened)
+    headers = {
+        **_PLAIN_MCP_HEADERS,
+        "mcp-session-id": opened.headers["mcp-session-id"],
+        "mcp-protocol-version": handshake["result"]["protocolVersion"],
+    }
+    notified = client.post(
+        url,
+        headers=headers,
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+    )
+    assert notified.status_code == 202
+    return headers
+
+
+def _plain_call(
+    client,
+    url: str,
+    headers: dict[str, str],
+    request_id: int,
+    name: str,
+    arguments: dict,
+):
+    return client.post(
+        url,
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+    )
+
+
+def _plain_call_text(response) -> str:
+    assert response.status_code == 200
+    (message,) = _sse_messages(response)
+    return message["result"]["content"][0]["text"]
+
+
+def _answer_after_idle(
+    client,
+    url: str,
+    headers: dict[str, str],
+    limit: float,
+):
+    """Return the session's answer once it was idle for longer than ``limit``.
+
+    A request that reaches a live session restarts its idle period, so this
+    cannot poll quickly. Each try waits a whole multiple of the limit, the
+    later ones longer in case a loaded machine delayed the first expiry.
+    ``tools/list`` is used because it never reaches the toolset.
+    """
+    response = None
+    for request_id, multiple in ((901, 2.0), (902, 4.0), (903, 8.0)):
+        time.sleep(multiple * limit)
+        response = client.post(
+            url,
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": request_id, "method": "tools/list"},
+        )
+        if response.status_code != 200:
+            break
+    return response
+
+
+def _recorded_idle_limits(monkeypatch) -> list[object]:
+    """Record the idle limit mcp holds for each FastMCP a server builds."""
+    import mcp.server.fastmcp as fastmcp_module
+
+    real_fastmcp = fastmcp_module.FastMCP
+    seen: list[object] = []
+
+    def recording_fastmcp(*args, **kwargs):
+        instance = real_fastmcp(*args, **kwargs)
+        seen.append(instance.settings.session_idle_timeout)
+        return instance
+
+    monkeypatch.setattr(fastmcp_module, "FastMCP", recording_fastmcp)
+    return seen
+
+
+def test_session_idle_limit_exceeds_default_turns_and_tool_waits():
+    """Tie the limit to the adapter defaults that one session must outlast.
+
+    Raising one of these defaults without raising the limit has to fail here
+    instead of silently letting a session expire inside a turn.
+    """
+    from crucible.backends import claude, codex, kimi
+
+    limit = _server_module.SESSION_IDLE_TIMEOUT_S
+    assert type(limit) is float
+    assert math.isfinite(limit) and limit > 0
+
+    default_turns = {
+        "codex._DEFAULT_POLICY": codex._DEFAULT_POLICY.timeout_seconds,
+        "CodexBackend(timeout_seconds=...)": inspect.signature(
+            codex.CodexBackend.__init__
+        ).parameters["timeout_seconds"].default,
+        "claude._DEFAULT_POLICY": claude._DEFAULT_POLICY.timeout_seconds,
+    }
+    for name, seconds in default_turns.items():
+        assert isinstance(seconds, float), name
+        assert limit >= seconds + _IDLE_MARGIN_S, name
+
+    shorter_waits = {
+        "kimi._DEFAULT_TIMEOUT_SECONDS": kimi._DEFAULT_TIMEOUT_SECONDS,
+        "TOOL_TIMEOUT_S": TOOL_TIMEOUT_S,
+        "BUILD_TOOL_TIMEOUT_S": BUILD_TOOL_TIMEOUT_S,
+        "kimi._MCP_TOOL_TIMEOUT_MS": kimi._MCP_TOOL_TIMEOUT_MS / 1000.0,
+    }
+    for name, seconds in shorter_waits.items():
+        assert limit > seconds, name
+
+
+def test_server_hands_its_finite_idle_limit_to_mcp(monkeypatch):
+    seen = _recorded_idle_limits(monkeypatch)
+
+    with CrucibleHttpMcpServer(_RecordingToolset()):
+        pass
+    # A deadline nearer than the constant never lowers the limit.
+    with CrucibleHttpMcpServer(
+        _RecordingToolset(),
+        invocation_deadline=time.monotonic() + 60.0,
+    ):
+        pass
+
+    assert seen == [
+        _server_module.SESSION_IDLE_TIMEOUT_S,
+        _server_module.SESSION_IDLE_TIMEOUT_S,
+    ]
+
+
+def test_idle_limit_follows_a_deadline_beyond_the_constant(monkeypatch):
+    seen = _recorded_idle_limits(monkeypatch)
+    to_deadline = 3.0 * _server_module.SESSION_IDLE_TIMEOUT_S
+
+    before = time.monotonic()
+    server = CrucibleHttpMcpServer(
+        _RecordingToolset(),
+        invocation_deadline=before + to_deadline,
+    )
+    constructed_within = time.monotonic() - before
+    with server:
+        pass
+
+    (limit,) = seen
+    assert isinstance(limit, float) and math.isfinite(limit)
+    # Beyond the deadline by the margin, and by no more than that.
+    assert limit >= to_deadline - constructed_within + _IDLE_MARGIN_S - 1e-3
+    assert limit <= to_deadline + _IDLE_MARGIN_S + 1e-3
+
+
+@pytest.mark.parametrize(
+    "unbounded",
+    [None, math.inf, math.nan, 0.0, -1.0, True],
+    ids=["none", "inf", "nan", "zero", "negative", "bool"],
+)
+def test_idle_limit_can_never_be_unset_or_unbounded(monkeypatch, unbounded):
+    """mcp reads ``None`` as "never expire"; the server must refuse it."""
+    monkeypatch.setattr(_server_module, "SESSION_IDLE_TIMEOUT_S", unbounded)
+
+    with pytest.raises(ValueError, match="SESSION_IDLE_TIMEOUT_S"):
+        CrucibleHttpMcpServer(_RecordingToolset())
+    with pytest.raises(ValueError, match="SESSION_IDLE_TIMEOUT_S"):
+        CrucibleHttpMcpServer(
+            _RecordingToolset(),
+            invocation_deadline=time.monotonic() + 36_000.0,
+        )
+
+
+def test_requests_hold_a_session_and_idleness_past_the_limit_ends_it(
+    monkeypatch,
+):
+    """One session, plain requests only, with the limit shortened to 2 s.
+
+    A call in flight for longer than the limit returns its result, calls
+    spaced closer than the limit keep the session alive past the limit, and
+    only then does a silence longer than the limit end the session.
+    """
+    import httpx
+
+    limit = 2.0
+    monkeypatch.setattr(_server_module, "SESSION_IDLE_TIMEOUT_S", limit)
+    toolset = _HoldingToolset(hold_seconds=2.5 * limit)
+
+    with CrucibleHttpMcpServer(toolset) as srv, httpx.Client(
+        timeout=60.0,
+        trust_env=False,
+    ) as client:
+        headers = _plain_open_session(client, srv.url)
+
+        started = time.monotonic()
+        held = _plain_call(client, srv.url, headers, 1, "slow", {})
+        in_flight_for = time.monotonic() - started
+        assert _plain_call_text(held) == "slow:done"
+        assert in_flight_for > limit
+
+        started = time.monotonic()
+        for request_id in (2, 3, 4):
+            time.sleep(limit / 2.0)
+            spaced = _plain_call(
+                client,
+                srv.url,
+                headers,
+                request_id,
+                "echo",
+                {"payload": str(request_id)},
+            )
+            assert _plain_call_text(spaced) == f"echo:{request_id}"
+        assert time.monotonic() - started > limit
+
+        expired = _answer_after_idle(client, srv.url, headers, limit)
+        assert expired.status_code == 404
+        assert "Session not found" in expired.text
+        # The server does not revive the session for a later request.
+        again = _plain_call(
+            client,
+            srv.url,
+            headers,
+            5,
+            "echo",
+            {"payload": "5"},
+        )
+        assert again.status_code == 404
+
+    assert toolset.calls == [
+        ("slow", {}),
+        ("echo", {"payload": "2"}),
+        ("echo", {"payload": "3"}),
+        ("echo", {"payload": "4"}),
+    ]
+
+
+def test_abandoned_session_is_closed_after_the_idle_limit(monkeypatch):
+    """Failure path: a client leaves without ending its session.
+
+    Driven with mcp's own client, which is told not to send the closing
+    DELETE. The session must stop answering once the limit this server set
+    has passed; with the library default it would stay for half an hour.
+    """
+    import httpx
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    limit = 2.0
+    monkeypatch.setattr(_server_module, "SESSION_IDLE_TIMEOUT_S", limit)
+
+    async def open_and_abandon(url: str) -> tuple[str, str, str]:
+        async with streamablehttp_client(
+            url,
+            terminate_on_close=False,
+        ) as (read, write, get_session_id):
+            async with ClientSession(read, write) as session:
+                handshake = await session.initialize()
+                result = await session.call_tool("echo", {"payload": "kept"})
+                session_id = get_session_id()
+                assert session_id
+                return (
+                    session_id,
+                    str(handshake.protocolVersion),
+                    result.content[0].text,
+                )
+
+    toolset = _RecordingToolset()
+    with CrucibleHttpMcpServer(toolset) as srv:
+        session_id, protocol_version, text = asyncio.run(
+            open_and_abandon(srv.url)
+        )
+        assert text == "echo:kept"
+        headers = {
+            **_PLAIN_MCP_HEADERS,
+            "mcp-session-id": session_id,
+            "mcp-protocol-version": protocol_version,
+        }
+        with httpx.Client(timeout=60.0, trust_env=False) as client:
+            expired = _answer_after_idle(client, srv.url, headers, limit)
+
+    assert expired.status_code == 404
+    assert "Session not found" in expired.text
+    assert toolset.calls == [("echo", {"payload": "kept"})]
 
 
 # ----------------------------------------------------------------------

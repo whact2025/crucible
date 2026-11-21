@@ -175,6 +175,7 @@ def _transport(
     *,
     extra_env: dict[str, str] | None = None,
     model: str = "claude-fable-5-1",
+    resume: str | None = None,
 ) -> SanitizedClaudeSessionTransport:
     home = tmp_path / "session-home"
     home.mkdir(exist_ok=True)
@@ -202,6 +203,7 @@ def _transport(
         skills=[],
         plugins=[],
         disallowed_tools=["Task", "Agent"],
+        resume=resume,
     )
     return SanitizedClaudeSessionTransport(
         prompt="offline transport test",
@@ -618,7 +620,7 @@ def test_session_transport_rejects_unreviewed_sdk_version(
 
     with pytest.raises(
         ClaudeSessionIdentityError,
-        match="claude-agent-sdk==0.2.110",
+        match="claude-agent-sdk==0.2.121",
     ):
         _transport(tmp_path, cli)
 
@@ -820,6 +822,32 @@ def test_opus_session_retains_legacy_reviewed_cli_compatibility(tmp_path):
 
     model_argv = _records(capture)[2]["argv"]
     assert model_argv[model_argv.index("--model") + 1] == "claude-opus-5"
+
+
+def test_session_resume_value_cannot_become_a_flag_of_its_own(tmp_path):
+    """A stored conversation handle that begins with a dash stays a value.
+
+    ``resume`` carries a handle taken from earlier output or from a workflow
+    conversation request. Passed as a separate argv token, a dash-leading
+    handle is parsed by the CLI as another flag (CVE-2026-96620); the
+    reviewed SDK binds it to ``--resume`` in a single token.
+    """
+    hostile_handle = "--mcp-config=/nonexistent.json"
+    cli, capture = _recording_cli(tmp_path)
+    transport = _transport(tmp_path, cli, resume=hostile_handle)
+
+    async def exercise() -> None:
+        await transport.connect()
+        await transport.close()
+
+    asyncio.run(exercise())
+
+    model_argv = _records(capture)[2]["argv"]
+    assert model_argv.count(f"--resume={hostile_handle}") == 1
+    assert "--resume" not in model_argv
+    assert not [
+        token for token in model_argv if token.startswith("--mcp-config")
+    ]
 
 
 @pytest.mark.parametrize(
