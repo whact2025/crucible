@@ -24,6 +24,14 @@ The harness then
    ``sys.path`` as the interpreter would have set them for the original
    command line.
 
+A worker environment may also bundle a program of its own (the official
+Codex SDK bundles the vendor's command-line runtime). Such a program opens its
+sockets outside this interpreter, where the guard does not see them. So the
+harness also refuses to start any program that lies inside the environment of
+the interpreter: the attempt is a violation. A driver that needs the worker
+to start a tool puts a scripted peer outside the environment in its place
+(:mod:`.codex_worker`).
+
 Every violation is appended to the journal as it happens, before the
 exception is raised: a worker may swallow the exception, and a supervisor may
 kill the worker. The test that started the worker reads the journal at its
@@ -68,6 +76,64 @@ _PACKAGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class HarnessError(Exception):
     """The harness was started in a way it cannot run a target under."""
+
+
+class UnguardedProgram(Exception):
+    """A worker tried to start a program of its own environment.
+
+    Not an ``OSError``: a worker that catches a failed launch must not turn
+    this one into an ordinary error of its own.
+    """
+
+
+def refuse_environment_programs(on_violation: Callable[[str], None]) -> None:
+    """Make the start of a program inside this interpreter's environment a violation.
+
+    The interpreter itself is a link to a base interpreter outside the
+    environment and stays startable; whatever else the environment holds as
+    an executable runs outside the network guard.
+    """
+
+    import shutil  # noqa: PLC0415 - nothing before the guard is installed
+    import subprocess  # noqa: PLC0415
+
+    # The environment as it is named and as it resolves: a file of it may be
+    # a link into a package cache.
+    roots = {os.path.abspath(sys.prefix) + os.sep, os.path.realpath(sys.prefix) + os.sep}
+    interpreter = os.path.realpath(sys.executable)
+    real = subprocess.Popen
+
+    def of_the_environment(program: str, search: str | None) -> str | None:
+        """The path of ``program`` when it is a program of this environment."""
+
+        if os.sep not in program:
+            program = shutil.which(program, path=search) or program
+        named = os.path.abspath(program)
+        resolved = os.path.realpath(named)
+        inside = any(path.startswith(root) for path in (named, resolved) for root in roots)
+        return named if inside and resolved != interpreter else None
+
+    class Popen(real):  # type: ignore[misc,valid-type]
+        def __init__(self, args: Any, *more: Any, **named: Any) -> None:
+            program = named.get("executable")
+            if program is None:
+                program = args if isinstance(args, (str, bytes, os.PathLike)) else args[0]
+            environment = named.get("env")
+            search = (os.environ if environment is None else environment).get("PATH")
+            located = None if named.get("shell") else of_the_environment(
+                os.fsdecode(program), search
+            )
+            if located is not None:
+                on_violation(
+                    f"started {located}: a program of the worker environment opens "
+                    "its sockets where the network guard does not see them"
+                )
+                raise UnguardedProgram(located)
+            super().__init__(args, *more, **named)
+
+    Popen.__name__ = real.__name__
+    Popen.__qualname__ = real.__qualname__
+    subprocess.Popen = Popen  # type: ignore[misc]
 
 
 def append(directory: str, name: str, record: dict[str, Any]) -> None:
@@ -184,6 +250,7 @@ def main(arguments: Sequence[str]) -> None:
 
     try:
         _load("crucible_matrix_netguard", "netguard.py").install(violation("network guard"))
+        refuse_environment_programs(violation("worker harness"))
         redirect = None
         if settings["mode"] == "redirect":
             redirect = {"origin": settings["origin"], "target": settings["target"]}

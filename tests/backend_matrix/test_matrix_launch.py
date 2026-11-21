@@ -672,7 +672,11 @@ def test_the_seams_are_restored_and_an_interposer_is_replaced_not_stacked(
     assert interposer.journal is not None and len(interposer.journal.launches()) == 1
     # The seams the suite fixture interposes at are the two the adapters have.
     assert ((deepseek_adapter.__name__, SUPERVISOR),) == launch.SUPERVISOR_SEAMS
-    assert ((kimi_adapter.__name__, "subprocess"),) == launch.SUBPROCESS_SEAMS
+    assert (kimi_adapter.__name__, "subprocess") in launch.SUBPROCESS_SEAMS
+    # ... and the two of the worker client of the official Codex route.
+    assert {module for module, _name in launch.SUBPROCESS_SEAMS[1:]} == {
+        module for module, _name in launch.ASYNCIO_SEAMS
+    }
     assert kimi_adapter.subprocess.matrix_real is subprocess
 
 

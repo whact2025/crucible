@@ -53,6 +53,8 @@ LOCAL_GATEWAY_KIND = "openai_compat:local"
 CLAUDE_KIND = "claude"
 DEEPSEEK_KIND = "deepseek"
 KIMI_KIND = "kimi"
+CODEX_LEGACY_KIND = "codex:legacy"
+CODEX_OFFICIAL_KIND = "codex:official"
 
 # (routing backend, adapter transport) of a catalog lane -> driver kind.
 KIND_TABLE: Mapping[tuple[str, str], str] = {
@@ -67,6 +69,12 @@ KIND_TABLE: Mapping[tuple[str, str], str] = {
 REAL_KINDS: tuple[str, ...] = tuple(sorted(set(KIND_TABLE.values())))
 REFERENCE_KINDS: frozenset[str] = frozenset({CLAUDE_KIND, "codex:legacy", "codex:official"})
 OPEN_WEIGHT_KINDS: frozenset[str] = frozenset(REAL_KINDS) - REFERENCE_KINDS
+# Kinds whose wire names no served model: no reply of their dialect can name
+# one, so the contract clause about identity has nothing to hold the trace's
+# served model against. The declared difference of that wire asserts instead
+# that the trace records none, and it is owed on every result cell of these
+# kinds (static cell H03 holds the ledger's list to it).
+UNNAMED_SERVED_MODEL_KINDS: frozenset[str] = frozenset({CODEX_LEGACY_KIND, CODEX_OFFICIAL_KIND})
 
 # Catalog profile -> role within its kind. The primary of a kind is written
 # down here; it does not follow the order of the catalog file.

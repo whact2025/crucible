@@ -549,6 +549,7 @@ def _cost_reported_only(plan: Plan) -> Plan:
 # Declared differences (the ledger holds their citation, owner and scope).
 D_STRUCT_UNQUALIFIED = "D-STRUCT-UNQUALIFIED"
 D_OAI_SCHEMA_FINAL = "D-OAI-SCHEMA-FINAL"
+D_CDX_SERVED = "D-CDX-SERVED"
 
 
 def _schema_in_one_final_request(plan: Plan) -> Plan:
@@ -568,6 +569,33 @@ def _schema_in_one_final_request(plan: Plan) -> Plan:
         script=replace(plan.script, tail=Say(SCHEMA_FINAL_ANSWER)),
         checks=(*kept, *prompt_half, schema_in_final_request, finalisation_is_the_answer),
     )
+
+
+def served_model_unnamed(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The trace records no served model where the wire names none."""
+
+    assert obs.result is not None
+    trace = obs.result.execution_trace
+    if trace is None or trace.served_model is None:
+        return []  # a missing trace is clause C7's digest.missing:trace
+    return [
+        Deviation(
+            "digest.mismatch:served_model",
+            "the wire of the route names no served model and the trace records "
+            f"{trace.served_model!r} as the one the provider served",
+        )
+    ]
+
+
+def _trace_names_no_served_model(plan: Plan) -> Plan:
+    """The wire has no served-model field: the trace must not present one.
+
+    The alternative adds an assertion and takes none away. Clause C7 compares
+    the served model only where the provider named one, so on such a wire it
+    is silent about the field; this states what the result owes instead.
+    """
+
+    return replace(plan, checks=(*plan.checks, served_model_unnamed))
 
 
 # -- the catalogue -----------------------------------------------------------
@@ -897,6 +925,21 @@ _ALL: tuple[Scenario, ...] = (
         plan=lambda: Plan(ProviderScript(())),
         admission=True,
     ),
+)
+
+# A wire without a served-model field is a property of a kind's dialect, not of
+# one scenario: every scenario that asserts a result defines the alternative
+# of that declared difference, and the ledger says on which cells it is in
+# force. The canary asserts none, and neither does an admission scenario,
+# which calls nothing.
+_ALL = tuple(
+    scenario
+    if scenario.canary or scenario.admission
+    else replace(
+        scenario,
+        alternatives={**scenario.alternatives, D_CDX_SERVED: _trace_names_no_served_model},
+    )
+    for scenario in _ALL
 )
 
 SCENARIOS: Mapping[str, Scenario] = {scenario.id: scenario for scenario in _ALL}

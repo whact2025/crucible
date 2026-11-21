@@ -76,6 +76,16 @@ SLOTS: frozenset[str] = frozenset(
         "reasoning_item_id",
         "reasoning_text",
         "reasoning_tokens",
+        # Notifications of a thread-oriented wire (an app-server that owns the
+        # tool loop): the thread and turn every notification names, the server
+        # a tool call went to, and the counters of the thread so far beside
+        # those of one response.
+        "thread_id",
+        "turn_id",
+        "tool_server",
+        "cumulative_input_tokens",
+        "cumulative_output_tokens",
+        "cumulative_total_tokens",
     }
 )
 # A mapping key that is a slot: the whole key, filled with a string.

@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The usage of a thread after one model response: the counters of the thread
+# so far and those of the last response. Nothing was observed of the real
+# tool (see app_server.agent_message), and what `last` holds is a choice of
+# this envelope: see the provenance.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: token_usage_updated
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai_codex.generated.v2_all.ThreadTokenUsageUpdatedNotification with a
+    ThreadTokenUsage of two TokenUsageBreakdown objects (method
+    thread/tokenUsage/updated in openai_codex.generated.notification_registry)
+  sdk_version: openai-codex 0.144.4
+  reason: >-
+    The notification holds exactly the required fields of the generated type
+    of the vendor (threadId, turnId, tokenUsage) and each breakdown its five
+    required counters; the optional model context window is left out. The
+    type names the two breakdowns and states the meaning of neither. That
+    total holds the counters of the thread so far and last those of one
+    model response is a choice of this envelope that no source in reach
+    states, and the two adapters do not read the field alike. The
+    app-server adapter reads total alone where the exact usage notification
+    is present, and in its fallback adds up last response by response
+    (crucible/backends/codex.py: _exact_raw_response_usage_evidence,
+    _harvest_usage_evidence). The worker of the official route reports last
+    as the usage of the whole turn
+    (crucible/backends/codex_worker/src/crucible_codex_worker/__main__.py).
+    So what the official column reports for a turn of several responses is
+    decided by this choice, not by an observation of the real tool, and the
+    green of the app-server column is no evidence for it. The test modules
+    of both columns play the other reading, last as the turn so far.
+    A scripted response reads nothing from a cache and reasons nothing, so
+    the cached-input and reasoning-output counters are zero; each total is
+    input plus output. That the real tool sends one such notification after
+    every model response is stated by no source in reach.
+
+status: 200
+
+body:
+  method: thread/tokenUsage/updated
+  params:
+    threadId: {slot: thread_id}
+    turnId: {slot: turn_id}
+    tokenUsage:
+      total:
+        inputTokens: {slot: cumulative_input_tokens}
+        cachedInputTokens: 0
+        outputTokens: {slot: cumulative_output_tokens}
+        reasoningOutputTokens: 0
+        totalTokens: {slot: cumulative_total_tokens}
+      last:
+        inputTokens: {slot: input_tokens}
+        cachedInputTokens: 0
+        outputTokens: {slot: output_tokens}
+        reasoningOutputTokens: 0
+        totalTokens: {slot: total_tokens}

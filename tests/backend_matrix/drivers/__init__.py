@@ -21,6 +21,8 @@ def load() -> frozenset[str]:
 
     from . import (  # noqa: F401,PLC0415 - registration on import
         claude,
+        codex_legacy,
+        codex_official,
         deepseek,
         kimi,
         openai_compat,

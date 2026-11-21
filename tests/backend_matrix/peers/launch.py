@@ -3,9 +3,11 @@
 
 """The launch interposer: a locked worker interpreter runs under the harness.
 
-Two adapters start an interpreter of a locked worker environment
-(``backends/<name>_worker/.venv``): the Kimi adapter through ``subprocess``
-and the DeepSeek adapter through its supervisor function. Whatever a test
+Three adapters start an interpreter of a locked worker environment
+(``backends/<name>_worker/.venv``): the Kimi adapter through ``subprocess``,
+the DeepSeek adapter through its supervisor function and the worker client of
+the official Codex route through ``subprocess`` (its probe) and ``asyncio``
+(a request). Whatever a test
 starts that way executes the dependencies of that environment in the test
 job, so it runs under :mod:`.worker_harness`, which installs the network
 guard before any of them is imported.
@@ -57,7 +59,16 @@ REPOSITORY = Path(os.path.abspath(__file__)).parents[3]
 SUPERVISOR_SEAMS: tuple[tuple[str, str], ...] = (
     ("crucible.backends.deepseek", "_run_supervised_command"),
 )
-SUBPROCESS_SEAMS: tuple[tuple[str, str], ...] = (("crucible.backends.kimi", "subprocess"),)
+SUBPROCESS_SEAMS: tuple[tuple[str, str], ...] = (
+    ("crucible.backends.kimi", "subprocess"),
+    # The probe of the official Codex worker.
+    ("crucible.backends.codex_official_worker", "subprocess"),
+)
+# The worker client of the official Codex route starts a request through
+# ``asyncio.create_subprocess_exec``, again through its own reference.
+ASYNCIO_SEAMS: tuple[tuple[str, str], ...] = (
+    ("crucible.backends.codex_official_worker", "asyncio"),
+)
 # Interpreter options that take no value and leave the target where it is.
 _PLAIN_OPTIONS = frozenset("BEIOPRSbdqsuv")
 _VALUE_OPTIONS = ("-W", "-X")
@@ -331,6 +342,60 @@ class SubprocessView:
         return self.matrix_interposer._subprocess(self.matrix_real.run, args, more, named)
 
 
+class AsyncioView:
+    """``asyncio`` as one adapter module sees it: ``create_subprocess_exec`` decided.
+
+    ``command`` is the decision: the command line and environment a launch
+    runs with, or ``None`` to pass it through (:meth:`Interposer.command`, or
+    a driver's own rule on top of it). Every other name is the real module's,
+    and the real function is looked up at each call.
+    """
+
+    def __init__(
+        self,
+        real: Any,
+        command: Callable[
+            [Sequence[str], Mapping[str, str] | None],
+            tuple[tuple[str, ...], dict[str, str]] | None,
+        ],
+    ) -> None:
+        self.matrix_real = real
+        self.matrix_command = command
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.matrix_real, name)
+
+    async def create_subprocess_exec(self, program: Any, *arguments: Any, **named: Any) -> Any:
+        argv = tuple(os.fsdecode(item) for item in (program, *arguments))
+        wrapped = self.matrix_command(argv, named.get("env"))
+        if wrapped is None:
+            return await self.matrix_real.create_subprocess_exec(program, *arguments, **named)
+        command, environment = wrapped
+        return await self.matrix_real.create_subprocess_exec(
+            *command, **{**named, "env": environment}
+        )
+
+
+@contextlib.contextmanager
+def at_asyncio(
+    module: Any,
+    command: Callable[
+        [Sequence[str], Mapping[str, str] | None],
+        tuple[tuple[str, ...], dict[str, str]] | None,
+    ],
+    name: str,
+) -> Iterator[None]:
+    """Interpose at ``asyncio`` as ``module`` sees it, for the block."""
+
+    current = getattr(module, name)
+    real = current.matrix_real if isinstance(current, AsyncioView) else current
+    setattr(module, name, AsyncioView(real, command))
+    try:
+        yield
+    finally:
+        setattr(module, name, current)
+
+
 @contextlib.contextmanager
 def at_supervisor(module: Any, interposer: Interposer, name: str) -> Iterator[None]:
     """Interpose at a module's supervisor function for the block.
@@ -383,6 +448,10 @@ def suite_guard(
             seams.enter_context(at_supervisor(importlib.import_module(module), interposer, name))
         for module, name in SUBPROCESS_SEAMS:
             seams.enter_context(at_subprocess(importlib.import_module(module), interposer, name))
+        for module, name in ASYNCIO_SEAMS:
+            seams.enter_context(
+                at_asyncio(importlib.import_module(module), interposer.command, name)
+            )
         yield interposer
     violations = interposer.violations()
     if violations:

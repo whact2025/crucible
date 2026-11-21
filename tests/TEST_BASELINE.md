@@ -126,6 +126,32 @@ What the peer does not emulate ends the cell as a setup error, never as an
 observation. A known gap on a reference column needs the owner's ruling in its
 ledger entry.
 
+The Codex app-server route is driven the same way: `extra.cli_path` points at
+[a scripted peer](backend_matrix/peers/codex_app_server.py), which the pinned
+`codex-app-server-sdk` starts where the route looks for the vendor tool. That
+route accepts only a native executable, so for as long as a cell holds a
+backend the driver replaces the adapter's native-binary predicate by one that
+also accepts the peer's launcher. It is the one product name the driver
+patches, it is listed in the driver's `private_seams`, and the predicate's own
+tests stay. The version probe is answered with a version the adapter has
+reviewed, and the sign-in file is a fake one in a home directory of the cell,
+which the driver makes `HOME` while the backend is open. The peer speaks the
+app-server's JSON-RPC, takes each model response from the scripted provider
+and reaches the ToolSet through the loopback tool server its command line
+names. Its notifications are built to the generated types of the vendor's
+official SDK, with one exception that says so: the exact usage of a response,
+which no installed vendor type states and on which the complete accounting of
+the column rests. The usage counters of the thread are emulated, and the type
+of their notification names two sets of them and the meaning of neither: the
+envelope fills `last` with one model response, a choice no source states. The
+green of this column does not rest on it (its adapter reads the thread's
+total there); what the official-SDK column reports for a turn of several
+responses does, and the test modules of both columns play the other reading.
+The wire of both Codex kinds names no served model; declared difference
+`D-CDX-SERVED` asserts on every result cell of those kinds that the trace
+records none, and static cell `H03` fails when the ledger's list leaves one
+out.
+
 A column whose adapter runs a locked worker environment is driven inside
 that environment. The DeepSeek route keeps its shipped routing file and gets
 one overlay, `extra.expected_worker_runtime_fingerprint`, captured in the cell
@@ -165,6 +191,20 @@ clause C5 reads from the limit guard's terminal whether a result the guard
 let stand is rankable, and reports `guard:not_rankable` where it is not;
 under the cost policy it never is.
 
+The Codex official-SDK route runs its locked worker too, and it has no
+provider origin to redirect: the SDK in the worker starts the vendor's
+command-line runtime, which its environment bundles. The driver starts the
+request launch of the worker on [a stage](backend_matrix/peers/codex_worker.py)
+under the harness. The stage puts the scripted peer of the app-server column
+where the SDK looks for that runtime and then runs the real worker module, so
+the worker, the pinned SDK and its generated types run for real and validate
+every notification of a cell. The canary fails unless the peer's parent is a
+journalled worker of the locked interpreter on the stage and the stage
+recorded what it replaced. The harness also refuses to start any program that
+lies inside the worker's own environment, because such a program opens its
+sockets where the network guard does not see them: without the stage the
+bundled runtime never starts, and the attempt is a violation.
+
 A column whose profile the catalogs call blocked runs three scenarios as soon
 as its kind is driven: the canary, the plain call and the admission scenario
 `S51`. An admission cell builds a backend for every capability a workflow can
@@ -191,13 +231,15 @@ states no rule.
 
 Every interpreter of a worker environment (`backends/<name>_worker/.venv`)
 that any test starts runs under the same harness. A suite-wide fixture in
-`tests/conftest.py` interposes where the two worker adapters start one,
+`tests/conftest.py` interposes where the worker adapters start one (the
+DeepSeek supervisor, `subprocess` as the Kimi adapter sees it, `subprocess`
+and `asyncio` as the worker client of the official Codex route sees them),
 decides by the executable and passes every other launch through untouched. A
 worker that reaches beyond loopback fails the test that started it, whatever
 the worker did with the exception. A test that starts such an interpreter
 itself uses the fixture's `run` or `popen` in place of `subprocess`. Test
-modules named after a worker adapter (`kimi`, `deepseek`) also run with the
-network guard in the test process.
+modules named after a worker adapter (`kimi`, `deepseek`, `codex`) also run
+with the network guard in the test process.
 
 A scripted reply is an envelope under `backend_matrix/envelopes/<dialect>/`
 with only its slots filled, and each envelope states where its shape comes
@@ -210,33 +252,38 @@ contract that is asserted instead; it replaces no contract clause.
 ```bash
 uv sync --frozen --reinstall --link-mode copy --project backends/deepseek_worker
 uv sync --frozen --reinstall --link-mode copy --project backends/kimi_worker
+uv sync --frozen --project backends/codex_worker
 uv run python -m pytest -q tests/backend_matrix
 ```
 
-The first two commands install the locked DeepSeek and Kimi worker
+The first three commands install the locked DeepSeek, Kimi and Codex worker
 environments, which their columns and the tests marked `matrix_worker` need.
-A missing or drifted environment is an error with its command in the
-message, never a skip. Both commands install in copy mode. The DeepSeek pin
-requires it: it refuses an installed file with more than one link, which an
-install that links from uv's cache leaves. The Kimi pin takes any regular
-file and does not require it; its command has the same shape so that both
-environments are installed one way. Whether a column can be driven is asked
-once per run, under the same cleared environment as its cells: a credential,
-a proxy, a TLS trust path or a `CRUCIBLE_*_WORKER_PYTHON` override of the
-machine decides nothing. Clone inside the Linux filesystem: the DeepSeek pin
-hashes its lock byte for byte and every installed file with its mode, so a
-checkout on a Windows filesystem reached through WSL can fail it. The pin
-also covers the worker's source directory with any bytecode in it, and it is
-checked again before every launch: a test that loads worker source in its
-own process loads it without writing bytecode (as
-`tests/test_backends_deepseek.py` and `tests/test_backends_kimi.py` do), or
-it would change the pin under the tests that run beside it in the same
-checkout. The Kimi pin hashes its source directory and its installed tree
-the same way, without the rule about links. CI installs both environments in
-every test shard. A test outside the matrix that needs the Kimi environment
-takes the `require_kimi_worker` fixture, which fails without it, and the
-`matrix_worker` marker; no test skips on a missing worker runtime (static
-cell `H01`).
+The Codex environment holds the vendor's command-line runtime, which the
+official SDK depends on: most of its size (about 340 MB installed), and never
+started by a test. A missing or drifted environment is an error with its
+command in the message, never a skip. The DeepSeek and the Kimi command
+install in copy mode. The DeepSeek pin requires it: it refuses an installed
+file with more than one link, which an install that links from uv's cache
+leaves. The Kimi pin takes any regular file and does not require it; its
+command has the same shape so that the two environments are installed one
+way. The Codex command is the plain locked sync: the official route qualifies
+its worker by a version probe and has no rule about links. Whether a column
+can be driven is asked once per run, under the same cleared environment as
+its cells: a credential, a proxy, a TLS trust path or a
+`CRUCIBLE_*_WORKER_PYTHON` override of the machine decides nothing. Clone
+inside the Linux filesystem: the DeepSeek pin hashes its lock byte for byte
+and every installed file with its mode, so a checkout on a Windows filesystem
+reached through WSL can fail it. The pin also covers the worker's source
+directory with any bytecode in it, and it is checked again before every
+launch: a test that loads worker source in its own process loads it without
+writing bytecode (as `tests/test_backends_deepseek.py` and
+`tests/test_backends_kimi.py` do), or it would change the pin under the tests
+that run beside it in the same checkout. The Kimi pin hashes its source
+directory and its installed tree the same way, without the rule about links.
+CI installs each of them in every test shard. A test outside the matrix that
+needs the Kimi environment takes the `require_kimi_worker` fixture, which
+fails without it, and the `matrix_worker` marker; no test skips on a missing
+worker runtime (static cell `H01`).
 
 On a machine without the worker environment, leave these tests out explicitly
 and keep the configured expression:

@@ -462,6 +462,11 @@ class World:
     # (id -> the scenarios that define it).
     difference_variants: frozenset[str] = frozenset()
     difference_alternatives: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Declared differences that belong to the wire of a kind and not to one
+    # scenario or adapter path (id -> the kinds whose wire it is about). Such
+    # a difference is in force on every result cell of those kinds and on no
+    # cell of another kind.
+    wire_differences: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 def _pack(world: World, scenario: str) -> str:
@@ -706,7 +711,11 @@ def _entry_problems(ledger: Ledger, world: World) -> list[Deviation]:
 
 
 def _difference_problems(ledger: Ledger, world: World) -> list[Deviation]:
-    """A declared difference is asserted by a scenario, and only where listed."""
+    """A declared difference is asserted by a scenario, and only where listed.
+
+    One that belongs to the wire of a kind is listed on every result cell of
+    that kind.
+    """
 
     out: list[Deviation] = []
     declared = [item.id for item in ledger.differences]
@@ -761,6 +770,38 @@ def _difference_problems(ledger: Ledger, world: World) -> list[Deviation]:
                         f"{where} lists {cell}: it must be listed once, be a "
                         "generated cell of a real kind, not the canary, and its "
                         "scenario must define the alternative",
+                    )
+                )
+        kinds = world.wire_differences.get(item.id)
+        if kinds is None:
+            continue
+        # A difference of a wire. Where the wire cannot carry something, the
+        # clause that would compare it is silent, and the alternative is the
+        # only assertion left: a cell of such a kind that the list leaves out
+        # would be checked by nothing. Owed on every cell of the kind whose
+        # scenario defines the alternative (a static cell has no scenario
+        # that does).
+        owed = {
+            cell
+            for cell in world.generated
+            for kind, scenario, _role, _lens in (parse_cell_id(cell),)
+            if kind in kinds and scenario in scenarios
+        }
+        for cell in sorted(owed - set(item.cells)):
+            out.append(
+                Deviation(
+                    "static:difference_cell_missing",
+                    f"{where} is about the wire of kind {parse_cell_id(cell)[0]} and "
+                    f"is not in force on its result cell {cell}",
+                )
+            )
+        for cell in sorted(set(item.cells)):
+            if parse_cell_id(cell)[0] not in kinds:
+                out.append(
+                    Deviation(
+                        "static:difference_cell_invalid",
+                        f"{where} is about the wire of {sorted(kinds)} and lists "
+                        f"{cell}, a cell of another kind",
                     )
                 )
     return out

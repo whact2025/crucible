@@ -9,14 +9,14 @@ This module contains only fixtures shared across the current test suite:
   interpreter tracer and fails a test that leaks trace-state drift;
 - ``locked_worker_launch`` (autouse): every interpreter of a locked worker
   environment (``backends/<name>_worker/.venv``) that a test starts, through
-  either worker adapter, runs under the worker harness of the backend matrix,
+  any worker adapter, runs under the worker harness of the backend matrix,
   which installs the network guard before the worker's dependencies are
   imported. A worker that reaches beyond loopback fails the test that started
   it. A test that starts such an interpreter itself uses the fixture's
   ``run`` or ``popen`` in place of ``subprocess``;
 - ``_contain_worker_adapter_network`` (autouse): the same network guard in
   the test process, for every test module whose file name names a worker
-  adapter (``kimi``, ``deepseek``);
+  adapter (``kimi``, ``deepseek``, ``codex``);
 - ``require_kimi_worker``: the interpreter of the locked Kimi worker
   environment. A test that needs it takes this fixture instead of a skip
   marker: a missing environment is an error that names the install command.
@@ -36,9 +36,10 @@ from .backend_matrix.peers import launch
 
 # The adapters that run a locked worker environment. A test module is named
 # after the adapter it tests, so the rule is the file name, not a list.
-_WORKER_ADAPTERS = ("kimi", "deepseek")
-# The command of the CI step. Copy mode is the one shape both worker installs
-# have; the Kimi pin takes any regular file and does not require it.
+_WORKER_ADAPTERS = ("kimi", "deepseek", "codex")
+# The command of the CI step, in the shape of the DeepSeek worker's. Copy mode
+# is a convention here: the Kimi pin takes any regular file and does not
+# require it.
 _KIMI_WORKER_INSTALL = (
     "uv sync --frozen --reinstall --link-mode copy --project backends/kimi_worker"
 )

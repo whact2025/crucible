@@ -75,6 +75,7 @@ from .provider import (
 )
 from .scenarios import (
     BUDGET_USD,
+    D_CDX_SERVED,
     D_OAI_SCHEMA_FINAL,
     D_STRUCT_UNQUALIFIED,
     PACK_A,
@@ -1681,6 +1682,8 @@ def test_kinds_without_a_driver_yield_no_cell_and_no_error() -> None:
         matrix_columns.CLAUDE_KIND,
         matrix_columns.DEEPSEEK_KIND,
         matrix_columns.KIMI_KIND,
+        matrix_columns.CODEX_LEGACY_KIND,
+        matrix_columns.CODEX_OFFICIAL_KIND,
     }
     assert [cell for cell in cells.behaviour_cells() if cell.column.kind == TOY_KIND] == list(
         generated
@@ -2328,13 +2331,23 @@ def test_h03_declared_difference_rules() -> None:
     hosted = matrix_columns.HOSTED_GATEWAY_KIND
     in_force = f"{hosted}/S04/primary/raw"
 
-    # The two of today: one a declared value selects, one in force on listed cells.
-    assert set(shipped) == {D_STRUCT_UNQUALIFIED, D_OAI_SCHEMA_FINAL}
+    # Those of today: one a declared value selects, two in force on listed cells.
+    assert set(shipped) == {D_STRUCT_UNQUALIFIED, D_OAI_SCHEMA_FINAL, D_CDX_SERVED}
     assert shipped[D_STRUCT_UNQUALIFIED].cells == ()
     assert LEDGER.differences_for(in_force) == (D_OAI_SCHEMA_FINAL,)
     assert LEDGER.differences_for(f"{hosted}/S03/primary/raw") == ()
     assert cells.world().difference_variants == {D_STRUCT_UNQUALIFIED}
-    assert cells.world().difference_alternatives == {D_OAI_SCHEMA_FINAL: {"S04"}}
+    # One is a scenario's own; the other belongs to a wire and so to every
+    # scenario that asserts a result: not the canary, and not the admission
+    # scenario, which calls nothing.
+    assert cells.world().difference_alternatives == {
+        D_OAI_SCHEMA_FINAL: {"S04"},
+        D_CDX_SERVED: {
+            name
+            for name, item in SCENARIOS.items()
+            if not item.canary and not item.admission
+        },
+    }
 
     # A scenario may assert an alternative only when the ledger declares it...
     for name in shipped:
@@ -2378,6 +2391,29 @@ def test_h03_declared_difference_rules() -> None:
     assert scoped(D_OAI_SCHEMA_FINAL, [in_force, in_force]) == {"static:difference_cell_invalid"}
     # One that a declared value selects has no cell list of its own.
     assert scoped(D_STRUCT_UNQUALIFIED, [in_force]) == {"static:difference_cell_invalid"}
+    # One that belongs to the wire of a kind is in force on every result cell
+    # of that kind: where the wire names no served model the identity clause
+    # compares none, so a cell the list left out would have the field checked
+    # by nothing. It is in force on no cell of another kind.
+    wire = cells.world().wire_differences
+    served = list(shipped[D_CDX_SERVED].cells)
+    assert wire == {D_CDX_SERVED: matrix_columns.UNNAMED_SERVED_MODEL_KINDS}
+    assert {ledger.parse_cell_id(cell)[0] for cell in served} == set(wire[D_CDX_SERVED])
+    for left_out in served:
+        assert scoped(D_CDX_SERVED, [cell for cell in served if cell != left_out]) == {
+            "static:difference_cell_missing"
+        }, left_out
+    assert scoped(D_CDX_SERVED, [*served, f"{hosted}/S01/primary/raw"]) == {
+        "static:difference_cell_invalid"
+    }
+    # Without the rule that list is taken: the cell is generated, of a real
+    # kind, not the canary, and its scenario defines the alternative.
+    assert _problem_codes(wire_differences={}) == set()
+    document = _document()
+    _difference(document, D_CDX_SERVED)["cells"] = served[1:]
+    assert _problem_codes(document, wire_differences={}) == set()
+    # A scenario's own difference stays where the ledger lists it.
+    assert D_OAI_SCHEMA_FINAL not in wire
     malformed = _document()
     _difference(malformed, D_OAI_SCHEMA_FINAL)["cells"] = ["S04"]
     with pytest.raises(MatrixSetupError, match="cell id"):

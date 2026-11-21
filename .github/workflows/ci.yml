@@ -178,6 +178,8 @@ jobs:
         run: uv sync --frozen --reinstall --link-mode copy --project backends/deepseek_worker
       - name: Install the locked Kimi worker environment
         run: uv sync --frozen --reinstall --link-mode copy --project backends/kimi_worker
+      - name: Install the locked Codex worker environment
+        run: uv sync --frozen --project backends/codex_worker
       - name: Enable hosted-runner user namespaces for descriptor tests
         run: |
           test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns

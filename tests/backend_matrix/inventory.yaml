@@ -52,8 +52,10 @@ cell_counts:
   toy: 72
   # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
   claude: 14
-  "codex:legacy": 0
-  "codex:official": 0
+  # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
+  "codex:legacy": 7
+  # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
+  "codex:official": 7
   # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
   deepseek: 7
   # Starter set on the two diagnostic columns (7 each); S00, S01 in both

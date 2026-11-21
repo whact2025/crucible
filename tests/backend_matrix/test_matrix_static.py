@@ -463,6 +463,8 @@ def _handed_interpreters(
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr in _LAUNCHERS
+                # ``asyncio.run`` runs a coroutine and starts no process.
+                and ast.unparse(node.func.value) != "asyncio"
                 and node.args
                 and "WORKER_PYTHON" in ast.unparse(node.args[0]).upper()
                 and id(node) not in guarded
@@ -573,13 +575,24 @@ def _without_install_step(ci_text: str, worker: str) -> str:
     return str(yaml.safe_dump(ci))
 
 
+def _only_install_step(ci_text: str, worker: str) -> str:
+    """The CI workflow with the install step of one worker environment and of no other."""
+
+    for other in installed_worker_environments(ci_text):
+        if other != worker:
+            ci_text = _without_install_step(ci_text, other)
+    return ci_text
+
+
 def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
     tmp_path: Path,
 ) -> None:
-    both = CI_WORKFLOW.read_text(encoding="utf-8")
-    # The cases up to the Kimi ones are about one environment, the DeepSeek one.
-    ci_text = _without_install_step(both, "kimi")
+    every = CI_WORKFLOW.read_text(encoding="utf-8")
+    # The cases up to those of one worker's own are about one environment,
+    # the DeepSeek one, whatever else the workflow installs.
+    ci_text = _only_install_step(every, "deepseek")
     assert installed_worker_environments(ci_text) == ["deepseek"]
+    assert len(installed_worker_environments(every)) > 1
     conftest = (TESTS / "conftest.py").read_text(encoding="utf-8")
 
     def problems(name: str, text: str = conftest, ci: str = ci_text) -> list[str]:
@@ -607,13 +620,18 @@ def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
     # Without the file-name rule, or with one that does not name the worker.
     (unruled,) = problems("no-rule", conftest.replace("netguard.watch(", "netguard.other("))
     assert "the file-name rule for 'deepseek'" in unruled
-    (unnamed,) = problems("other-rule", conftest.replace('"kimi", "deepseek"', '"kimi",'))
+    assert conftest.count('"deepseek", ') == 1
+    (unnamed,) = problems("other-rule", conftest.replace('"deepseek", ', ""))
     assert "the file-name rule for 'deepseek'" in unnamed
-    # Without the harness.
+    # Without the harness: one deviation, and one per environment the
+    # workflow installs.
     root = _guarded_tests_root(tmp_path / "no-harness", conftest)
     (root / "backend_matrix" / "peers" / "worker_harness.py").unlink()
     (no_harness,) = worker_environment_problems(ci_text, root)
     assert "the worker harness" in no_harness.detail
+    unguarded = worker_environment_problems(every, root)
+    assert len(unguarded) == len(installed_worker_environments(every))
+    assert all("the worker harness" in item.detail for item in unguarded)
     # With a test module that hands the interpreter to subprocess itself. The
     # one of another worker is that worker's business.
     root = _guarded_tests_root(tmp_path / "handed", conftest)
@@ -623,19 +641,34 @@ def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
     (root / "test_other.py").write_text(source.format("deepseek_mod"), encoding="utf-8")
     (handed,) = worker_environment_problems(ci_text, root)
     assert "['test_other.py'] start its interpreter themselves" in handed.detail
+    # With every environment the workflow installs. A coroutine runner starts
+    # no process, whatever its coroutine is given; a launcher in a module
+    # named after another worker is that worker's.
+    assert "codex" in installed_worker_environments(every)
+    root = _guarded_tests_root(tmp_path / "coroutine", conftest)
+    module = root / "test_codex_official_own.py"
+    module.write_text(
+        "import asyncio\n\nasyncio.run(start(worker_python=WORKER_PYTHON))\n", encoding="utf-8"
+    )
+    assert worker_environment_problems(every, root) == []
+    module.write_text(
+        "import subprocess\n\nsubprocess.run([WORKER_PYTHON, '-c', ''])\n", encoding="utf-8"
+    )
+    (codex,) = worker_environment_problems(every, root)
+    assert "the codex worker" in codex.detail and module.name in codex.detail
     # With the install step of the Kimi worker: on the real tree its test
     # modules start that interpreter through the launcher of the suite
     # fixture, which runs it under the harness, so the step is behind the
     # guard.
-    assert installed_worker_environments(both) == ["deepseek", "kimi"]
-    assert worker_environment_problems(both, TESTS) == []
+    assert installed_worker_environments(every) == ["codex", "deepseek", "kimi"]
+    assert worker_environment_problems(every, TESTS) == []
     launch_line = "{}.run([str(parent._DEFAULT_WORKER_PYTHON), '-c', ''])\n"
     through = "def test_x(locked_worker_launch):\n    " + launch_line.format(
         "locked_worker_launch"
     )
     root = _guarded_tests_root(tmp_path / "launcher", conftest)
     (root / "test_backends_kimi_own.py").write_text(through, encoding="utf-8")
-    assert worker_environment_problems(both, root) == []
+    assert worker_environment_problems(every, root) == []
     # Not behind it: the same line under a name the fixture is not (a helper
     # that takes it under another name), under the fixture's name where no
     # function takes the fixture, and where the function rebinds the name.
@@ -652,7 +685,7 @@ def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
     ):
         root = _guarded_tests_root(tmp_path / f"handed-{name}", conftest)
         (root / "test_backends_kimi_own.py").write_text(source, encoding="utf-8")
-        (kimi,) = worker_environment_problems(both, root)
+        (kimi,) = worker_environment_problems(every, root)
         assert kimi.code == "static:worker_env_unguarded" and "the kimi worker" in kimi.detail
         assert "['test_backends_kimi_own.py'] start its interpreter themselves" in kimi.detail
     # Without the fixture in the suite conftest nothing is its launcher.
@@ -663,7 +696,7 @@ def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
     (root / "test_backends_kimi_own.py").write_text(through, encoding="utf-8")
     assert any(
         "['test_backends_kimi_own.py'] start its interpreter" in item.detail
-        for item in worker_environment_problems(both, root)
+        for item in worker_environment_problems(every, root)
     )
     # No install step, no demand.
     ci = yaml.safe_load(ci_text)
@@ -1024,6 +1057,98 @@ def test_a_test_that_requires_a_worker_environment_carries_the_marker() -> None:
             assert requires == marked, f"{path.name}::{node.name}"
             paired += requires
     assert paired > 0
+
+
+def test_codex_drivers_touch_only_the_seams_they_list() -> None:
+    def imported(tree: ast.Module) -> list[str]:
+        return sorted(
+            f"{node.module}.{alias.name}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and not node.level
+            for alias in node.names
+            if (node.module or "").startswith(("crucible", "assay"))
+        )
+
+    def used(tree: ast.Module, name: str) -> set[str]:
+        return {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == name
+        }
+
+    def called(tree: ast.Module) -> set[str]:
+        return {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+
+    # The app-server column. Routing is the boundary; of the adapter module
+    # the driver touches two private names and lists both: the native-binary
+    # predicate, which it replaces for as long as a backend is open, and the
+    # table of reviewed tool versions, which it reads.
+    legacy = _tree("drivers/codex_legacy.py")
+    driver = drivers.get(matrix_columns.CODEX_LEGACY_KIND)
+    assert imported(legacy) == [
+        "crucible.backends.codex",
+        "crucible.backends.config.load_routing",
+        "crucible.backends.config.resolve_for_role",
+    ]
+    from crucible.backends import codex as adapter  # noqa: PLC0415
+
+    private = {name for name in used(legacy, "adapter") if name.startswith("_")} - {"__name__"}
+    assert {f"{adapter.__name__}.{name}" for name in private} == set(driver.private_seams)
+    assigned = {
+        ast.unparse(target)
+        for node in ast.walk(legacy)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "adapter"
+    }
+    assert assigned == {"adapter._is_native_codex_binary"}
+    assert all(hasattr(adapter, name) for name in private)
+    assert not {name for name in called(legacy) if "setattr" in name or "patch" in name}
+    assert driver.fidelity == "wire" and driver.dialect == "codex_app_server"
+    assert len(driver.bypassed_layers) == 3 and driver.inexpressible == {}
+
+    # The official-SDK column. Of the worker client the driver uses public
+    # names only; its seams are the two module globals it hands to the launch
+    # interposer by name and never sets itself.
+    official = _tree("drivers/codex_official.py")
+    driver = drivers.get(matrix_columns.CODEX_OFFICIAL_KIND)
+    assert imported(official) == [
+        "crucible.backends.codex_official_worker",
+        "crucible.backends.config.load_routing",
+        "crucible.backends.config.resolve_for_role",
+    ]
+    from crucible.backends import codex_official_worker as worker_client  # noqa: PLC0415
+
+    assert used(official, "worker_client") - {"__name__"} <= set(worker_client.__all__)
+    seams = {(worker_client.__name__, name.rpartition(".")[2]) for name in driver.private_seams}
+    assert seams == {
+        seam
+        for seam in (*launch.SUBPROCESS_SEAMS, *launch.ASYNCIO_SEAMS)
+        if seam[0] == worker_client.__name__
+    }
+    assert len(seams) == 2 and all(hasattr(worker_client, name) for _module, name in seams)
+    assert not {name for name in called(official) if "setattr" in name or "patch" in name}
+    assert {"launch.at_subprocess", "launch.at_asyncio"} <= called(official)
+    assert driver.fidelity == "wire" and driver.dialect == "codex_app_server"
+    assert len(driver.bypassed_layers) == 3 and driver.inexpressible == {}
+    # Both columns answer from the same envelopes, through the same peer.
+    assert driver.envelopes == drivers.get(matrix_columns.CODEX_LEGACY_KIND).envelopes
+    # That dialect names no served model (it refuses the step that would),
+    # and the kinds that speak it are the ones the difference of that wire is
+    # owed on (H03).
+    assert matrix_columns.UNNAMED_SERVED_MODEL_KINDS == {
+        kind for kind in drivers.load() if drivers.get(kind).dialect == driver.dialect
+    }
+    # The peer and the stage run outside the test environment, on the
+    # standard library alone.
+    assert _import_problems(_tree("peers/codex_app_server.py")) == []
+    assert _import_problems(_tree("peers/codex_worker.py")) == []
+    for module, name in launch.ASYNCIO_SEAMS:
+        assert hasattr(importlib.import_module(module), name), (module, name)
 
 
 def test_every_envelope_is_rendered_by_a_dialect_and_exists() -> None:

@@ -39,6 +39,7 @@ from .contract import ADMITTED, CLAUSES
 from .drivers import toy
 from .drivers.base import MatrixSetupError
 from .scenarios import (
+    D_CDX_SERVED,
     PACK_A,
     PACK_B,
     SCENARIOS,
@@ -62,6 +63,8 @@ ENABLEMENT: Mapping[str, tuple[str, ...]] = {
     matrix_columns.CLAUDE_KIND: (STARTER,),
     matrix_columns.DEEPSEEK_KIND: (STARTER,),
     matrix_columns.KIMI_KIND: (STARTER,),
+    matrix_columns.CODEX_LEGACY_KIND: (STARTER,),
+    matrix_columns.CODEX_OFFICIAL_KIND: (STARTER,),
 }
 # A secondary column runs these sets. A blocked column runs these scenarios
 # as soon as its kind is driven, whatever sets the kind runs: what a blocked
@@ -85,6 +88,8 @@ MODULE_BY_KIND: Mapping[str, str] = {
     matrix_columns.CLAUDE_KIND: "test_matrix_claude",
     matrix_columns.DEEPSEEK_KIND: "test_matrix_deepseek",
     matrix_columns.KIMI_KIND: "test_matrix_kimi",
+    matrix_columns.CODEX_LEGACY_KIND: "test_matrix_codex",
+    matrix_columns.CODEX_OFFICIAL_KIND: "test_matrix_codex_official",
 }
 STATIC_MODULE = "test_matrix_static"
 # Static scenario -> its test, and whether the test is parametrised by cell id.
@@ -109,6 +114,15 @@ STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
 # reads; the codes of its cells are those of any rejection after the request,
 # so only the text of the error shows the cause, and only the same cells
 # answered with the count show that nothing else is behind their entries.
+# The official Codex route never flags its token usage complete on a reply
+# that reads nothing from a cache, and the accounting clause holds a result
+# that is flagged incomplete to no number: only this proof compares what the
+# route reports for a response with what the provider billed. What the route
+# reports for a turn of several responses is known gap R05 of the ledger,
+# unconfirmed: its one code shows only while the cost is flagged complete, so
+# the record leans on the test that plays both readings of the usage
+# notification on the two cells of such a turn, and that test is held here
+# too, cell by cell.
 REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND]: (
         "test_the_probe_and_the_request_launch_run_under_the_harness",
@@ -116,6 +130,11 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     MODULE_BY_KIND[matrix_columns.KIMI_KIND]: (
         "test_the_strict_route_rejects_the_plain_reply_for_its_missing_cache_read_count",
         "test_the_strict_route_answers_once_the_reply_carries_a_cache_read_count",
+    ),
+    MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]: (
+        "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
+        "test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last[S03]",
+        "test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last[S04]",
     ),
 }
 
@@ -557,4 +576,5 @@ def world() -> ledger.World:
         },
         difference_variants=difference_variants(),
         difference_alternatives=difference_alternatives(),
+        wire_differences={D_CDX_SERVED: matrix_columns.UNNAMED_SERVED_MODEL_KINDS},
     )
