@@ -37,7 +37,7 @@ schema_version: crucible.backend-matrix.ledger.v1
 
 ceilings:
   max_known_gaps:
-    pack_a: 25
+    pack_a: 32
     pack_b: 0
   max_declared_differences: 3
 
@@ -425,6 +425,115 @@ registry:
         observed_under: {structured_output: prompt_only}
         closes_under: {structured_output: prompt_only}
 
+  R04:
+    title: The official Codex route flags its token usage incomplete on a reply that is not all cache-read, and its cost complete without pricing evidence
+    origin: reference
+    severity: medium
+    # First run of the column (part 6), not predicted. Accepted by the owner
+    # as a known gap of the official-SDK route; a strict expected failure
+    # until the product is fixed. Owner, 2026-11-21, asked "Accept the two
+    # Codex official-route findings as known gaps and keep the real worker?":
+    # "Yes, accept both". That ruling is the `ruling` of every known-gap
+    # entry that names this record. Here it is quoted and is not a field of
+    # the record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled. The severity is the one
+    # proposed with the finding; the ruling names none.
+    # One accounting rule of both Codex transports for usage without a
+    # cache-write counter, not a quirk of this route: on the same
+    # notifications, without the exact usage notification, the app-server
+    # adapter shows the same two codes (and the kind code of its enforcing
+    # admission), and the official client never asks for that notification.
+    # crucible/backends/codex_official.py: the token partition is complete
+    # only when all input was read from a cache;
+    # crucible/backends/codex.py, _codex_usage_cost_upper_bound: the cost is
+    # flagged complete whenever the cache-write rate is absent or equals the
+    # input rate, with pricing evidence built only when both flags are true.
+    # pricing:unreconciled therefore shows only under a rate without a
+    # cache-write premium (the matrix rate card); under the shipped price of
+    # the route's model the adapter clears the cost flag too. In the guarded
+    # lens the limit guard replaces the result and revokes the backend.
+    # What the column-wide flag code waives: clause C6 takes any lower bound
+    # for honest once the token flag is false, so while these entries stand
+    # the token comparison of C6 is off on every cell of the kind (a result
+    # that reported no tokens at all would show the same codes). What still
+    # compares the reported tokens with the provider's ledger on this column
+    # are two tests of the official module, both required by name by the
+    # verifier (cells.REQUIRED_PROOFS): a turn of one response, and the test
+    # that plays both readings of `last` on a turn of several.
+    column_wide:
+      - {kind: "codex:official", code: "flag:token_usage_complete=False"}
+      - {kind: "codex:official", code: "pricing:unreconciled"}
+    cells:
+      - cell: codex:official/S01/primary/guarded
+        observed_under: {}
+        closes_under: {}
+      - cell: codex:official/S03/primary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+      - cell: codex:official/S04/primary/guarded
+        observed_under: {structured_output: native}
+        closes_under: {structured_output: native}
+
+  R05:
+    title: On the official Codex route a turn of several model responses reports the usage of its last response (unconfirmed, reference emulated)
+    origin: reference
+    severity: medium
+    # Unconfirmed. First run of the column (part 6), not predicted; the codes
+    # below are as observed. Accepted by the owner as a second known gap of
+    # the route; a strict expected failure until it is settled and, if it is
+    # a defect, fixed. Owner, 2026-11-21, asked "Accept the two Codex
+    # official-route findings as known gaps and keep the real worker?": "Yes,
+    # accept both". That ruling is the `ruling` of every known-gap entry that
+    # names this record. Here it is quoted and is not a field of the record:
+    # a ruling on a registry record is leave to withdraw the record's cells
+    # (H03 then accepts a cell that is pinned not expressible or no longer
+    # generated), which was not ruled.
+    # It rests on the reading of the last-response usage field. The worker
+    # reports `last` of the turn's usage
+    # (crucible/backends/codex_worker/src/crucible_codex_worker/__main__.py).
+    # The envelope of the usage notification fills `last` with one model
+    # response, a choice no source in reach states: the vendor's type names
+    # the field and no meaning. Filled with the turn so far, the same cells
+    # report the whole turn and show R04's codes only
+    # (test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last
+    # in the official module, required by name by the verifier). The green
+    # app-server column is no evidence either way: its adapter never reads
+    # `last` there. So it is a wrong envelope or an under-count of the
+    # worker, and nothing in the matrix can say which.
+    # What settles it: a recording of the real tool at the pinned version
+    # (what `last` holds on a turn of several model responses). If the tool
+    # sends one response there, the worker under-counts every such turn and
+    # a budget on this route is compared with the cost of the last response
+    # only; if it sends the turn so far, there is no gap, the envelope
+    # changes and this record's codes go.
+    # The severity is the integrator's, not the owner's (the ruling names
+    # none): medium while the record is unconfirmed, to be raised if a
+    # recording confirms an under-count.
+    # Never closed or dropped because usage.cost_usd:lt went away. That code
+    # shows only while the adapter flags the cost complete (R04's second
+    # behaviour, under a rate without a cache-write premium): a change of
+    # that flag alone removes the code and leaves the worker as it is. The
+    # record closes on a worker, or on an envelope after a recording, under
+    # which the test named above no longer holds.
+    cells:
+      - cell: codex:official/S03/primary/raw
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["usage.cost_usd:lt"]
+      - cell: codex:official/S03/primary/guarded
+        observed_under: {event_detail: usage}
+        closes_under: {event_detail: usage}
+        predicted: ["usage.cost_usd:lt"]
+      - cell: codex:official/S04/primary/raw
+        observed_under: {structured_output: native}
+        closes_under: {structured_output: native}
+        predicted: ["usage.cost_usd:lt"]
+      - cell: codex:official/S04/primary/guarded
+        observed_under: {structured_output: native}
+        closes_under: {structured_output: native}
+        predicted: ["usage.cost_usd:lt"]
+
 known_gaps:
   - cell: kimi/H01/-/static
     observed_under: {}
@@ -545,6 +654,63 @@ known_gaps:
       "guard:revoked": G16
       "digest.mismatch:tool_authority": G24
   - column_wide: {kind: deepseek, code: "digest.missing:feature_profile", gap: G24}
+
+  # The official-SDK Codex column, first run of part 6 (starter set). A
+  # reference column: every entry carries the owner's ruling, word for word
+  # the same. The two accounting codes of R04 are column-wide; in the guarded
+  # lens the limit guard replaces the result for its incomplete evidence and
+  # revokes the backend. On a turn of several model responses the reported
+  # cost is that of the last response (R05, unconfirmed: decided by the
+  # envelope's reading of `last`, not yet by an observation of the real
+  # tool).
+  - cell: codex:official/S01/primary/guarded
+    observed_under: {}
+    codes:
+      "guard:limit_evidence_incomplete": R04
+      "guard:revoked": R04
+    ruling: >-
+      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
+      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+  - cell: codex:official/S03/primary/raw
+    observed_under: {event_detail: usage}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
+      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+  - cell: codex:official/S03/primary/guarded
+    observed_under: {event_detail: usage}
+    codes:
+      "guard:limit_evidence_incomplete": R04
+      "guard:revoked": R04
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
+      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+  - cell: codex:official/S04/primary/raw
+    observed_under: {structured_output: native}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
+      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+  - cell: codex:official/S04/primary/guarded
+    observed_under: {structured_output: native}
+    codes:
+      "guard:limit_evidence_incomplete": R04
+      "guard:revoked": R04
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
+      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+  - column_wide: {kind: "codex:official", code: "flag:token_usage_complete=False", gap: R04}
+    ruling: >-
+      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
+      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+  - column_wide: {kind: "codex:official", code: "pricing:unreconciled", gap: R04}
+    ruling: >-
+      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
+      as known gaps and keep the real worker?" Answer: "Yes, accept both".
 
 declared_differences:
   - id: D-STRUCT-UNQUALIFIED

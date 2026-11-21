@@ -104,13 +104,20 @@ STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
 # Codex route never flags its token usage complete on a reply that reads
 # nothing from a cache, and the accounting clause holds a result that is
 # flagged incomplete to no number: only this proof compares what the route
-# reports for a response with what the provider billed.
+# reports for a response with what the provider billed. What the route
+# reports for a turn of several responses is known gap R05 of the ledger,
+# unconfirmed: its one code shows only while the cost is flagged complete, so
+# the record leans on the test that plays both readings of the usage
+# notification on the two cells of such a turn, and that test is held here
+# too, cell by cell.
 REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND]: (
         "test_the_probe_and_the_request_launch_run_under_the_harness",
     ),
     MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]: (
         "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
+        "test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last[S03]",
+        "test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last[S04]",
     ),
 }
 

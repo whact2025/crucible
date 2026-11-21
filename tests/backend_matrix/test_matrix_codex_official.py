@@ -27,9 +27,11 @@ log's, not this module's: a test here asserts shapes and rules, never a gap.
 One rule is held by name for the verifier, because no cell shows when it
 stops: a turn of one response reports the tokens the provider billed.
 One test holds an open point instead of a rule: what the column reports for a
-turn of several model responses is decided by how the scripted peer fills
-the ``last`` counters of a usage notification, which no source in reach
-states. It plays both readings and leaves with whatever settles the point.
+turn of several model responses is decided by how the envelope fills the
+``last`` counters of a usage notification, which no source in reach states.
+It plays both readings and leaves with whatever settles the point. The
+ledger carries the point as a known gap that is unconfirmed and its record
+leans on this test, so the verifier requires it by name too, on both cells.
 
 The two lying counterparts it shares with the app-server column are defined
 in that column's module.
@@ -437,21 +439,26 @@ def test_a_turn_of_one_response_reports_the_tokens_the_provider_billed(
 
 @pytest.mark.parametrize("scenario", ["S03", "S04"])
 def test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last(
-    scenario: str, tmp_path: Path
+    scenario: str, tmp_path: Path, request: pytest.FixtureRequest
 ) -> None:
-    """An open point, held from both sides: it is not a rule and not yet a gap.
+    """An open point, held from both sides: not a rule, and a gap unconfirmed.
 
-    The worker reports ``last`` of the turn's usage. The peer fills ``last``
-    with one model response, and the column then reports the last response of
-    a turn the provider billed several for. Filled with the turn so far, which
-    is as much an instance of the vendor's type, the column reports the whole
-    turn. No source in reach says which the real tool sends, and the green
-    app-server column does not say either: its adapter never reads ``last``
-    there. So a usage code on these cells is, for now, the peer's choice and
-    not an observation of the worker. Whatever settles it (a recording of the
-    real tool, a ruling, a change of the worker) rewrites this test.
+    The worker reports ``last`` of the turn's usage. The envelope fills
+    ``last`` with one model response, and the column then reports the last
+    response of a turn the provider billed several for. Filled with the turn
+    so far, which is as much an instance of the vendor's type, the column
+    reports the whole turn. No source in reach says which the real tool sends,
+    and the green app-server column does not say either: its adapter never
+    reads ``last`` there. So a usage code on these cells is, for now, the
+    envelope's choice and not an observation of the worker: the ledger carries
+    it as a known gap that is unconfirmed (R05). Whatever settles it (a
+    recording of the real tool, a ruling on the reading, a change of the
+    worker) rewrites this test.
     """
 
+    # The verifier requires this test by name on both cells: the record of the
+    # ledger leans on it, and a run without it is refused.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_OFFICIAL_KIND]]
     cell = Cell(COLUMN, scenario, "raw")
     one = _played(scenario, tmp_path / "one-response")
     driver = _OtherReadingOfLast()

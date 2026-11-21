@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 
 # The frame that opens a session of the command-line tool. Nothing was
-# observed of the real tool: no vendor command-line tool is installed where
-# this package is built, and the package may not install or contact one.
+# observed of the real tool: where this package is built no vendor
+# command-line tool is started, signed in or contacted.
 
 schema_version: crucible.backend-matrix.envelope.v1
 dialect: claude_cli
