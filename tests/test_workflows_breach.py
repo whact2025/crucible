@@ -1360,7 +1360,7 @@ def test_pre_fix_observation_channel_failure_is_not_author_repaired(
     ]) == 3
     assert len(scripted.calls) == 2
     assert all(
-        "bounded test-only settlement" not in call.user
+        "# BREACH TEST AUTHOR — bounded repair" not in call.user
         for call in scripted.calls
     )
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
@@ -1369,6 +1369,869 @@ def test_pre_fix_observation_channel_failure_is_not_author_repaired(
     assert round_summary["test_author_repair_attempts"] == 0
     assert round_summary["skip_reason"] == "observation_failure"
     assert round_summary["observation_failure"] == failure
+    # An infrastructure envelope is the runner's statement that the gate
+    # produced no evidence: nothing judged the candidate.
+    assert summary["status"] == "inconclusive_gate_unavailable"
+    outcome = json.loads((run_dir / "outcome.json").read_text())
+    assert outcome["terminal_class"] == "inconclusive"
+
+
+def _unavailable_round_gate(*result_lines: str):
+    """A round gate whose runner flagged that it produced no evidence.
+
+    The shape is the one ``_build_verify`` returns with this classification:
+    the runner result in ``dev_verify`` with the unavailable flag set, and no
+    ``verify`` result.
+    """
+
+    from crucible.workflows._build_verify import BuildVerifyOutcome
+
+    return BuildVerifyOutcome(
+        "dev_verify_unavailable",
+        build=None,
+        verify=None,
+        dev_verify=dataclasses.replace(
+            _runner_result(
+                *result_lines,
+                returncode=2,
+                values={"dev_verify_infrastructure_unavailable": 1.0},
+            ),
+            role="dev_verify",
+            runner="crucible.products.deepswe.runners.deepswe_dev_verify",
+        ),
+    )
+
+
+def _breach_run_files(corpus: Corpus) -> tuple[dict, dict, list[dict]]:
+    """Return summary, typed outcome and events of the latest breach run."""
+
+    run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
+    summary = json.loads((run_dir / "summary.json").read_text())
+    outcome = json.loads((run_dir / "outcome.json").read_text())
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text().splitlines()
+    ]
+    return summary, outcome, events
+
+
+def test_round_gate_unavailable_reads_the_runner_flag_or_an_infrastructure_envelope():
+    from crucible.workflows._build_verify import BuildVerifyOutcome
+    from crucible.workflows.breach import _round_gate_unavailable
+
+    ran = BuildVerifyOutcome("verify_failed", build=None, verify=_runner_result())
+    unavailable = _unavailable_round_gate()
+
+    def envelope(kind: str) -> dict[str, str]:
+        return {"schema_version": "v1", "kind": kind, "detail": "d"}
+
+    assert _round_gate_unavailable(unavailable, None) is True
+    assert _round_gate_unavailable(ran, envelope("infrastructure")) is True
+    # The runner's own flag is not hidden by a channel or configuration
+    # envelope on the same result.
+    assert _round_gate_unavailable(unavailable, envelope("channel")) is True
+    assert _round_gate_unavailable(unavailable, envelope("configuration")) is True
+    assert _round_gate_unavailable(ran, None) is False
+    assert _round_gate_unavailable(ran, envelope("channel")) is False
+    assert _round_gate_unavailable(ran, envelope("configuration")) is False
+    assert _round_gate_unavailable(
+        BuildVerifyOutcome("dev_verify_failed", build=None, verify=None),
+        None,
+    ) is False
+
+
+def _window_closed_round_gate(
+    observation_failure: dict[str, str] | None,
+    *,
+    gate_command_returncode: float,
+    unavailable: bool = False,
+):
+    """The DeepSWE runner's result when its window closed before the observers.
+
+    Exit 124 with an ``infrastructure`` envelope. ``gate_command_returncode``
+    is what the gate's own command ended with: 124 when the candidate's
+    suite itself ran to the cap.
+    """
+
+    from crucible.workflows._build_verify import BuildVerifyOutcome
+
+    return BuildVerifyOutcome(
+        "dev_verify_unavailable" if unavailable else "dev_verify_failed",
+        build=None,
+        verify=None,
+        dev_verify=dataclasses.replace(
+            _runner_result(
+                returncode=124,
+                values={
+                    "returncode": 124.0,
+                    "dev_verify_candidate_process_returncode": (
+                        gate_command_returncode
+                    ),
+                    "dev_verify_infrastructure_unavailable": (
+                        1.0 if unavailable else 0.0
+                    ),
+                },
+                observation_failure=observation_failure,
+            ),
+            role="dev_verify",
+            runner="crucible.products.deepswe.runners.deepswe_dev_verify",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("gate_command_returncode", "unavailable", "expected"),
+    [
+        # The candidate's suite ran to the cap: a timeout, judged as in Tier.
+        pytest.param(124.0, False, False, id="gate-command-timed-out"),
+        # The suite returned and the window closed before the observers.
+        pytest.param(1.0, False, True, id="window-closed-after-a-failing-suite"),
+        pytest.param(0.0, False, True, id="window-closed-after-a-passing-suite"),
+        # The runner's own flag stays decisive, as Tier files that gate.
+        pytest.param(
+            124.0, True, True, id="gate-command-timed-out-and-runner-flag",
+        ),
+    ],
+)
+def test_infrastructure_envelope_after_a_gate_command_timeout_is_not_an_outage(
+    gate_command_returncode: float,
+    unavailable: bool,
+    expected: bool,
+) -> None:
+    """A gate command that timed out leaves an ``infrastructure`` envelope too.
+
+    The runner has one window for the gate command and the observers. The
+    envelope then only says that the observers got none of it; the timeout
+    belongs to the candidate's suite and is not "no evidence".
+    """
+
+    from crucible.workflows.breach import _round_gate_unavailable
+
+    envelope = {
+        "schema_version": "v1",
+        "kind": "infrastructure",
+        "detail": "workflow-owned development-verifier deadline expired",
+    }
+    gate = _window_closed_round_gate(
+        envelope,
+        gate_command_returncode=gate_command_returncode,
+        unavailable=unavailable,
+    )
+
+    assert _round_gate_unavailable(gate, envelope) is expected
+    # Without an envelope only the runner's flag counts, timed out or not.
+    assert _round_gate_unavailable(gate, None) is unavailable
+
+
+@pytest.mark.parametrize(
+    ("gate_command_returncode", "expected_unavailable"),
+    [
+        pytest.param(124, False, id="gate-command-timed-out"),
+        pytest.param(1, True, id="window-closed-after-a-failing-suite"),
+    ],
+)
+def test_deepswe_gate_that_exhausts_the_runner_window_as_the_round_reads_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_command_returncode: int,
+    expected_unavailable: bool,
+) -> None:
+    """The real runner's result for a suite that uses up the gate window.
+
+    One absolute deadline covers the gate command and the observers, so the
+    observers of a breach round never start and the runner reports exit 124,
+    no unavailable flag and an ``infrastructure`` envelope. ``_build_verify``
+    classifies that ``dev_verify_failed``. Only the return code of the gate's
+    own command tells a hanging candidate from a window that closed after
+    the suite returned.
+    """
+
+    import io
+
+    from crucible.common.runners.breach_observation import (
+        BREACH_OBSERVATION_FAILURE_KEY,
+    )
+    from crucible.products.deepswe.runners import deepswe_dev_verify
+    from crucible.workflows import _build_verify
+    from crucible.workflows.breach import (
+        _gate_observation_failure,
+        _round_gate_unavailable,
+    )
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+
+    def contained_exec(_container_id, _command, *, timeout, cleanup_timeout):
+        # The candidate's suite uses the whole window it was given.
+        clock.now += timeout
+        if gate_command_returncode == 124:
+            return 124, "", "dev_verify timed out"
+        return (
+            1,
+            "1 failed, 3 passed in 9.00s\nFAILED tests/test_x.py::test_a\n",
+            "",
+        )
+
+    runner_stdout = io.StringIO()
+    with monkeypatch.context() as runner_patch:
+        runner_patch.setattr(deepswe_dev_verify.time, "monotonic", clock)
+        runner_patch.setattr(
+            deepswe_dev_verify, "run_contained_docker_exec", contained_exec,
+        )
+        runner_returncode = deepswe_dev_verify.main(
+            stdin=io.StringIO(json.dumps({
+                "parameters": {
+                    "role": "dev_verify",
+                    "runner_timeout_s": 10,
+                    "deepswe_metadata": {
+                        "container_id": "candidate",
+                        "language": "python",
+                        "dev_verify_command": "cd /app && python -m pytest -q",
+                    },
+                    "breach_observations": True,
+                    "breach_test_file": "tests/test_breach_attacks.py",
+                    "breach_attack_ids": ["attack_one"],
+                },
+            })),
+            stdout=runner_stdout,
+        )
+    payload = json.loads(runner_stdout.getvalue())
+
+    assert runner_returncode == 124
+    assert payload["values"]["returncode"] == 124.0
+    assert payload["values"]["dev_verify_candidate_process_returncode"] == float(
+        gate_command_returncode
+    )
+    assert payload["values"].get("dev_verify_infrastructure_unavailable", 0.0) == 0.0
+    assert payload[BREACH_OBSERVATION_FAILURE_KEY]["kind"] == "infrastructure"
+
+    def runner_process(role, runner, _payload, **_kwargs):
+        return _build_verify.RunnerResult(
+            role=role,
+            runner=runner,
+            returncode=runner_returncode,
+            values=payload["values"],
+            raw_output=runner_stdout.getvalue().encode("utf-8"),
+            stderr=b"",
+            duration_s=0.0,
+        )
+
+    monkeypatch.setattr(_build_verify, "_run_runner", runner_process)
+    outcome = _build_verify.build_and_verify(
+        _starter_spec(runners={
+            "dev_verify": "crucible.products.deepswe.runners.deepswe_dev_verify",
+        }),
+        cwd=str(tmp_path),
+        gate="dev_verify",
+    )
+
+    # Tier files this gate as a judged failure in both cases.
+    assert outcome.classification == "dev_verify_failed"
+    envelope = _gate_observation_failure(outcome)
+    assert envelope is not None
+    assert envelope["kind"] == "infrastructure"
+    assert _round_gate_unavailable(outcome, envelope) is expected_unavailable
+
+
+@pytest.mark.parametrize(
+    ("result_lines", "max_rounds", "unavailable_slice"),
+    [
+        # The exact observation was collected although the gate could not
+        # produce comparable evidence: no row is a blocker.
+        pytest.param(
+            ("tests/test_breach.py::test_race_a FAILED",),
+            1,
+            "breach_r0_pre_fix",
+            id="valid-observations",
+        ),
+        # No observation at all: every row is an authoring blocker.
+        pytest.param((), 1, "breach_r0_pre_fix", id="no-observations"),
+        # A second round is allowed and is not started.
+        pytest.param((), 2, "breach_r0_pre_fix", id="two-rounds-allowed"),
+        # The first pre-fix gate ran and returned no observation, so the
+        # Test Author gets its repair turn; the gate after that turn is the
+        # one that could not run.
+        pytest.param(
+            (), 1, "breach_r0_pre_fix_repair_a1", id="repair-gate",
+        ),
+    ],
+)
+def test_pre_fix_gate_that_could_not_run_stops_the_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    result_lines: tuple[str, ...],
+    max_rounds: int,
+    unavailable_slice: str,
+) -> None:
+    """A pre-fix gate that could not run starts no further paid role.
+
+    The stop reads the gate classification, not the observation rows: no
+    Test Author repair turn, no Defender and no Judge follow, and the loop
+    ends without a verdict instead of ``incomplete``. The same holds for the
+    gate that follows a Test Author repair turn, and no further round starts
+    when more rounds are allowed.
+    """
+
+    from crucible.workflows import _mutation_journal
+    from crucible.workflows import breach as breach_mod
+    from crucible.workflows._build_verify import BuildVerifyOutcome
+
+    corpus, diff = _setup_corpus(tmp_path)
+    # Spare responses: before the stop existed the round went on to a repair
+    # turn (no observations) or to the Defender and the Judge.
+    scripted = ScriptedBackend(
+        [
+            _breaker_with_attacks("race_a"),
+            _implementation_response(),
+            _implementation_response(),
+            _judge_reject(),
+            _implementation_response(),
+        ],
+        mutate_production=True,
+    )
+    _patch_backend(monkeypatch, scripted)
+    gate_calls: list[str] = []
+    repair_gate = unavailable_slice == "breach_r0_pre_fix_repair_a1"
+
+    def unavailable_gate(*_args, **kwargs):
+        gate_calls.append(kwargs["slice_id"])
+        if kwargs["slice_id"] != unavailable_slice:
+            # A gate that ran; its runner returned no exact observation.
+            return BuildVerifyOutcome(
+                "verify_failed",
+                build=None,
+                verify=_runner_result(
+                    returncode=2,
+                    diagnostic="pytest collection failed: SyntaxError",
+                ),
+            )
+        return _unavailable_round_gate(*result_lines)
+
+    monkeypatch.setattr(
+        breach_mod._build_verify,
+        "build_and_verify",
+        _contract_aware_build_verify_stub(unavailable_gate),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert breach_mod.main([
+        "--spec", str(corpus.spec_dir),
+        "--diff", str(diff),
+        "--max-rounds", str(max_rounds),
+    ]) == 3
+
+    # Breaker and Test Author only, and one gate; in the repair row one Test
+    # Author repair turn and its gate as well.
+    assert len(scripted.calls) == (3 if repair_gate else 2)
+    assert gate_calls == [
+        "breach_r0_pre_fix",
+        *(["breach_r0_pre_fix_repair_a1"] if repair_gate else []),
+    ]
+    assert [
+        "# BREACH TEST AUTHOR — bounded repair" in call.user
+        for call in scripted.calls
+    ] == [False, False, *([True] if repair_gate else [])]
+    assert all(
+        "# BREACH DEFENDER" not in call.user
+        and "technical judge evaluating" not in call.system
+        for call in scripted.calls
+    )
+    summary, outcome, events = _breach_run_files(corpus)
+    assert summary["status"] == "inconclusive_gate_unavailable"
+    assert outcome["detail_status"] == "inconclusive_gate_unavailable"
+    assert outcome["terminal_class"] == "inconclusive"
+    assert len(summary["rounds"]) == 1
+    round_summary = summary["rounds"][0]
+    assert round_summary["skip_reason"] == "gate_unavailable"
+    assert round_summary["pre_fix_classification"] == "dev_verify_unavailable"
+    assert round_summary["post_fix_classification"] == "not_run"
+    assert round_summary["test_author_repair_attempts"] == (
+        1 if repair_gate else 0
+    )
+    assert round_summary["defender_classification"] == (
+        "round_skipped_pre_fix_gate_unavailable"
+    )
+    assert round_summary["observation_failure"] is None
+    assert {
+        "round": 0,
+        "status": "pre_fix_gate_unavailable",
+        "skipped": True,
+        "classification": "dev_verify_unavailable",
+    } in events
+    # Nothing is accepted: the pre-breach candidate is back and no journal
+    # is left behind.
+    assert (tmp_path / "file").read_text(encoding="utf-8") == "new\n"
+    assert not (tmp_path / "tests" / "test_breach.py").exists()
+    assert _mutation_journal.discover_mutation_journals(
+        corpus,
+        workspace=tmp_path,
+    ) == ()
+
+
+def test_round_gate_that_could_not_run_and_changed_source_keeps_its_integrity_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gate-integrity error wins over the gate's own unavailable flag.
+
+    A round gate that rewrote the candidate is deterministic evidence,
+    whether or not it could run: the loop keeps
+    ``inconclusive_workspace_mismatch``, as the final shipping gate keeps
+    ``inconclusive_post_strip_verify``.
+    """
+
+    from crucible.workflows import breach as breach_mod
+
+    corpus, diff = _setup_corpus(tmp_path)
+    scripted = ScriptedBackend(
+        [
+            _breaker_with_attacks("race_a"),
+            _implementation_response(),
+            _implementation_response(),
+            _judge_reject(),
+        ],
+        mutate_production=True,
+    )
+    _patch_backend(monkeypatch, scripted)
+    gate_calls: list[str] = []
+
+    def source_writing_gate(*_args, **kwargs):
+        gate_calls.append(kwargs["slice_id"])
+        (tmp_path / "file").write_text("gate\n", encoding="utf-8")
+        return _unavailable_round_gate()
+
+    monkeypatch.setattr(
+        breach_mod._build_verify,
+        "build_and_verify",
+        _contract_aware_build_verify_stub(source_writing_gate),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert breach_mod.main([
+        "--spec", str(corpus.spec_dir),
+        "--diff", str(diff),
+        "--max-rounds", "1",
+    ]) == 3
+
+    # Breaker and Test Author only; one gate.
+    assert len(scripted.calls) == 2
+    assert gate_calls == ["breach_r0_pre_fix"]
+    run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
+    summary = json.loads((run_dir / "summary.json").read_text())
+    outcome = json.loads((run_dir / "outcome.json").read_text())
+    assert summary["status"] == "inconclusive_workspace_mismatch"
+    assert outcome["terminal_class"] == "inconclusive"
+    round_summary = summary["rounds"][0]
+    assert round_summary["pre_fix_classification"] == "dev_verify_unavailable"
+    assert round_summary["skip_reason"] != "gate_unavailable"
+    # The unavailable stop never ran: it would have written its event.
+    events_path = run_dir / "events.jsonl"
+    assert not events_path.exists() or (
+        "pre_fix_gate_unavailable" not in events_path.read_text()
+    )
+    assert (tmp_path / "file").read_text(encoding="utf-8") == "new\n"
+    assert not (tmp_path / "tests" / "test_breach.py").exists()
+
+
+def test_post_fix_gate_that_could_not_run_never_reaches_the_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No Judge rules on a Defender fix whose gate produced no evidence.
+
+    The post-fix result even names the attack as passing; the gate still
+    could not run, so neither a ``pass`` nor the scripted ``reject`` may be
+    taken from a Judge.
+    """
+
+    from crucible.workflows import _mutation_journal
+    from crucible.workflows import breach as breach_mod
+    from crucible.workflows._build_verify import BuildVerifyOutcome
+
+    corpus, diff = _setup_corpus(tmp_path)
+    scripted = ScriptedBackend(
+        [
+            _breaker_with_attacks("race_a"),
+            _implementation_response(),
+            _implementation_response(),
+            _judge_reject(),
+        ],
+        mutate_production=True,
+    )
+    _patch_backend(monkeypatch, scripted)
+    outcomes = iter((
+        BuildVerifyOutcome(
+            "verify_failed",
+            build=None,
+            verify=_runner_result(
+                "tests/test_breach.py::test_race_a FAILED",
+                returncode=1,
+            ),
+        ),
+        _unavailable_round_gate("tests/test_breach.py::test_race_a PASSED"),
+    ))
+    gate_calls: list[str] = []
+
+    def gates(*_args, **kwargs):
+        gate_calls.append(kwargs["slice_id"])
+        return next(outcomes)
+
+    monkeypatch.setattr(
+        breach_mod._build_verify,
+        "build_and_verify",
+        _contract_aware_build_verify_stub(gates),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert breach_mod.main([
+        "--spec", str(corpus.spec_dir),
+        "--diff", str(diff),
+        "--max-rounds", "1",
+    ]) == 3
+
+    # Breaker, Test Author, Defender; the Judge response is never consumed.
+    assert len(scripted.calls) == 3
+    assert all(
+        "technical judge evaluating" not in call.system
+        for call in scripted.calls
+    )
+    assert gate_calls == ["breach_r0_pre_fix", "breach_r0_post_fix"]
+    summary, outcome, events = _breach_run_files(corpus)
+    assert summary["status"] == "inconclusive_gate_unavailable"
+    assert outcome["terminal_class"] == "inconclusive"
+    round_summary = summary["rounds"][0]
+    assert round_summary["skip_reason"] == "gate_unavailable"
+    assert round_summary["pre_fix_classification"] == "verify_failed"
+    assert round_summary["post_fix_classification"] == "dev_verify_unavailable"
+    assert round_summary["defender_classification"] == "success"
+    assert round_summary["judge_findings"] == 0
+    assert round_summary["observation_failure"] is None
+    assert {
+        "round": 0,
+        "status": "post_fix_gate_unavailable",
+        "skipped": True,
+        "classification": "dev_verify_unavailable",
+    } in events
+    # The Defender's edit and the breach test are rolled back.
+    assert (tmp_path / "file").read_text(encoding="utf-8") == "new\n"
+    assert not (tmp_path / "tests" / "test_breach.py").exists()
+    assert _mutation_journal.discover_mutation_journals(
+        corpus,
+        workspace=tmp_path,
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    ("envelope_kind", "expected_status", "expected_skip_reason"),
+    [
+        # The runner's own flag, no envelope.
+        pytest.param(
+            None, "inconclusive_gate_unavailable", "gate_unavailable",
+            id="runner-flag",
+        ),
+        pytest.param(
+            "infrastructure", "inconclusive_gate_unavailable",
+            "observation_failure",
+            id="infrastructure-envelope",
+        ),
+        # Guard: a channel failure can be caused by the candidate.
+        pytest.param(
+            "channel", "incomplete", "observation_failure",
+            id="channel-envelope",
+        ),
+    ],
+)
+def test_recovery_post_fix_gate_that_could_not_run_never_reaches_the_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    envelope_kind: str | None,
+    expected_status: str,
+    expected_skip_reason: str,
+) -> None:
+    """The gate after a no-progress Defender repair has the same stop."""
+
+    from crucible.common.runners.breach_observation import (
+        BREACH_OBSERVATION_FAILURE_SCHEMA,
+    )
+    from crucible.workflows import breach as breach_mod
+    from crucible.workflows._build_verify import BuildVerifyOutcome
+
+    corpus, diff = _setup_corpus(tmp_path)
+    source = tmp_path / "file"
+    source_before = source.read_bytes()
+    scripted = ScriptedBackend(
+        [
+            _breaker_with_attacks("race_a"),
+            _implementation_response(),
+            _implementation_response(),
+            _implementation_response(),
+            _judge_reject(),
+            _implementation_response(),
+        ],
+    )
+    original_invoke = scripted.invoke
+    defender_calls = 0
+
+    def changing_defender(invocation: Invocation) -> InvocationResult:
+        # Each Defender turn leaves a different in-scope edit, so neither
+        # is an empty repair.
+        nonlocal defender_calls
+        is_defender = "# BREACH DEFENDER — production fix" in invocation.user
+        if is_defender:
+            defender_calls += 1
+            scripted.mutate_production = defender_calls == 1
+        result = original_invoke(invocation)
+        if is_defender and defender_calls == 2:
+            source.write_text("recovery-fix\n", encoding="utf-8")
+        return result
+
+    scripted.invoke = changing_defender
+    _patch_backend(monkeypatch, scripted)
+    monkeypatch.setattr(
+        breach_mod,
+        "_load_deepswe_metadata",
+        lambda _path: {"container_id": "cid", "language": "python"},
+    )
+    monkeypatch.setattr(
+        breach_mod,
+        "validate_breach_observation_runner",
+        lambda *args, **kwargs: None,
+    )
+    failed = BuildVerifyOutcome(
+        "verify_failed",
+        build=None,
+        verify=_runner_result(
+            "tests/test_breach.py::test_race_a FAILED",
+            returncode=1,
+        ),
+    )
+    failure = (
+        None
+        if envelope_kind is None
+        else {
+            "schema_version": BREACH_OBSERVATION_FAILURE_SCHEMA,
+            "kind": envelope_kind,
+            "detail": f"exact observation {envelope_kind} failure",
+        }
+    )
+    last_gate = (
+        _unavailable_round_gate()
+        if failure is None
+        else BuildVerifyOutcome(
+            "verify_failed",
+            build=None,
+            verify=_runner_result(returncode=2, observation_failure=failure),
+        )
+    )
+    outcomes = iter((failed, failed, last_gate))
+    gate_calls = 0
+
+    def gates(*_args, **_kwargs):
+        nonlocal gate_calls
+        gate_calls += 1
+        try:
+            return next(outcomes)
+        except StopIteration as exc:
+            raise AssertionError(
+                "the round ran another gate after its last one gave no evidence"
+            ) from exc
+
+    monkeypatch.setattr(
+        breach_mod._build_verify,
+        "build_and_verify",
+        _contract_aware_build_verify_stub(gates),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert breach_mod.main([
+        "--spec", str(corpus.spec_dir),
+        "--diff", str(diff),
+        "--max-rounds", "1",
+    ]) == 3
+
+    # Breaker, Test Author, Defender, one no-progress Defender repair.
+    assert len(scripted.calls) == 4
+    assert defender_calls == 2
+    assert all(
+        "technical judge evaluating" not in call.system
+        for call in scripted.calls
+    )
+    assert gate_calls == 3
+    summary, outcome, events = _breach_run_files(corpus)
+    assert summary["status"] == expected_status
+    assert outcome["terminal_class"] == (
+        "inconclusive"
+        if expected_status == "inconclusive_gate_unavailable"
+        else "permanent_failure"
+    )
+    round_summary = summary["rounds"][0]
+    assert round_summary["skip_reason"] == expected_skip_reason
+    assert round_summary["defender_recovery_attempts"] == 1
+    assert round_summary["judge_findings"] == 0
+    assert round_summary["observation_failure"] == failure
+    if failure is None:
+        assert round_summary["post_fix_classification"] == (
+            "dev_verify_unavailable"
+        )
+        assert any(
+            event.get("status") == "post_fix_gate_unavailable"
+            and event.get("classification") == "dev_verify_unavailable"
+            and event.get("recovery") == "no_progress"
+            for event in events
+        )
+    else:
+        assert round_summary["post_fix_classification"] == "verify_failed"
+        assert any(
+            event.get("status") == "post_fix_observation_failure"
+            and event.get("failure") == failure
+            for event in events
+        )
+    assert source.read_bytes() == source_before
+    assert not (tmp_path / "tests" / "test_breach.py").exists()
+
+
+@pytest.mark.parametrize(
+    ("phase", "kind", "unavailable", "gate_command_timed_out", "expected_status"),
+    [
+        pytest.param(
+            "pre_fix", "channel", False, False, "incomplete", id="pre-channel",
+        ),
+        pytest.param(
+            "pre_fix", "configuration", False, False, "incomplete",
+            id="pre-configuration",
+        ),
+        # The runner's own flag wins over a channel envelope.
+        pytest.param(
+            "pre_fix", "channel", True, False, "inconclusive_gate_unavailable",
+            id="pre-channel-and-unavailable-gate",
+        ),
+        # The candidate's suite ran to the runner's cap, so the observers
+        # never started: a judged timeout, not an outage.
+        pytest.param(
+            "pre_fix", "infrastructure", False, True, "incomplete",
+            id="pre-infrastructure-after-gate-command-timeout",
+        ),
+        pytest.param(
+            "post_fix", "infrastructure", False, False,
+            "inconclusive_gate_unavailable",
+            id="post-infrastructure",
+        ),
+        # The same for a Defender fix that hangs the suite.
+        pytest.param(
+            "post_fix", "infrastructure", False, True, "incomplete",
+            id="post-infrastructure-after-gate-command-timeout",
+        ),
+        pytest.param(
+            "post_fix", "channel", False, False, "incomplete", id="post-channel",
+        ),
+        pytest.param(
+            "post_fix", "configuration", False, False, "incomplete",
+            id="post-configuration",
+        ),
+    ],
+)
+def test_observation_failure_status_follows_the_envelope_kind_and_the_gate_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    kind: str,
+    unavailable: bool,
+    gate_command_timed_out: bool,
+    expected_status: str,
+) -> None:
+    """Channel and configuration failures stay ``incomplete``.
+
+    They can be caused by the candidate or the generated test. Only an
+    infrastructure envelope, or the runner's own unavailable flag, files the
+    loop as ended without a verdict; an infrastructure envelope that follows
+    a timed-out gate command does not. The envelope stop itself is unchanged.
+    """
+
+    from crucible.common.runners.breach_observation import (
+        BREACH_OBSERVATION_FAILURE_SCHEMA,
+    )
+    from crucible.workflows import breach as breach_mod
+    from crucible.workflows._build_verify import BuildVerifyOutcome
+
+    corpus, diff = _setup_corpus(tmp_path)
+    scripted = ScriptedBackend([
+        _breaker_with_attacks("race_a"),
+        _implementation_response(),
+        _implementation_response(),
+        _judge_reject(),
+    ])
+    _patch_backend(monkeypatch, scripted)
+    failure = {
+        "schema_version": BREACH_OBSERVATION_FAILURE_SCHEMA,
+        "kind": kind,
+        "detail": f"exact observation {kind} failure",
+    }
+    failed_with_envelope = (
+        _window_closed_round_gate(failure, gate_command_returncode=124.0)
+        if gate_command_timed_out
+        else BuildVerifyOutcome(
+            "dev_verify_unavailable" if unavailable else "verify_failed",
+            build=None,
+            verify=_runner_result(returncode=2, observation_failure=failure),
+        )
+    )
+    outcomes = iter(
+        (failed_with_envelope,)
+        if phase == "pre_fix"
+        else (
+            BuildVerifyOutcome(
+                "verify_failed",
+                build=None,
+                verify=_runner_result(
+                    "tests/test_breach.py::test_race_a FAILED",
+                    returncode=1,
+                ),
+            ),
+            failed_with_envelope,
+        )
+    )
+    monkeypatch.setattr(
+        breach_mod._build_verify,
+        "build_and_verify",
+        _contract_aware_build_verify_stub(
+            lambda *args, **kwargs: next(outcomes)
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert breach_mod.main([
+        "--spec", str(corpus.spec_dir),
+        "--diff", str(diff),
+        "--max-rounds", "1",
+    ]) == 3
+
+    assert len(scripted.calls) == (2 if phase == "pre_fix" else 3)
+    assert all(
+        "technical judge evaluating" not in call.system
+        for call in scripted.calls
+    )
+    summary, outcome, events = _breach_run_files(corpus)
+    assert summary["status"] == expected_status
+    assert outcome["terminal_class"] == (
+        "inconclusive"
+        if expected_status == "inconclusive_gate_unavailable"
+        else "permanent_failure"
+    )
+    round_summary = summary["rounds"][0]
+    assert round_summary["skip_reason"] == "observation_failure"
+    assert round_summary["observation_failure"] == failure
+    assert round_summary["test_author_repair_attempts"] == 0
+    assert any(
+        event.get("status") == f"{phase}_observation_failure"
+        and event.get("failure") == failure
+        for event in events
+    )
+    assert not (tmp_path / "tests" / "test_breach.py").exists()
 
 
 def _patch_repeated_named_attack_runs(
@@ -1545,6 +2408,125 @@ def test_breach_first_round_clean_returns_0(tmp_path: Path, monkeypatch):
     # Breaker verdict + LifecycleEvent both appended.
     assert len(spec.verdict_refs) == 1
     assert len(spec.lifecycle_event_refs) == 1
+
+
+@pytest.mark.parametrize(
+    ("classification", "gate_writes_source", "expected_status"),
+    [
+        pytest.param(
+            "dev_verify_unavailable",
+            False,
+            "inconclusive_gate_unavailable",
+            id="could-not-run",
+        ),
+        pytest.param(
+            "dev_verify_failed",
+            False,
+            "inconclusive_post_strip_verify",
+            id="ran-and-failed",
+        ),
+        pytest.param(
+            "dev_verify_unavailable",
+            True,
+            "inconclusive_post_strip_verify",
+            id="could-not-run-and-changed-source",
+        ),
+    ],
+)
+def test_final_shipping_gate_that_could_not_run_ends_without_a_verdict(
+    tmp_path: Path,
+    monkeypatch,
+    classification: str,
+    gate_writes_source: bool,
+    expected_status: str,
+):
+    """An unavailable final shipping gate is not a failed verification.
+
+    The Breaker found no attack, so the final shipping gate is the only gate
+    of the run. When it could not run, nothing judged the accepted bytes and
+    the loop ends ``inconclusive_gate_unavailable``. A gate that ran and
+    failed, or that changed source whatever it classified, is deterministic
+    evidence and keeps ``inconclusive_post_strip_verify``.
+    """
+
+    from assay import LifecycleEvent
+    from crucible.workflows import _mutation_journal
+    from crucible.workflows import breach as breach_mod
+    from crucible.workflows._build_verify import (
+        BuildVerifyOutcome,
+        RunnerResult,
+    )
+
+    corpus, diff = _setup_corpus(tmp_path)
+    scripted = ScriptedBackend([_breaker_clean()])
+    _patch_backend(monkeypatch, scripted)
+    unavailable = classification == "dev_verify_unavailable"
+    gate_calls: list[str] = []
+
+    def shipping_gate(*_args, **kwargs):
+        gate_calls.append(kwargs["slice_id"])
+        if gate_writes_source:
+            (tmp_path / "file").write_text("gate\n", encoding="utf-8")
+        return BuildVerifyOutcome(
+            classification,
+            build=None,
+            verify=None,
+            dev_verify=RunnerResult(
+                role="dev_verify",
+                runner="crucible.products.deepswe.runners.deepswe_dev_verify",
+                returncode=2 if unavailable else 1,
+                values={
+                    "dev_verify_infrastructure_unavailable": (
+                        1.0 if unavailable else 0.0
+                    ),
+                },
+                raw_output=b'{"raw_output":"final shipping gate"}',
+                stderr=b"",
+                duration_s=0.01,
+            ),
+        )
+
+    monkeypatch.setattr(
+        breach_mod._build_verify,
+        "build_and_verify",
+        _contract_aware_build_verify_stub(shipping_gate),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert breach_mod.main([
+        "--spec", str(corpus.spec_dir),
+        "--diff", str(diff),
+        "--max-rounds", "1",
+    ]) == 3
+
+    # One Breaker call and one gate: no Defender ran, no round gate ran.
+    assert len(scripted.calls) == 1
+    assert gate_calls == ["breach_final_shipping"]
+    run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
+    summary = json.loads((run_dir / "summary.json").read_text())
+    result = json.loads((run_dir / "result.json").read_text())
+    outcome = json.loads((run_dir / "outcome.json").read_text())
+    assert summary["status"] == expected_status
+    assert result["status"] == expected_status
+    assert outcome["detail_status"] == expected_status
+    assert outcome["terminal_class"] == "inconclusive"
+    # Nothing is accepted: the pre-breach candidate is back, no journal is
+    # left, and the lifecycle records an abandoned loop.
+    assert (tmp_path / "file").read_text(encoding="utf-8") == "new\n"
+    assert not (tmp_path / "tests" / "test_breach.py").exists()
+    assert _mutation_journal.discover_mutation_journals(
+        corpus,
+        workspace=tmp_path,
+    ) == ()
+    latest = corpus.latest_spec()
+    assert latest is not None
+    assert len(latest.lifecycle_event_refs) == 1
+    event = corpus.get_record(
+        latest.lifecycle_event_refs[0],
+        as_type=LifecycleEvent,
+    )
+    assert event.kind == "abandoned"
+    assert event.reason == f"breach loop {expected_status}"
 
 
 def test_medium_and_low_breaker_pass_stops_before_paid_admission(
@@ -6614,7 +7596,7 @@ def test_breach_defender_blocked_restores_partial_and_stops_before_judge(
     assert gate_calls == 1
     assert source.read_bytes() == source_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())
@@ -6695,7 +7677,7 @@ def test_breach_exact_defender_budget_terminal_outranks_blocked_report(
     assert gate_calls == 1
     assert source.read_bytes() == source_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())
@@ -6858,7 +7840,7 @@ def test_exact_defender_budget_terminal_outranks_malformed_completion(
     assert gate_calls == 1
     assert source.read_bytes() == source_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())
@@ -8851,6 +9833,14 @@ def test_no_progress_requires_identical_status_and_failure_signature():
             "hard_fail_tool_mutation_indeterminate",
             None,
         ),
+        # The Defender ends its turn normally and writes in scope, but the
+        # capture ``assay.implement`` takes after the call fails.
+        (
+            "capture",
+            "hard_fail_capture",
+            "incomplete",
+            "defender_incomplete_terminal",
+        ),
     ],
 )
 def test_defender_incomplete_write_restores_inherited_dirty_baseline(
@@ -8863,9 +9853,36 @@ def test_defender_incomplete_write_restores_inherited_dirty_baseline(
 ):
     """A failed Defender terminal cannot promote its partial production edit."""
 
+    import importlib
+
     from assay.types.invocation import TransportError
     from crucible.workflows import breach as breach_mod
     from crucible.workflows._build_verify import BuildVerifyOutcome
+
+    # ``assay.primitives`` re-exports the ``implement`` function under the
+    # module's own name, so resolve the module explicitly.
+    assay_implement = importlib.import_module("assay.primitives.implement")
+    real_diff_bytes = assay_implement._git_diff_bytes  # noqa: SLF001
+    capture = {"defender_returned": False, "failed": 0}
+
+    def diff_bytes(*args, **kwargs):
+        # ``assay.implement`` calls this helper directly; Breach's own
+        # captures go through ``capture_workspace_delta``, which always
+        # passes ``max_diff_bytes``. Fail only the capture the primitive
+        # takes after the Defender call returned.
+        if (
+            terminal_kind == "capture"
+            and capture["defender_returned"]
+            and "max_diff_bytes" not in kwargs
+            and not capture["failed"]
+        ):
+            capture["failed"] = 1
+            raise assay_implement.GitCaptureError(
+                "capture Git diff failed: scratch index unavailable"
+            )
+        return real_diff_bytes(*args, **kwargs)
+
+    monkeypatch.setattr(assay_implement, "_git_diff_bytes", diff_bytes)
 
     corpus, diff = _setup_corpus(tmp_path)
     source = tmp_path / "file"
@@ -8889,6 +9906,9 @@ def test_defender_incomplete_write_restores_inherited_dirty_baseline(
         if "# BREACH DEFENDER — production fix" not in invocation.user:
             return result
         escaped.write_text("partial escape\n", encoding="utf-8")
+        if terminal_kind == "capture":
+            capture["defender_returned"] = True
+            return result
         if terminal_kind == "max_turns":
             return dataclasses.replace(result, stop_reason="max_turns")
         return dataclasses.replace(
@@ -8934,10 +9954,11 @@ def test_defender_incomplete_write_restores_inherited_dirty_baseline(
         "--diff", str(diff),
         "--max-rounds", "1",
     ]) == 3
+    assert capture["failed"] == (1 if terminal_kind == "capture" else 0)
     assert len(scripted.calls) == 3
     assert len(gate_calls) == 1
     assert all(
-        "BREACH JUDGE" not in call.system
+        "technical judge evaluating" not in call.system
         for call in scripted.calls
     )
     # ``file`` was already dirty before Breach. Role rollback must preserve
@@ -9047,7 +10068,7 @@ def test_empty_retry_repeated_max_turn_write_never_reaches_post_fix(
     assert source.read_bytes() == source_before
     assert stat.S_IMODE(source.stat().st_mode) == mode_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())
@@ -9153,7 +10174,7 @@ def test_no_progress_retry_max_turn_write_stops_before_second_post_fix(
     assert gate_calls == 2
     assert source.read_bytes() == source_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())
@@ -9267,7 +10288,7 @@ def test_defender_blocked_recovery_stops_without_another_gate_or_judge(
     assert gate_calls == expected_gate_calls
     assert source.read_bytes() == source_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())
@@ -9381,7 +10402,7 @@ def test_defender_recovery_preserves_exact_role_budget_terminal(
     assert gate_calls == expected_gate_calls
     assert source.read_bytes() == source_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())
@@ -9550,7 +10571,7 @@ def test_defender_recovery_accounting_debt_stops_at_exact_retry_call(
     )
     assert source.read_bytes() == source_before
     assert not (tmp_path / "tests" / "test_breach.py").exists()
-    assert all("BREACH JUDGE" not in call.system for call in scripted.calls)
+    assert all("technical judge evaluating" not in call.system for call in scripted.calls)
 
     run_dir = sorted((corpus.spec_dir / "runs").glob("*breach*"))[-1]
     summary = json.loads((run_dir / "summary.json").read_text())

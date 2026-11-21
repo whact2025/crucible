@@ -18,7 +18,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from assay import BackendPolicy, Invocation, MaxTurnsExceeded
+from assay import (
+    CONSERVATIVE_BACKEND_FEATURES,
+    BackendPolicy,
+    BudgetExhausted,
+    Invocation,
+    MaxTurnsExceeded,
+    TransportError,
+)
 
 from crucible.backends import DeepSeekBackend
 from crucible.backends import deepseek as deepseek_mod
@@ -27,9 +34,18 @@ from crucible.backends.config import (
     RoleConfig,
     _parse_role_config,
     resolve_for_role,
+    routing_fingerprint,
 )
-from crucible.backends.features import FeatureAdmissionError
-from crucible.backends.pricing import compute_cost, pricing_for_model
+from crucible.backends.features import (
+    FeatureAdmissionError,
+    feature_profile_for_route,
+)
+from crucible.backends.pricing import (
+    DEFAULT_PRICING,
+    PricingConfigurationError,
+    compute_cost,
+    pricing_for_model,
+)
 
 
 _DIGEST = "sha256:" + "a" * 64
@@ -77,7 +93,7 @@ def _usage(
 def _terminal(
     *,
     response_id: str = "resp_1",
-    model: str = "deepseek-v4-flash",
+    model: str = "deepseek-flash",
     text: str = "done",
     calls: tuple[deepseek_mod._DeepSeekToolCall, ...] = (),
     usage: deepseek_mod._DeepSeekUsage | None = None,
@@ -175,6 +191,22 @@ def worker_module():
     return module
 
 
+@pytest.fixture(scope="module")
+def transport_check_module():
+    source = (
+        Path(deepseek_mod.__file__).with_name("deepseek_worker")
+        / "provider_free_transport_check.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "crucible_deepseek_transport_check_test_module",
+        source,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _terminal_wire(
     sequence: int,
     *,
@@ -185,7 +217,7 @@ def _terminal_wire(
         type="terminal",
         terminal_type="response.completed",
         response_id="resp_1",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         system_fingerprint="fp_1",
         output_text="ok",
         tool_calls=[],
@@ -222,7 +254,7 @@ def test_exact_request_identity_and_dispatch_only_credential(monkeypatch):
             {"role": "user", "content": "user"},
         ],
         "max_output_tokens": 32_000,
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "reasoning": {"effort": "high"},
         "stream": True,
         "tools": [],
@@ -234,7 +266,7 @@ def test_exact_request_identity_and_dispatch_only_credential(monkeypatch):
     trace = result.execution_trace
     assert trace is not None
     assert trace.backend == "deepseek"
-    assert trace.requested_model == trace.served_model == "deepseek-v4-flash"
+    assert trace.requested_model == trace.served_model == "deepseek-flash"
     assert trace.endpoint == "https://api.deepseek.com/responses"
     assert trace.requested_effort == "high"
     assert trace.served_effort is None
@@ -272,6 +304,71 @@ def test_alias_host_writer_and_ignored_request_fields_fail_locally(monkeypatch):
                 )
             )
         )
+
+
+def test_route_identity_tables_agree_on_current_flash_alias(
+    worker_module,
+    transport_check_module,
+):
+    import crucible.backends.config as config_mod
+
+    # The request alias is a closed constant in the parent, routing
+    # validation, the worker and the provider-free conformance script. A
+    # partial move leaves a route that one table admits and another refuses.
+    assert deepseek_mod._MODEL == "deepseek-flash"
+    assert config_mod._DEEPSEEK_MODEL == "deepseek-flash"
+    assert worker_module._MODEL == "deepseek-flash"
+    assert transport_check_module.MODEL == "deepseek-flash"
+    assert transport_check_module.EXPECTED_VERSION == deepseek_mod._OPENAI_VERSION
+    assert worker_module._OPENAI_VERSION == deepseek_mod._OPENAI_VERSION
+    profile = feature_profile_for_route("deepseek", model="deepseek-flash")
+    assert profile != CONSERVATIVE_BACKEND_FEATURES
+    assert profile.structured_output == "prompt_only"
+    assert profile.turn_limit == "hard"
+    # The adapter resolves this price before every dispatch.
+    assert "deepseek-flash" in DEFAULT_PRICING
+    assert pricing_for_model("deepseek-flash").output_per_mtok > 0
+
+
+def test_retired_flash_name_is_refused_by_every_table(worker_module):
+    # The vendor still answers the retired name, so only the closed tables
+    # can show that no alias for it remains.
+    retired = "deepseek-v4-flash"
+    with pytest.raises(ValueError, match="only exact request alias"):
+        DeepSeekBackend(model=retired, _worker_pin=_pin())
+    with pytest.raises(worker_module.WorkerContractError, match="Flash alias"):
+        worker_module._validate_request(
+            {
+                "protocol": "crucible.deepseek-worker.v1",
+                "api_key": "secret-deepseek-test-key",
+                "input": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "user"},
+                ],
+                "max_output_tokens": 32_000,
+                "model": retired,
+                "reasoning": {"effort": "high"},
+                "stream": True,
+                "tools": [],
+            }
+        )
+    with pytest.raises(ValueError, match="requires exact model"):
+        routing_fingerprint(
+            BackendRouting(
+                default=RoleConfig(
+                    backend="deepseek",
+                    model=retired,
+                    feature_admission="diagnostic",
+                )
+            )
+        )
+    assert (
+        feature_profile_for_route("deepseek", model=retired)
+        == CONSERVATIVE_BACKEND_FEATURES
+    )
+    assert retired not in DEFAULT_PRICING
+    with pytest.raises(PricingConfigurationError):
+        pricing_for_model(retired, pricing=dict(DEFAULT_PRICING))
 
 
 def test_runtime_identity_binds_sdk_artifacts_sbom_and_expected_fingerprint(
@@ -326,7 +423,7 @@ def test_diagnostic_routing_requires_predeclared_worker_identity():
     routing = BackendRouting(
         default=RoleConfig(
             backend="deepseek",
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             feature_admission="diagnostic",
             extra={"max_response_tokens": 32_000},
         )
@@ -352,7 +449,7 @@ def test_exact_diagnostic_route_resolves_text_and_confined_writer(monkeypatch):
     routing = BackendRouting(
         default=RoleConfig(
             backend="deepseek",
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             feature_admission="diagnostic",
             extra={
                 "diagnostic_workspace_write": True,
@@ -393,7 +490,7 @@ def test_deepseek_writer_route_rejects_unconfined_controls(monkeypatch):
     routing = BackendRouting(
         default=RoleConfig(
             backend="deepseek",
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             feature_admission="diagnostic",
             extra={"expected_worker_runtime_fingerprint": _DIGEST},
         )
@@ -417,7 +514,7 @@ def test_deepseek_writer_route_control_requires_exact_bool(control):
     routing = BackendRouting(
         default=RoleConfig(
             backend="deepseek",
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             feature_admission="diagnostic",
             extra={
                 "diagnostic_workspace_write": control,
@@ -528,7 +625,7 @@ def test_deepseek_routing_rejects_credentials_before_environment_expansion(
         _parse_role_config(
             {
                 "backend": "deepseek",
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-flash",
                 "api_key": "${SHOULD_NOT_BE_READ}",
             },
             location="default",
@@ -633,12 +730,12 @@ def test_worker_rejects_silently_ignored_request_and_tool_fields(worker_module):
             {"role": "user", "content": "user"},
         ],
         "max_output_tokens": 32_000,
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "reasoning": {"effort": "high"},
         "stream": True,
         "tools": [],
     }
-    assert worker_module._validate_request(request)["model"] == ("deepseek-v4-flash")
+    assert worker_module._validate_request(request)["model"] == ("deepseek-flash")
 
     with pytest.raises(worker_module.WorkerContractError, match="unknown"):
         worker_module._validate_request({**request, "temperature": 0})
@@ -731,7 +828,7 @@ def test_worker_requires_full_stateless_history_and_preserves_reasoning_in_memor
             },
         ],
         "max_output_tokens": 32_000,
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "reasoning": {"effort": "high"},
         "stream": True,
         "tools": [],
@@ -742,6 +839,99 @@ def test_worker_requires_full_stateless_history_and_preserves_reasoning_in_memor
         worker_module._validate_request(
             {**request, "input": request["input"][:-1]}
         )
+
+
+def test_worker_refuses_unpriced_usage_and_server_tool_output(worker_module):
+    base = {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}
+    # Server-side tool use and safety review carry charges the Flash row does
+    # not price, and neither can be requested through the closed request.
+    with pytest.raises(
+        worker_module.WorkerContractError,
+        match="usage fields changed",
+    ):
+        worker_module._usage(
+            {"usage": {**base, "server_tool_use": {"tool_search": 1}}}
+        )
+    with pytest.raises(
+        worker_module.WorkerContractError,
+        match="output token detail fields changed",
+    ):
+        worker_module._usage(
+            {
+                "usage": {
+                    **base,
+                    "output_tokens_details": {
+                        "reasoning_tokens": 5,
+                        "safety_tokens": 3,
+                    },
+                }
+            }
+        )
+    for item_type in ("tool_search_call", "web_search_call"):
+        with pytest.raises(
+            worker_module.WorkerContractError,
+            match="unsupported output item type",
+        ):
+            worker_module._terminal_output(
+                {"output": [{"type": item_type, "id": "item_1"}]}
+            )
+
+
+def test_worker_tolerates_message_phase_and_replays_exact_fields(worker_module):
+    message = {
+        "type": "message",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+    }
+    text, calls, continuation = worker_module._terminal_output(
+        {"output": [message]}
+    )
+    assert text == "ok"
+    assert calls == []
+
+    function_call = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "lookup",
+        "arguments": '{"q":"life"}',
+    }
+    text, calls, continuation = worker_module._terminal_output(
+        {"output": [message, function_call]}
+    )
+    assert text == "ok"
+    assert calls == [
+        {"call_id": "call_1", "name": "lookup", "arguments": '{"q":"life"}'}
+    ]
+    # Only the exact fields the closed request admits are replayed.
+    assert continuation == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "ok"}],
+        },
+        function_call,
+    ]
+    request = {
+        "protocol": "crucible.deepseek-worker.v1",
+        "api_key": "secret-deepseek-test-key",
+        "input": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "user"},
+            *continuation,
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "answer=42",
+            },
+        ],
+        "max_output_tokens": 32_000,
+        "model": "deepseek-flash",
+        "reasoning": {"effort": "high"},
+        "stream": True,
+        "tools": [],
+    }
+    assert worker_module._validate_request(request)["input"] == request["input"]
 
 
 def test_worker_sdk_call_is_exact_native_responses_without_fallback(
@@ -765,7 +955,7 @@ def test_worker_sdk_call_is_exact_native_responses_without_fallback(
                 "sequence_number": 7,
                 "response": {
                     "id": "resp_exact",
-                    "model": "deepseek-v4-flash",
+                    "model": "deepseek-flash",
                     "status": "completed",
                     "system_fingerprint": "fp_exact",
                     "output": [
@@ -813,7 +1003,7 @@ def test_worker_sdk_call_is_exact_native_responses_without_fallback(
                 {"role": "user", "content": "user"},
             ],
             "max_output_tokens": 32_000,
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "reasoning": {"effort": "high"},
             "stream": True,
             "tools": [],
@@ -827,7 +1017,7 @@ def test_worker_sdk_call_is_exact_native_responses_without_fallback(
     assert captured["client"]["max_retries"] == 0
     assert captured["client"]["http_client"].__class__ is FakeHttpClient
     assert captured["create"] == {
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "input": request["input"],
         "max_output_tokens": 32_000,
         "reasoning": {"effort": "high"},
@@ -852,7 +1042,7 @@ def test_missing_cache_counter_remains_unknown_and_uses_incomplete_upper_bound(
     assert result.usage.cache_read_tokens == 0
     assert result.usage.cost_usd == pytest.approx(
         compute_cost(
-            "deepseek-v4-flash",
+            "deepseek-flash",
             input_tokens=1_000,
             output_tokens=100,
             cache_read_tokens=0,
@@ -878,13 +1068,15 @@ def test_missing_reasoning_counter_keeps_usage_incomplete(monkeypatch):
 def test_exact_cache_partition_and_flash_pricing(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek-test-key")
     result = _backend(lambda *_args, **_kwargs: _terminal()).invoke(_invocation())
-    expected = 750 * 0.14 / 1_000_000 + 250 * 0.0028 / 1_000_000
-    expected += 100 * 0.28 / 1_000_000
+    # The row holds the published peak rates (a ceiling off-peak).
+    expected = 750 * 0.30 / 1_000_000 + 250 * 0.006 / 1_000_000
+    expected += 100 * 1.20 / 1_000_000
 
-    pricing = pricing_for_model("deepseek-v4-flash")
-    assert pricing.input_per_mtok == 0.14
-    assert pricing.cache_read_per_mtok == 0.0028
-    assert pricing.output_per_mtok == 0.28
+    pricing = pricing_for_model("deepseek-flash")
+    assert pricing.input_per_mtok == 0.30
+    assert pricing.cache_read_per_mtok == 0.006
+    assert pricing.output_per_mtok == 1.20
+    assert expected == pytest.approx(0.0003465)
     assert result.usage.cost_usd == pytest.approx(expected)
     assert result.usage.cache_read_tokens == 250
     assert result.completeness.token_usage_complete is True
@@ -902,7 +1094,7 @@ def test_cache_write_counter_is_retained_at_cache_miss_rate(monkeypatch):
     assert result.usage.cache_read_tokens == 250
     assert result.usage.cost_usd == pytest.approx(
         compute_cost(
-            "deepseek-v4-flash",
+            "deepseek-flash",
             input_tokens=1_000,
             output_tokens=100,
             cache_creation_tokens=100,
@@ -931,7 +1123,7 @@ def test_prompt_free_response_evidence_retains_physical_accounting(monkeypatch):
             {
                 "response_ordinal": 0,
                 "response_id": "resp_1",
-                "served_model": "deepseek-v4-flash",
+                "served_model": "deepseek-flash",
                 "system_fingerprint": "fp_test",
                 "terminal_type": "response.completed",
                 "input_tokens": 1_000,
@@ -951,10 +1143,24 @@ def test_prompt_free_response_evidence_retains_physical_accounting(monkeypatch):
     assert "user\"" not in serialized
 
 
-def test_served_alias_mismatch_is_terminal_but_not_promotable(monkeypatch):
+@pytest.mark.parametrize(
+    "served_model",
+    (
+        # The snapshot label of the vendor's pricing page instead of the alias.
+        "DeepSeek-V4.1-Flash-1017",
+        # The retired compatibility name of the same route.
+        "deepseek-v4-flash",
+        # The other current native id.
+        "deepseek-v4-pro",
+    ),
+)
+def test_served_alias_mismatch_is_terminal_but_not_promotable(
+    monkeypatch,
+    served_model,
+):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek-test-key")
     result, evidence = _backend(
-        lambda *_args, **_kwargs: _terminal(model="DeepSeek-V4-Flash-0731")
+        lambda *_args, **_kwargs: _terminal(model=served_model)
     ).invoke_with_response_evidence(_invocation())
 
     assert result.error is not None
@@ -965,8 +1171,41 @@ def test_served_alias_mismatch_is_terminal_but_not_promotable(monkeypatch):
     assert result.completeness.terminal_complete is True
     assert result.completeness.cost_complete is False
     assert result.completeness.trace_complete is False
-    assert evidence.responses[0].served_model == "DeepSeek-V4-Flash-0731"
+    trace = result.execution_trace
+    assert trace is not None
+    assert trace.requested_model == "deepseek-flash"
+    assert trace.served_model == served_model
+    assert any(
+        event.kind == "terminal" and event.name == "served_model_mismatch"
+        for event in trace.events
+    )
+    assert evidence.responses[0].served_model == served_model
     assert evidence.complete is False
+
+
+def test_post_response_budget_guard_uses_the_peak_ceiling(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek-test-key")
+    # The standard usage is recorded at the published peak rate. Off-peak the
+    # vendor charges half of it. The guard compares the recorded value, so it
+    # can stop an invocation early and can never let one pass late.
+    peak_cost = 0.0003465
+    off_peak_charge = peak_cost / 2
+
+    inside = _backend(lambda *_args, **_kwargs: _terminal()).invoke(
+        _invocation(budget_usd=0.0004)
+    )
+    assert inside.error is None
+    assert inside.stop_reason == "end_turn"
+    assert inside.usage.cost_usd == pytest.approx(peak_cost)
+
+    assert off_peak_charge < 0.0002 < peak_cost
+    between = _backend(lambda *_args, **_kwargs: _terminal()).invoke(
+        _invocation(budget_usd=0.0002)
+    )
+    assert between.stop_reason == "budget_exhausted"
+    assert type(between.error) is BudgetExhausted
+    assert between.error.spent_usd == pytest.approx(peak_cost)
+    assert between.error.limit_usd == 0.0002
 
 
 class _ReadOnlyToolSet:
@@ -1404,6 +1643,77 @@ def test_dispatch_budget_terminal_stops_before_provider_continuation(monkeypatch
     )
 
 
+@pytest.mark.parametrize(
+    ("limit_name", "stop_reason", "error_type"),
+    (
+        ("budget_usd", "budget_exhausted", BudgetExhausted),
+        ("max_turns", "max_turns", MaxTurnsExceeded),
+        ("context_bytes", "context_limit", TransportError),
+    ),
+)
+def test_limit_exits_return_typed_results_with_one_final_terminal(
+    monkeypatch,
+    limit_name,
+    stop_reason,
+    error_type,
+):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek-test-key")
+    if limit_name == "budget_usd":
+        backend = _backend(lambda *_args, **_kwargs: _terminal())
+        invocation = _invocation(budget_usd=0.0002)
+        response_id = "resp_1"
+    else:
+        pending_call = _terminal(
+            response_id="resp_tool",
+            text="",
+            calls=(
+                deepseek_mod._DeepSeekToolCall(
+                    call_id="call_1",
+                    name="lookup",
+                    arguments='{"q":"life"}',
+                ),
+            ),
+        )
+        backend = _backend(
+            lambda *_args, **_kwargs: pending_call,
+            capability="read_only",
+        )
+        response_id = "resp_tool"
+        if limit_name == "max_turns":
+            # The only admitted round ends with a pending function call.
+            backend.attach_toolset(_ReadOnlyToolSet(), context_budget=1024)
+            invocation = _invocation(max_turns=1)
+        else:
+            # The tool result is nine bytes; the attached bound admits eight.
+            backend.attach_toolset(_ReadOnlyToolSet(), context_budget=8)
+            invocation = _invocation(max_turns=2)
+
+    result, evidence = backend.invoke_with_response_evidence(invocation)
+
+    assert result.stop_reason == stop_reason
+    assert type(result.error) is error_type
+    # The response that reached the limit was paid for. Its usage and both
+    # evidence flags survive the limit exit.
+    assert result.usage.input_tokens == 1_000
+    assert result.usage.output_tokens == 100
+    assert result.usage.cost_usd == pytest.approx(0.0003465)
+    assert result.completeness.token_usage_complete is True
+    assert result.completeness.cost_complete is True
+    assert result.completeness.terminal_complete is True
+    assert result.completeness.trace_complete is True
+    assert result.pricing_evidence is not None
+    assert result.pricing_evidence.complete is True
+    assert len(result.pricing_evidence.segments) == 1
+    assert [item.response_id for item in evidence.responses] == [response_id]
+    trace = result.execution_trace
+    assert trace is not None
+    assert [(event.kind, event.name) for event in trace.events[-2:]] == [
+        ("limit", limit_name),
+        ("terminal", stop_reason),
+    ]
+    assert [event.kind for event in trace.events].count("terminal") == 1
+
+
 def test_cross_response_tool_call_id_reuse_rejects_before_dispatch_or_accounting(
     monkeypatch,
 ):
@@ -1481,7 +1791,7 @@ def test_invocation_evidence_rejects_duplicate_physical_response_ids():
     response = deepseek_mod.DeepSeekResponseEvidence(
         response_ordinal=0,
         response_id="resp_reused",
-        served_model="deepseek-v4-flash",
+        served_model="deepseek-flash",
         system_fingerprint=None,
         terminal_type="response.completed",
         input_tokens=1,

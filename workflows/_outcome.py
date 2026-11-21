@@ -128,17 +128,27 @@ _NO_WORK = frozenset({
     "skipped_empty",
 })
 _INCONCLUSIVE = frozenset({
+    "breach_inconclusive",
     "budget_accounting_incomplete",
+    # A fixed plan candidate whose reviewer answered ``inconclusive`` itself
+    # while none rejected it: nothing ruled on the plan.
+    "candidate_review_inconclusive",
     "cost_incomplete",
     "critic_failures_exhausted",
     "critic_infrastructure_failure",
     "critic_protocol_failure",
+    # A table entry is tested before the permanent ``hard_fail_`` prefix: a
+    # delta that could not be captured was not judged.
+    "hard_fail_capture",
     "incomplete_accounting",
     "inconclusive",
     "inconclusive_breaker",
     "inconclusive_authority",
+    "inconclusive_gate_unavailable",
     "inconclusive_judge",
     "inconclusive_post_strip_verify",
+    "inconclusive_tasks_failed",
+    "inconclusive_tier_failure",
     "inconclusive_transport_failed",
     "inconclusive_workspace_mismatch",
     "insufficient_input",
@@ -148,7 +158,15 @@ _INCONCLUSIVE = frozenset({
     "lifecycle_output_invalid",
     "no_mode_selected",
     "partial_stopped",
+    # Independent drafts shared provider state: a harness fault. The
+    # competition keeps ``plan_competition_inconclusive`` for a ruling and for
+    # a run whose records do not prove a lost call; that status stays in no
+    # table.
+    "plan_competition_isolation_failed",
+    "planner_infrastructure_failure",
     "planner_protocol_failure",
+    "review_inconclusive",
+    "slice_inconclusive",
 })
 _BUDGET = frozenset({
     "aggregate_budget_exceeded",
@@ -156,7 +174,12 @@ _BUDGET = frozenset({
     "budget_exhausted",
     "hard_fail_budget_exhausted",
 })
-_CANCELLED = frozenset({"cancelled", "canceled"})
+_CANCELLED = frozenset({
+    "cancelled",
+    "canceled",
+    # Tested before the permanent ``hard_fail_`` prefix as well.
+    "hard_fail_cancellation",
+})
 _RETRYABLE = frozenset({
     "all_slices_transport_failed",
     "backend_error",
@@ -173,6 +196,8 @@ _RETRYABLE = frozenset({
 _PERMANENT = frozenset({
     "bench_error",
     "breach_exception",
+    "breach_failed",
+    "breach_reject",
     "cascade_error",
     "cleanup_failed",
     "container_preflight_failed",
@@ -216,6 +241,19 @@ _PERMANENT = frozenset({
     "validate_blocked",
     "verification_failed",
     "weighted_severity_veto",
+})
+
+# Classes that are not a ruling on the work: nothing judged it, or the run
+# was stopped. None of them is a retry instruction; a parent uses the set
+# only to keep such a child apart from a judged failure. The inconclusive
+# class also holds the accounting terminals (``incomplete_accounting``,
+# ``cost_incomplete``, ``budget_accounting_incomplete``) and
+# ``partial_stopped``, after which the work may have been judged in full; a
+# reader tests accounting and budget first.
+UNJUDGED_TERMINAL_CLASSES: frozenset[TerminalClass] = frozenset({
+    TerminalClass.INCONCLUSIVE,
+    TerminalClass.RETRYABLE_FAILURE,
+    TerminalClass.CANCELLED,
 })
 
 
@@ -1987,6 +2025,7 @@ __all__ = [
     "TOOL_MUTATION_INDETERMINATE_CLASSIFICATION",
     "TOOL_MUTATION_INDETERMINATE_STOP_REASON",
     "TerminalClass",
+    "UNJUDGED_TERMINAL_CLASSES",
     "UnknownToolMutationUsage",
     "WorkflowOutcome",
     "begin_run",

@@ -33,7 +33,9 @@ Filesystem checks per slice are anchored at
    implementation/project/checkout bases agree, and the live Git
    mode/type/blob matches the dependency-ordered final postimage. A plain
    ``RuleContext`` carries no such authority, so planning-time collisions
-   remain blocking.
+   remain blocking. The authority is per exact triple. A retained slice of
+   an incomplete tier holds it once Crucible proves its postimage; a failed,
+   pending, or unrecorded sibling never inherits it.
 
 3. **creates_paths** parent directory existence.
    Severity: **Low** (informational, non-blocking). A creates_path
@@ -105,6 +107,12 @@ class CitedPathExistsContext(RuleContext):
     base and whose successful Implementation evidence was validated. Callers
     must derive these sets from Crucible's resume partition rather than from
     unbound records in the artifact store.
+
+    The create authority is per exact triple. A retained slice of an
+    incomplete tier holds it once Crucible proves its postimage; a failed,
+    pending, or unrecorded sibling never inherits it. ``scope_covers_intent``
+    reads ``verified_create_paths`` with ``successful_plan_bound_slices`` for
+    the same proof.
 
     Planning and pre-implementation validation deliberately use the base
     :class:`RuleContext`, which cannot suppress an existing-path collision.

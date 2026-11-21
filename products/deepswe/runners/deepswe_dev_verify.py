@@ -53,7 +53,11 @@ Recognized ``parameters``:
   ``base_commit``. The optional ``dev_verify_parser`` selects one of
   ``pytest``, ``rust-libtest``, ``go-json``, ``jest``, ``vitest``, ``mocha``,
   ``node-tap``, or ``ava-tap`` when the exact command/output cannot be
-  detected safely.
+  detected safely. ``dev_verify_gate_created_paths`` is the workflow-owned
+  record of the paths this gate's command creates on the untouched checkout
+  (from the clean preflight): the runner removes those of them that were
+  absent before its commands and exist after them, in the candidate
+  checkout and after each baseline command in the clean-base checkout.
 - ``role``: injected by ``_build_verify``; only ``"dev_verify"`` (or
   the unset default) is honored. Other roles are a routing bug.
 - ``declared_verification_surface``: workflow-owned, normalized slice paths.
@@ -94,6 +98,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -117,6 +122,7 @@ from crucible.common.runners.repair_progress import (
     build_repair_failure_set,
 )
 from crucible.common.runners.container_exec import (
+    CONTAINMENT_NOT_STARTED_RC,
     CONTAINMENT_UNUSABLE_RC,
     run_contained_docker_exec,
 )
@@ -198,10 +204,22 @@ PROVENANCE_INFRASTRUCTURE_FLAGS = (
     "dev_verify_dependency_unavailable",
     "dev_verify_parser_unavailable",
 )
+GATE_CREATED_PATHS_KEY = "dev_verify_gate_created_paths"
+GATE_CREATED_PATHS_SCHEMA = "crucible.deepswe-gate-created-paths.v1"
+# One contained command carries the complete record as a single ``bash -c``
+# argument.  These bounds keep that argument below the kernel's 128 KiB limit
+# for one argument even when every byte needs the longest shell quoting.
+MAX_GATE_CREATED_PATHS = 256
+MAX_GATE_CREATED_PATH_BYTES = 16_384
+_CONTAINER_WORKSPACE = "/app"
 
 
 class _RunnerDeadlineExceeded(RuntimeError):
     """The workflow-owned runner execution window has closed."""
+
+
+class _ContainedCommandNotStarted(RuntimeError):
+    """Docker or the exec supervisor failed before a later command existed."""
 
 
 class _RunnerDeadline:
@@ -256,8 +274,8 @@ class _RunnerDeadline:
 # breaks every construction site project-wide, which a scoped run would
 # miss. A correct incomplete increment (optional field + inline default)
 # does not red the suite, so the full suite is already the right
-# discriminator. The plan-critic's required-field-atomicity rule
-# (deepswe_plan_critic rule 7) is the upstream lever that keeps each
+# discriminator. The plan-critic's contract-atomicity rule
+# (deepswe_plan_critic rule 8) is the upstream lever that keeps each
 # slice non-regressing — not a looser gate here.
 # Each command is COMPILE-then-TEST in a single in-container run (``&&``),
 # so a signature / symbol / wiring deviation fails as a BUILD error before
@@ -427,7 +445,8 @@ def _run_docker_exec(
     The containment helper preserves the source container's exact workspace,
     environment, and staged toolchain while proving that no command descendant
     survives this call.  Timeout surfaces as returncode 124; missing Docker or
-    the static-helper compiler as 127.
+    the static-helper compiler as 127; a command that never started because
+    Docker or the supervisor failed first as ``CONTAINMENT_NOT_STARTED_RC``.
     """
     bounded_timeout = (
         deadline.remaining(cap=float(timeout))
@@ -443,6 +462,43 @@ def _run_docker_exec(
         timeout=bounded_timeout,
         cleanup_timeout=cleanup_grace,
     )
+
+
+def _not_started_diagnostic(stdout: str, stderr: str) -> str:
+    """Describe a contained command that never started, never as empty text."""
+
+    return "contained command never started: " + (
+        (stdout + stderr).strip()[-500:] or "no diagnostic"
+    )
+
+
+def _run_started_docker_exec(
+    container_id: str,
+    command: str,
+    *,
+    timeout: float = _DEV_VERIFY_TIMEOUT_SEC,
+    deadline: _RunnerDeadline | None = None,
+) -> tuple[int, str, str]:
+    """Run one contained command that follows the gate's own command.
+
+    The declared-file probes and the exact observations read a status as an
+    outcome of the candidate's tests.  A command that never started has none,
+    so it raises ``_ContainedCommandNotStarted`` instead of returning
+    ``CONTAINMENT_NOT_STARTED_RC`` for a caller to parse; every other status
+    is returned unchanged.
+    """
+
+    rc, stdout, stderr = _run_docker_exec(
+        container_id,
+        command,
+        timeout=timeout,
+        deadline=deadline,
+    )
+    if rc == CONTAINMENT_NOT_STARTED_RC:
+        raise _ContainedCommandNotStarted(
+            _not_started_diagnostic(stdout, stderr)
+        )
+    return rc, stdout, stderr
 
 
 def _declared_container_path_state(
@@ -465,7 +521,7 @@ def _declared_container_path_state(
         '[ "$resolved" = "$candidate" ] || exit 44; '
         'printf "safe\\n"'
     )
-    rc, stdout, stderr = _run_docker_exec(
+    rc, stdout, stderr = _run_started_docker_exec(
         container_id,
         command,
         timeout=30,
@@ -979,6 +1035,313 @@ def _clean_infrastructure_provenance(
     }
 
 
+def _canonical_gate_created_paths(raw: object) -> tuple[str, ...]:
+    """Return an exact bindable record of gate-created paths or raise.
+
+    A record names workspace-relative roots: sorted, unique, none below
+    another, each a canonical POSIX path whose name is valid UTF-8 without
+    control characters and never Git metadata.  Anything else is refused as
+    a whole; the runner removes recorded paths, so it binds no approximation.
+    """
+
+    if type(raw) not in (list, tuple):
+        raise ValueError("gate-created paths must be a list")
+    paths = tuple(raw)
+    if not paths:
+        raise ValueError("gate-created paths must not be empty")
+    if len(paths) > MAX_GATE_CREATED_PATHS:
+        raise ValueError(
+            f"gate-created paths exceed {MAX_GATE_CREATED_PATHS} entries"
+        )
+    total_bytes = 0
+    for path in paths:
+        if type(path) is not str or not path:
+            raise ValueError("gate-created path must be a non-empty string")
+        try:
+            total_bytes += len(path.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "gate-created path name is not valid UTF-8"
+            ) from exc
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or not pure.parts
+            or pure.as_posix() != path
+            or any(part in {".", ".."} for part in pure.parts)
+            or any(part.casefold() == ".git" for part in pure.parts)
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in path)
+        ):
+            raise ValueError(f"gate-created path is not canonical: {path!r}")
+    if total_bytes > MAX_GATE_CREATED_PATH_BYTES:
+        raise ValueError(
+            f"gate-created paths exceed {MAX_GATE_CREATED_PATH_BYTES} bytes"
+        )
+    if paths != tuple(sorted(set(paths))):
+        raise ValueError("gate-created paths must be sorted and unique")
+    recorded = frozenset(paths)
+    for path in paths:
+        if any(
+            parent.as_posix() in recorded
+            for parent in PurePosixPath(path).parents
+        ):
+            raise ValueError(
+                f"gate-created path lies below another recorded path: {path!r}"
+            )
+    return paths
+
+
+def gate_created_paths_evidence(
+    paths: Iterable[str],
+) -> dict[str, object] | None:
+    """Bind the paths a gate run creates on the untouched checkout.
+
+    Returns the evidence a later gate run accepts under
+    ``GATE_CREATED_PATHS_KEY``, or ``None`` when there is nothing to bind or
+    the record cannot be bound exactly (too many paths, too many bytes, or a
+    name that is not canonical).  It never raises.
+    """
+
+    if isinstance(paths, (str, bytes)):
+        # One name is not a record; its characters are not paths.
+        return None
+    try:
+        canonical = _canonical_gate_created_paths(sorted(set(paths)))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "schema_version": GATE_CREATED_PATHS_SCHEMA,
+        "paths": list(canonical),
+    }
+
+
+def _validated_gate_created_paths(metadata: dict[str, Any]) -> tuple[str, ...]:
+    """Return the workflow-bound gate-created paths, ``()`` when unbound."""
+
+    if GATE_CREATED_PATHS_KEY not in metadata:
+        return ()
+    raw = metadata[GATE_CREATED_PATHS_KEY]
+    if (
+        type(raw) is not dict
+        or set(raw) != {"schema_version", "paths"}
+        or raw["schema_version"] != GATE_CREATED_PATHS_SCHEMA
+        or type(raw["paths"]) is not list
+    ):
+        raise ValueError(
+            f"{GATE_CREATED_PATHS_KEY} must be exact "
+            f"{GATE_CREATED_PATHS_SCHEMA} evidence"
+        )
+    try:
+        return _canonical_gate_created_paths(raw["paths"])
+    except ValueError as exc:
+        raise ValueError(f"{GATE_CREATED_PATHS_KEY} is malformed: {exc}") from exc
+
+
+def _gate_created_path_arguments(
+    paths: tuple[str, ...],
+    *,
+    workspace_root: str,
+) -> str:
+    """Render each path once, as its parent directory and its name."""
+
+    root = PurePosixPath(workspace_root)
+    words: list[str] = []
+    for path in paths:
+        absolute = root / PurePosixPath(path)
+        words.append(shlex.quote(absolute.parent.as_posix()))
+        words.append(shlex.quote(absolute.name))
+    return "set -- " + " ".join(words)
+
+
+def _gate_created_probe_script(
+    paths: tuple[str, ...],
+    *,
+    workspace_root: str = _CONTAINER_WORKSPACE,
+) -> str:
+    """Render the read-only script that reports each path's presence.
+
+    The script prints exactly one line per path, in order: ``present`` when
+    anything (a dangling symlink included) has that name, else ``absent``.
+    """
+
+    return "\n".join((
+        _gate_created_path_arguments(paths, workspace_root=workspace_root),
+        'while [ "$#" -gt 0 ]; do',
+        '  if [ -e "$1/$2" ] || [ -L "$1/$2" ]; then printf "present\\n";',
+        '  else printf "absent\\n"; fi',
+        "  shift 2",
+        "done",
+    ))
+
+
+def _gate_created_removal_script(
+    paths: tuple[str, ...],
+    *,
+    workspace_root: str = _CONTAINER_WORKSPACE,
+) -> str:
+    """Render the script that removes each recorded path that exists.
+
+    The first pass removes nothing: it exits 44 unless the parent directory
+    of every existing path resolves to itself, so no operand is reached
+    through a symlink.  The second pass prints exactly one line per path, in
+    order: ``absent``, or ``removed`` after ``rm -rf`` on that one name (a
+    symlink operand is unlinked, never followed) left nothing behind.
+    """
+
+    return "\n".join((
+        _gate_created_path_arguments(paths, workspace_root=workspace_root),
+        "check() {",
+        '  if [ -e "$1/$2" ] || [ -L "$1/$2" ]; then',
+        '    resolved=$(readlink -f "$1") || exit 42',
+        '    [ "$resolved" = "$1" ] || exit 44',
+        "  fi",
+        "}",
+        "remove() {",
+        '  if [ ! -e "$1/$2" ] && [ ! -L "$1/$2" ]; then',
+        '    printf "absent\\n"; return 0',
+        "  fi",
+        '  rm -rf -- "$1/$2" || exit 45',
+        '  if [ -e "$1/$2" ] || [ -L "$1/$2" ]; then exit 46; fi',
+        '  printf "removed\\n"',
+        "}",
+        "each() {",
+        "  action=$1; shift",
+        '  while [ "$#" -gt 0 ]; do "$action" "$1" "$2"; shift 2; done',
+        "}",
+        'each check "$@"',
+        'each remove "$@"',
+    ))
+
+
+def _gate_created_path_states(
+    container_id: str,
+    script: str,
+    paths: tuple[str, ...],
+    *,
+    states: frozenset[str],
+    action: str,
+    timeout: float,
+    deadline: _RunnerDeadline | None,
+) -> tuple[str, ...]:
+    """Run one gate-created-path script and read its exact line protocol."""
+
+    rc, stdout, stderr = _run_docker_exec(
+        container_id,
+        script,
+        timeout=timeout,
+        deadline=deadline,
+    )
+    observed = tuple(stdout.splitlines())
+    if (
+        rc != 0
+        or len(observed) != len(paths)
+        or any(state not in states for state in observed)
+    ):
+        raise ValueError(
+            f"gate-created path {action} failed: rc={rc}, "
+            f"lines={len(observed)}/{len(paths)}, stderr={stderr[-500:]!r}"
+        )
+    return observed
+
+
+def _absent_gate_created_paths(
+    container_id: str,
+    paths: tuple[str, ...],
+    *,
+    deadline: _RunnerDeadline | None = None,
+    workspace_root: str = _CONTAINER_WORKSPACE,
+) -> tuple[str, ...]:
+    """Return the recorded paths that do not exist in the checkout now."""
+
+    states = _gate_created_path_states(
+        container_id,
+        _gate_created_probe_script(paths, workspace_root=workspace_root),
+        paths,
+        states=frozenset({"present", "absent"}),
+        action="probe",
+        timeout=30,
+        deadline=deadline,
+    )
+    return tuple(
+        path
+        for path, state in zip(paths, states, strict=True)
+        if state == "absent"
+    )
+
+
+def _remove_gate_created_paths(
+    container_id: str,
+    paths: tuple[str, ...],
+    *,
+    deadline: _RunnerDeadline | None = None,
+    workspace_root: str = _CONTAINER_WORKSPACE,
+) -> int:
+    """Remove the given recorded paths and return how many existed.
+
+    The caller passes only paths that were absent before its own commands
+    ran.  That makes each one found here the residue of those commands, on
+    one condition: nothing but this runner's commands writes the checkout
+    between the probe and this removal.  DeepSWE runs one task serially and
+    the gate holds the build lock, so the condition holds; a concurrent
+    writer on the same checkout would have a file deleted whenever it landed
+    on a recorded path.
+    """
+
+    states = _gate_created_path_states(
+        container_id,
+        _gate_created_removal_script(paths, workspace_root=workspace_root),
+        paths,
+        states=frozenset({"removed", "absent"}),
+        action="removal",
+        timeout=120,
+        deadline=deadline,
+    )
+    return sum(state == "removed" for state in states)
+
+
+def _invalid_baseline_outcome(parser_kind: str, reason: str) -> TestOutcome:
+    """Build the clean-base outcome that makes a comparison unavailable."""
+
+    return TestOutcome(
+        parser_kind=parser_kind,
+        returncode=2,
+        tests_run=None,
+        summary=(),
+        failures=(),
+        failure_set_complete=False,
+        output_sha256="0" * 64,
+        structural_error=reason,
+    )
+
+
+def _baseline_gate_residue_error(
+    baseline: dict[str, str],
+    gate_created_paths: tuple[str, ...],
+    *,
+    deadline: _RunnerDeadline | None,
+) -> str:
+    """Remove what one baseline command created in the clean-base checkout.
+
+    The clean-base probe shows that checkout without untracked paths before
+    the baseline commands of an invocation and each of them is followed by
+    this removal, so every recorded path found there was created by the
+    command that just ran.  Without it the next clean-base probe would find
+    the checkout dirty and end the gate unavailable.
+    """
+
+    if not gate_created_paths:
+        return ""
+    try:
+        _remove_gate_created_paths(
+            baseline["baseline_container_id"],
+            gate_created_paths,
+            deadline=deadline,
+        )
+    except (OSError, ValueError) as exc:
+        return f"clean-base checkout was not restored after its command: {exc}"
+    return ""
+
+
 def _diagnostic_output(
     combined: str,
     candidate: TestOutcome,
@@ -1068,7 +1431,7 @@ def _python_exact_observations(
         node_id = f"{test_file}::{test_id}"
         argv = exact_pytest_command(node_id, python_prefix=("python",))
         command = "cd /app && " + " ".join(shlex.quote(arg) for arg in argv)
-        rc, probe_stdout, stderr = _run_docker_exec(
+        rc, probe_stdout, stderr = _run_started_docker_exec(
             container_id,
             command,
             deadline=deadline,
@@ -1122,7 +1485,7 @@ def _rust_exact_observations(
         " --features " + shlex.quote(",".join(features)) if features else ""
     )
     prefix = f"cargo test{scope}{feature_args}"
-    rc, listed_stdout, listed_stderr = _run_docker_exec(
+    rc, listed_stdout, listed_stderr = _run_started_docker_exec(
         container_id,
         f"cd /app && {prefix} -- --list",
         deadline=deadline,
@@ -1159,7 +1522,7 @@ def _rust_exact_observations(
             })
             continue
         test_id = matches[0]
-        test_rc, test_stdout, test_stderr = _run_docker_exec(
+        test_rc, test_stdout, test_stderr = _run_started_docker_exec(
             container_id,
             f"cd /app && {prefix} {shlex.quote(test_id)} -- "
             "--exact --test-threads=1",
@@ -1216,7 +1579,7 @@ def _go_exact_observations(
     list_command = (
         "cd /app && go list -f '{{.ImportPath}}' " + shlex.quote(package)
     )
-    list_rc, list_stdout, list_stderr = _run_docker_exec(
+    list_rc, list_stdout, list_stderr = _run_started_docker_exec(
         container_id,
         list_command,
         deadline=deadline,
@@ -1241,7 +1604,7 @@ def _go_exact_observations(
             f"{shlex.quote(package)} -run {shlex.quote('^' + test_id + '$')} "
             "-count=1"
         )
-        rc, stdout, stderr = _run_docker_exec(
+        rc, stdout, stderr = _run_started_docker_exec(
             container_id,
             command,
             deadline=deadline,
@@ -1330,7 +1693,7 @@ def _nearest_javascript_package_dir(
         'directory=${directory%/*}; done; '
         'printf "/app\\n"'
     )
-    rc, stdout, stderr = _run_docker_exec(
+    rc, stdout, stderr = _run_started_docker_exec(
         container_id,
         command,
         timeout=30,
@@ -1516,7 +1879,7 @@ def _javascript_exact_observations(
         if setup_command:
             command += setup_command + " && "
         command += invocation
-        rc, stdout, stderr = _run_docker_exec(
+        rc, stdout, stderr = _run_started_docker_exec(
             container_id,
             command,
             deadline=deadline,
@@ -1695,7 +2058,7 @@ def _nearest_rust_package_dir(
         '[ "$directory" = "/app" ] && break; '
         'directory=${directory%/*}; done; exit 1'
     )
-    rc, stdout, stderr = _run_docker_exec(
+    rc, stdout, stderr = _run_started_docker_exec(
         container_id,
         command,
         timeout=30,
@@ -1805,9 +2168,15 @@ def _run_declared_test_probes(
     language: str,
     parser_kind: str,
     baseline: dict[str, str] | None = None,
+    gate_created_paths: tuple[str, ...] = (),
     deadline: _RunnerDeadline | None = None,
 ) -> tuple[int, dict[str, float], str, float, dict[str, object]]:
-    """Run each declared native test file independently and non-vacuously."""
+    """Run each declared native test file independently and non-vacuously.
+
+    ``gate_created_paths`` are removed from the clean-base checkout after
+    each focused baseline command; a checkout that cannot be restored that
+    way ends the probes as unavailable.
+    """
 
     test_files = _declared_test_files(parameters, language)
     accepted_outcomes = _accepted_predecessor_outcomes(
@@ -1846,6 +2215,7 @@ def _run_declared_test_probes(
     effective_rc = 0
     wall_seconds = 0.0
     diagnostics = ["[crucible declared-test verification]"]
+    baseline_residue_errors: list[str] = []
     if baseline is not None:
         probe_error = _probe_clean_baseline_container(
             baseline,
@@ -1870,7 +2240,7 @@ def _run_declared_test_probes(
                 deadline=deadline,
             )
             start = time.monotonic()
-            rc, probe_stdout, probe_stderr = _run_docker_exec(
+            rc, probe_stdout, probe_stderr = _run_started_docker_exec(
                 container_id,
                 command,
                 deadline=deadline,
@@ -1929,12 +2299,23 @@ def _run_declared_test_probes(
                         command: str = command,
                     ) -> TestOutcome | None:
                         baseline_rc, baseline_stdout, baseline_stderr = (
-                            _run_docker_exec(
+                            _run_started_docker_exec(
                                 baseline["baseline_container_id"],
                                 command,
                                 deadline=deadline,
                             )
                         )
+                        residue_error = _baseline_gate_residue_error(
+                            baseline,
+                            gate_created_paths,
+                            deadline=deadline,
+                        )
+                        if residue_error:
+                            baseline_residue_errors.append(residue_error)
+                            return _invalid_baseline_outcome(
+                                parser_kind,
+                                residue_error,
+                            )
                         return parse_test_outcome(
                             language=language,
                             command=command,
@@ -2015,7 +2396,9 @@ def _run_declared_test_probes(
                     diagnostics.append(
                         f"path={test_file} output_tail:\n{output_tail}"
                     )
-        except _RunnerDeadlineExceeded:
+        except (_RunnerDeadlineExceeded, _ContainedCommandNotStarted):
+            # Neither is evidence about this file: the caller ends the
+            # probes as a timeout or as unavailable.
             raise
         except (OSError, TypeError, ValueError) as exc:
             failed += 1
@@ -2025,6 +2408,10 @@ def _run_declared_test_probes(
                 f"path={test_file} status=runner_error "
                 f"reason={str(exc)[:500]}"
             )
+    if baseline_residue_errors:
+        # The clean-base checkout no longer is one: no file comparison of
+        # this run is evidence about the candidate.
+        raise ValueError(baseline_residue_errors[0])
     values = {
         "dev_verify_declared_test_files_required": float(required),
         "dev_verify_declared_test_files_executed": float(executed),
@@ -2106,6 +2493,7 @@ def _emit_runner_unavailable(
     specific_flag: str,
     returncode: int = 2,
     runner_started: float | None = None,
+    breach_observation_failure_payload: dict[str, str] | None = None,
 ) -> None:
     """Emit machine-readable setup unavailability before returning non-zero."""
 
@@ -2123,7 +2511,23 @@ def _emit_runner_unavailable(
         ),
         raw_output=diagnostic,
         test_observations=[],
+        breach_observation_failure_payload=breach_observation_failure_payload,
     )
+
+
+def _unobserved_gate_failure(
+    breach_observations: bool,
+    diagnostic: str,
+) -> dict[str, str] | None:
+    """Type a gate run that Docker or the host ended before its observations.
+
+    A breach round reads this envelope, not the infrastructure flag, to tell
+    a gate that could not run from attack tests that need a repair turn.
+    """
+
+    if not breach_observations:
+        return None
+    return breach_observation_failure("infrastructure", diagnostic)
 
 
 def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
@@ -2270,6 +2674,42 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
         return 2
 
     try:
+        gate_created_paths = _validated_gate_created_paths(metadata)
+    except ValueError as exc:
+        _emit_runner_unavailable(
+            stdout,
+            diagnostic=f"deepswe_dev_verify: {exc}",
+            specific_flag="dev_verify_runner_configuration_unavailable",
+            runner_started=runner_started,
+        )
+        return 2
+
+    # Recorded paths that do not exist now can only be created by the
+    # commands of this invocation; those are removed again after them.
+    restorable_paths: tuple[str, ...] = ()
+    try:
+        if gate_created_paths:
+            try:
+                restorable_paths = _absent_gate_created_paths(
+                    str(container_id),
+                    gate_created_paths,
+                    deadline=deadline,
+                )
+            except (OSError, ValueError) as exc:
+                diagnostic = f"deepswe_dev_verify: {exc}"
+                _emit_runner_unavailable(
+                    stdout,
+                    diagnostic=diagnostic,
+                    specific_flag="dev_verify_gate_residue_unavailable",
+                    runner_started=runner_started,
+                    breach_observation_failure_payload=(
+                        _unobserved_gate_failure(
+                            breach_observations,
+                            diagnostic,
+                        )
+                    ),
+                )
+                return 2
         rc, exec_stdout, exec_stderr = _run_docker_exec(
             str(container_id),
             command,
@@ -2284,10 +2724,53 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
             test_observations=[],
         )
         return 124
+    except OSError as exc:
+        # A host error around the contained command (helper cache, its lock,
+        # the in-flight marker, spawning the Docker client) is not evidence
+        # about the candidate, whether or not the command had started.
+        diagnostic = (
+            "deepswe_dev_verify: contained execution failed on the host: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _emit_runner_unavailable(
+            stdout,
+            diagnostic=diagnostic,
+            specific_flag="dev_verify_containment_unavailable",
+            runner_started=runner_started,
+            breach_observation_failure_payload=_unobserved_gate_failure(
+                breach_observations,
+                diagnostic,
+            ),
+        )
+        return 2
     if exec_stdout:
         logger.info("deepswe_dev_verify: stdout (tail):\n%s", exec_stdout[-2000:])
     if exec_stderr:
         logger.info("deepswe_dev_verify: stderr (tail):\n%s", exec_stderr[-2000:])
+
+    if rc == CONTAINMENT_NOT_STARTED_RC:
+        # Docker or the supervisor failed before the command existed: this
+        # command executed nothing the candidate wrote, so it has no outcome
+        # to parse and nothing a model turn can act on.  The observer
+        # commands of a breach round are not tried either; its gate ends
+        # typed instead.
+        _emit_kpi(
+            stdout,
+            values={
+                "returncode": float(CONTAINMENT_NOT_STARTED_RC),
+                "dev_verify_candidate_process_returncode": float(rc),
+                "dev_verify_command_not_started": 1.0,
+                "dev_verify_infrastructure_unavailable": 1.0,
+            },
+            wall_seconds=time.monotonic() - runner_started,
+            raw_output=(exec_stdout + exec_stderr)[-_RAW_OUTPUT_LIMIT:],
+            test_observations=[],
+            breach_observation_failure_payload=_unobserved_gate_failure(
+                breach_observations,
+                _not_started_diagnostic(exec_stdout, exec_stderr),
+            ),
+        )
+        return CONTAINMENT_NOT_STARTED_RC
 
     if rc == CONTAINMENT_UNUSABLE_RC:
         diagnostic = (exec_stdout + exec_stderr)[-_RAW_OUTPUT_LIMIT:]
@@ -2373,21 +2856,25 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
                 deadline=deadline,
             )
             if probe_error:
-                return TestOutcome(
-                    parser_kind=parser_hint or language,
-                    returncode=2,
-                    tests_run=None,
-                    summary=(),
-                    failures=(),
-                    failure_set_complete=False,
-                    output_sha256="0" * 64,
-                    structural_error=probe_error,
+                return _invalid_baseline_outcome(
+                    parser_hint or language,
+                    probe_error,
                 )
             baseline_rc, baseline_stdout, baseline_stderr = _run_docker_exec(
                 baseline["baseline_container_id"],
                 command,
                 deadline=deadline,
             )
+            residue_error = _baseline_gate_residue_error(
+                baseline,
+                gate_created_paths,
+                deadline=deadline,
+            )
+            if residue_error:
+                return _invalid_baseline_outcome(
+                    parser_hint or language,
+                    residue_error,
+                )
             return parse_test_outcome(
                 language=language,
                 command=command,
@@ -2487,6 +2974,7 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
                 language=language,
                 parser_kind=candidate.parser_kind,
                 baseline=baseline,
+                gate_created_paths=gate_created_paths,
                 deadline=deadline,
             )
             effective_rc = max(effective_rc, declared_rc)
@@ -2501,10 +2989,14 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
                 "[crucible declared-test verification]\n"
                 f"status=timeout reason={str(exc)[:500]}"
             )
-        except (OSError, TypeError, ValueError) as exc:
+        except (
+            _ContainedCommandNotStarted,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:
             effective_rc = max(effective_rc, 2)
             values.update({
-                "dev_verify_infrastructure_unavailable": 1.0,
                 "dev_verify_declared_probe_unavailable": 1.0,
                 "dev_verify_declared_test_files_required": 0.0,
                 "dev_verify_declared_test_files_executed": 0.0,
@@ -2512,6 +3004,11 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
                 "dev_verify_declared_test_files_failed": 1.0,
                 "dev_verify_declared_test_files_structural_failures": 1.0,
             })
+            # A later command that never started is the exception after a
+            # gate command that timed out: the timeout stays attributed to
+            # the candidate, and the command is only reported.
+            if rc != 124 or not isinstance(exc, _ContainedCommandNotStarted):
+                values["dev_verify_infrastructure_unavailable"] = 1.0
             declared_diagnostic = (
                 "[crucible declared-test verification]\n"
                 f"path=<surface> status=runner_error reason={str(exc)[:500]}"
@@ -2577,7 +3074,7 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
             )
             effective_rc = max(effective_rc, 124)
             values["returncode"] = float(effective_rc)
-        except OSError as exc:
+        except (_ContainedCommandNotStarted, OSError) as exc:
             observations = []
             observation_error = str(exc)
             observation_failure_payload = breach_observation_failure(
@@ -2595,6 +3092,43 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
             )
             effective_rc = max(effective_rc, 2)
             values["returncode"] = float(effective_rc)
+    residue_diagnostic = ""
+    if restorable_paths:
+        # Every candidate command of this invocation has run.  What exists
+        # now of the paths that were absent before them is their residue.
+        try:
+            removed_paths = _remove_gate_created_paths(
+                str(container_id),
+                restorable_paths,
+                deadline=deadline,
+            )
+        except _RunnerDeadlineExceeded as exc:
+            # Nothing is removed after the workflow-owned window; the run is
+            # a timeout and the journal deals with what was left.
+            effective_rc = max(effective_rc, 124)
+            values["returncode"] = float(effective_rc)
+            residue_diagnostic = f"status=not_removed reason={str(exc)[:500]}"
+        except (OSError, ValueError) as exc:
+            # A gate whose own residue stays in the checkout is neither a
+            # pass nor evidence against the slice.  A gate command that timed
+            # out is the exception: the timeout stays attributed to the
+            # candidate, and the failed removal is only reported.  Every
+            # other status of the gate command, that of a gate whose tests
+            # failed included, sets ``dev_verify_infrastructure_unavailable``
+            # here.  Tier files such a slice ``dev_verify_unavailable`` and,
+            # once its transaction is restored, halts ``slice_inconclusive``.
+            effective_rc = max(effective_rc, 2)
+            values.update({
+                "returncode": float(effective_rc),
+                "dev_verify_gate_residue_unavailable": 1.0,
+            })
+            if rc != 124:
+                values["dev_verify_infrastructure_unavailable"] = 1.0
+            residue_diagnostic = f"status=unavailable reason={str(exc)[:500]}"
+        else:
+            values["dev_verify_gate_created_paths_removed"] = float(
+                removed_paths
+            )
     raw_diagnostic = (
         observation_error
         or _diagnostic_output(combined, candidate, comparison)
@@ -2602,6 +3136,12 @@ def _run_dev_verify(parameters: dict[str, Any], stdout: Any) -> int:
     if declared_diagnostic:
         raw_diagnostic = (
             raw_diagnostic + "\n" + declared_diagnostic
+        )[-_RAW_OUTPUT_LIMIT:]
+    if residue_diagnostic:
+        raw_diagnostic = (
+            raw_diagnostic
+            + "\n[crucible gate-created paths]\n"
+            + residue_diagnostic
         )[-_RAW_OUTPUT_LIMIT:]
     try:
         deadline.remaining()

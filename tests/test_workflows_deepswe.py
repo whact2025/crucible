@@ -25,6 +25,7 @@ from assay import Usage, UsagePricingEvidence, UsagePricingSegment
 from assay.corpus.runs import RunHandle, RunResult
 from assay.corpus.store import Corpus
 
+from crucible.products.deepswe.secure_artifacts import RewardTestInventory
 from crucible.workflows import (
     _deepswe_baseline_preflight as baseline_preflight,
     _outcome,
@@ -358,6 +359,54 @@ def _entry(
         "repository_url": f"https://github.com/{repo}",
         "language": language,
         "category": category,
+    }
+
+
+def _declare_test_whitelist(
+    manifest: Path,
+    task_id: str,
+    *,
+    f2p: list[str],
+    p2p: list[str],
+) -> None:
+    """Give one fixture task the ``tests/config.json`` of a v1.1 task."""
+
+    (manifest.parent / task_id / "tests" / "config.json").write_text(
+        json.dumps(
+            {
+                "base_commit": "0123456789abcdef0123456789abcdef01234567",
+                "f2p_node_ids": f2p,
+                "grade": {"format": "ctrf", "reports": []},
+                "p2p_node_ids": p2p,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _v11_reward(
+    *,
+    f2p_passed: int,
+    f2p_total: int,
+    p2p_passed: int,
+    p2p_total: int,
+) -> dict:
+    """Build a reward document exactly as the dataset's ``grader.py`` does."""
+
+    total = f2p_total + p2p_total
+    return {
+        "reward": int(
+            f2p_total > 0
+            and f2p_passed == f2p_total
+            and p2p_passed == p2p_total
+        ),
+        "f2p_total": f2p_total,
+        "f2p_passed": f2p_passed,
+        "p2p_total": p2p_total,
+        "p2p_passed": p2p_passed,
+        "f2p": f2p_passed / f2p_total if f2p_total else 0.0,
+        "p2p": p2p_passed / p2p_total if p2p_total else 1.0,
+        "partial": (f2p_passed + p2p_passed) / total if total else 0.0,
     }
 
 
@@ -1140,7 +1189,9 @@ def _restoration_receipt_payload(tmp_path: Path) -> dict[str, object]:
                 workspace_device=candidate_stat.st_dev,
                 workspace_inode=candidate_stat.st_ino,
                 namespace=("nested",),
-                split_namespaces=(("nested", ("repo",), nested_device, 1),),
+                split_namespaces=(
+                    ("nested", ("keep.txt", "repo"), nested_device, 1),
+                ),
                 initialized_gitlinks=(
                     (
                         "nested/repo",
@@ -1166,6 +1217,7 @@ def _restoration_receipt_payload(tmp_path: Path) -> dict[str, object]:
                     ("c" * 32, "a" * 32),
                     ("d" * 32, "c" * 32),
                 ),
+                gate_created_paths=("gate-report", "nested/gate-created.lock"),
             ),
             baseline_preflight.DevelopmentPreflightWorkspaceRestoration(
                 label="baseline",
@@ -1177,6 +1229,7 @@ def _restoration_receipt_payload(tmp_path: Path) -> dict[str, object]:
                 initialized_gitlinks=(),
                 journal_transaction_id="b" * 32,
                 journal_family=(("b" * 32, None),),
+                gate_created_paths=(),
             ),
         )
     )
@@ -1233,6 +1286,14 @@ def test_development_preflight_restoration_receipt_round_trips_without_fs(
         "duplicate_gitlink_guard",
         "tampered_gitlink_guard_slice",
         "disconnected_family",
+        "missing_gate_created_paths",
+        "gate_created_paths_not_a_list",
+        "unsorted_gate_created_paths",
+        "nested_gate_created_paths",
+        "escaping_gate_created_path",
+        "gate_created_path_below_gitlink",
+        "gate_created_path_in_namespace",
+        "gate_created_path_in_split_namespace",
     ],
 )
 def test_development_preflight_restoration_receipt_rejects_tamper(
@@ -1300,6 +1361,23 @@ def test_development_preflight_restoration_receipt_rejects_tamper(
         candidate["initialized_gitlinks"][1]["guard_slice_id"] += "-tampered"
     elif case == "disconnected_family":
         candidate["journal_family"][1]["parent_transaction_id"] = "d" * 32
+    elif case == "missing_gate_created_paths":
+        del candidate["gate_created_paths"]
+    elif case == "gate_created_paths_not_a_list":
+        candidate["gate_created_paths"] = "gate-report"
+    elif case == "unsorted_gate_created_paths":
+        candidate["gate_created_paths"].reverse()
+    elif case == "nested_gate_created_paths":
+        candidate["gate_created_paths"].insert(1, "gate-report/index.html")
+    elif case == "escaping_gate_created_path":
+        candidate["gate_created_paths"] = ["../gate-report"]
+    elif case == "gate_created_path_below_gitlink":
+        candidate["gate_created_paths"] = ["nested/repo/build"]
+    elif case == "gate_created_path_in_namespace":
+        # A name the checkout had before the gate ran was not created by it.
+        candidate["gate_created_paths"] = ["nested"]
+    elif case == "gate_created_path_in_split_namespace":
+        candidate["gate_created_paths"] = ["nested/keep.txt"]
     else:  # pragma: no cover - parameter inventory is closed above
         raise AssertionError(case)
 
@@ -1539,6 +1617,8 @@ def test_emit_summary_rolls_up_cost_and_counts(tmp_path: Path):
             cost=cost,
             status="tasks_failed",
             halt_reason=None,
+            tasks_selected=5,
+            tasks_not_started=2,
         )
 
     payload = json.loads(out.read_text())
@@ -1546,6 +1626,26 @@ def test_emit_summary_rolls_up_cost_and_counts(tmp_path: Path):
     assert payload["tasks_ok"] == 1
     assert payload["tasks_failed"] == 2
     assert payload["tasks_resolved"] == 1  # only t1 graded reward==1.0
+    assert payload["tasks_selected"] == 5
+    assert payload["tasks_not_started"] == 2
+    assert payload["tasks_unrecorded"] == 0
+    assert payload["tasks_graded"] == 2
+    assert payload["tasks_unresolved"] == 1
+    assert payload["tasks_ungraded"] == 1
+    assert payload["tasks_lease_busy"] == 0
+    assert payload["tasks_by_status"] == {
+        "cascade_error": 1,
+        "resolved": 1,
+        "unresolved": 1,
+    }
+    assert payload["reward_counts"] == {
+        "tasks_counted": 0,
+        "tasks_apply_failed": 0,
+        "f2p_passed": 0,
+        "f2p_total": 0,
+        "p2p_passed": 0,
+        "p2p_total": 0,
+    }
     assert payload["cost_total_usd"] == cost.total_cost_usd
     assert payload["tasks"][0]["command_returncode"] == 0.0
     assert payload["tasks"][0]["verify_returncode"] == 0.0
@@ -1603,6 +1703,8 @@ def test_emit_summary_persists_optional_physical_pricing_ledger(tmp_path: Path):
             cost=cost,
             status="deepswe_complete",
             halt_reason=None,
+            tasks_selected=1,
+            tasks_not_started=0,
         )
 
     payload = json.loads(out.read_text())
@@ -1667,12 +1769,175 @@ def test_emit_summary_never_advertises_negative_or_untrusted_budget(
             cost=cost,
             status=("cost_incomplete" if cost_incomplete else "tasks_failed"),
             halt_reason=("cost_incomplete" if cost_incomplete else None),
+            tasks_selected=1,
+            tasks_not_started=0,
         )
 
     payload = json.loads(out.read_text())
     assert payload["cost_incomplete"] is cost_incomplete
     assert payload["cost_total_usd"] == pytest.approx(spent_usd)
     assert payload["budget_remaining_usd"] == pytest.approx(expected_remaining)
+
+
+def _emit_summary_payload(
+    tmp_path: Path,
+    task_summaries: list[dict],
+    *,
+    tasks_selected: int,
+    tasks_not_started: int,
+) -> dict:
+    from crucible.common.cost import CostAccumulator
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    corpus = wf._open_or_create_corpus(ns.spec)
+    with wf.open_run_with_capture(corpus, "deepswe") as handle:
+        out = wf._emit_summary(
+            handle=handle,
+            args=ns,
+            task_summaries=task_summaries,
+            cost=CostAccumulator(),
+            status="tasks_failed",
+            halt_reason=None,
+            tasks_selected=tasks_selected,
+            tasks_not_started=tasks_not_started,
+        )
+    return json.loads(out.read_text())
+
+
+def test_emit_summary_separates_ungraded_and_not_started_from_unsolved(
+    tmp_path: Path,
+):
+    """A task without a grade is never counted with the tasks graded zero."""
+
+    statuses = (
+        "resolved",
+        "unresolved",
+        "verification_failed",
+        "verification_incomplete",
+        "setup_failed",
+        "candidate_failed",
+        "task_lease_busy",
+    )
+    payload = _emit_summary_payload(
+        tmp_path,
+        [
+            {"task_id": f"t{index}", "ext_id": f"e{index}", "status": status}
+            for index, status in enumerate(statuses)
+        ],
+        # Ten were selected: seven have a summary, one ended without one, and
+        # two were never handed to execution.
+        tasks_selected=10,
+        tasks_not_started=2,
+    )
+
+    assert payload["tasks_selected"] == 10
+    assert payload["tasks_total"] == 7
+    assert payload["tasks_unrecorded"] == 1
+    assert payload["tasks_not_started"] == 2
+    assert payload["tasks_resolved"] == 1
+    assert payload["tasks_unresolved"] == 1
+    assert payload["tasks_graded"] == 2
+    assert payload["tasks_ungraded"] == 4
+    assert payload["tasks_lease_busy"] == 1
+    # setup_failed and candidate_failed carry no reuse authority. The two
+    # hidden-verifier terminals are one-shot, and the lease-busy task is
+    # another process's work, not a result of this run.
+    assert payload["tasks_rerun_by_default"] == 2
+    assert payload["tasks_by_status"] == {
+        status: 1 for status in sorted(statuses)
+    }
+    # Existing keys keep their meaning.
+    assert payload["tasks_ok"] == 1
+    assert payload["tasks_failed"] == 6
+    assert payload["tasks_selected"] == (
+        payload["tasks_total"]
+        + payload["tasks_unrecorded"]
+        + payload["tasks_not_started"]
+    )
+    assert payload["tasks_total"] == (
+        payload["tasks_graded"]
+        + payload["tasks_ungraded"]
+        + payload["tasks_lease_busy"]
+    )
+    assert payload["tasks_graded"] == (
+        payload["tasks_resolved"] + payload["tasks_unresolved"]
+    )
+    assert payload["tasks_failed"] == (
+        payload["tasks_unresolved"]
+        + payload["tasks_ungraded"]
+        + payload["tasks_lease_busy"]
+    )
+
+
+def test_emit_summary_sums_reward_counts_over_graded_tasks(tmp_path: Path):
+    def _counts(f2p_passed, f2p_total, p2p_passed, p2p_total, apply_failed=False):
+        return {
+            "apply_failed": apply_failed,
+            "f2p_passed": f2p_passed,
+            "f2p_total": f2p_total,
+            "p2p_passed": p2p_passed,
+            "p2p_total": p2p_total,
+        }
+
+    payload = _emit_summary_payload(
+        tmp_path,
+        [
+            {
+                "task_id": "t1",
+                "ext_id": "e1",
+                "status": "resolved",
+                "reward_counts": _counts(3, 3, 120, 120),
+            },
+            {
+                "task_id": "t2",
+                "ext_id": "e2",
+                "status": "unresolved",
+                "reward_counts": _counts(1, 4, 7, 9),
+            },
+            {
+                "task_id": "t3",
+                "ext_id": "e3",
+                "status": "unresolved",
+                "reward_counts": _counts(0, 5, 0, 11, apply_failed=True),
+            },
+            # Graded from a count-less v1.0 token: graded, but not counted.
+            {
+                "task_id": "t4",
+                "ext_id": "e4",
+                "status": "resolved",
+                "reward_counts": None,
+            },
+            # Counts of a task whose verifier result is not a grade stay out.
+            {
+                "task_id": "t5",
+                "ext_id": "e5",
+                "status": "verification_failed",
+                "reward_counts": _counts(2, 2, 6, 6),
+            },
+        ],
+        tasks_selected=5,
+        tasks_not_started=0,
+    )
+
+    assert payload["tasks_graded"] == 4
+    assert payload["reward_counts"] == {
+        "tasks_counted": 3,
+        "tasks_apply_failed": 1,
+        "f2p_passed": 4,
+        "f2p_total": 12,
+        "p2p_passed": 127,
+        "p2p_total": 140,
+    }
+    assert payload["tasks"][0]["reward_counts"] == _counts(3, 3, 120, 120)
 
 
 # ---------- isolated lifecycle: _run_task_cascade ----------
@@ -1694,15 +1959,23 @@ def _patch_container_lifecycle(
         return image.split(":", 1)[0] + "@sha256:" + "a" * 64
 
     monkeypatch.setattr(wf, "pull_image", _pull)
-    monkeypatch.setattr(
-        wf,
-        "populate_workspace_from_image",
-        lambda image, ws, *, base_commit=None, labels=None, register_container=None: (
-            calls.setdefault("populate", []).append(
-                (image, str(ws), base_commit, labels, register_container)
-            )
-        ),
-    )
+
+    def _populate(
+        image,
+        ws,
+        *,
+        base_commit=None,
+        labels=None,
+        register_container=None,
+    ):
+        calls.setdefault("populate", []).append(
+            (image, str(ws), base_commit, labels, register_container)
+        )
+        # The real call returns the checkout's full base-commit id. Fixture
+        # tasks pin a full id, so the pin is that id.
+        return base_commit
+
+    monkeypatch.setattr(wf, "populate_workspace_from_image", _populate)
 
     def _auth(
         inst,
@@ -2076,6 +2349,14 @@ def test_dev_verify_preflight_exactly_restores_both_writable_checkouts(
     ]
     assert restoration.fingerprint.startswith("sha256:")
     assert len(restoration.fingerprint) == 71
+    # Of everything the gate run touched, only what a slice gate would
+    # charge is recorded: the new untracked file and the new ignored
+    # directory below an existing one.  The new ignored top-level tree, the
+    # tracked file and the inherited untracked and ignored files are not.
+    assert [item.gate_created_paths for item in restoration.workspaces] == [
+        ("existing/generated", "new-top-level.txt"),
+        ("existing/generated", "new-top-level.txt"),
+    ]
     for workspace in (candidate, baseline):
         assert _preflight_checkout_image(workspace) == before[workspace]
         assert not (workspace / "new-ignored").exists()
@@ -2221,6 +2502,7 @@ def test_dev_verify_restoration_receipt_is_independent_of_build_outcome(
     def _build(*_args, **_kwargs):
         for workspace in (candidate, baseline):
             (workspace / "tracked.txt").write_text("preflight mutation\n")
+            (workspace / "gate-created.lock").write_text("locked\n")
         if mode.startswith("exception"):
             raise RuntimeError("injected build exception")
         if mode.startswith("keyboard_interrupt"):
@@ -2278,6 +2560,12 @@ def test_dev_verify_restoration_receipt_is_independent_of_build_outcome(
     assert type(receipts[0]) is (
         baseline_preflight.DevelopmentPreflightRestorationReceipt
     )
+    # Whatever the gate run returned or raised, the receipt names the path
+    # it created.
+    assert [item.gate_created_paths for item in receipts[0].workspaces] == [
+        ("gate-created.lock",),
+        ("gate-created.lock",),
+    ]
     for workspace in (candidate, baseline):
         assert _preflight_checkout_image(workspace) == before[workspace]
 
@@ -2521,6 +2809,11 @@ def test_dev_verify_preflight_failure_stops_before_provider_invocation(
     assert summary["dev_verify_preflight"]["returncode"] == 2
     assert summary["cleanup_status"] == "complete"
     assert "verifier" not in calls
+    # Architect was never started; the real summary of this stop is what the
+    # run-status projection files as unjudged.
+    assert "architect_operation_id" not in summary
+    assert summary["architect_terminal_class"] is None
+    assert wf._all_task_failures_are_unjudged([summary]) is True
 
 
 def test_dev_verify_preflight_exception_publishes_classifiable_failure_rc(
@@ -2642,6 +2935,11 @@ def test_rust_toolchain_unavailable_is_retryable_before_hidden_verifier(
     lifecycle = wf._lifecycle_record(summary)
     assert lifecycle["status_policy"] == "retryable"
     assert wf._checkpoint_is_reusable(lifecycle, args=ns) is False
+    # Architect was never started: the run-status projection files this real
+    # summary as unjudged.
+    assert "architect_operation_id" not in summary
+    assert summary["architect_terminal_class"] is None
+    assert wf._all_task_failures_are_unjudged([summary]) is True
 
 
 def test_verifier_toolchain_failure_never_executes_hidden_command(
@@ -2714,6 +3012,8 @@ def test_verifier_toolchain_failure_never_executes_hidden_command(
     assert summary["hidden_verifier_measurement_ref"] is None
     assert summary["hidden_verifier_lifecycle_ref"] is None
     assert calls["events"].count("verifier_toolchain_probe") == 1
+    # A one-shot oracle failure is never relabelled as unjudged work.
+    assert wf._all_task_failures_are_unjudged([summary]) is False
     lifecycle = wf._lifecycle_record(summary)
     assert lifecycle["status_policy"] == "reusable"
     assert wf._checkpoint_is_reusable(lifecycle, args=ns) is True
@@ -3155,6 +3455,13 @@ def test_strict_authoring_stop_failure_blocks_capture_and_hidden_verifier(
     assert summary["status"] == "setup_failed"
     assert calls["strict_stop"] == ["authoring-cid"]
     assert "verifier" not in calls
+    # Architect ran and completed: this setup stop is not "Architect never
+    # started". The row stays retryable, but the run-status projection does
+    # not file the task as unjudged.
+    assert summary["architect_operation_id"]
+    assert summary["architect_terminal_class"] == "succeeded"
+    assert wf._lifecycle_record(summary)["status_policy"] == "retryable"
+    assert wf._all_task_failures_are_unjudged([summary]) is False
     # The id is retained after the failed proof and retried by final cleanup.
     assert ("authoring-cid", None) in calls["teardown"]
     assert ("baseline-cid", None) in calls["teardown"]
@@ -3408,6 +3715,14 @@ def test_unproven_tier_journal_settlement_blocks_full_candidate_capture(
             "inconclusive",
             "retryable",
         ),
+        # The planner backend was lost: no plan was ruled on, so the task
+        # is neither cached as a permanent veto nor filed as judged.
+        (
+            "planner_infrastructure_failure",
+            "inconclusive",
+            "inconclusive",
+            "retryable",
+        ),
     ],
 )
 def test_zero_tier_architect_failure_skips_candidate_and_hidden_verifier(
@@ -3498,6 +3813,12 @@ def test_zero_tier_architect_failure_skips_candidate_and_hidden_verifier(
     assert wf._checkpoint_is_reusable(lifecycle, args=ns) is (
         status_policy == "permanent"
     )
+    # The run-status projection reads the same task summary: a deterministic
+    # veto is a judged failure, a lost ruling is not.
+    assert wf._all_task_failures_are_unjudged([summary]) is (
+        status_policy == "retryable"
+    )
+    assert wf._all_task_failures_are_retryable([summary]) is False
 
 
 def test_zero_tier_settlement_failure_is_secondary_to_architect_failure(
@@ -3946,6 +4267,625 @@ def test_reward_is_revalidated_only_after_verifier_is_strictly_stopped(
     assert summary["status"] == "resolved"
     assert summary["reward_state"] == "valid"
     assert calls["strict_stop"][-1] == "verifier-cid"
+    # A tests tree without config.json declares no whitelist: the v1.0 token
+    # is the grade and carries no per-test counts.
+    assert summary["test_inventory"] is None
+    assert summary["reward_counts"] is None
+    assert summary["reward_error"] is None
+
+
+def _run_cascade_with_reward_artifact(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    whitelist: tuple[list[str], list[str]] | None,
+    artifact: str,
+    payload: str,
+):
+    """Run one stubbed cascade whose verifier leaves ``payload`` at its stop."""
+
+    from crucible.common.cost import CostAccumulator
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    inst = wf._load_and_filter(ns)[0]
+    if whitelist is not None:
+        _declare_test_whitelist(
+            manifest,
+            inst.task_id,
+            f2p=whitelist[0],
+            p2p=whitelist[1],
+        )
+    calls: dict = {}
+    actual_reward_validation = wf._validate_stopped_verifier_reward
+    _patch_container_lifecycle(monkeypatch, tmp_path, calls)
+    monkeypatch.setattr(
+        wf,
+        "_validate_stopped_verifier_reward",
+        actual_reward_validation,
+    )
+
+    def _strict_stop(container_id):
+        calls.setdefault("strict_stop", []).append(container_id)
+        if container_id == "verifier-cid":
+            reward = Path(calls["verifier"][0]["logs"]) / "verifier" / artifact
+            reward.parent.mkdir(parents=True, exist_ok=True)
+            reward.write_text(payload, encoding="utf-8")
+
+    monkeypatch.setattr(wf, "stop_instance_container_strict", _strict_stop)
+    monkeypatch.setattr(
+        "crucible.workflows.architect.run_architect",
+        lambda **kwargs: _publish_architect_child(
+            Path(kwargs["spec"]),
+            cost_usd=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        wf,
+        "_run_dataset_verify",
+        lambda *args, **kwargs: {
+            "rc": 0,
+            "reward": None,
+            "resolved": None,
+            "command_returncode": 0.0,
+            "verify_returncode": 0.0,
+        },
+    )
+    summary = wf._run_task_cascade(
+        inst,
+        args=ns,
+        run_dir=_prepare_parent_run(tmp_path / "s" / "runs" / "reward-artifact"),
+        cost=CostAccumulator(),
+    )
+    corpus = Corpus(tmp_path / "s" / "instances" / inst.task_id / "corpus")
+    return summary, corpus
+
+
+_FIXTURE_WHITELIST = (["f2p::a", "f2p::b"], ["p2p::a", "p2p::b", "p2p::c"])
+
+
+def test_run_task_cascade_reports_v11_reward_counts(
+    tmp_path: Path,
+    monkeypatch,
+):
+    summary, corpus = _run_cascade_with_reward_artifact(
+        tmp_path,
+        monkeypatch,
+        whitelist=_FIXTURE_WHITELIST,
+        artifact="reward.json",
+        payload=json.dumps(
+            _v11_reward(f2p_passed=2, f2p_total=2, p2p_passed=3, p2p_total=3)
+        ),
+    )
+
+    counts = {
+        "apply_failed": False,
+        "f2p_passed": 2,
+        "f2p_total": 2,
+        "p2p_passed": 3,
+        "p2p_total": 3,
+    }
+    assert summary["status"] == "resolved"
+    assert summary["reward"] == 1.0
+    assert summary["reward_state"] == "valid"
+    assert summary["reward_error"] is None
+    assert summary["test_inventory"] == {"f2p_total": 2, "p2p_total": 3}
+    assert summary["reward_counts"] == counts
+    record = wf._validate_lifecycle_record(
+        wf._lifecycle_record(summary),
+        line_number=1,
+    )
+    assert record["reward_counts"] == counts
+    measurement = corpus.get_measurement(
+        summary["hidden_verifier_measurement_ref"]
+    )
+    assert measurement.values["reward"] == 1.0
+    assert {name: measurement.values[name] for name in counts} == {
+        "apply_failed": 0.0,
+        "f2p_passed": 2.0,
+        "f2p_total": 2.0,
+        "p2p_passed": 3.0,
+        "p2p_total": 3.0,
+    }
+    raw = json.loads(corpus.get_artifact(measurement.raw_output_ref))
+    assert raw["schema_version"] == 3
+    assert raw["verifier"]["reward_counts"] == counts
+    assert raw["checkpoint"]["reward_counts"] == counts
+    # A later run resumes this task from the checkpoint committed with the
+    # hidden evidence; the counts it sums per run come back with it.
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(tmp_path / "tasks" / "manifest.json"),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    inst = wf._load_and_filter(ns)[0]
+    assert inst.task_id == summary["task_id"]
+    checkpoint = wf._load_hidden_oracle_checkpoint(ns.spec, inst)
+    assert checkpoint["reward_counts"] == counts
+
+
+def test_run_task_cascade_reports_unresolved_counts(
+    tmp_path: Path,
+    monkeypatch,
+):
+    summary, _corpus = _run_cascade_with_reward_artifact(
+        tmp_path,
+        monkeypatch,
+        whitelist=_FIXTURE_WHITELIST,
+        artifact="reward.json",
+        payload=json.dumps(
+            _v11_reward(f2p_passed=1, f2p_total=2, p2p_passed=3, p2p_total=3)
+        ),
+    )
+
+    assert summary["status"] == "unresolved"
+    assert summary["reward"] == 0.0
+    assert summary["reward_counts"] == {
+        "apply_failed": False,
+        "f2p_passed": 1,
+        "f2p_total": 2,
+        "p2p_passed": 3,
+        "p2p_total": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    ("artifact", "payload", "reason"),
+    (
+        # A self-consistent, all-passing grade of some other whitelist.
+        (
+            "reward.json",
+            json.dumps(
+                _v11_reward(f2p_passed=5, f2p_total=5, p2p_passed=3, p2p_total=3)
+            ),
+            "whitelist",
+        ),
+        # The v1.0 token: this task's grader writes reward.json.
+        ("reward.txt", "1\n", "reward.txt cannot grade"),
+    ),
+    ids=("totals_of_another_whitelist", "token_for_whitelisted_task"),
+)
+def test_run_task_cascade_rejects_reward_not_bound_to_its_whitelist(
+    tmp_path: Path,
+    monkeypatch,
+    artifact: str,
+    payload: str,
+    reason: str,
+):
+    summary, corpus = _run_cascade_with_reward_artifact(
+        tmp_path,
+        monkeypatch,
+        whitelist=_FIXTURE_WHITELIST,
+        artifact=artifact,
+        payload=payload,
+    )
+
+    assert summary["status"] == "verification_failed"
+    assert summary["verifier_status"] == "reward_mismatch"
+    assert summary["failure_phase"] == "hidden_verifier"
+    assert summary["failure_kind"] == "reward_mismatch"
+    assert summary["reward"] is None
+    assert summary["resolved"] is None
+    assert summary["reward_state"] == "mismatch"
+    assert summary["reward_counts"] is None
+    assert reason in summary["reward_error"]
+    # The one-shot verifier ran: its ungraded terminal needs explicit rerun.
+    assert wf._lifecycle_record(summary)["status_policy"] == "reusable"
+    measurement = corpus.get_measurement(
+        summary["hidden_verifier_measurement_ref"]
+    )
+    assert measurement.values["reward_valid"] == 0.0
+    assert "reward" not in measurement.values
+    assert "f2p_passed" not in measurement.values
+
+
+def test_run_task_cascade_rejects_malformed_tests_config_before_any_spend(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from crucible.common.cost import CostAccumulator
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    inst = wf._load_and_filter(ns)[0]
+    (manifest.parent / inst.task_id / "tests" / "config.json").write_text(
+        '{"f2p_node_ids": ["a"], "p2p_node_ids": "not a list"}',
+        encoding="utf-8",
+    )
+    calls: dict = {}
+    _patch_container_lifecycle(monkeypatch, tmp_path, calls)
+    monkeypatch.setattr(
+        "crucible.workflows.architect.run_architect",
+        lambda **kwargs: pytest.fail(
+            "a malformed tests/config.json must stop the task before Architect"
+        ),
+    )
+
+    summary = wf._run_task_cascade(
+        inst,
+        args=ns,
+        run_dir=_prepare_parent_run(tmp_path / "s" / "runs" / "bad-config"),
+        cost=CostAccumulator(),
+    )
+
+    assert summary["status"] == "cascade_error"
+    assert summary["failure_kind"] == "DeepSWEInstanceError"
+    assert "tests/config.json p2p_node_ids" in summary["error"]
+    assert summary["cost_usd"] == 0.0
+    assert summary["hidden_invocation_measurement_ref"] is None
+    # The image pull precedes this check: "before any spend" means before
+    # workspace population, any container, Architect and any model cost.
+    # Nothing was populated or started for a task that cannot be graded.
+    assert "populate" not in calls
+    assert "authoring" not in calls
+
+
+def test_snapshot_whitelist_failure_consumes_no_oracle_authority(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The snapshot whitelist is read before the one-shot invocation marker."""
+
+    from crucible.common.cost import CostAccumulator
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    inst = wf._load_and_filter(ns)[0]
+    _declare_test_whitelist(
+        manifest,
+        inst.task_id,
+        f2p=_FIXTURE_WHITELIST[0],
+        p2p=_FIXTURE_WHITELIST[1],
+    )
+    calls: dict = {}
+    _patch_container_lifecycle(monkeypatch, tmp_path, calls)
+    monkeypatch.setattr(
+        "crucible.workflows.architect.run_architect",
+        lambda **kwargs: 0,
+    )
+    marker_calls = 0
+    persist_marker = wf._persist_hidden_invocation_marker
+
+    def _record_marker(*args, **kwargs):
+        nonlocal marker_calls
+        marker_calls += 1
+        return persist_marker(*args, **kwargs)
+
+    monkeypatch.setattr(wf, "_persist_hidden_invocation_marker", _record_marker)
+    inventory_reads: list = []
+
+    def _unreadable_snapshot_whitelist(snapshot):
+        inventory_reads.append(snapshot)
+        raise wf.DeepSWEInstanceError("cannot safely read tests/config.json")
+
+    monkeypatch.setattr(
+        wf,
+        "load_snapshot_test_inventory",
+        _unreadable_snapshot_whitelist,
+    )
+    monkeypatch.setattr(
+        wf,
+        "_run_dataset_verify",
+        lambda *args, **kwargs: pytest.fail(
+            "hidden verifier must not run without a readable whitelist"
+        ),
+    )
+
+    summary = wf._run_task_cascade(
+        inst,
+        args=ns,
+        run_dir=_prepare_parent_run(tmp_path / "s" / "runs" / "bad-snapshot"),
+        cost=CostAccumulator(),
+    )
+
+    # The live tree parsed and the private copy exists: the failure is the
+    # read of that copy, the last step before hidden authority is consumed.
+    assert len(inventory_reads) == 1
+    assert summary["tests_snapshot"] == inventory_reads[0].to_payload()
+    assert summary["status"] == "cascade_error"
+    assert summary["status"] not in wf._GRADED_TASK_STATUSES
+    assert summary["failure_kind"] == "DeepSWEInstanceError"
+    assert "cannot safely read tests/config.json" in summary["error"]
+    assert summary["test_inventory"] is None
+    assert summary["reward"] is None
+    assert summary["reward_counts"] is None
+    assert summary["hidden_invocation_measurement_ref"] is None
+    assert summary["hidden_invocation_lifecycle_ref"] is None
+    assert marker_calls == 0
+    assert "verifier" not in calls
+    # No one-shot authority was spent, so a plain re-run may try again.
+    assert wf._lifecycle_record(summary)["status_policy"] == "retryable"
+
+
+_ABBREVIATED_PIN = "68dafce"
+_FULL_BASE_COMMIT = _ABBREVIATED_PIN + "0123456789abcdef" * 2 + "0"
+
+
+def _run_cascade_with_abbreviated_base_commit(tmp_path: Path, monkeypatch):
+    """Run one stubbed cascade for a task the dataset pins by 7 characters."""
+
+    from crucible.common.cost import CostAccumulator
+
+    assert len(_FULL_BASE_COMMIT) == 40
+    tasks_root = tmp_path / "tasks"
+    tasks_root.mkdir()
+    _write_task_dir(
+        tasks_root,
+        task_id="task-abbrev",
+        ext_id="khabbrev",
+        base_commit_hash=_ABBREVIATED_PIN,
+    )
+    manifest = _write_manifest(
+        tasks_root,
+        [_entry("task-abbrev", ext_id="khabbrev")],
+    )
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    dataset_inst = wf._load_and_filter(ns)[0]
+    assert dataset_inst.base_commit_hash == _ABBREVIATED_PIN
+    candidate = wf.candidate_from_image_patch(
+        b"abbreviated base candidate\n",
+        files_modified=("module.py",),
+        raw_diff_bytes=27,
+        max_bytes=ns.max_patch_bytes,
+    )
+    calls: dict = {}
+    observed: dict = {}
+    _patch_container_lifecycle(
+        monkeypatch,
+        tmp_path,
+        calls,
+        candidate=candidate,
+    )
+
+    def _populate(
+        image,
+        ws,
+        *,
+        base_commit=None,
+        labels=None,
+        register_container=None,
+    ):
+        calls.setdefault("populate", []).append(
+            (image, str(ws), base_commit, labels, register_container)
+        )
+        return _FULL_BASE_COMMIT
+
+    monkeypatch.setattr(wf, "populate_workspace_from_image", _populate)
+    preflight = wf._run_dev_verify_preflight
+
+    def _preflight(**kwargs):
+        observed["preflight_metadata"] = kwargs["extra_parameters"][
+            "deepswe_metadata"
+        ]["base_commit"]
+        observed["preflight_spec"] = kwargs["spec"].project_context.base_commit
+        return preflight(**kwargs)
+
+    monkeypatch.setattr(wf, "_run_dev_verify_preflight", _preflight)
+    settlement = wf._establish_capture_mutation_settlement
+
+    def _settlement(*args, **kwargs):
+        observed["settlement"] = kwargs["inst"].base_commit_hash
+        return settlement(*args, **kwargs)
+
+    monkeypatch.setattr(wf, "_establish_capture_mutation_settlement", _settlement)
+
+    def _capture(_container_id, *, base_commit, max_bytes):
+        observed.setdefault("renders", []).append(base_commit)
+        return candidate.patch
+
+    monkeypatch.setattr(wf, "capture_model_patch_from_container", _capture)
+    prepare = wf.prepare_candidate_replay
+
+    def _prepare(workspace, applied, *, expected_base_commit, max_bytes):
+        observed["apply"] = expected_base_commit
+        return prepare(
+            workspace,
+            applied,
+            expected_base_commit=expected_base_commit,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(wf, "prepare_candidate_replay", _prepare)
+    prove = wf.prove_image_replay
+
+    def _prove(*args, expected_base_commit, max_bytes):
+        observed["proof"] = expected_base_commit
+        return prove(
+            *args,
+            expected_base_commit=expected_base_commit,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(wf, "prove_image_replay", _prove)
+
+    def _architect(**kwargs):
+        observed["checkpoint_hook"] = kwargs["checkpoint_hook"].expected_base_commit
+        observed["architect_metadata"] = kwargs["extra_parameters"][
+            "deepswe_metadata"
+        ]["base_commit"]
+        return _publish_architect_child(Path(kwargs["spec"]), cost_usd=0.0)
+
+    monkeypatch.setattr("crucible.workflows.architect.run_architect", _architect)
+    monkeypatch.setattr(
+        wf,
+        "_run_dataset_verify",
+        lambda *args, **kwargs: {
+            "rc": 0,
+            "reward": 1.0,
+            "resolved": 1.0,
+            "verify_returncode": 0.0,
+            "reward_valid": True,
+        },
+    )
+    summary = wf._run_task_cascade(
+        dataset_inst,
+        args=ns,
+        run_dir=_prepare_parent_run(tmp_path / "s" / "runs" / "abbreviated"),
+        cost=CostAccumulator(),
+    )
+    corpus = Corpus(tmp_path / "s" / "instances" / dataset_inst.task_id / "corpus")
+    return ns, dataset_inst, calls, observed, summary, corpus
+
+
+def test_abbreviated_base_commit_is_bound_as_full_id_at_every_git_comparison(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _ns, _inst, calls, observed, summary, corpus = (
+        _run_cascade_with_abbreviated_base_commit(tmp_path, monkeypatch)
+    )
+
+    assert summary["status"] == "resolved"
+    assert summary["base_commit"] == _FULL_BASE_COMMIT
+    # Only the first population sees the dataset pin; it resolves the id that
+    # the other three checkouts must then match exactly.
+    assert [
+        (Path(entry[1]).name, entry[2]) for entry in calls["populate"]
+    ] == [
+        ("candidate", _ABBREVIATED_PIN),
+        ("baseline", _FULL_BASE_COMMIT),
+        ("verifier", _FULL_BASE_COMMIT),
+        ("grading", _FULL_BASE_COMMIT),
+    ]
+    assert observed == {
+        "preflight_metadata": _FULL_BASE_COMMIT,
+        "preflight_spec": _FULL_BASE_COMMIT,
+        "checkpoint_hook": _FULL_BASE_COMMIT,
+        "architect_metadata": _FULL_BASE_COMMIT,
+        "settlement": _FULL_BASE_COMMIT,
+        "renders": [_FULL_BASE_COMMIT, _FULL_BASE_COMMIT],
+        "apply": _FULL_BASE_COMMIT,
+        "proof": _FULL_BASE_COMMIT,
+    }
+    assert corpus.latest_spec().project_context.base_commit == _FULL_BASE_COMMIT
+
+
+def test_abbreviated_base_commit_keeps_the_dataset_pin_as_checkpoint_identity(
+    tmp_path: Path,
+    monkeypatch,
+):
+    ns, dataset_inst, _calls, _observed, summary, corpus = (
+        _run_cascade_with_abbreviated_base_commit(tmp_path, monkeypatch)
+    )
+
+    # Resume recomputes the fingerprint from the dataset instance, so the
+    # resolved id must never enter task identity.
+    assert summary["checkpoint_fingerprint"] == wf._deepswe_checkpoint_fingerprint(
+        wf.dataclasses.replace(
+            dataset_inst,
+            docker_image=summary["image_digest"],
+        ),
+        args=ns,
+        child_budget_usd=summary["budget_usd"],
+    )
+    for ref in (
+        summary["candidate_measurement_ref"],
+        summary["hidden_invocation_measurement_ref"],
+        summary["hidden_verifier_measurement_ref"],
+    ):
+        assert corpus.get_measurement(ref).commit == _ABBREVIATED_PIN
+    checkpoint = wf._load_hidden_oracle_checkpoint(ns.spec, dataset_inst)
+    assert checkpoint["status"] == "resolved"
+    assert checkpoint["checkpoint_fingerprint"] == summary["checkpoint_fingerprint"]
+
+
+@pytest.mark.parametrize(
+    "returned",
+    (None, _ABBREVIATED_PIN, "F" * 40, "0" * 41),
+    ids=("none", "abbreviated", "upper_case", "wrong_length"),
+)
+def test_run_task_cascade_binds_only_a_full_base_commit_id(
+    tmp_path: Path,
+    monkeypatch,
+    returned,
+):
+    from crucible.common.cost import CostAccumulator
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    inst = wf._load_and_filter(ns)[0]
+    calls: dict = {}
+    _patch_container_lifecycle(monkeypatch, tmp_path, calls)
+
+    def _populate(image, ws, **kwargs):
+        calls.setdefault("populate", []).append(str(ws))
+        return returned
+
+    monkeypatch.setattr(wf, "populate_workspace_from_image", _populate)
+    monkeypatch.setattr(
+        "crucible.workflows.architect.run_architect",
+        lambda **kwargs: pytest.fail(
+            "an unresolved base commit must stop the task before Architect"
+        ),
+    )
+
+    summary = wf._run_task_cascade(
+        inst,
+        args=ns,
+        run_dir=_prepare_parent_run(tmp_path / "s" / "runs" / "unresolved-base"),
+        cost=CostAccumulator(),
+    )
+
+    assert summary["status"] == "setup_failed"
+    assert summary["failure_phase"] == "container_setup"
+    assert summary["failure_kind"] == "InstanceContainerSetupError"
+    assert "full base commit id" in summary["error"]
+    assert summary["base_commit"] is None
+    assert len(calls["populate"]) == 1
+    assert "authoring" not in calls
+    assert "architect_operation_id" not in summary
+    assert wf._all_task_failures_are_unjudged([summary]) is True
+    # No starter Spec was synthesized from an id that is not the checkout's.
+    assert (
+        Corpus(
+            tmp_path / "s" / "instances" / inst.task_id / "corpus"
+        ).latest_spec()
+        is None
+    )
 
 
 def test_run_task_cascade_grades_salvaged_candidate_when_cascade_raises(
@@ -4437,6 +5377,7 @@ def test_post_stop_reward_token_is_sole_kpi_authority(tmp_path: Path):
     validated = wf._validate_stopped_verifier_reward(
         verdict,
         instance_log_dir=tmp_path,
+        test_inventory=None,
     )
 
     assert validated["raw_reward"] == "1"
@@ -4445,18 +5386,14 @@ def test_post_stop_reward_token_is_sole_kpi_authority(tmp_path: Path):
     assert validated["reward_pending"] is False
     assert validated["reward_valid"] is True
     assert validated["reward_state"] == "valid"
+    assert validated["reward_counts"] is None
+    assert validated["reward_error"] is None
     assert validated["verifier_status"] == "resolved"
     assert wf._dataset_verdict_status(validated) == "resolved"
 
 
-def test_post_stop_v11_json_reward_is_sole_kpi_authority(tmp_path: Path):
-    reward = tmp_path / "verifier" / "reward.json"
-    reward.parent.mkdir()
-    reward.write_text(
-        '{"reward":1,"f2p_passed":44,"f2p_total":44}',
-        encoding="utf-8",
-    )
-    verdict = {
+def _pending_verdict() -> dict:
+    return {
         "rc": 0,
         "reward": None,
         "resolved": None,
@@ -4464,9 +5401,21 @@ def test_post_stop_v11_json_reward_is_sole_kpi_authority(tmp_path: Path):
         "reward_pending": True,
     }
 
+
+def test_post_stop_v11_json_reward_is_sole_kpi_authority(tmp_path: Path):
+    reward = tmp_path / "verifier" / "reward.json"
+    reward.parent.mkdir()
+    reward.write_text(
+        json.dumps(
+            _v11_reward(f2p_passed=44, f2p_total=44, p2p_passed=12, p2p_total=12)
+        ),
+        encoding="utf-8",
+    )
+
     validated = wf._validate_stopped_verifier_reward(
-        verdict,
+        _pending_verdict(),
         instance_log_dir=tmp_path,
+        test_inventory=RewardTestInventory(f2p_total=44, p2p_total=12),
     )
 
     assert validated["raw_reward"] == "1"
@@ -4475,7 +5424,178 @@ def test_post_stop_v11_json_reward_is_sole_kpi_authority(tmp_path: Path):
     assert validated["reward_pending"] is False
     assert validated["reward_valid"] is True
     assert validated["reward_state"] == "valid"
+    assert validated["reward_error"] is None
+    assert validated["reward_counts"] == {
+        "apply_failed": False,
+        "f2p_passed": 44,
+        "f2p_total": 44,
+        "p2p_passed": 12,
+        "p2p_total": 12,
+    }
     assert validated["verifier_status"] == "resolved"
+    assert wf._dataset_verdict_status(validated) == "resolved"
+
+
+@pytest.mark.parametrize(
+    ("artifact", "document", "inventory", "reason"),
+    (
+        # reward 1 although a fail-to-pass test failed
+        (
+            "reward.json",
+            {
+                **_v11_reward(
+                    f2p_passed=43, f2p_total=44, p2p_passed=12, p2p_total=12
+                ),
+                "reward": 1,
+            },
+            RewardTestInventory(f2p_total=44, p2p_total=12),
+            "reward disagrees with its counts",
+        ),
+        # a self-consistent grade of some other whitelist
+        (
+            "reward.json",
+            _v11_reward(f2p_passed=5, f2p_total=5, p2p_passed=3, p2p_total=3),
+            RewardTestInventory(f2p_total=44, p2p_total=12),
+            "whitelist",
+        ),
+        # the same, with only the pass-to-pass total of another whitelist
+        (
+            "reward.json",
+            _v11_reward(f2p_passed=44, f2p_total=44, p2p_passed=11, p2p_total=11),
+            RewardTestInventory(f2p_total=44, p2p_total=12),
+            "whitelist",
+        ),
+        # the same, with only the fail-to-pass total of another whitelist
+        (
+            "reward.json",
+            _v11_reward(f2p_passed=43, f2p_total=43, p2p_passed=12, p2p_total=12),
+            RewardTestInventory(f2p_total=44, p2p_total=12),
+            "whitelist",
+        ),
+        # counts although the tests snapshot declares no whitelist
+        (
+            "reward.json",
+            _v11_reward(f2p_passed=44, f2p_total=44, p2p_passed=12, p2p_total=12),
+            None,
+            "cannot be bound to a tests/config.json whitelist",
+        ),
+        # a count-less token although the tests snapshot declares a whitelist
+        (
+            "reward.txt",
+            None,
+            RewardTestInventory(f2p_total=44, p2p_total=12),
+            "reward.txt cannot grade a task whose tests declare a whitelist",
+        ),
+    ),
+    ids=(
+        "self_inconsistent",
+        "totals_of_another_whitelist",
+        "pass_to_pass_total_of_another_whitelist",
+        "fail_to_pass_total_of_another_whitelist",
+        "counts_without_whitelist",
+        "token_with_whitelist",
+    ),
+)
+def test_post_stop_reward_mismatch_is_not_a_grade(
+    tmp_path: Path,
+    artifact: str,
+    document: dict | None,
+    inventory: RewardTestInventory | None,
+    reason: str,
+):
+    reward = tmp_path / "verifier" / artifact
+    reward.parent.mkdir()
+    reward.write_text(
+        "1\n" if document is None else json.dumps(document),
+        encoding="utf-8",
+    )
+
+    validated = wf._validate_stopped_verifier_reward(
+        _pending_verdict(),
+        instance_log_dir=tmp_path,
+        test_inventory=inventory,
+    )
+
+    assert validated["raw_reward"] == ""
+    assert validated["reward"] is None
+    assert validated["resolved"] is None
+    assert validated["reward_valid"] is False
+    assert validated["reward_state"] == "mismatch"
+    assert validated["reward_counts"] is None
+    assert reason in validated["reward_error"]
+    assert validated["verifier_status"] == "reward_mismatch"
+    assert wf._dataset_verdict_status(validated) == "verification_failed"
+
+
+@pytest.mark.parametrize(
+    ("command_returncode", "verifier_status"),
+    ((1.0, "command_failed"), (124.0, "timeout")),
+    ids=("command_failed", "timeout"),
+)
+def test_post_stop_valid_reward_of_failed_verifier_is_not_a_grade(
+    tmp_path: Path,
+    command_returncode: float,
+    verifier_status: str,
+):
+    """The task status decides what is a grade, not the artifact alone."""
+
+    reward = tmp_path / "verifier" / "reward.json"
+    reward.parent.mkdir()
+    reward.write_text(
+        json.dumps(
+            _v11_reward(f2p_passed=44, f2p_total=44, p2p_passed=12, p2p_total=12)
+        ),
+        encoding="utf-8",
+    )
+
+    validated = wf._validate_stopped_verifier_reward(
+        {**_pending_verdict(), "command_returncode": command_returncode},
+        instance_log_dir=tmp_path,
+        test_inventory=RewardTestInventory(f2p_total=44, p2p_total=12),
+    )
+
+    status = wf._dataset_verdict_status(validated)
+    assert validated["verifier_status"] == verifier_status
+    assert status == "verification_failed"
+    assert status not in wf._GRADED_TASK_STATUSES
+    # The result keeps what its valid artifact held; the run roll-up counts
+    # the task ungraded and leaves these counts out of its sum.
+    assert validated["reward_valid"] is True
+    assert validated["reward"] == 1.0
+    assert validated["reward_counts"] == {
+        "apply_failed": False,
+        "f2p_passed": 44,
+        "f2p_total": 44,
+        "p2p_passed": 12,
+        "p2p_total": 12,
+    }
+
+
+def test_post_stop_reward_json_without_contract_fields_is_not_a_grade(
+    tmp_path: Path,
+):
+    reward = tmp_path / "verifier" / "reward.json"
+    reward.parent.mkdir()
+    reward.write_text(
+        '{"reward":1,"f2p_passed":44,"f2p_total":44}',
+        encoding="utf-8",
+    )
+
+    validated = wf._validate_stopped_verifier_reward(
+        _pending_verdict(),
+        instance_log_dir=tmp_path,
+        test_inventory=RewardTestInventory(f2p_total=44, p2p_total=12),
+    )
+
+    assert validated["reward"] is None
+    assert validated["resolved"] is None
+    assert validated["reward_state"] == "invalid"
+    assert validated["reward_counts"] is None
+    assert validated["reward_error"] == (
+        "reward.json fields are not the exact v1.1 contract"
+    )
+    assert validated["verifier_status"] == "reward_invalid"
+    assert wf._dataset_verdict_status(validated) == "verification_failed"
 
 
 def test_dataset_runner_defers_all_reward_reads_until_stop(
@@ -4586,6 +5706,7 @@ def test_post_stop_reward_leaf_symlink_fails_closed(tmp_path: Path):
             "reward_pending": True,
         },
         instance_log_dir=tmp_path,
+        test_inventory=None,
     )
 
     assert validated["raw_reward"] == ""
@@ -4593,6 +5714,7 @@ def test_post_stop_reward_leaf_symlink_fails_closed(tmp_path: Path):
     assert validated["resolved"] is None
     assert validated["reward_valid"] is False
     assert validated["reward_state"] == "unreadable"
+    assert validated["reward_error"]
     assert validated["verifier_status"] == "reward_invalid"
 
 
@@ -4610,6 +5732,7 @@ def test_post_stop_reward_oversize_fails_closed(tmp_path: Path):
             "reward_pending": True,
         },
         instance_log_dir=tmp_path,
+        test_inventory=None,
     )
 
     assert validated["raw_reward"] == ""
@@ -5277,6 +6400,451 @@ def test_retryable_task_projection_requires_every_failed_task_to_match():
     )
 
 
+def _unjudged_task_summary(inst, **override) -> dict:
+    """A settled pre-oracle task failure whose Architect reached no ruling."""
+
+    return {
+        "task_id": inst.task_id,
+        "ext_id": inst.ext_id,
+        "status": "candidate_failed",
+        "architect_operation_id": "architect-test",
+        "architect_detail_status": "inconclusive_tier_failure",
+        "architect_terminal_class": "inconclusive",
+        "rc": 1,
+        "reward": None,
+        "resolved": None,
+        "hidden_invocation_measurement_ref": None,
+        "cost_usd": 0.0,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+
+
+def _setup_stop_task_summary(inst, **override) -> dict:
+    """A settled stop before Architect was started."""
+
+    return {
+        "task_id": inst.task_id,
+        "ext_id": inst.ext_id,
+        "status": "setup_failed",
+        "failure_phase": "dev_verify_preflight",
+        "failure_kind": "dev_verify_unavailable",
+        "architect_detail_status": None,
+        "architect_terminal_class": None,
+        "rc": 2,
+        "reward": None,
+        "resolved": None,
+        "hidden_invocation_measurement_ref": None,
+        "cost_usd": 0.0,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+
+
+def _run_status_for_task_summaries(tmp_path: Path, monkeypatch, build_rows):
+    """Run the serial implement loop over stubbed task results.
+
+    ``build_rows`` receives the selected instances and returns one task
+    summary per instance. Returns ``(rc, result.json, outcome.json)``.
+    """
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    selected = wf._load_and_filter(ns)
+    rows = build_rows(selected)
+    selected = selected[: len(rows)]
+    by_task = {
+        inst.task_id: row for inst, row in zip(selected, rows, strict=True)
+    }
+    monkeypatch.setattr(
+        wf,
+        "_run_task_cascade",
+        lambda inst, **kwargs: by_task[inst.task_id],
+    )
+
+    rc = wf._implement_serial(selected, args=ns)
+
+    run_dir = next((tmp_path / "s" / "runs").iterdir())
+    result = json.loads((run_dir / "result.json").read_text())
+    outcome = json.loads((run_dir / "outcome.json").read_text())
+    return rc, result, outcome
+
+
+@pytest.mark.parametrize(
+    "build_rows",
+    [
+        pytest.param(
+            lambda insts: [_unjudged_task_summary(insts[0])],
+            id="inconclusive-architect",
+        ),
+        pytest.param(
+            lambda insts: [_unjudged_task_summary(
+                insts[0],
+                architect_detail_status="cancelled",
+                architect_terminal_class="cancelled",
+            )],
+            id="cancelled-architect",
+        ),
+        pytest.param(
+            lambda insts: [_unjudged_task_summary(
+                insts[0],
+                architect_detail_status="planner_infrastructure_failure",
+                rc=2,
+            )],
+            id="planner-backend-lost",
+        ),
+        pytest.param(
+            lambda insts: [
+                _unjudged_task_summary(
+                    insts[0],
+                    architect_detail_status="retryable_tier_failure",
+                    architect_terminal_class="retryable_failure",
+                ),
+                _unjudged_task_summary(insts[1]),
+            ],
+            id="one-retryable-one-inconclusive",
+        ),
+        pytest.param(
+            lambda insts: [
+                _lifecycle_summary(insts[0].task_id, insts[0].ext_id),
+                _unjudged_task_summary(insts[1]),
+            ],
+            id="one-resolved-one-inconclusive",
+        ),
+    ],
+)
+def test_implement_reports_unjudged_failures_as_inconclusive_at_run_boundary(
+    tmp_path: Path,
+    monkeypatch,
+    build_rows,
+):
+    """A run whose failed tasks were never judged is not ``tasks_failed``."""
+
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path, monkeypatch, build_rows,
+    )
+
+    assert rc == 1
+    assert result["status"] == "inconclusive_tasks_failed"
+    assert outcome["detail_status"] == "inconclusive_tasks_failed"
+    assert outcome["terminal_class"] == "inconclusive"
+
+
+@pytest.mark.parametrize(
+    "build_rows",
+    [
+        pytest.param(
+            lambda insts: [
+                _unjudged_task_summary(insts[0]),
+                {
+                    **_lifecycle_summary(
+                        insts[1].task_id, insts[1].ext_id, status="unresolved",
+                    ),
+                    "hidden_invocation_measurement_ref": "sha256:" + "a" * 64,
+                },
+            ],
+            id="one-unresolved",
+        ),
+        pytest.param(
+            lambda insts: [
+                _unjudged_task_summary(insts[0]),
+                _unjudged_task_summary(
+                    insts[1],
+                    architect_detail_status="partial_failed",
+                    architect_terminal_class="permanent_failure",
+                ),
+            ],
+            id="one-judged-architect-failure",
+        ),
+        pytest.param(
+            lambda insts: [
+                _setup_stop_task_summary(insts[0]),
+                _unjudged_task_summary(
+                    insts[1],
+                    architect_detail_status="inflation_veto",
+                    architect_terminal_class="permanent_failure",
+                ),
+            ],
+            id="setup-stop-and-judged-architect-failure",
+        ),
+    ],
+)
+def test_one_judged_failure_keeps_tasks_failed(
+    tmp_path: Path,
+    monkeypatch,
+    build_rows,
+):
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path, monkeypatch, build_rows,
+    )
+
+    assert rc == 1
+    assert result["status"] == "tasks_failed"
+    assert outcome["terminal_class"] == "permanent_failure"
+
+
+def test_all_retryable_failures_keep_retryable_tasks_failed(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The retryable projection is tested first and is not widened."""
+
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path,
+        monkeypatch,
+        lambda insts: [_unjudged_task_summary(
+            insts[0],
+            architect_detail_status="retryable_tier_failure",
+            architect_terminal_class="retryable_failure",
+        )],
+    )
+
+    assert rc == 1
+    assert result["status"] == "retryable_tasks_failed"
+    assert outcome["terminal_class"] == "retryable_failure"
+
+
+@pytest.mark.parametrize(
+    ("drop_field", "override"),
+    [
+        # The settlement terms of the retryable projection.
+        (None, {"hidden_invocation_measurement_ref": "sha256:" + "a" * 64}),
+        ("hidden_invocation_measurement_ref", {}),
+        (None, {"cost_incomplete": True}),
+        (None, {"cost_incomplete": 0}),
+        ("cost_incomplete", {}),
+        (None, {"cleanup_status": "failed"}),
+        ("cleanup_status", {}),
+        (None, {"status": "unresolved"}),
+        (None, {"status": "verification_incomplete"}),
+        # A class that is a ruling, a budget stop or a contract error.
+        (None, {"architect_terminal_class": "permanent_failure"}),
+        (None, {"architect_terminal_class": "contract_error"}),
+        (None, {"architect_terminal_class": "succeeded"}),
+        (None, {"architect_terminal_class": "budget_exhausted"}),
+        (None, {"architect_terminal_class": "interrupted"}),
+        # A setup stop raised after Architect returned: Architect ran, and
+        # its class decides.
+        (None, {"status": "setup_failed", "architect_terminal_class": "succeeded"}),
+        (
+            None,
+            {
+                "status": "toolchain_unavailable",
+                "architect_terminal_class": "permanent_failure",
+            },
+        ),
+        # Without a typed class only a setup stop before Architect counts,
+        # and only when Architect was never started.
+        (None, {"architect_terminal_class": None}),
+        ("architect_terminal_class", {}),
+        (
+            None,
+            {"status": "cascade_error", "architect_terminal_class": None},
+        ),
+        (
+            None,
+            {"status": "storage_quota_exceeded", "architect_terminal_class": None},
+        ),
+        (None, {"status": "setup_failed", "architect_terminal_class": None}),
+        # Architect never started, but the stop is not a setup stop.
+        (
+            None,
+            {
+                "status": "cascade_error",
+                "architect_terminal_class": None,
+                "architect_operation_id": None,
+            },
+        ),
+        (
+            "architect_operation_id",
+            {"status": "storage_quota_exceeded", "architect_terminal_class": None},
+        ),
+        ("architect_operation_id", {"architect_terminal_class": None}),
+    ],
+)
+def test_unjudged_task_projection_requires_exact_preoracle_settlement(
+    drop_field,
+    override,
+):
+    summary = {
+        "status": "candidate_failed",
+        "architect_operation_id": "architect-test",
+        "architect_terminal_class": "inconclusive",
+        "hidden_invocation_measurement_ref": None,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+    if drop_field is not None:
+        summary.pop(drop_field)
+
+    assert wf._all_task_failures_are_unjudged([summary]) is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {},
+        {"architect_terminal_class": "cancelled"},
+        {"architect_terminal_class": "retryable_failure"},
+        {"status": "cascade_error"},
+        {
+            "status": "setup_failed",
+            "architect_terminal_class": None,
+            "architect_operation_id": None,
+        },
+        {
+            "status": "toolchain_unavailable",
+            "architect_terminal_class": None,
+            "architect_operation_id": None,
+        },
+    ],
+)
+def test_unjudged_task_projection_accepts_only_unjudged_failures(override):
+    summary = {
+        "status": "candidate_failed",
+        "architect_operation_id": "architect-test",
+        "architect_terminal_class": "inconclusive",
+        "hidden_invocation_measurement_ref": None,
+        "cost_incomplete": False,
+        "cleanup_status": "complete",
+        **override,
+    }
+    resolved = {"status": "resolved"}
+
+    assert wf._all_task_failures_are_unjudged([summary]) is True
+    assert wf._all_task_failures_are_unjudged([resolved, summary]) is True
+    assert wf._all_task_failures_are_unjudged([resolved]) is False
+    assert wf._all_task_failures_are_unjudged([]) is False
+    assert wf._all_task_failures_are_unjudged(
+        [summary, {**summary, "status": "unresolved"}]
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            {"failure_kind": "dev_verify_unavailable"},
+            id="preflight-gate-could-not-run",
+        ),
+        pytest.param(
+            {"failure_kind": "dev_verify_failed", "rc": 1},
+            id="preflight-baseline-red",
+        ),
+        pytest.param(
+            {"failure_kind": "gate_created_paths_unbindable", "rc": 2},
+            id="preflight-gate-created-paths-unbindable",
+        ),
+        pytest.param(
+            {
+                "failure_phase": "container_setup",
+                "failure_kind": "InstanceContainerSetupError",
+            },
+            id="container-setup",
+        ),
+        pytest.param(
+            {
+                "status": "toolchain_unavailable",
+                "failure_phase": "container_setup",
+                "failure_kind": "toolchain_unavailable",
+            },
+            id="toolchain-unavailable",
+        ),
+    ],
+)
+def test_setup_stop_only_run_ends_inconclusive_tasks_failed(
+    tmp_path: Path,
+    monkeypatch,
+    override,
+):
+    """No model was called and no work exists: nothing was judged.
+
+    The rows of such a run re-run by default, so the run is not filed under
+    the permanent ``tasks_failed``.
+    """
+
+    rc, result, outcome = _run_status_for_task_summaries(
+        tmp_path,
+        monkeypatch,
+        lambda insts: [_setup_stop_task_summary(insts[0], **override)],
+    )
+
+    assert rc == 1
+    assert result["status"] == "inconclusive_tasks_failed"
+    assert outcome["detail_status"] == "inconclusive_tasks_failed"
+    assert outcome["terminal_class"] == "inconclusive"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            {
+                "status": "toolchain_unavailable",
+                "failure_phase": "container_setup",
+                "failure_kind": "toolchain_unavailable",
+                "architect_operation_id": "architect-test",
+                "architect_detail_status": "partial_failed",
+                "architect_terminal_class": "permanent_failure",
+            },
+            id="after-a-judged-architect-failure",
+        ),
+        pytest.param(
+            {
+                "failure_phase": "container_setup",
+                "failure_kind": "InstanceContainerSetupError",
+                "architect_operation_id": "architect-test",
+                "architect_detail_status": "complete",
+                "architect_terminal_class": "succeeded",
+            },
+            id="after-a-completed-architect",
+        ),
+        pytest.param(
+            {
+                "failure_phase": "container_setup",
+                "failure_kind": "InstanceContainerSetupError",
+                "architect_operation_id": "architect-test",
+            },
+            id="architect-started-without-a-typed-outcome",
+        ),
+        pytest.param({"cost_incomplete": True}, id="cost-incomplete"),
+        pytest.param({"cleanup_status": "failed"}, id="cleanup-failed"),
+    ],
+)
+def test_setup_stop_unsettled_or_after_architect_start_keeps_its_run_status(
+    tmp_path: Path,
+    monkeypatch,
+    override,
+):
+    """The setup arm needs positive proof that Architect never started.
+
+    It also needs the exact settlement of cost and cleanup: the last two
+    rows are stops before Architect that lack it.
+    """
+
+    rc, result, _outcome_json = _run_status_for_task_summaries(
+        tmp_path,
+        monkeypatch,
+        lambda insts: [_setup_stop_task_summary(insts[0], **override)],
+    )
+
+    assert rc == 1
+    assert result["status"] == (
+        "cost_incomplete" if override.get("cost_incomplete") else "tasks_failed"
+    )
+
+
 def test_implement_composes_remaining_budget_and_fails_last_task_overshoot(
     tmp_path: Path,
     monkeypatch,
@@ -5323,6 +6891,189 @@ def test_implement_composes_remaining_budget_and_fails_last_task_overshoot(
     assert summary["cost_total_usd"] == pytest.approx(12.0)
     assert summary["halt_reason"] == "aggregate_budget_exceeded"
     assert result["status"] == "budget_exhausted"
+    assert summary["tasks_selected"] == 4
+    assert summary["tasks_total"] == 2
+    assert summary["tasks_unrecorded"] == 0
+    assert summary["tasks_not_started"] == 2
+
+
+def test_implement_reports_tasks_not_started_after_budget_halt(
+    tmp_path: Path,
+    monkeypatch,
+):
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement",
+            "--budget-usd",
+            "10",
+            "--budget-usd-per-instance",
+            "10",
+        ]
+    )
+    executed: list[str] = []
+
+    def _task(inst, *, cost, **kwargs):
+        executed.append(inst.task_id)
+        cost.record(
+            role=inst.task_id,
+            usage=wf._CostShim(10.0),
+            backend_name="stub",
+            model="stub",
+        )
+        return {
+            "task_id": inst.task_id,
+            "ext_id": inst.ext_id,
+            "status": "resolved",
+            "cost_usd": 10.0,
+            "cost_incomplete": False,
+        }
+
+    monkeypatch.setattr(wf, "_run_task_cascade", _task)
+    filtered = wf._load_and_filter(ns)
+
+    assert wf._implement_serial(filtered, args=ns) == 1
+
+    assert executed == [filtered[0].task_id]
+    run_dir = next((tmp_path / "s" / "runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    result = json.loads((run_dir / "result.json").read_text())
+    assert summary["halt_reason"] == "aggregate_budget_reached"
+    assert result["status"] == "budget_exhausted"
+    assert summary["tasks_selected"] == 4
+    assert summary["tasks_total"] == 1
+    assert summary["tasks_resolved"] == 1
+    assert summary["tasks_failed"] == 0
+    assert summary["tasks_unrecorded"] == 0
+    # The three tasks the halt never reached are not failures and not zeros.
+    assert summary["tasks_not_started"] == 3
+    assert summary["tasks_ungraded"] == 0
+
+
+@pytest.mark.parametrize(
+    ("failure", "halt_reason"),
+    [
+        pytest.param("checkpoint", "lifecycle_output_failed", id="checkpoint"),
+        pytest.param("lease", "task_lease_error", id="task-lease"),
+    ],
+)
+def test_implement_counts_a_task_without_summary_apart_from_not_started(
+    tmp_path: Path,
+    monkeypatch,
+    failure: str,
+    halt_reason: str,
+):
+    """A task handed to execution that left no summary is not 'not started'.
+
+    It ran but could not be checkpointed, or its lease could not be taken.
+    """
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+            "--lifecycle-out",
+            str(tmp_path / "lifecycle.jsonl"),
+        ]
+    )
+    filtered = wf._load_and_filter(ns)
+    executed: list[str] = []
+
+    def _task(inst, **kwargs):
+        executed.append(inst.task_id)
+        return _lifecycle_summary(inst.task_id, inst.ext_id)
+
+    def _append(*, out_path, summary):
+        raise OSError("lifecycle volume is read-only")
+
+    def _lease(spec_dir, task_id):
+        raise OSError("task lease directory is read-only")
+
+    monkeypatch.setattr(wf, "_run_task_cascade", _task)
+    if failure == "checkpoint":
+        monkeypatch.setattr(wf, "_append_lifecycle_record", _append)
+    else:
+        monkeypatch.setattr(wf, "_task_execution_lease", _lease)
+
+    assert wf._implement_serial(filtered, args=ns) == 1
+
+    # The cascade of the first task ran to a resolved grade, unless the
+    # lease it runs under could not be taken.
+    assert executed == (
+        [filtered[0].task_id] if failure == "checkpoint" else []
+    )
+    run_dir = next((tmp_path / "s" / "runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    result = json.loads((run_dir / "result.json").read_text())
+    assert result["status"] == halt_reason
+    assert summary["halt_reason"] == halt_reason
+    assert summary["tasks"] == []
+    assert summary["tasks_selected"] == 4
+    assert summary["tasks_total"] == 0
+    assert summary["tasks_unrecorded"] == 1
+    assert summary["tasks_not_started"] == 3
+
+
+def test_implement_setup_stop_is_counted_ungraded_and_rerun_by_default(
+    tmp_path: Path,
+    monkeypatch,
+):
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+            "--limit",
+            "1",
+        ]
+    )
+    monkeypatch.setattr(
+        wf,
+        "_run_task_cascade",
+        lambda inst, **kwargs: {
+            "task_id": inst.task_id,
+            "ext_id": inst.ext_id,
+            "status": "setup_failed",
+            "failure_phase": "dev_verify_preflight",
+            "failure_kind": "dev_verify_failed",
+            "rc": 1,
+            "reward": None,
+            "resolved": None,
+            "hidden_invocation_measurement_ref": None,
+            "cost_usd": 0.0,
+            "cost_incomplete": False,
+            "cleanup_status": "complete",
+        },
+    )
+
+    # Exit 1 as for any non-resolved task; there is no separate exit code for
+    # a task that was never graded.
+    assert wf._implement_serial(wf._load_and_filter(ns), args=ns) == 1
+
+    run_dir = next((tmp_path / "s" / "runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["tasks_selected"] == 1
+    assert summary["tasks_total"] == 1
+    assert summary["tasks_failed"] == 1
+    assert summary["tasks_graded"] == 0
+    assert summary["tasks_unresolved"] == 0
+    assert summary["tasks_ungraded"] == 1
+    assert summary["tasks_rerun_by_default"] == 1
+    assert summary["tasks_not_started"] == 0
+    assert summary["tasks_unrecorded"] == 0
+    assert summary["tasks_by_status"] == {"setup_failed": 1}
+    assert summary["tasks"][0]["reward"] is None
 
 
 def _lifecycle_summary(
@@ -5349,6 +7100,81 @@ def _lifecycle_summary(
         "checkpoint_fingerprint": "sha256:" + "1" * 64,
         "image_digest": "test/image@sha256:" + "a" * 64,
     }
+
+
+def _permanent_planning_summary(task_id: str, ext_id: str) -> dict:
+    """A deterministic zero-tier Architect veto with every proof complete."""
+
+    summary = _lifecycle_summary(task_id, ext_id, status="candidate_failed")
+    summary.update(
+        {
+            "rc": 2,
+            "reward": None,
+            "resolved": None,
+            "authoring_status": "failed",
+            "candidate_capture_status": "failed",
+            "candidate": None,
+            "pristine_replay": None,
+            "verifier_status": "not_run",
+            "verifier_patch": None,
+            "tests_snapshot": None,
+            "architect_detail_status": "inflation_veto",
+            "architect_terminal_class": "permanent_failure",
+            "architect_failure_phase": "architect_planning",
+            "architect_failure_kind": "inflation_veto",
+            "architect_tiers_executed": 0,
+            "zero_tier_settlement_proven": True,
+            "secondary_failures": [],
+            "failure_phase": "architect_planning",
+            "failure_kind": "inflation_veto",
+        }
+    )
+    return summary
+
+
+@pytest.mark.parametrize(
+    ("summary", "policy"),
+    (
+        (_lifecycle_summary("task", "ext", status="resolved"), "reusable"),
+        (_lifecycle_summary("task", "ext", status="unresolved"), "reusable"),
+        (
+            _lifecycle_summary("task", "ext", status="verification_failed"),
+            "reusable",
+        ),
+        (
+            _lifecycle_summary("task", "ext", status="verification_incomplete"),
+            "reusable",
+        ),
+        (_lifecycle_summary("task", "ext", status="setup_failed"), "retryable"),
+        (_lifecycle_summary("task", "ext", status="cascade_error"), "retryable"),
+        (
+            _lifecycle_summary("task", "ext", status="candidate_failed"),
+            "retryable",
+        ),
+        (_permanent_planning_summary("task", "ext"), "permanent"),
+        (
+            {
+                **_lifecycle_summary("task", "ext", status="resolved"),
+                "diagnostic_cost_policy": "any-declared-policy",
+            },
+            "diagnostic_only",
+        ),
+        (
+            {
+                **_permanent_planning_summary("task", "ext"),
+                "diagnostic_cost_policy": "any-declared-policy",
+            },
+            "diagnostic_only",
+        ),
+    ),
+)
+def test_task_status_policy_is_literal_for_each_lifecycle_class(
+    summary: dict,
+    policy: str,
+):
+    assert wf._task_status_policy(summary) == policy
+    # The durable row and the run roll-up classify through the same rule.
+    assert wf._lifecycle_record(summary)["status_policy"] == policy
 
 
 def test_lifecycle_checkpoint_restores_physical_pricing_ledger():
@@ -5772,6 +7598,50 @@ def test_checkpoint_fingerprint_binds_shared_container_runtime_policy(
     assert changed != baseline
 
 
+@pytest.mark.parametrize("authority_file", ["secure_artifacts.py", "dataset.py"])
+def test_checkpoint_fingerprint_binds_reward_grade_authority(
+    tmp_path: Path,
+    monkeypatch,
+    authority_file: str,
+):
+    """The reward reader and the whitelist rule decide what is a grade."""
+
+    manifest = _build_corpus(tmp_path)
+    ns = wf._parse_args(
+        [
+            "--spec",
+            str(tmp_path / "s"),
+            "--dataset",
+            str(manifest),
+            "--implement", "--planner-count", "1",
+        ]
+    )
+    inst = wf._load_and_filter(ns)[0]
+    baseline = wf._deepswe_checkpoint_fingerprint(
+        inst,
+        args=ns,
+        child_budget_usd=3.0,
+    )
+    original_file_digest = wf.file_digest
+    product_root = Path(wf.__file__).resolve().parents[1] / "products" / "deepswe"
+
+    def _changed_authority_digest(path):
+        digest = original_file_digest(path)
+        if Path(path) == product_root / authority_file:
+            return {**digest, "sha256": "e" * 64}
+        return digest
+
+    monkeypatch.setattr(wf, "file_digest", _changed_authority_digest)
+
+    changed = wf._deepswe_checkpoint_fingerprint(
+        inst,
+        args=ns,
+        child_budget_usd=3.0,
+    )
+
+    assert changed != baseline
+
+
 def test_checkpoint_fingerprint_binds_product_mutation_settlement_adapter(
     tmp_path: Path,
     monkeypatch,
@@ -6007,13 +7877,14 @@ def test_lifecycle_v2_is_strictly_normalized_with_unknown_new_fields():
             "verifier_stderr_bytes",
             "verifier_stdout_truncated",
             "verifier_stderr_truncated",
+            "reward_counts",
         }
     }
     legacy["schema_version"] = "crucible.deepswe.lifecycle.v2"
 
     normalized = wf._validate_lifecycle_record(legacy, line_number=1)
 
-    assert normalized["schema_version"] == "crucible.deepswe.lifecycle.v4"
+    assert normalized["schema_version"] == "crucible.deepswe.lifecycle.v5"
     assert normalized["assigned_budget_usd"] is None
     assert normalized["candidate"] is None
     assert normalized["verifier_status"] is None
@@ -6023,6 +7894,7 @@ def test_lifecycle_v2_is_strictly_normalized_with_unknown_new_fields():
     assert normalized["baseline_test_returncode"] is None
     assert normalized["new_test_returncode"] is None
     assert normalized["diagnostics_persisted"] is None
+    assert normalized["reward_counts"] is None
 
 
 def test_lifecycle_v3_is_normalized_without_inventing_architect_provenance():
@@ -6047,12 +7919,13 @@ def test_lifecycle_v3_is_normalized_without_inventing_architect_provenance():
         "verifier_stderr_bytes",
         "verifier_stdout_truncated",
         "verifier_stderr_truncated",
+        "reward_counts",
     ):
         legacy.pop(field)
 
     normalized = wf._validate_lifecycle_record(legacy, line_number=1)
 
-    assert normalized["schema_version"] == "crucible.deepswe.lifecycle.v4"
+    assert normalized["schema_version"] == "crucible.deepswe.lifecycle.v5"
     assert normalized["architect_detail_status"] is None
     assert normalized["architect_terminal_class"] is None
     assert normalized["zero_tier_settlement_proven"] is False
@@ -6064,6 +7937,115 @@ def test_lifecycle_v3_is_normalized_without_inventing_architect_provenance():
     assert normalized["baseline_test_returncode"] is None
     assert normalized["new_test_returncode"] is None
     assert normalized["diagnostics_persisted"] is None
+    assert normalized["reward_counts"] is None
+
+
+def test_lifecycle_v4_is_normalized_without_inventing_reward_counts():
+    legacy = wf._lifecycle_record(_lifecycle_summary("task", "ext"))
+    legacy["schema_version"] = "crucible.deepswe.lifecycle.v4"
+    legacy.pop("reward_counts")
+
+    normalized = wf._validate_lifecycle_record(legacy, line_number=1)
+
+    assert normalized["schema_version"] == "crucible.deepswe.lifecycle.v5"
+    assert normalized["reward_counts"] is None
+    assert normalized["reward"] == 1.0
+    assert normalized["status_policy"] == "reusable"
+
+
+def test_lifecycle_rejects_unknown_schema_version():
+    record = wf._lifecycle_record(_lifecycle_summary("task", "ext"))
+    record["schema_version"] = "crucible.deepswe.lifecycle.v6"
+
+    with pytest.raises(ValueError, match="unsupported schema"):
+        wf._validate_lifecycle_record(record, line_number=1)
+
+
+_LIFECYCLE_COUNTS = {
+    "apply_failed": False,
+    "f2p_passed": 3,
+    "f2p_total": 3,
+    "p2p_passed": 120,
+    "p2p_total": 120,
+}
+
+
+def test_lifecycle_persists_reward_counts():
+    summary = _lifecycle_summary("task", "ext")
+    summary["reward_counts"] = dict(_LIFECYCLE_COUNTS)
+
+    record = wf._lifecycle_record(summary)
+    validated = wf._validate_lifecycle_record(record, line_number=1)
+
+    assert validated["schema_version"] == "crucible.deepswe.lifecycle.v5"
+    assert validated["reward_counts"] == _LIFECYCLE_COUNTS
+    # The row survives its JSON round trip through the checkpoint file.
+    assert (
+        wf._validate_lifecycle_record(
+            json.loads(json.dumps(validated)),
+            line_number=1,
+        )
+        == validated
+    )
+    countless = wf._lifecycle_record(_lifecycle_summary("task", "ext"))
+    assert countless["reward_counts"] is None
+    assert (
+        wf._validate_lifecycle_record(countless, line_number=1)["reward_counts"]
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("reward", "reward_counts"),
+    (
+        (1.0, {**_LIFECYCLE_COUNTS, "partial": 1.0}),
+        (
+            1.0,
+            {
+                key: value
+                for key, value in _LIFECYCLE_COUNTS.items()
+                if key != "apply_failed"
+            },
+        ),
+        (1.0, {**_LIFECYCLE_COUNTS, "p2p_passed": -1}),
+        (1.0, {**_LIFECYCLE_COUNTS, "f2p_total": True}),
+        (1.0, {**_LIFECYCLE_COUNTS, "f2p_passed": 3.0}),
+        (1.0, {**_LIFECYCLE_COUNTS, "f2p_passed": 4}),
+        (1.0, {**_LIFECYCLE_COUNTS, "apply_failed": 0}),
+        (1.0, [3, 3, 120, 120]),
+        # counts without a reward
+        (None, dict(_LIFECYCLE_COUNTS)),
+        # counts that earn the other reward
+        (0.0, dict(_LIFECYCLE_COUNTS)),
+        (1.0, {**_LIFECYCLE_COUNTS, "f2p_passed": 2}),
+        (True, dict(_LIFECYCLE_COUNTS)),
+    ),
+    ids=(
+        "unknown_key",
+        "missing_key",
+        "negative",
+        "boolean_count",
+        "float_count",
+        "passed_above_total",
+        "apply_failed_not_boolean",
+        "not_a_mapping",
+        "no_reward",
+        "reward_zero_all_passing",
+        "reward_one_with_failure",
+        "boolean_reward",
+    ),
+)
+def test_lifecycle_rejects_malformed_or_ungraded_reward_counts(
+    reward,
+    reward_counts,
+):
+    record = wf._lifecycle_record(_lifecycle_summary("task", "ext"))
+    record["reward"] = reward
+    record["resolved"] = reward
+    record["reward_counts"] = reward_counts
+
+    with pytest.raises(ValueError, match="reward_counts"):
+        wf._validate_lifecycle_record(record, line_number=1)
 
 
 def test_lifecycle_persists_original_assigned_budget():
@@ -6131,7 +8113,7 @@ def test_lifecycle_checkpoint_deduplicates_and_recovers_torn_tail(
     records = [json.loads(line) for line in out.read_text().splitlines()]
     assert [record["task_id"] for record in records] == ["task-1", "task-2"]
     assert all(
-        record["schema_version"] == "crucible.deepswe.lifecycle.v4"
+        record["schema_version"] == "crucible.deepswe.lifecycle.v5"
         for record in records
     )
 
@@ -6178,6 +8160,11 @@ def test_invalid_lifecycle_terminal_records_run_duration(
     result = json.loads((run_dir / "result.json").read_text())
     assert result["status"] == "lifecycle_output_invalid"
     assert result["duration_s"] == 12.25
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["tasks_selected"] == 4
+    assert summary["tasks_total"] == 0
+    assert summary["tasks_unrecorded"] == 0
+    assert summary["tasks_not_started"] == 4
 
 
 def test_implement_resumes_checkpoint_without_duplicate_task_work(
@@ -6307,6 +8294,11 @@ def test_completed_single_track_checkpoint_cannot_be_relabelled_as_competition(
     run_dir = next((tmp_path / "s" / "runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text())
     assert summary["halt_reason"] == "lifecycle_identity_conflict"
+    # The task was handed to execution and ended without a task summary.
+    assert summary["tasks_selected"] == 1
+    assert summary["tasks_total"] == 0
+    assert summary["tasks_unrecorded"] == 1
+    assert summary["tasks_not_started"] == 0
     assert lifecycle.read_bytes() == original_record
 
 
@@ -6558,6 +8550,16 @@ def test_task_execution_lease_prevents_concurrent_duplicate_work(
     assert summary["status"] == "task_lease_busy"
     assert summary["halt_reason"] == "task_lease_busy"
     assert summary["tasks"][0]["status"] == "task_lease_busy"
+    # Another process holds the task: it is neither an ungraded result of
+    # this run nor a row this run leaves behind for a re-run.
+    assert summary["tasks_selected"] == 1
+    assert summary["tasks_total"] == 1
+    assert summary["tasks_lease_busy"] == 1
+    assert summary["tasks_ungraded"] == 0
+    assert summary["tasks_rerun_by_default"] == 0
+    assert summary["tasks_not_started"] == 0
+    assert summary["tasks_unrecorded"] == 0
+    assert summary["tasks_by_status"] == {"task_lease_busy": 1}
     assert result["status"] == "task_lease_busy"
     assert any(event.get("reason") == "task_lease_busy" for event in events)
 
@@ -6776,6 +8778,9 @@ def test_implement_empty_dataset_is_no_work_terminal(
     result = json.loads((run_dir / "result.json").read_text())
     assert summary["status"] == "no_work"
     assert summary["tasks_total"] == 0
+    assert summary["tasks_selected"] == 0
+    assert summary["tasks_not_started"] == 0
+    assert summary["tasks_unrecorded"] == 0
     assert result["status"] == "no_work"
     assert result["duration_s"] == 4.75
 
@@ -6809,6 +8814,11 @@ def test_implement_preflight_failure_has_summary_result_and_event(
     assert summary["status"] == "container_runtime_required"
     assert result["status"] == "container_runtime_required"
     assert events[-1]["status"] == "container_runtime_required"
+    # Four tasks were selected before Docker turned out to be unavailable.
+    assert summary["tasks_selected"] == 4
+    assert summary["tasks_total"] == 0
+    assert summary["tasks_unrecorded"] == 0
+    assert summary["tasks_not_started"] == 4
 
 
 def test_implement_dataset_failure_is_a_visible_run(tmp_path: Path):
@@ -6831,6 +8841,8 @@ def test_implement_dataset_failure_is_a_visible_run(tmp_path: Path):
     result = json.loads((run_dir / "result.json").read_text())
     assert summary["status"] == "dataset_missing"
     assert result["status"] == "dataset_missing"
+    assert summary["tasks_selected"] == 0
+    assert summary["tasks_not_started"] == 0
 
 
 # ---------- per-task cost roll-up (_architect_run_cost / _rollup_architect_cost) ----------

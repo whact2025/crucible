@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import copy
 import json
-import logging
 import sys
 import threading
 from types import SimpleNamespace
@@ -52,8 +51,8 @@ def _isolate_inference_gateway_env(monkeypatch, tmp_path):
                 "kwarg-model",
                 "env-model",
                 "qwen2.5-coder-32b",
-                "nvidia/zai-org/glm-5.2",
-                "nvidia/moonshotai/kimi-k2.6",
+                "nvidia/zai-org/glm-5.3",
+                "nvidia/moonshotai/kimi-k3.1-pro",
             )
         ) + "\n",
         encoding="utf-8",
@@ -374,130 +373,86 @@ def test_invoke_passes_vendor_neutral_schema_to_native_strict_json():
     }
 
 
-def test_nvidia_glm52_recursively_omits_unsupported_unique_items(caplog):
-    backend = OpenAIBackend(
-        model="nvidia/zai-org/glm-5.2",
-        base_url="https://inference-api.nvidia.com/v1",
-    )
-    schema = {
-        "type": "object",
-        "properties": {
-            "values": {
-                "type": "array",
-                "uniqueItems": True,
-                "items": {
-                    "anyOf": [
-                        {"type": "array", "uniqueItems": True},
-                        {"type": "string"},
-                    ],
-                },
-            },
-            # This is a property name, not a JSON Schema keyword.
-            "uniqueItems": {"type": "boolean"},
-            # Objects inside enum are data, not subschemas.
-            "literal": {"enum": [{"uniqueItems": True}]},
-        },
-        "$defs": {
-            "nested": {"type": "array", "uniqueItems": True},
-        },
-    }
-    original = copy.deepcopy(schema)
-
-    with caplog.at_level(logging.WARNING):
-        first = backend._structured_output_kwargs(schema)
-        backend._structured_output_kwargs(schema)
-
-    sent = first["response_format"]["json_schema"]["schema"]
-    assert "uniqueItems" not in sent["properties"]["values"]
-    assert (
-        "uniqueItems"
-        not in sent["properties"]["values"]["items"]["anyOf"][0]
-    )
-    assert "uniqueItems" not in sent["$defs"]["nested"]
-    assert sent["properties"]["uniqueItems"] == {"type": "boolean"}
-    assert sent["properties"]["literal"]["enum"] == [{"uniqueItems": True}]
-    assert schema == original, "server compatibility must not mutate Assay's schema"
-    warnings = [
-        record for record in caplog.records
-        if "unsupported uniqueItems" in record.getMessage()
-    ]
-    assert len(warnings) == 1
-
-
 @pytest.mark.parametrize(
     ("model", "base_url"),
     [
-        ("nvidia/zai-org/glm-5.2", "https://other.example/v1"),
+        ("nvidia/zai-org/glm-5.3", "https://inference-api.nvidia.com"),
+        ("nvidia/zai-org/glm-5.3", "https://inference-api-dev.nvidia.com/v1"),
+        ("nvidia/zai-org/glm-5.3", "https://other.example/v1"),
         ("x", "https://inference-api.nvidia.com/v1"),
     ],
 )
-def test_unique_items_schema_is_unchanged_for_unrelated_routes(model, base_url):
+def test_unique_items_schema_reaches_every_route_unchanged(model, base_url):
+    """No route, the hub's GLM route included, gets a weakened schema."""
+
     backend = OpenAIBackend(model=model, base_url=base_url)
     schema = {
         "type": "array",
         "items": {"type": "array", "uniqueItems": True},
         "uniqueItems": True,
     }
+    original = copy.deepcopy(schema)
 
     kwargs = backend._structured_output_kwargs(schema)
 
-    assert kwargs["response_format"]["json_schema"]["schema"] == schema
-
-
-def test_nvidia_glm52_accepts_structured_json_from_reasoning_content():
-    backend = OpenAIBackend(
-        model="nvidia/zai-org/glm-5.2",
-        base_url="https://inference-api.nvidia.com",
-    )
-    backend._client = _stub_client(_stub_response(
-        None,
-        reasoning_content='{"values":["alpha","beta"]}',
-    ))
-    schema = {
-        "type": "object",
-        "properties": {
-            "values": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["values"],
-        "additionalProperties": False,
-    }
-
-    result = backend.invoke(Invocation(
-        system="s",
-        user="u",
-        tools=None,
-        max_turns=1,
-        budget_usd=None,
-        response_schema=schema,
-    ))
-
-    assert result.error is None
-    assert result.final_message == '{"values":["alpha","beta"]}'
-    assert result.transcript[-1].content == result.final_message
+    assert kwargs["response_format"]["json_schema"]["schema"] == original
+    assert schema == original
 
 
 @pytest.mark.parametrize(
-    ("model", "base_url", "response_schema"),
+    (
+        "model",
+        "base_url",
+        "response_schema",
+        "reasoning_content",
+        "finish_reason",
+    ),
     [
-        (
-            "nvidia/zai-org/glm-5.2",
+        # The route and the shape that used to be taken as a structured answer.
+        pytest.param(
+            "nvidia/zai-org/glm-5.3",
+            "https://inference-api.nvidia.com",
+            {"type": "object"},
+            '{"private":"reasoning"}',
+            "stop",
+            id="hub-glm-schema-json-object",
+        ),
+        pytest.param(
+            "nvidia/zai-org/glm-5.3",
+            "https://inference-api.nvidia.com",
+            {"type": "object"},
+            "The caller wants one object. I will answer now.",
+            "length",
+            id="hub-glm-schema-prose-length",
+        ),
+        pytest.param(
+            "nvidia/zai-org/glm-5.3",
             "https://inference-api.nvidia.com",
             None,
+            '{"private":"reasoning"}',
+            "stop",
+            id="hub-glm-no-schema",
         ),
-        (
+        pytest.param(
             "x",
             "http://localhost:8000/v1",
             {"type": "object"},
+            '{"private":"reasoning"}',
+            "stop",
+            id="local-schema",
         ),
     ],
 )
-def test_reasoning_content_is_not_exposed_without_exact_structured_route(
-    model, base_url, response_schema,
+def test_reasoning_content_is_never_a_completion_answer(
+    model, base_url, response_schema, reasoning_content, finish_reason,
 ):
+    """A content-free reply stays empty whatever its reasoning field holds."""
+
     backend = OpenAIBackend(model=model, base_url=base_url)
     backend._client = _stub_client(_stub_response(
         None,
-        reasoning_content='{"private":"reasoning"}',
+        reasoning_content=reasoning_content,
+        finish_reason=finish_reason,
     ))
 
     result = backend.invoke(Invocation(
@@ -512,7 +467,13 @@ def test_reasoning_content_is_not_exposed_without_exact_structured_route(
 
     assert result.final_message == ""
     assert result.error is not None
-    assert "empty completion" in result.error.message
+    if finish_reason == "length":
+        assert result.stop_reason == "max_turns"
+        assert isinstance(result.error, MaxTurnsExceeded)
+    else:
+        assert result.error.retriable is True
+        assert "empty completion" in result.error.message
+    assert [message.content for message in result.transcript] == ["u", ""]
 
 
 def test_invoke_finish_reason_length_classifies_as_max_turns(monkeypatch):
@@ -1235,7 +1196,7 @@ def test_tool_loop_replays_opaque_reasoning_content_without_transcript_leak(
 
     toolset = _StubToolSet(results={"lookup": "evidence"})
     backend = OpenAIBackend(
-        model="nvidia/moonshotai/kimi-k2.6",
+        model="nvidia/moonshotai/kimi-k3.1-pro",
         capability="read_only",
     )
     backend.attach_toolset(toolset)
@@ -1277,8 +1238,8 @@ def test_tool_loop_replays_opaque_reasoning_content_without_transcript_leak(
     )
 
 
-def test_kimi_k26_write_turn_uses_auto_instead_of_required_tool_choice():
-    """K2.6 thinking-mode tool calls do not support ``required``."""
+def test_kimi_k31_pro_write_turn_requires_a_tool_call():
+    """Write-only turns send ``required``; no model-specific exception."""
 
     class _MutatingToolSet(_StubToolSet):
         write_names = {"apply_patch"}
@@ -1291,7 +1252,7 @@ def test_kimi_k26_write_turn_uses_auto_instead_of_required_tool_choice():
 
     toolset = _MutatingToolSet(results={"apply_patch": "ok"})
     backend = OpenAIBackend(
-        model="nvidia/moonshotai/kimi-k2.6",
+        model="nvidia/moonshotai/kimi-k3.1-pro",
         capability="workspace_write",
     )
     backend.attach_toolset(toolset)
@@ -1322,10 +1283,21 @@ def test_kimi_k26_write_turn_uses_auto_instead_of_required_tool_choice():
     ))
 
     tool_calls = [call for call in calls if "tools" in call]
-    assert [call.get("tool_choice") for call in tool_calls] == ["auto"]
-    assert all(call.get("tool_choice") != "required" for call in calls)
+    assert [call.get("tool_choice") for call in tool_calls] == ["required"]
     assert toolset.dispatched == [("apply_patch", {})]
+    echoed = [
+        message for message in calls[-1]["messages"]
+        if message.get("role") == "assistant"
+    ]
+    assert [message.get("reasoning_content") for message in echoed] == [
+        "opaque-thinking-state",
+    ]
+    assert echoed[0]["tool_calls"][0]["id"] == "write-1"
     assert result.final_message == "done"
+    assert all(
+        "opaque-thinking-state" not in message.content
+        for message in result.transcript
+    )
 
 
 def test_tool_loop_timeout_preserves_accumulated_usage():
@@ -2541,9 +2513,16 @@ def test_tool_loop_defers_schema_until_no_tools_finalization():
     assert result.usage.output_tokens == 60
 
 
-def test_nvidia_structured_finalization_reads_provider_specific_reasoning():
+def test_structured_finalization_never_reads_reasoning_content():
+    """A finalization that returns only reasoning leaves the draft as it is.
+
+    The reasoning here is one complete JSON object, the shape that used to be
+    taken as the structured answer.  The unstructured draft stays the final
+    message of a normal end turn; Assay's validation of it decides the rest.
+    """
+
     backend = OpenAIBackend(
-        model="nvidia/zai-org/glm-5.2",
+        model="nvidia/zai-org/glm-5.3",
         base_url="https://inference-api.nvidia.com",
         capability="read_only",
     )
@@ -2579,7 +2558,137 @@ def test_nvidia_structured_finalization_reads_provider_specific_reasoning():
     ))
 
     assert result.error is None
-    assert result.final_message == '{"answer":"final"}'
+    assert result.stop_reason == "end_turn"
+    assert result.final_message == "draft"
+    assert [message.content for message in result.transcript] == ["u", "draft"]
+
+
+@pytest.mark.parametrize(
+    "site",
+    ["required_write_nudge", "length_continuation", "finalization_draft"],
+)
+@pytest.mark.parametrize(
+    ("reasoning_fields", "replayed"),
+    [
+        ({"reasoning_content": "prose-turn-thinking"}, True),
+        (
+            {
+                "provider_specific_fields": {
+                    "reasoning_content": "prose-turn-thinking",
+                },
+            },
+            True,
+        ),
+        ({}, False),
+    ],
+)
+def test_prose_assistant_turns_replay_reasoning_content(
+    site, reasoning_fields, replayed,
+):
+    """An assistant turn without tool calls goes back with its reasoning.
+
+    Three places put such a turn back into the provider conversation: the
+    nudge after an ignored required write, the continuation after an early
+    ``length`` stop, and the draft before the constrained finalization.  The
+    K3 series requires the complete assistant message on the next request, so
+    each carries the provider's reasoning when one was sent and no
+    ``reasoning_content`` key otherwise.  None of it reaches Crucible's
+    transcript or final message.
+    """
+
+    class _MutatingToolSet(_StubToolSet):
+        write_names = {"apply_patch"}
+
+        def to_openai_tools(self):
+            return [{
+                "type": "function",
+                "function": {"name": "apply_patch", "parameters": {}},
+            }]
+
+    schema = None
+    if site == "finalization_draft":
+        toolset = _StubToolSet(results={"lookup": "evidence"})
+        capability = "read_only"
+        max_turns = 5
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        responses = [
+            _stub_response(
+                "",
+                tool_calls=[_tool_call("c1", "lookup", "{}")],
+                reasoning_content="tool-turn-thinking",
+            ),
+            _stub_response("prose turn", **reasoning_fields),
+            _stub_response('{"answer":"final"}'),
+        ]
+    else:
+        toolset = _MutatingToolSet(results={"apply_patch": "ok"})
+        capability = "workspace_write"
+        # One turn makes the first request a required write; four leave room
+        # for the same-conversation completion after an early ``length``.
+        max_turns = 1 if site == "required_write_nudge" else 4
+        responses = [
+            _stub_response(
+                "prose turn",
+                finish_reason=(
+                    "stop" if site == "required_write_nudge" else "length"
+                ),
+                **reasoning_fields,
+            ),
+            _stub_response(
+                "",
+                tool_calls=[_tool_call("write-1", "apply_patch", "{}")],
+            ),
+        ]
+    backend = OpenAIBackend(
+        model="nvidia/moonshotai/kimi-k3.1-pro",
+        capability=capability,
+    )
+    backend.attach_toolset(toolset)
+    pending = iter(responses)
+    calls = []
+
+    def _create(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        return next(pending)
+
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=_create),
+        ),
+    )
+
+    result = backend.invoke(Invocation(
+        system="s",
+        user="u",
+        tools=None,
+        max_turns=max_turns,
+        budget_usd=None,
+        response_schema=schema,
+    ))
+
+    assert len(calls) == len(responses)
+    if site == "required_write_nudge":
+        assert calls[0]["tool_choice"] == "required"
+        assert "write tool was not called" in calls[-1]["messages"][-1]["content"]
+    elif site == "length_continuation":
+        assert "tool_choice" not in calls[0]
+        assert "hit its output limit" in calls[-1]["messages"][-1]["content"]
+    else:
+        assert "response_format" in calls[-1]
+        assert result.final_message == '{"answer":"final"}'
+    expected = {"role": "assistant", "content": "prose turn"}
+    if replayed:
+        expected["reasoning_content"] = "prose-turn-thinking"
+    assert calls[-1]["messages"][-2] == expected
+    assert all(
+        "thinking" not in message.content for message in result.transcript
+    )
+    assert "thinking" not in result.final_message
 
 
 def test_outer_invoke_does_not_double_retry_tool_loop_error(monkeypatch):

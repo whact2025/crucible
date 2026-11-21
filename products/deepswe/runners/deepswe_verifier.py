@@ -15,7 +15,9 @@ Subprocess contract (per ``assay.bench``):
 - Emits JSON KPI payload on stdout.
 - In direct/read-reward mode, exit 0 means the verifier command completed and
   wrote ``reward=1``. Reward 0 or invalid/missing reward evidence exits
-  non-zero.
+  non-zero. This mode holds no tests-tree authority: a v1.1 ``reward.json`` is
+  checked against the dataset contract and its own counts, not against the
+  task's whitelist sizes.
 - In workflow ``defer_reward_read`` mode, the runner cannot classify reward
   before strict container stop. Its process exit is therefore only the hidden
   command return code; reward resolution is published later by the workflow's
@@ -40,7 +42,8 @@ Recognized ``parameters``:
   any pre-stop reward read; the workflow then performs the authoritative
   descriptor-safe read after strictly stopping the container.
 
-KPI shape emitted::
+KPI shape emitted (``reward`` and ``resolved`` are present only when a valid
+reward artifact was read)::
 
     {
       "values": {
@@ -63,13 +66,15 @@ short tail only.
 
 Verifier failure modes captured in the KPI:
 
-- ``docker exec`` returned non-zero: emit ``reward=0``,
-  ``verify_returncode=<rc>``; exit non-zero.
-- reward artifact missing: emit ``reward=0``,
-  ``verify_returncode=-1``; exit non-zero. (The verifier exited
-  before Step 5 — likely a setup-time error inside the shell.)
-- reward evidence is ambiguous, malformed, unsafe, non-regular, or oversized:
-  same as missing, without logging attacker-controlled contents.
+A missing or rejected reward artifact is never reported as a score of zero:
+
+- ``docker exec`` returned non-zero and left no valid reward: no reward is
+  emitted, ``verify_returncode=<rc>``; exit with that code.
+- reward artifact missing: no reward is emitted; exit non-zero. (The verifier
+  exited before Step 5 — likely a setup-time error inside the shell.)
+- reward evidence is ambiguous, malformed, unsafe, non-regular, oversized, or
+  contradicts its own counts: same as missing, without logging
+  attacker-controlled contents.
 
 The per-task image's ``tests/test.sh`` handles its own workspace staging;
 Crucible publishes the captured candidate at ``/logs/artifacts/model.patch``
@@ -613,11 +618,13 @@ def _run_verify(
         )
         return command.returncode
 
-    reward_read = read_reward_artifact(logs_dir)
+    # Direct mode holds no tests-tree authority, so a reward.json is checked
+    # against its own counts only, not against the task's whitelist sizes.
+    reward_read = read_reward_artifact(logs_dir, inventory=None)
     reward = reward_read.reward
-    if reward is None:
-        # The runner's read is diagnostic until the workflow has strictly
-        # stopped the container and repeats the same descriptor-safe read.
+    if reward_read.state != "valid" or reward is None:
+        # No valid artifact, no score: a missing or rejected reward is never
+        # published as reward 0. The non-zero exit still fails the gate.
         if reward_read.state == "missing":
             logger.error(
                 "deepswe_verifier: reward artifact missing under %s "
@@ -629,13 +636,13 @@ def _run_verify(
             logger.error(
                 "deepswe_verifier: reward artifact rejected "
                 "(state=%s, reason=%s); "
-                "treating as reward=0",
+                "no reward is reported",
                 reward_read.state,
                 reward_read.error or "unspecified",
             )
         _emit_kpi(
             stdout,
-            reward=0.0,
+            reward=None,
             command_returncode=command.returncode,
             wall_seconds=wall,
             command_evidence=command,

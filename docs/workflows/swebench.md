@@ -49,13 +49,28 @@ Patch capture admits production source and rejects test-only, out-of-scope,
 metadata, or ambiguous candidates according to suite policy. Exact captured
 bytes drive pristine replay and prediction publication. Hidden tests are
 available only to deterministic evaluator code. Official evaluation outcome
-remains distinct from the authoring cascade classification.
+remains distinct from the authoring cascade classification. A cascade that
+ends on its budget ceiling, like one that raises, is partial work: its
+candidate stays in the Corpus, the instance is reported
+`cascade_aborted_partial`, and official inline evaluation is skipped even when
+`--submit-any-nonempty-best-effort` publishes the patch. The same holds for a
+cascade that returned a failure without a ruling on its work: its Architect
+terminal is inconclusive, retryable, or cancelled (a gate, reviewer, breach
+loop, or planning backend gave no verdict). A judged failure such as
+`partial_failed` and an accounting terminal are not partial work in this
+sense. Each `per_instance` row of a run names its own Architect terminal in
+`architect_detail_status` and `architect_terminal_class`; both are `null` for
+an instance restored from an earlier run.
 
 The [profile catalog](../../products/swebench/backend_profile_catalog.yaml)
 names exact selectable adapter/model/transport identities. Bind an explicit
 profile with `--backend-config` to change routes. Diagnostic Kimi, DeepSeek,
 local, and OpenAI-compatible profiles retain their declared admission and
-completeness limits. DeepSeek construction templates require
+completeness limits. The diagnostic Kimi SDK profiles need the cost
+upper-bound policy, which `crucible swebench` has no option to select: a
+budgeted suite run on one of them pays for the planner replies and then stops
+on incomplete accounting, so use them with `architect`, `tier`, `breach`, or
+`review` and the policy. DeepSeek construction templates require
 [route binding](backend_config_bind_deepseek.md). Catalog metadata does not
 establish launch or promotion authority.
 

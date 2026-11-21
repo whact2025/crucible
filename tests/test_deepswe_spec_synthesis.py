@@ -3,18 +3,33 @@
 
 """Tests for ``crucible.products.deepswe.spec_synthesis``.
 
-Hermetic — constructs ``DeepSWEInstance`` records inline (no
-filesystem touches, no docker, no network). Verifies the Spec
-shape produced for each supported language + the policy constants.
+Hermetic — constructs ``DeepSWEInstance`` records inline (no docker,
+no network; only the read-only reference test writes files, under
+``tmp_path``). Verifies the Spec shape produced for each supported
+language + the policy constants.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 
+from assay import (
+    ImplementationDirective,
+    ReadOnlySourceReference,
+    Slice,
+    Tier,
+    TierDAG,
+)
+from assay.corpus.store import Corpus
 from assay.types.spec import Spec
 
 from crucible.common.policies import BreachPolicy, ReviewPolicy
+from crucible.common.read_only_sources import (
+    capture_read_only_sources,
+    source_context_provider,
+)
 from crucible.products.deepswe.dataset import DeepSWEInstance
 from crucible.products.deepswe.spec_synthesis import (
     DEEPSWE_BREACH_POLICY,
@@ -276,6 +291,151 @@ def test_twelve_dollars_and_one_cent_preserves_feature_decomposition():
     assert policy.max_total_tiers == 12
     assert policy.max_total_slices == 16
     assert policy.max_verification_only_empty_scope_slices == 1
+
+
+_CONTRACT_SHAPES = (
+    "mirrored or forwarded signatures",
+    "an interface and its implementers",
+    "a public api and its registry",
+    "a signature and its call sites",
+    "a required field and its construction sites",
+)
+
+
+def _planner_guidance(task_budget_usd: float | None) -> str:
+    policy = resolve_deepswe_plan_policy(task_budget_usd)
+    return " ".join(policy.planner_guidance.split())
+
+
+def test_standard_plan_policy_guidance_keeps_one_contract_in_one_slice():
+    guidance = _planner_guidance(None)
+
+    assert "Edits that form one contract belong in one slice" in guidance
+    for shape in _CONTRACT_SHAPES:
+        assert shape in guidance.lower()
+    assert "whose intent names the paired sites" in guidance
+    assert "Do not split them across sibling slices or across tiers" in guidance
+    assert (
+        "implemented and verified on its own before the next slice starts"
+    ) in guidance
+    assert (
+        "refines the general rule that dependent work goes in later tiers"
+    ) in guidance
+    assert "not permission to bundle" in guidance
+    # Every slice is gated on its own; no gate waits for a tier's siblings.
+    assert "combined change" not in guidance
+    assert "once every slice of a tier" not in guidance
+
+    # One slice cannot split a contract, and the compact bound stays last.
+    compact = _planner_guidance(DEEPSWE_COMPACT_PLAN_MAX_BUDGET_USD)
+    assert "Edits that form one contract" not in compact
+    assert compact.endswith(
+        "not permission to narrow, omit, or reinterpret the task."
+    )
+
+
+def test_plan_policy_guidance_keeps_new_files_at_captured_paths():
+    for budget in (None, DEEPSWE_COMPACT_PLAN_MAX_BUDGET_USD):
+        guidance = _planner_guidance(budget)
+
+        assert (
+            "Plan every new file at a path the repository does not ignore"
+        ) in guidance
+        assert "`git add -A`" in guidance
+        assert "`.gitignore`" in guidance
+        assert "`creates_paths`" in guidance
+        # A partial excerpt cannot show that no pattern matches the path.
+        assert (
+            "cite the complete root `.gitignore` and any `.gitignore` in a "
+            "parent directory of the path as read-only references"
+        ) in guidance
+        assert "`read_only_references`" in guidance
+        assert "each from line 1 to its last line" in guidance
+        assert (
+            "state in the slice intent that each of these references is the "
+            "whole file"
+        ) in guidance
+        assert "governing `.gitignore` lines" not in guidance
+        assert (
+            "An edit to an already tracked file is captured wherever it lives"
+        ) in guidance
+
+
+def test_planner_guidance_and_plan_critic_agree():
+    """The Planner and its Critic name the same contracts and capture rule."""
+    from crucible.rubrics import load as load_rubric
+
+    # The generated response contract follows this marker; compare the
+    # authored rules only.
+    authored, marker, _ = load_rubric(
+        "deepswe_plan_critic"
+    ).system_prompt.partition("=== MANDATORY ASSAY.REVIEW.V2 CONTRACT ===")
+    assert marker
+    critic = " ".join(authored.split()).lower()
+    guidance = _planner_guidance(None).lower()
+
+    for phrase in (
+        *_CONTRACT_SHAPES,
+        "sibling slices",
+        "`git add -a`",
+        "`.gitignore`",
+        "`creates_paths`",
+        (
+            "cite the complete root `.gitignore` and any `.gitignore` in a "
+            "parent directory of the path as read-only references"
+        ),
+        "whole file",
+    ):
+        assert phrase in guidance
+        assert phrase in critic
+
+
+def test_gitignore_can_be_cited_as_read_only_evidence_for_a_new_path(tmp_path):
+    """The capture note depends on `.gitignore` being admissible evidence."""
+    rules = b"__pycache__/\nbuild/\n*.pyc\n"
+    paths = (".gitignore", "src/.gitignore")
+    (tmp_path / "src").mkdir()
+    for path in paths:
+        (tmp_path / path).write_bytes(rules)
+    dag = TierDAG(tiers=(Tier(tier_id="t0", depends_on=(), slices=(Slice(
+        id="s0",
+        directive=ImplementationDirective(
+            slice_id="s0",
+            intent=(
+                "Add the generated schema module. Each of root-ignore and "
+                "src-ignore is the whole file; no pattern matches the path."
+            ),
+            files_in_scope=(),
+            creates_paths=("src/generated/schema.py",),
+            verify_mode="tests",
+            blast_radius={},
+            read_only_references=tuple(
+                ReadOnlySourceReference(
+                    reference_id=reference_id,
+                    path=path,
+                    sha256="sha256:" + hashlib.sha256(rules).hexdigest(),
+                    start_line=1,
+                    end_line=3,
+                )
+                for reference_id, path in zip(
+                    ("root-ignore", "src-ignore"), paths, strict=True
+                )
+            ),
+        ),
+    ),)),))
+
+    captured = capture_read_only_sources(dag, workspace_root=tmp_path)
+    entries = json.loads(captured)["references"]
+
+    assert [
+        (entry["path"], entry["start_line"], entry["excerpt"])
+        for entry in entries
+    ] == [(path, 1, rules.decode()) for path in paths]
+    # The same bytes are what every plan review round is given.
+    context = source_context_provider(
+        corpus=Corpus(tmp_path / "corpus"), workspace_root=tmp_path,
+    )(dag)
+    assert context["read_only_sources"].endswith(captured.decode())
 
 
 def test_synthesize_language_is_case_insensitive_post_load():

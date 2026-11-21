@@ -1181,13 +1181,18 @@ def test_crashed_rollback_reaped(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "classification",
-    ("dev_verify_failed", "dev_verify_unavailable", "runner_missing"),
+    (
+        "dev_verify_failed",
+        "dev_verify_unavailable",
+        "runner_missing",
+        "smoke_unavailable",
+    ),
 )
 def test_tier_build_outcome_failure_is_reaped(
     tmp_path: Path,
     classification: str,
 ) -> None:
-    """Tier's terminal build classifications remain rollback authorities."""
+    """Tier's terminal gate classifications remain rollback authorities."""
     from crucible.workflows._reaper import reap_orphaned_dirt
 
     _init_git_repo(tmp_path)

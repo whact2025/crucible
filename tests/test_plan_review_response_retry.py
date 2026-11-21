@@ -300,7 +300,7 @@ class _PricingBackend(_Backend):
 
 class _KimiBackend(_Backend):
     name = "kimi"
-    model = "kimi-k2.7-code-highspeed"
+    model = "kimi-k3.1-pro"
 
 
 class _BudgetRefusalBackend:

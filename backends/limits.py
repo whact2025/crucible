@@ -18,10 +18,10 @@ retry, and turns a post-call wall/USD overshoot into a non-retriable terminal.
 The diagnostic path is useful for qualification; its downgrade record is not
 an authorization to describe post-hoc accounting as a hard provider limit.
 Incomplete or unpersisted diagnostic evidence revokes later call authority.
-One explicit, fresh-run K3 policy may instead settle a separately typed cost
-upper bound when only cache-read accounting is unknown. It never completes
-actual accounting or grants ranking authority; failed or unpersisted bounds
-still revoke continuation, including after reopening the durable ledger.
+One explicit, fresh-run Kimi K3.1 Pro policy may instead settle a separately
+typed cost upper bound when only cache-read accounting is unknown. It never
+completes actual accounting or grants ranking authority; failed or unpersisted
+bounds still revoke continuation, including after reopening the durable ledger.
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ from assay import (
 )
 
 from .cost_bounds import (
+    DIAGNOSTIC_COST_MODEL,
     DIAGNOSTIC_COST_POLICY,
     valid_diagnostic_cost_bounds,
 )
@@ -1090,7 +1091,7 @@ class InvocationLimitLedger:
             resolution = _resolution_from_record(intent.get("request"))
             if resolution.diagnostic_cost_policy is not None and (
                 identity.backend, identity.model
-            ) != ("kimi", "kimi-k3"):
+            ) != ("kimi", DIAGNOSTIC_COST_MODEL):
                 raise ValueError("diagnostic cost policy has a different route identity")
             if intent != {
                 "invocation_id": reservation.invocation_id,
@@ -1224,9 +1225,9 @@ class InvocationLimitLedger:
                     "diagnostic cost policy cannot reinterpret prior ledger evidence"
                 )
             if resolution.diagnostic_cost_policy is not None:
-                if (identity.backend, identity.model) != ("kimi", "kimi-k3"):
+                if (identity.backend, identity.model) != ("kimi", DIAGNOSTIC_COST_MODEL):
                     raise InvocationLimitContractError(
-                        "diagnostic cost policy requires exact Kimi K3 identity"
+                        "diagnostic cost policy requires exact Kimi K3.1 Pro identity"
                     )
                 if any(record["state"] == "dispatched" for record in self._records):
                     raise InvocationLimitContractError(
@@ -1740,7 +1741,7 @@ def _normalize_returned_result(
         and physical_attempts == 1
         and trace is not None
         and (trace.backend, trace.requested_model, trace.served_model)
-        == ("kimi", "kimi-k3", "kimi-k3")
+        == ("kimi", DIAGNOSTIC_COST_MODEL, DIAGNOSTIC_COST_MODEL)
         and trace.requested_effort == "max"
         and trace.endpoint == "https://api.moonshot.ai/v1"
         and trace.feature_profile_digest == resolution.feature_profile_digest
@@ -1865,9 +1866,9 @@ def _validate_diagnostic_backend_binding(
         getattr(backend, "effort", None),
         identity.backend,
         identity.model,
-    ) != ("kimi", "kimi-k3", "max", "kimi", "kimi-k3"):
+    ) != ("kimi", DIAGNOSTIC_COST_MODEL, "max", "kimi", DIAGNOSTIC_COST_MODEL):
         raise InvocationLimitContractError(
-            "diagnostic cost policy requires the exact Kimi K3/max route"
+            "diagnostic cost policy requires the exact Kimi K3.1 Pro/max route"
         )
 
 

@@ -16,10 +16,12 @@ dependencies = [
     # supplementary groups, and process-pool stderr deadlock fixes.
     "anyio>=4.14.2",
     # Claude is an opt-in backend. The organization-session credential
-    # boundary subclasses the reviewed 0.2.110 subprocess transport, so an
-    # SDK upgrade must be deliberate and accompanied by a transport audit.
+    # boundary subclasses the 0.2.121 subprocess transport, reviewed by
+    # offline source comparison (the live organization-session check is
+    # still owed; see backends/_claude_session_transport.py), so an SDK
+    # upgrade must be deliberate and accompanied by a transport audit.
     # Installing from sdist (configured below) avoids bundling another CLI.
-    "claude-agent-sdk==0.2.110",
+    "claude-agent-sdk==0.2.121",
     "pyyaml>=6.0",
     # assay (sibling submodule) — typed-primitives toolkit consumed
     # by crucible/rules/ and crucible/workflows/.
@@ -39,7 +41,7 @@ dependencies = [
     # separates base-existing test files from newly added ones.
     "unidiff>=0.7.5",
     # Internal agent tool transport shared by the backend adapters.
-    "mcp==1.28.1",
+    "mcp==1.30.0",
     "uvicorn>=0.52.4",
     "websockets>=16.0,<17.0",
     # Codex is Crucible's built-in backend, so its transport SDK is part of

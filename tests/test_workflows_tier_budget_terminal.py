@@ -22,6 +22,7 @@ from assay import (
     Implementation,
     Invocation,
     InvocationResult,
+    LifecycleEvent,
     ProjectContext,
     ReviewCoverage,
     Spec,
@@ -1082,6 +1083,427 @@ def test_child_accounting_debt_propagates_without_budget_misclassification(
     assert summary["costs"]["remaining_usd"] == 0.0
     assert result["status"] == "incomplete_accounting"
     assert result["cost_usd"] == pytest.approx(0.21)
+
+
+def _publishing_breach(
+    status: str,
+    exit_code: int,
+    calls: list[str],
+    *,
+    spent_usd: float = 0.0,
+    tokens: tuple[int, int] = (0, 0),
+):
+    """A breach child that publishes one typed terminal and exits."""
+
+    def _breach(
+        argv: list[str],
+        *,
+        fresh_lineage: bool,
+        development_budget_ledger,
+    ) -> int:
+        assert fresh_lineage is False
+        assert development_budget_ledger is None
+        calls.append(status)
+        child_corpus = Corpus(Path(argv[argv.index("--spec") + 1]))
+        with open_run_with_capture(child_corpus, "breach") as child:
+            child.write_summary({
+                "status": status,
+                "spent_usd": spent_usd,
+                "costs": {
+                    "total_usd": spent_usd,
+                    "total_input_tokens": tokens[0],
+                    "total_output_tokens": tokens[1],
+                },
+                "rounds": [],
+            })
+            child.finalize(RunResult(status=status, cost_usd=spent_usd))
+        return exit_code
+
+    return _breach
+
+
+def _lifecycle_kinds(spec_dir: Path) -> list[str]:
+    corpus = Corpus(spec_dir)
+    latest = corpus.latest_spec()
+    assert latest is not None
+    return [
+        corpus.get_record(ref, as_type=LifecycleEvent).kind
+        for ref in latest.lifecycle_event_refs
+    ]
+
+
+@pytest.mark.parametrize(
+    ("child_status", "child_class"),
+    [
+        ("inconclusive_judge", "inconclusive"),
+        ("inconclusive_breaker", "inconclusive"),
+        # The attack-authority reviewer returned no usable admission, so no
+        # attack reached the Defender or the Judge.
+        ("inconclusive_authority", "inconclusive"),
+        ("inconclusive_transport_failed", "inconclusive"),
+        # A gate could not run: no evidence about the accepted bytes.
+        ("inconclusive_gate_unavailable", "inconclusive"),
+        # A retryable child is unruled as well; it is not a breach failure.
+        ("concurrent_spec_change", "retryable_failure"),
+        # Breach publishes no cancelled terminal of its own today; the hop
+        # reads the class, so a stopped child is not filed as a failure.
+        ("cancelled", "cancelled"),
+    ],
+)
+def test_unruled_breach_child_ends_breach_inconclusive(
+    tmp_path: Path,
+    monkeypatch,
+    child_status: str,
+    child_class: str,
+):
+    """A breach loop that reached no ruling is not a failed breach."""
+
+    repo, spec_dir, backend = _setup(tmp_path, monkeypatch)
+    breach_calls: list[str] = []
+    monkeypatch.setattr(
+        "crucible.workflows.tier.breach_workflow.main",
+        _publishing_breach(child_status, 3, breach_calls),
+    )
+    monkeypatch.setattr(
+        "crucible.workflows.tier.review",
+        lambda *args, **kwargs: pytest.fail("unruled breach reached review"),
+    )
+
+    assert _run_tier(
+        repo,
+        spec_dir,
+        budget_usd=1.0,
+        review_policy=ReviewPolicy(rubrics=("diff_scope",)),
+    ) == 1
+    assert backend.calls == 1
+    assert breach_calls == [child_status]
+    summary, result = _tier_documents(spec_dir)
+    assert summary["status"] == "breach_inconclusive"
+    assert result["status"] == "breach_inconclusive"
+    # The exact child terminal stays readable below the tier status.
+    assert summary["phase_3_breach"]["status"] == child_status
+    assert summary["phase_3_breach"]["terminal_class"] == child_class
+    assert summary["phase_3_breach"]["exit_code"] == 3
+    assert summary["phase_4_reviews"] == []
+    outcome = json.loads(
+        (_tier_run_dir(spec_dir) / "outcome.json").read_text()
+    )
+    assert outcome["detail_status"] == "breach_inconclusive"
+    assert outcome["terminal_class"] == "inconclusive"
+    # Nothing lands. The verified Phase 1 candidate stays as it was before
+    # breach, exactly as for a failed breach.
+    assert "landed" not in _lifecycle_kinds(spec_dir)
+    assert (repo / "file_0.py").read_text() == "# implementation 1\n"
+
+
+def test_unruled_breach_child_on_a_deferred_seed_ends_breach_inconclusive(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The benchmark repair loop was lost; the seed's own gate row is kept.
+
+    A single-slice benchmark tier hands a slice that failed its gate to
+    Breach as the repair seed. When that loop ends without a ruling, the tier
+    reports the lost loop; the deterministic judgement of the seed stays in
+    its Phase 1 row and the seed is restored.
+    """
+
+    repo, spec_dir, backend = _setup(tmp_path, monkeypatch)
+    from crucible.workflows import tier as tier_workflow
+
+    def _failed_gate(*args, **kwargs):  # noqa: ARG001
+        outcome = BuildVerifyOutcome(
+            "dev_verify_failed",
+            build=None,
+            verify=None,
+            dev_verify=RunnerResult(
+                role="dev_verify",
+                runner="tests.deferred_seed_gate",
+                returncode=1,
+                values={"tests_failed": 1.0},
+                raw_output=json.dumps({
+                    "raw_output": "one project-visible test failed",
+                }).encode(),
+                stderr=b"",
+                duration_s=0.01,
+            ),
+        )
+        tier_workflow._build_verify._settle_no_process_writer_epoch(
+            kwargs.get("writer_epoch_members"),
+            phase="test_deferred_seed_gate_stub",
+            succeeded=False,
+        )
+        return outcome
+
+    monkeypatch.setattr(
+        tier_workflow._build_verify,
+        "build_and_verify",
+        _failed_gate,
+    )
+    breach_calls: list[str] = []
+    seeds: list[str] = []
+    publish = _publishing_breach("inconclusive_judge", 3, breach_calls)
+
+    def _breach(argv, *, fresh_lineage, development_budget_ledger):
+        seeds.append((repo / "file_0.py").read_text())
+        from crucible.workflows import _mutation_journal
+
+        # A real child settles the writer epoch it joins on the deferred
+        # seed's transaction before it returns.
+        parent = (
+            _mutation_journal._require_live_parent_transaction(  # noqa: SLF001
+                argv[argv.index("--parent-mutation-transaction-id") + 1]
+            )
+        )
+        tier_workflow._build_verify._settle_no_process_writer_epoch(
+            _mutation_journal.live_writer_epoch_family(parent),
+            phase="test_deferred_seed_breach_stub",
+            succeeded=False,
+        )
+        return publish(
+            argv,
+            fresh_lineage=fresh_lineage,
+            development_budget_ledger=development_budget_ledger,
+        )
+
+    monkeypatch.setattr(tier_workflow.breach_workflow, "main", _breach)
+
+    assert _run_tier(
+        repo,
+        spec_dir,
+        budget_usd=1.0,
+        skip_build_verify=False,
+        build_retries=0,
+        extra_parameters={"deepswe_metadata": {}},
+    ) == 1
+    assert backend.calls == 1
+    # The failing candidate was the Breach seed.
+    assert seeds == ["# implementation 1\n"]
+    assert breach_calls == ["inconclusive_judge"]
+    summary, result = _tier_documents(spec_dir)
+    assert summary["status"] == "breach_inconclusive"
+    assert result["status"] == "breach_inconclusive"
+    assert summary["phase_1_slices"][0]["classification"] == (
+        "dev_verify_failed"
+    )
+    assert summary["phase_3_breach"]["status"] == "inconclusive_judge"
+    assert "landed" not in _lifecycle_kinds(spec_dir)
+    # The unrepaired seed is restored.
+    assert not (repo / "file_0.py").exists()
+
+
+def test_unruled_breach_child_that_spent_the_budget_ends_budget_exhausted(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Budget keeps its precedence over the unruled-loop status."""
+
+    repo, spec_dir, backend = _setup(tmp_path, monkeypatch)
+    breach_calls: list[str] = []
+    monkeypatch.setattr(
+        "crucible.workflows.tier.breach_workflow.main",
+        _publishing_breach(
+            "inconclusive_judge",
+            3,
+            breach_calls,
+            spent_usd=0.20,
+            tokens=(101, 23),
+        ),
+    )
+
+    # The implementer spends 0.01 and the child the remaining 0.20.
+    assert _run_tier(repo, spec_dir, budget_usd=0.21) == 1
+    assert backend.calls == 1
+    assert breach_calls == ["inconclusive_judge"]
+    summary, result = _tier_documents(spec_dir)
+    assert summary["status"] == "budget_exhausted"
+    assert result["status"] == "budget_exhausted"
+    assert summary["costs"]["total_usd"] == pytest.approx(0.21)
+    assert summary["costs"]["remaining_usd"] == 0.0
+    # The child's own unruled terminal stays readable below the tier status.
+    assert summary["phase_3_breach"]["status"] == "inconclusive_judge"
+    assert summary["phase_3_breach"]["terminal_class"] == "inconclusive"
+    assert summary["phase_3_breach"]["exit_code"] == 3
+    outcome = json.loads(
+        (_tier_run_dir(spec_dir) / "outcome.json").read_text()
+    )
+    assert outcome["detail_status"] == "budget_exhausted"
+    assert outcome["terminal_class"] == "budget_exhausted"
+
+
+@pytest.mark.parametrize(
+    "child_status",
+    [
+        # Breach accepted the candidate and the final shipping gate ran and
+        # did not pass it, or changed source or Git state.
+        "inconclusive_post_strip_verify",
+        # A deterministic gate changed source or Git state or wrote outside
+        # the transaction scope, or the candidate was absent from the
+        # workspace.
+        "inconclusive_workspace_mismatch",
+    ],
+)
+def test_breach_child_refused_on_deterministic_evidence_keeps_breach_failed(
+    tmp_path: Path,
+    monkeypatch,
+    child_status: str,
+):
+    """Not every inconclusive breach terminal is a loop without a ruling.
+
+    Breach files these two statuses under ``inconclusive``, but both follow
+    deterministic evidence, not a lost reviewer. As a Phase 1 gate that
+    changed source keeps ``slice_failed``, they keep ``breach_failed``.
+    """
+
+    repo, spec_dir, backend = _setup(tmp_path, monkeypatch)
+    breach_calls: list[str] = []
+    monkeypatch.setattr(
+        "crucible.workflows.tier.breach_workflow.main",
+        _publishing_breach(child_status, 3, breach_calls),
+    )
+
+    assert _run_tier(repo, spec_dir, budget_usd=1.0) == 1
+    assert backend.calls == 1
+    assert breach_calls == [child_status]
+    summary, result = _tier_documents(spec_dir)
+    assert summary["status"] == "breach_failed"
+    assert result["status"] == "breach_failed"
+    assert summary["phase_3_breach"]["status"] == child_status
+    assert summary["phase_3_breach"]["terminal_class"] == "inconclusive"
+    assert summary["phase_3_breach"]["exit_code"] == 3
+    outcome = json.loads(
+        (_tier_run_dir(spec_dir) / "outcome.json").read_text()
+    )
+    assert outcome["detail_status"] == "breach_failed"
+    assert outcome["terminal_class"] == "permanent_failure"
+    assert "landed" not in _lifecycle_kinds(spec_dir)
+    assert (repo / "file_0.py").read_text() == "# implementation 1\n"
+
+
+def test_unavailable_gate_in_a_benchmark_tier_is_never_a_breach_seed(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The benchmark shape that produces ``dev_verify_unavailable``.
+
+    A single-slice benchmark tier defers a slice its gate judged failing to
+    Breach. A gate that could not run judged nothing: the candidate is not a
+    seed, the model gets no retry, and the tier ends ``slice_inconclusive``.
+    """
+
+    from tests.test_tier_build_progress_retry import _dev_verify_unavailable
+
+    repo, spec_dir, backend = _setup(tmp_path, monkeypatch)
+    from crucible.workflows import tier as tier_workflow
+
+    gate_calls: list[str] = []
+
+    def _unavailable_gate(*args, **kwargs):  # noqa: ARG001
+        gate_calls.append(kwargs.get("slice_id", "?"))
+        tier_workflow._build_verify._settle_no_process_writer_epoch(
+            kwargs.get("writer_epoch_members"),
+            phase="test_unavailable_benchmark_gate_stub",
+            succeeded=False,
+        )
+        return _dev_verify_unavailable()
+
+    monkeypatch.setattr(
+        tier_workflow._build_verify,
+        "build_and_verify",
+        _unavailable_gate,
+    )
+    breach_seeds: list[str] = []
+
+    def _unexpected_breach(argv, *, fresh_lineage, development_budget_ledger):  # noqa: ARG001
+        from crucible.workflows import _mutation_journal
+
+        breach_seeds.append((repo / "file_0.py").read_text())
+        # Settle the writer epoch a real child joins on the seed transaction,
+        # so that a regression fails on the assertions below and not in the
+        # tier's own cleanup.
+        parent = (
+            _mutation_journal._require_live_parent_transaction(  # noqa: SLF001
+                argv[argv.index("--parent-mutation-transaction-id") + 1]
+            )
+        )
+        tier_workflow._build_verify._settle_no_process_writer_epoch(
+            _mutation_journal.live_writer_epoch_family(parent),
+            phase="test_unavailable_benchmark_gate_breach_stub",
+            succeeded=False,
+        )
+        raise RuntimeError("an unjudged slice must not reach Breach")
+
+    monkeypatch.setattr(tier_workflow.breach_workflow, "main", _unexpected_breach)
+
+    assert _run_tier(
+        repo,
+        spec_dir,
+        budget_usd=1.0,
+        skip_build_verify=False,
+        build_retries=2,
+        extra_parameters={"deepswe_metadata": {}},
+    ) == 1
+    assert breach_seeds == []
+    # No retry is keyed on the gate result: one gate run, one model call.
+    assert len(gate_calls) == 1
+    assert backend.calls == 1
+    summary, result = _tier_documents(spec_dir)
+    assert summary["status"] == "slice_inconclusive"
+    assert result["status"] == "slice_inconclusive"
+    assert summary["phase_1_slices"][0]["classification"] == (
+        "dev_verify_unavailable"
+    )
+    assert summary["phase_3_breach"] is None
+    outcome = json.loads(
+        (_tier_run_dir(spec_dir) / "outcome.json").read_text()
+    )
+    assert outcome["detail_status"] == "slice_inconclusive"
+    assert outcome["terminal_class"] == "inconclusive"
+    assert "landed" not in _lifecycle_kinds(spec_dir)
+    # The slice transaction is restored.
+    assert summary["rollback_applied"] is True
+    assert not (repo / "file_0.py").exists()
+
+
+@pytest.mark.parametrize(
+    ("child_status", "child_exit", "tier_status", "tier_exit"),
+    [
+        ("max_rounds_exhausted", 1, "breach_failed", 1),
+        ("persistence_veto", 1, "breach_failed", 1),
+        ("incomplete", 3, "breach_failed", 1),
+        ("reject", 2, "breach_reject", 2),
+    ],
+)
+def test_breach_child_with_a_permanent_terminal_keeps_its_tier_status(
+    tmp_path: Path,
+    monkeypatch,
+    child_status: str,
+    child_exit: int,
+    tier_status: str,
+    tier_exit: int,
+):
+    repo, spec_dir, backend = _setup(tmp_path, monkeypatch)
+    breach_calls: list[str] = []
+    monkeypatch.setattr(
+        "crucible.workflows.tier.breach_workflow.main",
+        _publishing_breach(child_status, child_exit, breach_calls),
+    )
+
+    assert _run_tier(repo, spec_dir, budget_usd=1.0) == tier_exit
+    assert backend.calls == 1
+    assert breach_calls == [child_status]
+    summary, result = _tier_documents(spec_dir)
+    assert summary["status"] == tier_status
+    assert result["status"] == tier_status
+    assert summary["phase_3_breach"]["status"] == child_status
+    assert summary["phase_3_breach"]["terminal_class"] == "permanent_failure"
+    outcome = json.loads(
+        (_tier_run_dir(spec_dir) / "outcome.json").read_text()
+    )
+    assert outcome["detail_status"] == tier_status
+    assert outcome["terminal_class"] == "permanent_failure"
+    assert "landed" not in _lifecycle_kinds(spec_dir)
+    assert (repo / "file_0.py").read_text() == "# implementation 1\n"
 
 
 def test_implementation_accounting_debt_stops_before_next_slice(

@@ -93,7 +93,7 @@ _CONTRACT_CANONICALIZATION_SCHEMA = (
     "crucible.review-contract-canonicalization.v1"
 )
 _SEVERITY_RANK = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
-_NVIDIA_GLM52_MODEL = "nvidia/zai-org/glm-5.2"
+_NVIDIA_GLM_MODEL = "nvidia/zai-org/glm-5.3"
 _OUTPUT_LENGTH_MESSAGE = "server returned finish_reason=length"
 _OUTPUT_LENGTH_RETRY_BUDGET = 1
 _CHUNK_OUTER_RETRY_DISABLED_REASON = "chunk_protocol_outer_retry_disabled"
@@ -209,7 +209,7 @@ def _assay_response_repair_policy(
         or (
             rollout == "auto"
             and (
-                getattr(backend, "model", None) == "nvidia/zai-org/glm-5.2"
+                getattr(backend, "model", None) == _NVIDIA_GLM_MODEL
                 or getattr(
                     backend,
                     "supports_review_evidence_anchors",
@@ -1751,7 +1751,7 @@ def _retryable_output_length_error(*, backend: Any, verdict: Any) -> str | None:
 
     if (
         getattr(backend, "name", None) != "openai_compat"
-        or getattr(backend, "model", None) != _NVIDIA_GLM52_MODEL
+        or getattr(backend, "model", None) != _NVIDIA_GLM_MODEL
         or verdict.decision != "inconclusive"
         or len(verdict.findings) != 1
     ):
@@ -1795,7 +1795,7 @@ def _glm_plan_decision_consistency_error(
 
     return bool(
         getattr(backend, "name", None) == "openai_compat"
-        and getattr(backend, "model", None) == _NVIDIA_GLM52_MODEL
+        and getattr(backend, "model", None) == _NVIDIA_GLM_MODEL
         and rubric_name == "plan_judge"
         and response_repair_policy is not None
         and validation_error == _GLM_PLAN_DECISION_CONSISTENCY_ERROR
@@ -3340,7 +3340,7 @@ def review(*args: Any, **kwargs: Any):
     target_ledger_extension_capacity = (
         _GLM_PLAN_TARGET_LEDGER_RETRY_BUDGET
         if effective_response_retry_budget > 0
-        and getattr(backend, "model", None) == _NVIDIA_GLM52_MODEL
+        and getattr(backend, "model", None) == _NVIDIA_GLM_MODEL
         and _is_plan_review_contract(meta)
         else 0
     )
@@ -3348,7 +3348,7 @@ def review(*args: Any, **kwargs: Any):
         _GLM_PLAN_DECISION_CONSISTENCY_RETRY_BUDGET
         if effective_response_retry_budget > 0
         and getattr(backend, "name", None) == "openai_compat"
-        and getattr(backend, "model", None) == _NVIDIA_GLM52_MODEL
+        and getattr(backend, "model", None) == _NVIDIA_GLM_MODEL
         and rubric.name == "plan_judge"
         and response_repair_policy is not None
         else 0
@@ -3558,7 +3558,7 @@ def review(*args: Any, **kwargs: Any):
         elif _all_deterministic_inconclusive(verdict):
             # Assay's backend/budget/coverage diagnostics are already typed,
             # fail-closed, and non-forgeable. The one narrow exception is an
-            # exact NVIDIA GLM-5.2 structured response truncated by the
+            # exact NVIDIA GLM route's structured response truncated by the
             # provider output limit. Re-run the original review through this
             # bounded, fully audited loop; never parse or salvage the partial.
             output_length_error = _retryable_output_length_error(
@@ -3667,7 +3667,7 @@ def review(*args: Any, **kwargs: Any):
                 retained_sources=retained_sources,
             )
             if (
-                getattr(backend, "model", None) == _NVIDIA_GLM52_MODEL
+                getattr(backend, "model", None) == _NVIDIA_GLM_MODEL
                 and response_repair_policy is not None
             ):
                 canonical_verdict, canonical_actions = (

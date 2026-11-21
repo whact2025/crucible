@@ -111,3 +111,32 @@ An exit-1 summary may report `retryable_tier_failure` when every failed child
 Tier supplied an immutable `retryable_failure` terminal. This is retry
 classification only: Architect has already stopped and has not promoted a
 partial topological result.
+
+In the same way an exit-1 summary reports `cancelled` when every failed child
+Tier was cancelled, and `inconclusive_tier_failure` when every failed child
+Tier ended without a ruling on its work (an inconclusive, retryable, or
+cancelled terminal, for example `slice_inconclusive`, `breach_inconclusive`,
+or `review_inconclusive`). One judged, contract-error, or untyped Tier keeps
+`partial_failed`; incomplete accounting and budget exhaustion are reported
+first. Neither status continues the walk, retries a Tier, or promotes a
+partial result.
+
+A validation-repair re-plan that nobody ruled on keeps its own typed status
+under exit `2` (for example `planner_infrastructure_failure` when the Planner
+backend was lost) instead of `replan_validate_failed`. Planning reports the
+same status when no Planner backend returned a reply: by the end of the round
+budget with one planner, when no independent draft came back with several. It
+reports `critic_`/`judge_infrastructure_failure` or
+`critic_`/`judge_protocol_failure` when a draft reviewer or the comparison
+reviewer gave no verdict while a candidate had no ruling against it;
+`outcome.json` files these as `inconclusive`. When such a call stopped on its
+budget instead, the status is `budget_exhausted` under exit `1`.
+`plan_competition_inconclusive` under exit `2` is kept when a ruling ended the
+run (the comparison selected nothing, or every candidate was refused) and when
+the records do not prove that a lost call ended it, for example when every
+planner stopped on its turn limit or a content rejection, or a draft's
+deterministic gate could not run. A planner that stopped on its budget does
+not change this while every draft that came back was refused: that run stays
+under exit `2`. A lost call that reported incomplete usage stays an accounting
+terminal at every planner count; the [plan reference](plan.md) lists the cases
+that still differ from one planner.

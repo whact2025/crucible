@@ -97,6 +97,14 @@ _CLAUDE_MAX_BUDGET_RESULT_SUBTYPES = frozenset({
     "error_max_budget_usd",
 })
 
+# Closed provider terminal spelling named by the pinned Agent SDK for a session
+# that used up ``max_turns``.  Claude Code reports it as an error terminal
+# whose ``stop_reason`` is the last API stop reason, then exits non-zero, so
+# the subtype is the only provider-owned statement of the turn limit.
+_CLAUDE_MAX_TURNS_RESULT_SUBTYPES = frozenset({
+    "error_max_turns",
+})
+
 # The pinned Agent SDK exposes these closed Claude Code API-error categories
 # on ``AssistantMessage.error``. Claude Code uses ``model="<synthetic>"`` for
 # that local, non-model envelope before emitting the authoritative
@@ -1459,7 +1467,9 @@ def _classify_max_turns(stop_reason: str | None, turns_used: int, turns_limit: i
     exhaust most of its turn budget — misclassifying a legitimate
     completion as a max-turns failure. The SDK's own counter is the
     source of truth; if it didn't say ``max_turns``, the invocation
-    wasn't a max-turns event.
+    wasn't a max-turns event. The provider's turn-limit terminal
+    subtype (``error_max_turns``) is normalised to the canonical stop
+    reason before this check.
     """
     return stop_reason in ("max_turns", "max-turns")
 
@@ -4777,6 +4787,13 @@ class ClaudeBackend:
                         "permission_denials",
                         None,
                     )
+                    terminal_subtype = getattr(sdk_msg, "subtype", None)
+                    turn_limit_terminal = (
+                        pending_api_error_category is None
+                        and type(terminal_subtype) is str
+                        and terminal_subtype
+                        in _CLAUDE_MAX_TURNS_RESULT_SUBTYPES
+                    )
                     if (
                         permission_denials
                         and pending_api_error_category is None
@@ -4846,6 +4863,14 @@ class ClaudeBackend:
                             "limit",
                             name="budget_usd",
                         )
+                    elif turn_limit_terminal:
+                        # A used-up turn allowance is a limit of the work, not
+                        # a provider failure.  The provider-owned subtype is
+                        # authoritative over ``is_error``, the reported error
+                        # prose and the last API stop reason.  Normalize it to
+                        # the canonical stop reason; the max-turns policy
+                        # after the stream owns the typed outcome.
+                        stop_reason = "max_turns"
                     elif pending_api_error_category is not None:
                         stop_reason = "error"
                         status = getattr(
@@ -5018,10 +5043,14 @@ class ClaudeBackend:
                         else None
                     )
                     identity_stop_reason = "model_mismatch"
+                    # A turn-limit terminal carries no typed error at this
+                    # point and may return its partial content, so it needs
+                    # the same served-model proof whichever ``is_error`` value
+                    # the provider reported.
                     if (
                         identity_error is None
                         and served_model is None
-                        and raw_is_error is False
+                        and (raw_is_error is False or turn_limit_terminal)
                         and result_error is None
                     ):
                         identity_error = _missing_served_model_identity()
@@ -5079,6 +5108,10 @@ class ClaudeBackend:
                         )
                     elif (
                         pending_api_error_category is None
+                        # ``result`` on a turn-limit terminal is the
+                        # provider's limit prose, never the model's reply:
+                        # the last assistant text stays the partial result.
+                        and not turn_limit_terminal
                         and isinstance(getattr(sdk_msg, "result", None), str)
                         and sdk_msg.result
                     ):
@@ -5308,7 +5341,10 @@ class ClaudeBackend:
 
         # Max-turns handling per policy (B31).
         turns_used = self._last_num_turns or 0
-        if _classify_max_turns(stop_reason, turns_used, effective_max_turns):
+        hit_max_turns = _classify_max_turns(
+            stop_reason, turns_used, effective_max_turns,
+        )
+        if hit_max_turns:
             _append_event(events, "limit", name="max_turns")
             if policy.on_max_turns == "raise":
                 return result_with_evidence(
@@ -5338,12 +5374,16 @@ class ClaudeBackend:
         # fires for non-tool invocations (``invoke()`` / review / plan),
         # where an empty final message is unambiguously a failure; tool-
         # driven loops legitimately end with an empty text turn after a
-        # tool_result and are handled in ``chat_with_tools``.
+        # tool_result and are handled in ``chat_with_tools``. A session
+        # that ended on its turn limit is not a stall: under
+        # ``continue_with_warning`` its partial result, text-free or not,
+        # is the requested outcome.
         if (
             not final_message
             and usage.output_tokens == 0
             and not invocation.tools
             and result_error is None
+            and not hit_max_turns
         ):
             logger.warning(
                 "ClaudeBackend: empty completion (stop_reason=%s, "

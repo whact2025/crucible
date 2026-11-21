@@ -89,16 +89,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_API_KEY = "not-needed"
 _DEFAULT_MODEL = ""  # No safe default — caller must pass a model id.
 
-# NVIDIA's GLM-5.2 structured-output implementation rejects the valid JSON
-# Schema ``uniqueItems`` keyword with HTTP 500.  Keep the compatibility shim
-# deliberately route-specific: other OpenAI-compatible providers (and even
-# other NVIDIA models) receive Assay's schema unchanged.
-_NVIDIA_INFERENCE_HOSTS = frozenset({
-    "inference-api.nvidia.com",
-    "inference-api-dev.nvidia.com",
-})
-_NVIDIA_GLM52_MODEL = "nvidia/zai-org/glm-5.2"
-_NVIDIA_KIMI_K26_MODEL = "nvidia/moonshotai/kimi-k2.6"
 _SOURCE_EDIT_TOOL_NAMES = frozenset({
     "apply_patch",
     "delete_source",
@@ -350,8 +340,6 @@ class OpenAIBackend:
         self._client: Any = None
         self._client_lock = threading.RLock()
         self._close_event = threading.Event()
-        self._logged_unique_items_compat = False
-        self._logged_reasoning_content_compat = False
         # Reasoning-effort knob. The hub honors the top-level
         # ``reasoning_effort`` param (confirmed: low→high raises the
         # reasoning_content length for both deepseek-v4-pro + kimi-k2.6;
@@ -858,9 +846,7 @@ class OpenAIBackend:
             )
 
         choice = response.choices[0]
-        text = self._structured_response_text(
-            choice.message, invocation.response_schema,
-        )
+        text = _message_text(choice.message)
         finish_reason = choice.finish_reason or "stop"
         transcript = (
             Message(role="user", content=invocation.user),
@@ -1025,96 +1011,16 @@ class OpenAIBackend:
 
         if response_schema is None:
             return {}
-        schema = deepcopy(response_schema)
-        if self._uses_nvidia_glm52_schema_compat():
-            schema, removed = _without_unique_items(schema)
-            if removed:
-                if not self._logged_unique_items_compat:
-                    logger.warning(
-                        "OpenAIBackend: removed %d unsupported uniqueItems "
-                        "keyword(s) from the server-side JSON schema for "
-                        "%s at %s; Assay retains the original schema for "
-                        "client-side validation",
-                        removed,
-                        self.model,
-                        _endpoint_identity(self._base_url),
-                    )
-                    self._logged_unique_items_compat = True
-                else:
-                    logger.debug(
-                        "OpenAIBackend: removed %d uniqueItems keyword(s) "
-                        "for NVIDIA GLM-5.2 structured output",
-                        removed,
-                    )
         return {
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "assay_structured_response",
                     "strict": True,
-                    "schema": schema,
+                    "schema": deepcopy(response_schema),
                 },
             }
         }
-
-    def _uses_nvidia_glm52_schema_compat(self) -> bool:
-        """Whether this exact route needs NVIDIA's ``uniqueItems`` shim."""
-
-        if self.model != _NVIDIA_GLM52_MODEL:
-            return False
-        try:
-            hostname = urlsplit(self._base_url).hostname
-        except (TypeError, ValueError):
-            return False
-        return bool(hostname and hostname.lower() in _NVIDIA_INFERENCE_HOSTS)
-
-    def _structured_response_text(
-        self, message: Any, response_schema: Any,
-    ) -> str:
-        """Extract an exact-route structured response without leaking CoT.
-
-        NVIDIA GLM-5.2 currently returns a valid constrained JSON document in
-        ``reasoning_content`` while leaving ``content`` null.  Only accept that
-        field when this exact provider/model route was given a response schema;
-        reasoning content remains private for ordinary completions, tool turns,
-        every other model, and every other provider.
-        """
-
-        content = getattr(message, "content", None)
-        if isinstance(content, str) and content:
-            return content
-        if response_schema is None or not self._uses_nvidia_glm52_schema_compat():
-            return ""
-
-        reasoning_content = getattr(message, "reasoning_content", None)
-        if not isinstance(reasoning_content, str) or not reasoning_content:
-            provider_fields = getattr(
-                message, "provider_specific_fields", None,
-            )
-            if isinstance(provider_fields, Mapping):
-                reasoning_content = provider_fields.get("reasoning_content")
-            elif provider_fields is not None:
-                reasoning_content = getattr(
-                    provider_fields, "reasoning_content", None,
-                )
-
-        if not isinstance(reasoning_content, str) or not reasoning_content:
-            return ""
-        if not self._logged_reasoning_content_compat:
-            logger.warning(
-                "OpenAIBackend: accepted schema-constrained JSON from "
-                "reasoning_content for %s at %s because message.content "
-                "was empty",
-                self.model,
-                _endpoint_identity(self._base_url),
-            )
-            self._logged_reasoning_content_compat = True
-        else:
-            logger.debug(
-                "OpenAIBackend: accepted NVIDIA GLM-5.2 structured output "
-                "from reasoning_content",
-            )
-        return reasoning_content
 
     def _invoke_with_tools(
         self,
@@ -1360,15 +1266,8 @@ class OpenAIBackend:
             if require_tool_call:
                 # These turns expose only scoped source mutators. Requiring a
                 # tool call prevents a write-only completion from ending in
-                # planning prose without changing the workspace. Kimi K2.6's
-                # thinking-mode protocol rejects ``required``; keep its
-                # transport at ``auto`` and enforce the write obligation with
-                # the same bounded no-tool-call recovery below.
-                request_kwargs["tool_choice"] = (
-                    "auto"
-                    if self.model == _NVIDIA_KIMI_K26_MODEL
-                    else "required"
-                )
+                # planning prose without changing the workspace.
+                request_kwargs["tool_choice"] = "required"
             for attempt in range(1, max(1, policy.retry_budget) + 1):
                 stopped = control.stopped()
                 if stopped is not None:
@@ -1507,10 +1406,7 @@ class OpenAIBackend:
                     # unresolved. Normal implementation-phase turns may try
                     # again within the existing budget; the last/special turn
                     # receives at most one bounded write-only recovery.
-                    messages.append({
-                        "role": "assistant",
-                        "content": text,
-                    })
+                    messages.append(_assistant_text_message(msg, text))
                     running = total_cost_usd
                     if (
                         invocation.budget_usd is not None
@@ -1586,10 +1482,7 @@ class OpenAIBackend:
                     # assistant text is retained before the workflow-owned
                     # nudge, and every prior assistant tool_call/tool result
                     # remains in ``messages`` with its original tool_call_id.
-                    messages.append({
-                        "role": "assistant",
-                        "content": text,
-                    })
+                    messages.append(_assistant_text_message(msg, text))
                     messages.append({
                         "role": "user",
                         "content": (
@@ -1623,10 +1516,9 @@ class OpenAIBackend:
                 # ends naturally, make one no-tools completion that turns the
                 # draft into the schema-constrained final response.
                 if invocation.response_schema is not None:
-                    final_messages = messages + [{
-                        "role": "assistant",
-                        "content": text,
-                    }]
+                    final_messages = messages + [
+                        _assistant_text_message(msg, text),
+                    ]
                     forced, final_error = self._force_final_answer(
                         client,
                         final_messages,
@@ -2158,11 +2050,8 @@ class OpenAIBackend:
             # body that could otherwise flow into a transcript or final answer.
             return evidence, None
         choice = response.choices[0]
-        text = self._structured_response_text(
-            choice.message, response_schema,
-        )
         return _ForcedFinalOutcome(
-            text=text,
+            text=_message_text(choice.message),
             input_tokens=fin_tok,
             output_tokens=fout_tok,
             served_model=served_model,
@@ -2310,82 +2199,6 @@ class OpenAIBackend:
         return None
 
 
-_DIRECT_SUBSCHEMA_KEYS = frozenset({
-    "additionalItems",
-    "additionalProperties",
-    "contains",
-    "contentSchema",
-    "else",
-    "if",
-    "items",
-    "not",
-    "propertyNames",
-    "then",
-    "unevaluatedItems",
-    "unevaluatedProperties",
-})
-_SUBSCHEMA_ARRAY_KEYS = frozenset({
-    "allOf", "anyOf", "oneOf", "prefixItems",
-})
-_NAMED_SUBSCHEMA_MAP_KEYS = frozenset({
-    "$defs",
-    "definitions",
-    "dependentSchemas",
-    "patternProperties",
-    "properties",
-})
-
-
-def _without_unique_items(schema: dict[str, Any]) -> tuple[dict[str, Any], int]:
-    """Copy a JSON Schema while omitting schema-keyword ``uniqueItems``.
-
-    Traversal follows JSON Schema's subschema-bearing keywords instead of
-    deleting every mapping key with this spelling.  That distinction retains
-    a legitimate object property named ``uniqueItems`` and literal objects in
-    ``enum``/``default`` while still handling arbitrarily nested schemas.
-    """
-
-    normalized = deepcopy(schema)
-
-    def _strip(node: Any) -> int:
-        if not isinstance(node, dict):
-            return 0
-        removed = int("uniqueItems" in node)
-        node.pop("uniqueItems", None)
-
-        for key in _DIRECT_SUBSCHEMA_KEYS:
-            child = node.get(key)
-            if isinstance(child, dict):
-                removed += _strip(child)
-            elif key == "items" and isinstance(child, list):
-                # Draft-07 permits tuple validation through an array here.
-                removed += sum(_strip(item) for item in child)
-
-        for key in _SUBSCHEMA_ARRAY_KEYS:
-            children = node.get(key)
-            if isinstance(children, list):
-                removed += sum(_strip(child) for child in children)
-
-        for key in _NAMED_SUBSCHEMA_MAP_KEYS:
-            children = node.get(key)
-            if isinstance(children, dict):
-                removed += sum(_strip(child) for child in children.values())
-
-        # In older drafts, each ``dependencies`` value may be either an array
-        # of required property names or a schema.
-        dependencies = node.get("dependencies")
-        if isinstance(dependencies, dict):
-            removed += sum(
-                _strip(child)
-                for child in dependencies.values()
-                if isinstance(child, dict)
-            )
-        return removed
-
-    removed = _strip(normalized)
-    return normalized, removed
-
-
 def _exception_http_status(exc: BaseException) -> int | None:
     """Extract a real HTTP status from SDK or response-shaped exceptions."""
 
@@ -2443,16 +2256,25 @@ def _usage_is_complete(response: Any) -> bool:
     )
 
 
+def _message_text(message: Any) -> str:
+    """Return a completion's visible text; reasoning is never an answer."""
+
+    content = getattr(message, "content", None)
+    return content if isinstance(content, str) else ""
+
+
 def _assistant_tool_call_message(msg: Any, tool_calls: Any) -> dict[str, Any]:
     """Render the assistant's tool-call turn as an OpenAI message dict.
 
     The follow-up ``role=tool`` messages must reference the
     ``tool_call_id``s from this turn, so we echo the assistant message
     (content + tool_calls) back into the running list. Reasoning-capable
-    providers such as Kimi K2.6 also require their opaque
-    ``reasoning_content`` to be replayed on the assistant turn before tool
-    results. Keep it in the provider conversation without exposing it in
-    Crucible's user-visible transcript.
+    providers also require their opaque ``reasoning_content`` to be replayed
+    on the assistant turn before tool results (observed with Kimi K2.6 on
+    the NVIDIA hub; Moonshot documents the same rule for the K3 series).
+    Keep it in the provider conversation without exposing it in Crucible's
+    user-visible transcript. Assistant turns without tool calls go back
+    through ``_assistant_text_message``, which carries it the same way.
     """
     message = {
         "role": "assistant",
@@ -2469,6 +2291,22 @@ def _assistant_tool_call_message(msg: Any, tool_calls: Any) -> dict[str, Any]:
             for tc in tool_calls
         ],
     }
+    reasoning_content = _message_reasoning_content(msg)
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    return message
+
+
+def _assistant_text_message(msg: Any, text: str) -> dict[str, Any]:
+    """Render an assistant turn without tool calls for provider replay.
+
+    Moonshot (K3 series) and DeepSeek document that the complete assistant
+    message, including ``reasoning_content``, is sent back on the next
+    request for turns without a tool call too.  The key is omitted when the
+    provider sent no reasoning.  The reasoning stays in the provider
+    conversation and never enters Crucible's transcript.
+    """
+    message: dict[str, Any] = {"role": "assistant", "content": text}
     reasoning_content = _message_reasoning_content(msg)
     if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content

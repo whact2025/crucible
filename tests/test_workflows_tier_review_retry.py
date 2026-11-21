@@ -19,17 +19,20 @@ first review.
 
 from __future__ import annotations
 
+import functools
 import json
 import hashlib
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from assay import (
     BackendExecutionEvent,
     BackendExecutionTrace,
+    BudgetExhausted,
     ContentHash,
     Evidence,
     ExecutionCompleteness,
@@ -37,6 +40,7 @@ from assay import (
     Implementation,
     Invocation,
     InvocationResult,
+    LifecycleEvent,
     Message,
     ProjectContext,
     ReviewCoverage,
@@ -46,6 +50,7 @@ from assay import (
 )
 from assay.corpus.store import Corpus
 from assay.types.dag import ImplementationDirective, Slice, Tier, TierDAG
+from assay.types.invocation import TransportError
 
 from crucible.common.policies import BreachPolicy, ReviewPolicy
 from crucible.workflows._build_verify import BuildVerifyOutcome, RunnerResult
@@ -1215,6 +1220,210 @@ class _TwoSliceFailThenPassBackend(_FailThenPassBackend):
         )
 
 
+def _lost_reviewer_result() -> InvocationResult:
+    """A reviewer call the backend lost, with complete accounting evidence."""
+
+    return InvocationResult(
+        final_message="",
+        transcript=(),
+        usage=Usage(input_tokens=0, output_tokens=0, cost_usd=0.0),
+        stop_reason="error",
+        error=TransportError(
+            http_status=None,
+            message="reviewer backend lost",
+            retriable=False,
+        ),
+        completeness=_COMPLETE_EXECUTION,
+        execution_trace=_COMPLETE_TRACE,
+    )
+
+
+class _LostReviewerBackend(_FailThenPassBackend):
+    """Every reviewer call is lost; the implementer stays successful."""
+
+    def invoke(self, invocation) -> InvocationResult:
+        if self._is_review(invocation):
+            self.review_calls += 1
+            return _lost_reviewer_result()
+        return super().invoke(invocation)
+
+
+class _BudgetStoppedReviewerBackend(_FailThenPassBackend):
+    """Every reviewer call ends on its budget, with complete evidence."""
+
+    def invoke(self, invocation) -> InvocationResult:
+        if self._is_review(invocation):
+            self.review_calls += 1
+            return replace(
+                _lost_reviewer_result(),
+                stop_reason="budget_exhausted",
+                error=BudgetExhausted(
+                    spent_usd=0.0,
+                    limit_usd=0.5,
+                    message="review budget exhausted",
+                ),
+            )
+        return super().invoke(invocation)
+
+
+class _LostReviewerUnknownUsageBackend(_LostReviewerBackend):
+    """The lost reviewer call also reports no usable accounting."""
+
+    def invoke(self, invocation) -> InvocationResult:
+        result = super().invoke(invocation)
+        if not self._is_review(invocation):
+            return result
+        return replace(
+            result,
+            completeness=ExecutionCompleteness(
+                token_usage_complete=False,
+                cost_complete=False,
+                terminal_complete=True,
+                trace_complete=True,
+            ),
+        )
+
+
+class _LostRereviewBackend(_FailThenPassBackend):
+    """The first review rules ``revise``; the re-review of the retry is lost."""
+
+    def invoke(self, invocation) -> InvocationResult:
+        if self._is_review(invocation) and self.review_calls >= 1:
+            self.review_calls += 1
+            return _lost_reviewer_result()
+        return super().invoke(invocation)
+
+
+class _UnchangedRetryLostRereviewBackend(_LostRereviewBackend):
+    """As ``_LostRereviewBackend``, but the feedback retry changes nothing."""
+
+    def invoke(self, invocation) -> InvocationResult:
+        if self._is_review(invocation) or self.implement_calls == 0:
+            return super().invoke(invocation)
+        self.implement_calls += 1
+        return InvocationResult(
+            final_message="done", transcript=(),
+            usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.01),
+            stop_reason="end_turn",
+            completeness=_COMPLETE_EXECUTION,
+            execution_trace=_COMPLETE_TRACE,
+        )
+
+
+class _ReviseThenLostReviewerBackend(_FailThenPassBackend):
+    """``diff_scope`` rules ``revise``; ``tier_completeness`` is then lost."""
+
+    def invoke(self, invocation) -> InvocationResult:
+        if not self._is_review(invocation):
+            return super().invoke(invocation)
+        self.review_calls += 1
+        system = " ".join((getattr(invocation, "system", "") or "").split())
+        if "tier-level implementation completeness" in system:
+            return _lost_reviewer_result()
+        assert "adversarial reviewer of implementer diffs" in system
+        return InvocationResult(
+            final_message=json.dumps({
+                "schema_version": "assay.review.v2",
+                "decision": "revise",
+                "reasoning": "The candidate contains an incidental change.",
+                "coverage": {
+                    "complete": True,
+                    "sources_reviewed": [
+                        "artifact",
+                        "context:files_in_scope",
+                        "context:creates_paths",
+                        "context:dependency_provided_files",
+                    ],
+                    "omissions": [],
+                },
+                "findings": [{
+                    "id": "incidental-comment",
+                    "criterion_id": "incidental_changes",
+                    "severity": "Medium",
+                    "confidence": 0.99,
+                    "disposition": "confirmed",
+                    "category": "incidental_change",
+                    "targets": [],
+                    "evidence": [{
+                        "source_id": "artifact",
+                        "kind": "diff_change",
+                        "location": "file_0.py",
+                        "excerpt": "# implement attempt 1",
+                    }],
+                    "proposal": {
+                        "action": "Remove the incidental comment.",
+                        "replacement": None,
+                    },
+                    "attack_spec": None,
+                }],
+            }),
+            transcript=(),
+            usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.01),
+            stop_reason="end_turn",
+            completeness=_COMPLETE_EXECUTION,
+            execution_trace=_COMPLETE_TRACE,
+        )
+
+
+class _LostFreshReviewerConflictBackend(_ConflictResolutionBackend):
+    """Loses ``diff_scope`` in the fresh pass after conflict reconciliation.
+
+    ``reject_fresh_completeness`` additionally makes the fresh
+    ``tier_completeness`` review rule against the reconciled candidate.
+    """
+
+    def __init__(
+        self,
+        repo: Path,
+        *,
+        reject_fresh_completeness: bool = False,
+        **kwargs,
+    ):
+        super().__init__(repo, **kwargs)
+        self.reject_fresh_completeness = reject_fresh_completeness
+
+    def invoke(self, invocation) -> InvocationResult:
+        system = " ".join((getattr(invocation, "system", "") or "").split())
+        if (
+            "adversarial reviewer of implementer diffs" in system
+            and self.diff_scope_calls >= 1
+        ):
+            self.review_calls += 1
+            self.diff_scope_calls += 1
+            return _lost_reviewer_result()
+        if (
+            "tier-level implementation completeness" in system
+            and self.completeness_calls >= 1
+            and self.reject_fresh_completeness
+        ):
+            # Replay the parent's first-pass ``revise`` verdict.
+            seen = self.completeness_calls
+            self.completeness_calls = 0
+            try:
+                return super().invoke(invocation)
+            finally:
+                self.completeness_calls = seen + 1
+        return super().invoke(invocation)
+
+
+def _tier_run_dir(tmp_path: Path) -> Path:
+    return sorted((tmp_path / "corpus" / "spec1" / "runs").glob("*tier*"))[-1]
+
+
+def _tier_outcome(tmp_path: Path) -> dict:
+    return json.loads((_tier_run_dir(tmp_path) / "outcome.json").read_text())
+
+
+def _lifecycle_kinds(tmp_path: Path) -> list[str]:
+    corpus = Corpus(tmp_path / "corpus" / "spec1")
+    latest = corpus.latest_spec()
+    assert latest is not None
+    return [
+        corpus.get_record(ref, as_type=LifecycleEvent).kind
+        for ref in latest.lifecycle_event_refs
+    ]
+
+
 def _init_repo(path: Path) -> str:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=path, check=True)
@@ -1743,8 +1952,9 @@ def test_response_contract_exhaustion_never_reimplements_domain_work(
 
     Nine malformed reviewer responses are the initial response plus the eight
     default strict-response repairs. They must produce one deterministic
-    inconclusive verdict and ``review_failed``; they must not be misread as
-    domain feedback and sent to the implementer/rebuild loop.
+    inconclusive verdict; they must not be misread as domain feedback and sent
+    to the implementer/rebuild loop. No reviewer ruled on the candidate, so
+    the tier ends ``review_inconclusive`` and not ``review_failed``.
     """
 
     rc, summary, backend = _run(
@@ -1755,7 +1965,12 @@ def test_response_contract_exhaustion_never_reimplements_domain_work(
     )
 
     assert rc == 3
-    assert summary["status"] == "review_failed"
+    assert summary["status"] == "review_inconclusive"
+    assert summary["phase_4_review_inconclusive"] == {
+        "rubric": "tier_completeness",
+        "domain": "protocol",
+    }
+    assert _tier_outcome(tmp_path)["terminal_class"] == "inconclusive"
     assert backend.review_calls == 9
     assert backend.implement_calls == 1
     assert len(summary["phase_4_reviews"]) == 1
@@ -1776,12 +1991,260 @@ def test_response_contract_exhaustion_never_reimplements_domain_work(
     assert len(retry_manifest["attempts"]) == 9
 
 
+@pytest.mark.parametrize(
+    ("backend_type", "domain"),
+    [
+        pytest.param(_LostReviewerBackend, "infrastructure", id="lost"),
+        # The reviewer backend returns a budget terminal: the summary names
+        # the budget, not an outage.
+        pytest.param(_BudgetStoppedReviewerBackend, "budget", id="budget"),
+    ],
+)
+def test_lost_gating_reviewer_ends_review_inconclusive(
+    tmp_path,
+    monkeypatch,
+    backend_type,
+    domain: str,
+):
+    """A reviewer backend that is lost returns no verdict on the candidate.
+
+    The same holds for a reviewer call that ends on its budget. The failed
+    call carries complete accounting evidence; with unknown usage the tier
+    ends ``incomplete_accounting`` before it reports the review.
+    """
+
+    rc, summary, backend = _run(
+        tmp_path,
+        monkeypatch,
+        retry_budget=2,
+        backend_type=backend_type,
+    )
+
+    assert rc == 3
+    assert summary["status"] == "review_inconclusive"
+    assert summary["phase_4_review_inconclusive"] == {
+        "rubric": "tier_completeness",
+        "domain": domain,
+    }
+    outcome = _tier_outcome(tmp_path)
+    assert outcome["detail_status"] == "review_inconclusive"
+    assert outcome["terminal_class"] == "inconclusive"
+    # Everything a failed review refuses is still refused: no implementation
+    # feedback, no final binding, no landing.
+    assert backend.review_calls == 1
+    assert backend.implement_calls == 1
+    assert summary["phase_4_reviews"][0]["infrastructure_failure"] is True
+    assert summary["phase_5_final_bindings"] == []
+    assert "phase_4_pre_breach_fallback" not in summary
+    assert "landed" not in _lifecycle_kinds(tmp_path)
+    assert summary["costs"]["accounting_debt"] is False
+
+
+def test_lost_gating_reviewer_with_unknown_usage_ends_incomplete_accounting(
+    tmp_path,
+    monkeypatch,
+):
+    """Accounting debt keeps its precedence over ``review_inconclusive``.
+
+    The assertion on ``phase_4_review_inconclusive`` pins today's behaviour:
+    the key stays in the summary under ``incomplete_accounting``. Dropping
+    the key at that return is an open decision (outcome-taxonomy/A-corr-5).
+    """
+
+    rc, summary, backend = _run(
+        tmp_path,
+        monkeypatch,
+        retry_budget=2,
+        backend_type=_LostReviewerUnknownUsageBackend,
+    )
+
+    assert rc == 1
+    assert summary["status"] == "incomplete_accounting"
+    assert _tier_outcome(tmp_path)["detail_status"] == "incomplete_accounting"
+    assert summary["phase_4_review_inconclusive"] == {
+        "rubric": "tier_completeness",
+        "domain": "infrastructure",
+    }
+    assert summary["costs"]["accounting_debt"] is True
+    assert backend.review_calls == 1
+    assert backend.implement_calls == 1
+    assert summary["phase_5_final_bindings"] == []
+    assert "landed" not in _lifecycle_kinds(tmp_path)
+
+
+def test_semantic_rejection_before_a_lost_reviewer_stays_review_failed(
+    tmp_path,
+    monkeypatch,
+):
+    """A ruling against the candidate stands when a later reviewer is lost."""
+
+    rc, summary, backend = _run(
+        tmp_path,
+        monkeypatch,
+        retry_budget=0,
+        backend_type=_ReviseThenLostReviewerBackend,
+        review_policy=ReviewPolicy(
+            rubrics=("diff_scope", "tier_completeness"),
+            retry_budget=0,
+        ),
+    )
+
+    assert rc == 3
+    assert summary["status"] == "review_failed"
+    assert "phase_4_review_inconclusive" not in summary
+    assert _tier_outcome(tmp_path)["terminal_class"] == "permanent_failure"
+    assert [
+        (item["rubric"], item["infrastructure_failure"])
+        for item in summary["phase_4_reviews"]
+    ] == [("diff_scope", False), ("tier_completeness", True)]
+    assert backend.implement_calls == 1
+
+
+def test_lost_advisory_reviewer_does_not_gate_or_relabel_the_tier(
+    tmp_path,
+    monkeypatch,
+):
+    """An advisory rubric never gates, with or without a verdict."""
+
+    rc, summary, backend = _run(
+        tmp_path,
+        monkeypatch,
+        retry_budget=0,
+        backend_type=_LostReviewerBackend,
+        review_policy=ReviewPolicy(
+            rubrics=("spec_clarity",),
+            advisory_rubrics=("spec_clarity",),
+        ),
+    )
+
+    assert rc == 0
+    assert summary["status"] == "complete"
+    assert "phase_4_review_inconclusive" not in summary
+    assert backend.review_calls == 1
+    assert summary["phase_4_reviews"][0]["infrastructure_failure"] is True
+
+
+def test_lost_rereview_of_a_retried_candidate_ends_review_inconclusive(
+    tmp_path,
+    monkeypatch,
+):
+    """Each pass reviews its own candidate.
+
+    The first candidate was ruled against and re-implemented. Nobody ruled on
+    the retry, so the run does not report the earlier ruling as its result.
+    The retry is rolled back all the same.
+    """
+
+    rc, summary, backend = _run(
+        tmp_path,
+        monkeypatch,
+        retry_budget=1,
+        backend_type=_LostRereviewBackend,
+    )
+
+    assert rc == 3
+    assert summary["status"] == "review_inconclusive"
+    assert summary["phase_4_review_inconclusive"] == {
+        "rubric": "tier_completeness",
+        "domain": "infrastructure",
+    }
+    assert [
+        (item["review_attempt"], item["infrastructure_failure"])
+        for item in summary["phase_4_reviews"]
+    ] == [(0, False), (1, True)]
+    assert backend.review_calls == 2
+    assert backend.implement_calls == 2
+    assert (tmp_path / "repo" / "file_0.py").read_text() == (
+        "# implement attempt 1\n"
+    )
+    assert summary["phase_5_final_bindings"] == []
+    assert "landed" not in _lifecycle_kinds(tmp_path)
+
+
+def test_lost_rereview_of_an_unchanged_candidate_stays_review_failed(
+    tmp_path,
+    monkeypatch,
+):
+    """A ruling stands for the bytes it was made on.
+
+    The feedback retry changed nothing, so the pass that lost its reviewer
+    looked at the candidate the first review had already ruled against.
+    """
+
+    rc, summary, backend = _run(
+        tmp_path,
+        monkeypatch,
+        retry_budget=1,
+        backend_type=_UnchangedRetryLostRereviewBackend,
+    )
+
+    assert rc == 3
+    assert summary["status"] == "review_failed"
+    assert "phase_4_review_inconclusive" not in summary
+    assert _tier_outcome(tmp_path)["terminal_class"] == "permanent_failure"
+    assert [
+        (item["review_attempt"], item["infrastructure_failure"])
+        for item in summary["phase_4_reviews"]
+    ] == [(0, False), (1, True)]
+    assert backend.review_calls == 2
+    assert backend.implement_calls == 2
+    assert (tmp_path / "repo" / "file_0.py").read_text() == (
+        "# implement attempt 1\n"
+    )
+    assert summary["phase_5_final_bindings"] == []
+    assert "landed" not in _lifecycle_kinds(tmp_path)
+
+
+def _review_terminal(*findings: tuple[str, str, str]):
+    """A verdict shape carrying only what the domain helpers read."""
+
+    return SimpleNamespace(
+        decision="inconclusive",
+        findings=tuple(
+            SimpleNamespace(source=source, category=category, id=finding_id)
+            for source, category, finding_id in findings
+        ),
+    )
+
+
+def test_review_no_verdict_domain_puts_budget_first():
+    from crucible.workflows.tier import _review_no_verdict_domain
+
+    semantic = SimpleNamespace(
+        decision="revise",
+        findings=(
+            SimpleNamespace(
+                source="llm",
+                category="partial_delivery",
+                id="missing_wiring",
+            ),
+        ),
+    )
+    assert _review_no_verdict_domain(semantic) is None
+    assert _review_no_verdict_domain(_review_terminal(
+        ("deterministic", "reviewer_output", "response_schema_invalid"),
+    )) == "protocol"
+    assert _review_no_verdict_domain(_review_terminal(
+        ("deterministic", "backend_error", "backend_transport"),
+    )) == "infrastructure"
+    # A reviewer stopped by its budget is a deterministic terminal that the
+    # shared classifier files under infrastructure; the tier names the cause.
+    assert _review_no_verdict_domain(_review_terminal(
+        ("deterministic", "budget_exhausted", "backend_budget_exhausted"),
+    )) == "budget"
+    assert _review_no_verdict_domain(_review_terminal(
+        ("deterministic", "backend_error", "backend_budget_overrun"),
+    )) == "budget"
+
+
 def test_no_retry_budget_abandons_on_first_failure(tmp_path, monkeypatch):
     """retry_budget=0 (default): the first review failure is terminal —
     rc=3, one review, one implement (no re-implement)."""
     rc, summary, backend = _run(tmp_path, monkeypatch, retry_budget=0)
     assert rc == 3
     assert summary["status"] == "review_failed"
+    assert "phase_4_review_inconclusive" not in summary
+    assert _tier_outcome(tmp_path)["terminal_class"] == "permanent_failure"
     assert backend.review_calls == 1
     assert backend.implement_calls == 1
 
@@ -2012,7 +2475,10 @@ def test_malformed_review_conflict_authority_fails_closed_after_exact_rollback(
     )
 
     assert rc == 3
+    # The candidate under review was ruled against by both gating reviewers
+    # before the authority call was lost: the rejection stands.
     assert summary["status"] == "review_failed"
+    assert "phase_4_review_inconclusive" not in summary
     assert gate_calls == 2
     assert backend.implement_calls == 2
     assert backend.authority_calls == 3
@@ -2022,6 +2488,77 @@ def test_malformed_review_conflict_authority_fails_closed_after_exact_rollback(
     conflict = summary["phase_4_review_conflict_authority"]
     assert conflict["status"] == "inconclusive"
     assert summary["phase_5_final_bindings"] == []
+
+
+@pytest.mark.timeout(300)
+def test_lost_fresh_reviewer_after_reconciliation_ends_review_inconclusive(
+    tmp_path,
+    monkeypatch,
+):
+    """The reconciled bytes are a new candidate; nobody ruled on them."""
+
+    rc, summary, backend, gate_calls, repo, _corpus = (
+        _run_public_export_conflict(
+            tmp_path,
+            monkeypatch,
+            backend_type=_LostFreshReviewerConflictBackend,
+        )
+    )
+
+    assert rc == 3
+    assert summary["status"] == "review_inconclusive"
+    assert summary["phase_4_review_inconclusive"] == {
+        "rubric": "diff_scope",
+        "domain": "infrastructure",
+    }
+    assert _tier_outcome(tmp_path)["terminal_class"] == "inconclusive"
+    conflict = summary["phase_4_review_conflict_authority"]
+    assert conflict["status"] == "fresh_reviews_failed"
+    # Initial candidate, rejected retry and reconciliation each reached the
+    # gate; the final gate did not run.
+    assert gate_calls == 3
+    assert backend.implement_calls == 3
+    assert backend.diff_scope_calls == 2
+    assert backend.completeness_calls == 2
+    assert summary["phase_5_final_bindings"] == []
+    assert "landed" not in _lifecycle_kinds(tmp_path)
+    # The unapproved reconciliation is rolled back like a rejected one.
+    assert (repo / "file_0.py").read_text() == (
+        "# candidate PublicSymbol reordered\n"
+    )
+
+
+@pytest.mark.timeout(300)
+def test_fresh_rejection_beside_a_lost_fresh_reviewer_stays_review_failed(
+    tmp_path,
+    monkeypatch,
+):
+    """The fresh pass runs every mandatory rubric; one ruling is enough."""
+
+    rc, summary, backend, gate_calls, repo, _corpus = (
+        _run_public_export_conflict(
+            tmp_path,
+            monkeypatch,
+            backend_type=functools.partial(
+                _LostFreshReviewerConflictBackend,
+                reject_fresh_completeness=True,
+            ),
+        )
+    )
+
+    assert rc == 3
+    assert summary["status"] == "review_failed"
+    assert "phase_4_review_inconclusive" not in summary
+    assert _tier_outcome(tmp_path)["terminal_class"] == "permanent_failure"
+    assert summary["phase_4_review_conflict_authority"]["status"] == (
+        "fresh_reviews_failed"
+    )
+    assert gate_calls == 3
+    assert backend.diff_scope_calls == 2
+    assert backend.completeness_calls == 2
+    assert (repo / "file_0.py").read_text() == (
+        "# candidate PublicSymbol reordered\n"
+    )
 
 
 def test_invalid_conflict_packet_starts_no_paid_authority_call(

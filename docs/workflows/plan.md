@@ -15,7 +15,11 @@ uv run crucible plan --spec /path/to/corpus --cwd /path/to/context-root \
 ```
 
 When `project_context.submodule_path` is set, `--cwd` is the outer context root;
-source tools and validators compose the declared submodule once. Source access
+source tools and validators compose the declared submodule once. Scope paths in
+every model-authored plan (a single-track Planner reply, each independent
+draft, a proposed synthesis) are canonicalized against that resolved project
+root, never the process working directory; the scope paths of a
+`--review-candidate` file are not rewritten. Source access
 is explicit and read-only. Planner source-call and payload-byte ceilings are
 workflow-owned and apply across the shared operation.
 
@@ -28,7 +32,8 @@ source bytes and modes, including local edits, with limits of two MiB per
 file, 128 MiB total, and 20,000 files. Read-only citations must match admitted
 snapshot bytes and are independently checked against the original project.
 
-Each draft receives one fixed-candidate adjudication. A malformed or
+Each draft receives one fixed-candidate adjudication. A malformed draft,
+including one with a scope path that is empty after canonicalization, or a
 deterministically invalid draft stays diagnostic; valid siblings can continue.
 The separate comparison reviewer can choose an accepted candidate by exact
 id/digest, abstain, or propose a full synthesis. A synthesis must pass fresh
@@ -44,6 +49,42 @@ limits can be post-hoc: these are disjoint workflow allowances, not a provider
 hard-stop guarantee. An overrun, missing pricing, or incomplete execution
 evidence stops later calls and approval. Cancellation closes and joins leases
 before a terminal is published. The configured route/model/effort is preserved.
+
+A competition that ends without a plan reports why.
+`plan_competition_inconclusive` is kept when a ruling ended the run: the
+comparison reviewer selected nothing, or every draft that came back was
+refused by the decoder, a deterministic gate, or its own reviewers. A Critic
+`reject` is such a refusal even when that draft's Judge gave no verdict. The
+status is also kept when the records do not prove that a lost call ended the
+run, for example when every planner stopped on its turn limit or a content
+rejection, or a draft's deterministic gate could not run. Otherwise the status
+is the one single-track planning reports for the lost call:
+`planner_infrastructure_failure` or `planner_protocol_failure` when no planner
+returned a draft; `critic_infrastructure_failure`, `critic_protocol_failure`,
+`judge_infrastructure_failure` or `judge_protocol_failure` when a draft
+reviewer or the comparison reviewer gave no verdict while a draft had no
+ruling against it; `budget_exhausted` when such a call stopped on its budget
+instead; and `cancelled` when a cancel request arrived before the comparison
+or before the review of a proposed synthesis. A lost draft is not retried, and
+no plan is published in any of these cases.
+
+These statuses name a lost call only when its backend reported complete usage
+and pricing evidence. A lost call with incomplete usage, which the
+OpenAI-compatible adapter returns for a connection or HTTP error, stays the
+accounting terminal `budget_accounting_incomplete`, as it stays
+`incomplete_accounting` with one planner.
+
+The status is not always the one single-track planning reports for the same
+events. A run in which every planner stopped on its turn limit or a content
+rejection keeps `plan_competition_inconclusive`, where one planner ends on
+`hard_fail_max_turns` or `hard_fail_content_rejected`. Lost planner calls
+beside such a stop are named by the lost call, where one planner ends on that
+stop. Lost planner calls beside a refused draft keep
+`plan_competition_inconclusive`, where one planner reports whichever came
+last. A planner that stopped on its budget beside drafts that were all refused
+keeps `plan_competition_inconclusive` too, where one planner reports
+`budget_exhausted`. A Critic `reject` followed by a lost Judge is a refusal
+here and the lost Judge with one planner.
 
 `--planner-count 1` selects the bounded single-track refinement loop and
 permits zero or one pre-review deterministic correction. Planner conversations,
@@ -94,7 +135,10 @@ success. Normal Corpus runs retain manifest, saga, summary, result, and outcome
 files; events, traces, and domain artifacts are conditional. A competition also
 retains `plan_competition.json`, content-addressed physical call receipts and
 prompts, every candidate and review, the comparison packet/decision, synthesis
-gates, source identity, policy, and implementation digests. Losing drafts never
+gates, source identity, policy, and implementation digests. A draft's `raw_ref`
+and the comparison response keep the model's text as written; candidate
+artifacts, digests, reviews, the comparison packet, and the published DAG hold
+the plan that was judged, with canonical scope paths. Losing drafts never
 become canonical Spec versions. Source:
 [workflows/plan.py](../../workflows/plan.py).
 
@@ -105,4 +149,4 @@ become canonical Spec versions. Source:
 | `0` | `PlanOutcome.decision="accepted"`; the enabled validation gate passed and an executable DAG was persisted. |
 | `1` | The accepted candidate failed the final deterministic TOCTOU recheck. |
 | `2` | `PlanOutcome.decision="rejected"` or a handled setup failure. |
-| `3` | `PlanOutcome.decision="inconclusive"`, including budget/round exhaustion, missing DAG, or incomplete review coverage. |
+| `3` | `PlanOutcome.decision="inconclusive"`, including budget/round exhaustion, missing DAG, incomplete review coverage, or a Planner backend that returned no reply (`planner_infrastructure_failure`): by the end of the round budget with one planner, or when no independent draft came back with several. |

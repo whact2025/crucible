@@ -13,9 +13,9 @@ uv sync --project backends/kimi_worker --locked
 ```
 
 The worker protocol binds exact model, reasoning effort, response/context
-bounds, and diagnostic cost policy. The configured K2.7 high-speed route and K3
-route use different request fields and retain separate identities. Unsupported
-model/effort pairs, runtime drift, and older protocols fail before dispatch.
+bounds, and diagnostic cost policy. The one admitted model is `kimi-k3.1-pro`
+at effort `max`, on the K3-series request fields. Any other model or effort,
+runtime drift, and older protocols fail before dispatch.
 Checked-in project-locked profiles reject arbitrary interpreter overrides and
 revalidate the installed runtime before probes and real spawns.
 
@@ -29,12 +29,12 @@ completion. Duplicate or malformed counters, served-model drift, contradictory
 terminals, or missing final evidence fail closed. Cached reads/writes remain
 explicit and are not subtracted twice.
 
-The opt-in K3 diagnostic cost policy permits only its specifically validated
-missing cache-read uncertainty. It retains lower/upper bounds, never invents
-exact reads or actual charges, and stops further work when the conservative
-ceiling is reached. Post-response spending guards can overshoot on the final
-indivisible response; diagnostic continuation never grants ranking, exact
-accounting, or promotion.
+The opt-in K3.1 Pro diagnostic cost policy permits only its specifically
+validated missing cache-read uncertainty. It retains lower/upper bounds, never
+invents exact reads or actual charges, and stops further work when the
+conservative ceiling is reached. Post-response spending guards can overshoot on
+the final indivisible response; diagnostic continuation never grants ranking,
+exact accounting, or promotion.
 
 Select the exact suite profile and inspect its admission and runtime binding.
 A new worker source or lock requires new runtime evidence. Existing retained

@@ -980,8 +980,11 @@ def test_artifact_directory_symlink_swap_cannot_escape_verified_fd(
 
 def test_sink_survives_unwriteable_log_dir(tmp_path: Path, caplog):
     """A bogus log_dir doesn't break the workflow — sink logs a warning."""
-    # Point log_dir at a path under a non-existent FS root.
-    bad = Path("/nonexistent_root/_xyz_") / tmp_path.name / "logs"
+    # A directory cannot be created beneath a regular file for any uid; a
+    # made-up absolute root can be created by root.
+    blocker = tmp_path / "not_a_directory"
+    blocker.write_text("x", encoding="utf-8")
+    bad = blocker / "logs"
     sink = SdkDebugSink(log_dir=bad, backend_name="claude")
     inv = Invocation(system="s", user="u", tools=None,
                      max_turns=5, budget_usd=None)
@@ -995,6 +998,7 @@ def test_sink_survives_unwriteable_log_dir(tmp_path: Path, caplog):
             started_iso="2026-05-18T12:00:00+00:00", duration_s=0.0,
         )
     assert path is None
+    assert not bad.exists()
     # Warning was emitted; workflow proceeds.
     assert any(
         "SdkDebugSink" in rec.message for rec in caplog.records

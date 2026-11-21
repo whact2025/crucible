@@ -49,8 +49,10 @@ from crucible.common.authority_io import (
 MATRIX_SCHEMA = "crucible.deepswe-backend-convergence-matrix.v1"
 PLAN_SCHEMA = "crucible.deepswe-backend-convergence-plan.v1"
 ANALYSIS_SCHEMA = "crucible.deepswe-backend-convergence-analysis.v1"
-COHORT_ID = "deepswe-astra-mythos51-kimi-quality-pilot-20260914-v1"
-SELECTION_SEED = COHORT_ID
+COHORT_ID = "deepswe-astra-mythos51-kimi-quality-pilot-20261118-v2"
+# The audited ten-task selection of the predecessor cohort is carried
+# unchanged; its seed is that cohort's id.
+SELECTION_SEED = "deepswe-astra-mythos51-kimi-quality-pilot-20260914-v1"
 
 ARMS = ("A", "B", "C")
 ORDERS = ("ABC", "BCA", "CAB")
@@ -169,12 +171,12 @@ _EXPECTED_LANES: Mapping[str, tuple[str, str, str, str, str, str | None, str]] =
         "enforce",
     ),
     "C": (
-        "kimi-k2.7-highspeed-diagnostic",
+        "kimi-k3.1-pro-diagnostic",
         "kimi",
         "kimi",
         "kimi_agent_sdk_worker",
-        "kimi-k2.7-code-highspeed",
-        None,
+        "kimi-k3.1-pro",
+        "max",
         "diagnostic",
     ),
 }
@@ -191,8 +193,8 @@ _EXPECTED_ROUTE_IDENTITIES = {
     ),
     "C": (
         "backends_kimi_sdk_diagnostic.yaml",
-        "sha256:0e772e66620c898592eb6ea48cbaf976a6de561363cfca8f370db01bf81a2c4b",
-        "sha256:1f8d11259eceefe784a77ac87a1b7287dc474c92bc1c3a861c248170f40914b4",
+        "sha256:847a868cffcfcef12aacff8b0a709ef990c61cd2fe8175b271dc1a104c4a6c65",
+        "sha256:129d284cb5d0777e8a0ca275a23a248b1cb93335d092250ceca4886bf4e29fa4",
     ),
 }
 _EXPECTED_ANALYSIS_DIGEST = (

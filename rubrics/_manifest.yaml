@@ -275,6 +275,7 @@ rubrics:
       path_grounding:
       - hallucinated_path
       - edits_test_files
+      - ignored_path
       eval_contract:
       - incomplete_increment
       - other

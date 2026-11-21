@@ -20,7 +20,7 @@ import openai
 
 
 _PROTOCOL = "crucible.deepseek-worker.v1"
-_MODEL = "deepseek-v4-flash"
+_MODEL = "deepseek-flash"
 _BASE_URL = "https://api.deepseek.com"
 _RESPONSES_ENDPOINT = "https://api.deepseek.com/responses"
 _OPENAI_VERSION = "2.53.0"

@@ -28,7 +28,9 @@ Spec shape:
   envelopes at or below $12 use an explicit one-tier/one-slice shape so one
   complete planning -> implementation -> Breaker/entailment -> mandatory-review
   cycle is budget-feasible; this boundary is not a provider-price promise.
-  Early acceptance still exits the loop immediately.
+  Early acceptance still exits the loop immediately. The planner guidance
+  keeps every new file at a path candidate capture can see and, for the
+  standard decomposition, keeps the edits of one contract in one slice.
 - ``tier_dag``: None — produced by the planner downstream.
 
 Implementations / verdicts / measurements / lifecycle events: all
@@ -100,6 +102,42 @@ identifies the identity itself as defective. A different directive identifier
 is not an alias and will be rejected before implementation.
 
 All root-to-plan and plan-to-root coverage obligations still apply.
+""".strip()
+
+# Tier executes and gates one slice at a time with a writer confined to that
+# slice's declared paths, so the first part of a contract split over slices
+# fails the full-suite gate where no implementer can make the paired edit.
+_DEEPSWE_CONTRACT_PLANNER_GUIDANCE = """
+Edits that form one contract belong in one slice. When one behavior needs
+paired edits that only build and pass together (mirrored or forwarded
+signatures, an interface and its implementers, a public API and its registry,
+a signature and its call sites, a required field and its construction sites),
+plan them as a single slice whose `files_in_scope` and `creates_paths` list
+every file of the contract and whose intent names the paired sites. Do not
+split them across sibling slices or across tiers: each slice is implemented
+and verified on its own before the next slice starts, its implementer may
+write only that slice's declared paths, and one part alone fails the project's
+own build or consistency tests. This refines the general rule that dependent
+work goes in later tiers: later tiers are for prerequisites that leave the
+repository coherent on their own, never for the other part of a paired edit.
+This bound is not permission to bundle independently landable behavior.
+""".strip()
+
+# Candidate capture stages the working tree with `git add -A`, which honors
+# the repository's ignore rules; an ignored new file never reaches the patch.
+_DEEPSWE_CAPTURE_PLANNER_GUIDANCE = """
+Plan every new file at a path the repository does not ignore. The candidate
+patch is captured the way `git add -A` sees the working tree, so a new file
+whose path matches the repository's ignore rules (`.gitignore`) is never
+captured and is missing at verification. Check those rules before declaring a
+`creates_paths` entry in a cache, dependency, environment, generated, or
+build-output location. When a new file has to live in such a location, cite
+the complete root `.gitignore` and any `.gitignore` in a parent directory of
+the path as read-only references (`read_only_references`), each from line 1 to
+its last line, and state in the slice intent that each of these references is
+the whole file, so the review can see that no pattern matches the path; a
+partial excerpt cannot show that. An edit to an already tracked file is
+captured wherever it lives.
 """.strip()
 
 
@@ -235,7 +273,11 @@ _DEEPSWE_DEFAULT_PLAN_POLICY = PlanPolicy(
     # Mutation-shaped empty slices and additional checkpoints are rejected as
     # filler before the plan becomes executable.
     max_verification_only_empty_scope_slices=1,
-    planner_guidance=_DEEPSWE_PLANNER_GUIDANCE,
+    planner_guidance="\n\n".join((
+        _DEEPSWE_PLANNER_GUIDANCE,
+        _DEEPSWE_CONTRACT_PLANNER_GUIDANCE,
+        _DEEPSWE_CAPTURE_PLANNER_GUIDANCE,
+    )),
 )
 
 _DEEPSWE_COMPACT_PLAN_POLICY = dataclasses.replace(
@@ -243,11 +285,13 @@ _DEEPSWE_COMPACT_PLAN_POLICY = dataclasses.replace(
     max_total_slices=1,
     max_total_tiers=1,
     max_verification_only_empty_scope_slices=0,
-    planner_guidance=(
-        _DEEPSWE_DEFAULT_PLAN_POLICY.planner_guidance
-        + "\n\n"
-        + _DEEPSWE_COMPACT_PLANNER_GUIDANCE
-    ),
+    # One slice cannot split a contract, so that note is left out. The
+    # captured-path note applies to every plan; the compact bound stays last.
+    planner_guidance="\n\n".join((
+        _DEEPSWE_PLANNER_GUIDANCE,
+        _DEEPSWE_CAPTURE_PLANNER_GUIDANCE,
+        _DEEPSWE_COMPACT_PLANNER_GUIDANCE,
+    )),
 )
 
 

@@ -25,14 +25,24 @@ _DEDICATED_SHARDS = {
 # plus estimates apportioned from timestamped workflow progress. They affect
 # placement only; every discovered file still runs. The unfinished writer tail
 # has a conservative allowance until a complete duration is available.
+# The hints for test_deepswe_gate_residue.py and
+# test_workflows_tier_unjudged_outcomes.py, and the raised hint for
+# test_workflows_tier_budget_terminal.py (18 to 34 cases), are estimates from
+# a local eight-shard run, not from a hosted run.
+# The hints for test_plan_competition_outcomes.py and
+# test_plan_competition_scope_paths.py are estimates from a local run of each
+# file alone.
 _DEFAULT_WEIGHT_SECONDS = 30
 _RUNTIME_WEIGHT_SECONDS = {
+    'tests/test_deepswe_gate_residue.py': 450,
     'tests/test_mutation_journal_active_parent_handoff.py': 270,
     'tests/test_mutation_journal_authority_regressions.py': 240,
     'tests/test_mutation_journal_external_root_lock.py': 330,
     'tests/test_mutation_journal_git_admin_adversarial.py': 210,
     'tests/test_mutation_journal_restore_confinement.py': 210,
     'tests/test_mutation_journal_writer_epoch_integration.py': 120,
+    'tests/test_plan_competition_outcomes.py': 150,
+    'tests/test_plan_competition_scope_paths.py': 90,
     'tests/test_reaper.py': 600,
     'tests/test_tier_build_progress_retry.py': 120,
     'tests/test_tier_restored_path_k3_compatibility.py': 150,
@@ -45,7 +55,7 @@ _RUNTIME_WEIGHT_SECONDS = {
     'tests/test_workflows_journal_recover.py': 750,
     'tests/test_workflows_swebench.py': 480,
     'tests/test_workflows_tier_breach_policy.py': 300,
-    'tests/test_workflows_tier_budget_terminal.py': 270,
+    'tests/test_workflows_tier_budget_terminal.py': 510,
     'tests/test_workflows_tier_cargo_options.py': 270,
     'tests/test_workflows_tier_diagnostic_recovery.py': 180,
     'tests/test_workflows_tier_empty_diff_retry.py': 2490,
@@ -56,6 +66,7 @@ _RUNTIME_WEIGHT_SECONDS = {
     'tests/test_workflows_tier_review_policy.py': 330,
     'tests/test_workflows_tier_review_retry.py': 810,
     'tests/test_workflows_tier_transport.py': 180,
+    'tests/test_workflows_tier_unjudged_outcomes.py': 330,
     'tests/test_workflows_writer_scheduler.py': 1710,
 }
 
