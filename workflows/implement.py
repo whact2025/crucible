@@ -78,6 +78,10 @@ from ._run import (
     open_run_with_capture,
     record_handled_terminal,
 )
+from ._write_root_guard import (
+    WRITE_ROOT_REFUSAL_ERROR_KIND,
+    host_route_write_root_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1140,6 +1144,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    cwd = Path.cwd()
+    refusal = host_route_write_root_refusal(args, cwd, ("implementer",))
+    if refusal is not None:
+        record_handled_terminal(
+            corpus,
+            "implement",
+            status="setup_error",
+            message=refusal,
+            error_kind=WRITE_ROOT_REFUSAL_ERROR_KIND,
+            provenance_root=None,
+        )
+        return 2
+
     # Attach the implementer profile (source + write + build) as an
     # adapter bridge so the agent can navigate source and perform only
     # directive-scoped canonical source mutation, including exact-root
@@ -1147,7 +1164,6 @@ def main(argv: list[str] | None = None) -> int:
     # workflow-owned. The SDK-native allowlist
     # below is empty, so this path-confined profile is the entire authoring
     # surface.
-    cwd = Path.cwd()
     write_scope = tuple(dict.fromkeys((
         *slice_.directive.files_in_scope,
         *slice_.directive.creates_paths,

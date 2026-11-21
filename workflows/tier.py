@@ -249,6 +249,10 @@ from ._review import (
     review_failure_domain,
 )
 from ._run_policy import WriterLanePolicy
+from ._write_root_guard import (
+    WRITE_ROOT_REFUSAL_ERROR_KIND,
+    host_route_write_root_refusal,
+)
 from ._writer_scheduler import (
     BackendFactory as WriterBackendFactory,
     IntegrationGate as WriterIntegrationGate,
@@ -6071,6 +6075,25 @@ def run_tier(
                     provenance_root=None,
                 )
                 return 2
+        # ``cwd`` is the root every write context below uses: the caller's
+        # checkout, or the worktree this call or Architect rebound it to.
+        refusal = host_route_write_root_refusal(
+            args,
+            cwd,
+            ("implementer", "breach_defender")
+            if args.breach_policy.enabled
+            else ("implementer",),
+        )
+        if refusal is not None:
+            record_handled_terminal(
+                corpus,
+                "tier",
+                status="setup_error",
+                message=refusal,
+                error_kind=WRITE_ROOT_REFUSAL_ERROR_KIND,
+                provenance_root=None,
+            )
+            return 2
         runner_parameters = extra_parameters
         ctx = ToolContext(
             workspace_root=Path(cwd), repo_root=Path(cwd),

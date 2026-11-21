@@ -54,6 +54,12 @@ The built-in model route is Codex `gpt-6-astra` with `max` reasoning. An explici
 closed routing file replaces or overrides it. Routes freeze across nested
 cascades; unsupported capabilities fail before transport.
 
+Implement, Tier, Breach, and Architect end as `setup_error` (exit `2`) before
+any model call when a role that writes routes to Codex, Claude, DeepSeek, or
+Kimi and the source root holds a directory, or a link to one, named like that
+root; run Tier or Architect with `--worktree`, or give the checkout directory
+another name.
+
 Most commands consume a promoted Corpus through `--spec`. Route binding runs
 before the Corpus exists. Journal Recovery acts on an exact retained journal.
 Normal run envelopes bind manifests, sagas, summaries, immutable results, and
