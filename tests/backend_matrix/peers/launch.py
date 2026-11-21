@@ -80,6 +80,32 @@ def worker_environments(repository: Path | None = None) -> tuple[Path, ...]:
     )
 
 
+def require_environment(
+    worker: str,
+    install: str,
+    fail: Callable[[str], Any],
+    *,
+    repository: Path | None = None,
+) -> Path:
+    """The interpreter of the locked environment of ``<worker>_worker``, or ``fail``.
+
+    For a test that needs a worker environment: where it is missing the test
+    must fail with the command that installs it, never skip. ``fail`` gets
+    that reason.
+    """
+
+    project = (repository or REPOSITORY) / "backends" / f"{worker}_worker"
+    interpreter = project / ".venv" / "bin" / "python"
+    if not interpreter.is_file():
+        fail(
+            f"this test needs the locked {worker} worker environment, and its "
+            f"interpreter ({'/'.join(interpreter.parts[-5:])}) does not exist; install "
+            f"it with `{install}`, or leave the tests marked matrix_worker out with "
+            "the expression tests/TEST_BASELINE.md documents"
+        )
+    return interpreter
+
+
 def is_locked_interpreter(
     argv0: str | os.PathLike[str], *, environments: Sequence[Path] | None = None
 ) -> bool:

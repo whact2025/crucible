@@ -18,6 +18,7 @@ import dataclasses
 import http.client
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -39,6 +40,8 @@ from assay import (
     Message,
     TransportError,
     Usage,
+    UsageCostBounds,
+    UsageCostBoundSegment,
     UsagePricingEvidence,
     UsagePricingSegment,
 )
@@ -48,6 +51,7 @@ from crucible.backends.config import BackendRouting, RoleConfig, load_routing
 from . import cells, contract, declarations, ledger, netguard, runner
 from . import columns as matrix_columns
 from . import envelopes as matrix_envelopes
+from . import verify as matrix_verify
 from .cells import Cell
 from .columns import TOY_KIND, Column
 from .contract import (
@@ -604,6 +608,112 @@ def test_c4_and_c6_report_flags_and_accounting(tmp_path: Path) -> None:
     ) == {"flag:trace_complete=False", "digest.missing:trace"}
 
 
+def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
+    tmp_path: Path,
+) -> None:
+    execution = _honest(tmp_path, "S03")
+    result, _trace = _result_and_trace(execution)
+    usage, flags = result.usage, result.completeness
+    billed = execution.observation.provider.billed
+    rate = execution.reference.pricing
+    assert len(billed) == 3 and not execution.reference.cost_bounded
+    bounded = dataclasses.replace(execution.reference, cost_bounded=True)
+    # What a result of such a route flags for a reply without a count of
+    # cache reads: token usage and cost incomplete, on purpose.
+    untold = {"flag:token_usage_complete=False", "flag:cost_complete=False"}
+    unaccounted = dataclasses.replace(flags, token_usage_complete=False, cost_complete=False)
+
+    def segment(tokens: Any, *, read: int | None = None) -> UsageCostBoundSegment:
+        upper = rate.compute_cost(
+            input_tokens=tokens.input_tokens, output_tokens=tokens.output_tokens
+        )
+        return UsageCostBoundSegment(
+            input_tokens=tokens.input_tokens,
+            output_tokens=tokens.output_tokens,
+            cache_creation_tokens=0,
+            cache_read_tokens=read,
+            lower_bound_usd=upper / 2 if read is None else upper,
+            upper_bound_usd=upper,
+            policy="a-cost-policy",
+        )
+
+    def interval(*segments: UsageCostBoundSegment, coverage: bool = True) -> UsageCostBounds:
+        return UsageCostBounds(tuple(segments), coverage)
+
+    def judged(
+        bounds: UsageCostBounds | None, *, reference: Any = bounded, **fields: Any
+    ) -> frozenset[str]:
+        cost = usage.cost_usd if bounds is None else bounds.lower_bound_usd
+        reported = dataclasses.replace(
+            usage, **{"cost_usd": cost, "cost_bounds": bounds, **fields}
+        )
+        return _judge(
+            execution,
+            reference=reference,
+            usage=reported,
+            completeness=unaccounted,
+            pricing_evidence=None,
+        )
+
+    whole = interval(*(segment(item) for item in billed))
+    # The interval of an honest result: one segment per billed response with
+    # its tokens, the reported cost its lower bound. Only the flags are named.
+    assert judged(whole) == untold
+    # Nothing is reported at all. Without the opt-in the cleared flags excuse
+    # it as a lower bound; with it the tokens and the interval are owed.
+    silent = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    short = {"usage.input_tokens:lt", "usage.output_tokens:lt"}
+    assert judged(None, reference=execution.reference, **silent) == untold
+    assert judged(None, **silent) == untold | short | {"usage.cost_bounds:none"}
+    assert judged(None) == untold | {"usage.cost_bounds:none"}
+    # The last response alone: an interval that covers what is reported, and
+    # that is not what the provider billed.
+    last = billed[-1]
+    assert judged(
+        interval(segment(last)),
+        input_tokens=last.input_tokens,
+        output_tokens=last.output_tokens,
+    ) == untold | short | {"usage.cost_bounds:segments"}
+    # A response without its segment, and segments that are not the billed
+    # responses although they add up to them.
+    assert judged(interval(*(segment(item) for item in billed[1:]))) == untold | {
+        "usage.cost_bounds:uncovered",
+        "usage.cost_bounds:segments",
+    }
+    moved = [
+        dataclasses.replace(billed[0], input_tokens=billed[0].input_tokens - 1),
+        dataclasses.replace(billed[1], input_tokens=billed[1].input_tokens + 1),
+        billed[2],
+    ]
+    assert judged(interval(*(segment(item) for item in moved))) == untold | {
+        "usage.cost_bounds:segments"
+    }
+    # Coverage that is not claimed, and a cost that is not the lower bound.
+    partial = interval(*(segment(item) for item in billed), coverage=False)
+    assert judged(partial) == untold | {"usage.cost_bounds:uncovered"}
+    assert judged(whole, cost_usd=whole.upper_bound_usd) == untold | {
+        "usage.cost_bounds:uncovered"
+    }
+    # With every count of cache reads known the interval is exact and the
+    # result may flag its accounting complete: nothing is named.
+    exact = interval(*(segment(item, read=0) for item in billed))
+    assert math.isclose(exact.lower_bound_usd, usage.cost_usd, rel_tol=1e-12)
+    assert _judge(
+        execution, reference=bounded, usage=dataclasses.replace(usage, cost_bounds=exact)
+    ) == frozenset()
+    assert _judge(execution, reference=bounded) == {"usage.cost_bounds:none"}
+    # A scenario that does not owe the accounting flags asks for no interval.
+    unowed = dataclasses.replace(execution.plan.expect, flags=())
+    assert _judge(
+        execution,
+        reference=bounded,
+        expect=unowed,
+        usage=dataclasses.replace(usage, **silent),
+        completeness=unaccounted,
+        pricing_evidence=None,
+    ) == frozenset()
+
+
 def test_pricing_evidence_is_asked_only_of_a_result_that_flags_its_cost_complete(
     tmp_path: Path,
 ) -> None:
@@ -716,6 +826,24 @@ def test_c5_and_optional_tool_events_report_on_their_own(tmp_path: Path) -> None
         SecondCall(requests=2),
     ):
         assert _judge(guarded, second_call=unusable) == {"guard:second_call_failed"}
+
+    # Rankable is read from the terminal the guard left, never inferred from
+    # the absence of a rewrite: under a cost policy the guard lets a result
+    # stand that it does not call rankable.
+    terminal = guarded.observation.limit_terminal
+    assert terminal is not None and terminal.rankable
+    unranked = dataclasses.replace(terminal, rankable=False)
+    assert _judge(guarded, limit_terminal=unranked) == {"guard:not_rankable"}
+    assert contract.clause_of(contract.NOT_RANKABLE) == "C5"
+    assert _judge(
+        guarded, limit_terminal=unranked, second_call=SecondCall(refused=True)
+    ) == {"guard:not_rankable", "guard:revoked"}
+    # An error result is not rankable by its kind, which C2 judges: C5 does
+    # not say it a second time.
+    failed = TransportError(message="refused", retriable=False)
+    failing = dataclasses.replace(guarded.plan.expect, kind="transport", retriable=False)
+    assert _judge(guarded, limit_terminal=unranked, error=failed, expect=failing) == frozenset()
+    assert _judge(guarded, limit_terminal=unranked, error=failed) == {"kind:transport!=none"}
 
     raw = _honest(tmp_path / "raw", "S03")
     _result, trace = _result_and_trace(raw)
@@ -1552,6 +1680,7 @@ def test_kinds_without_a_driver_yield_no_cell_and_no_error() -> None:
         matrix_columns.LOCAL_GATEWAY_KIND,
         matrix_columns.CLAUDE_KIND,
         matrix_columns.DEEPSEEK_KIND,
+        matrix_columns.KIMI_KIND,
     }
     assert [cell for cell in cells.behaviour_cells() if cell.column.kind == TOY_KIND] == list(
         generated
@@ -1570,8 +1699,12 @@ def test_role_scope_and_the_not_expressible_list_shape_a_column() -> None:
         for role in ("primary", "secondary-2", "blocked")
     }
 
-    assert by_role["primary"] == set(SCENARIOS) == by_role["secondary-2"]
-    assert by_role["blocked"] == {"S00", "S01"}
+    enabled = {name for name, item in SCENARIOS.items() if item.set in enablement["standin"]}
+    assert by_role["primary"] == enabled == by_role["secondary-2"]
+    # A blocked column runs its three scenarios whatever sets its kind runs:
+    # the admission scenario is of a set this stand-in kind does not run.
+    assert by_role["blocked"] == set(cells.BLOCKED_SCENARIOS) == {"S00", "S01", "S51"}
+    assert SCENARIOS["S51"].set not in enablement["standin"] and "S51" not in enabled
     row = {"scenario": "S23c", "kind": "standin", "step": "Refuse", "reason": "r", "checklist": "c"}
     pinned = cells.generate(
         columns,
@@ -2236,7 +2369,7 @@ def test_h03_declared_difference_rules() -> None:
         canary,
         f"{hosted}/S00/primary/raw",
         f"{hosted}/S03/primary/raw",
-        "kimi/S04/primary/raw",
+        "kimi/S04/blocked/raw",
         f"{hosted}/S04/tertiary/raw",
     ):
         assert scoped(D_OAI_SCHEMA_FINAL, [in_force, wrong]) == {
@@ -2669,6 +2802,215 @@ def test_toy_columns_are_derived_from_the_snapshot_not_typed() -> None:
     assert derived[0].features is not None
     unplayable = dataclasses.replace(derived[0].features, usd_limit="hard")
     assert toy.unsupported_values(unplayable) == ["usd_limit=hard"]
+
+
+# -- the admission scenario, and what a route asks of an invocation ---------------
+
+
+def test_an_admission_cell_calls_nothing_and_is_held_to_its_subjects(tmp_path: Path) -> None:
+    cell = next(cell for cell in TOY_CELLS if SCENARIOS[cell.scenario].admission)
+    scenario = SCENARIOS[cell.scenario]
+    admitted = contract.ADMITTED
+
+    # Its clauses follow from its definition: backends are built, none is called.
+    assert contract.applicable(
+        lens="raw", toolset=False, expects_result=False, call=False
+    ) == ("C0", "C8", "C9")
+    assert (scenario.lenses, scenario.toolset, scenario.governing) == (("raw",), None, ())
+    # A toy column stands behind no routing gate, and no catalog names it.
+    expected = cells.expected_admission(cell)
+    assert expected == dict.fromkeys(matrix_columns.ROLE_BY_CAPABILITY, admitted)
+
+    honest = runner.execute(cell, tmp_path / "honest")
+    assert honest.report.codes == frozenset()
+    assert set(honest.report.outcomes) == {"C0", "C8", "C9", contract.SCENARIO}
+    assert honest.observation.result is None and honest.observation.raised is None
+    assert honest.observation.provider.request_count == 0
+    # Held to another pin, a subject is named with what was seen and what is
+    # pinned; so is a pinned subject the cell never saw, and one it saw that
+    # the pin does not name.
+    refusal = "FeatureAdmissionError"
+
+    def held_to(name: str, pin: Mapping[str, str]) -> frozenset[str]:
+        return runner.execute(cell, tmp_path / name, admission=pin).report.codes
+
+    assert held_to("refused", {**expected, "read_only": refusal}) == {
+        f"admission:read_only:{admitted}!={refusal}"
+    }
+    assert held_to("unseen", {**expected, cells.AVAILABILITY: "blocked"}) == {
+        "admission:availability:unseen!=blocked"
+    }
+    assert held_to("unpinned", {"text": admitted}) == {
+        f"admission:read_only:{admitted}!=unpinned",
+        f"admission:workspace_write:{admitted}!=unpinned",
+    }
+    for code in ("admission:text:admitted!=FeatureAdmissionError", "admission:a:b!=c"):
+        assert contract.clause_of(code) == contract.SCENARIO
+
+
+def test_an_admission_cell_of_a_real_column_needs_its_pin_and_a_pin_its_cell() -> None:
+    blocked = _standin("blocked")
+    generated = cells.generate(
+        [_standin("primary"), blocked],
+        registered=frozenset({"standin"}),
+        enablement={"standin": (STARTER,)},
+    )
+    (cell,) = (item for item in generated if SCENARIOS[item.scenario].admission)
+    assert cell.column is blocked
+    row = {
+        "cell": cell.id,
+        "availability": "blocked",
+        "text": "admitted",
+        "read_only": "admitted",
+        "workspace_write": "FeatureAdmissionError",
+        "reason": "synthetic",
+    }
+
+    assert cells.admission_pin_problems(generated, [row]) == []
+    (missing,) = cells.admission_pin_problems(generated, [])
+    assert "has no pin" in missing
+    (stale,) = cells.admission_pin_problems(
+        generated, [row, {**row, "cell": "standin/S51/primary/raw"}]
+    )
+    assert "no generated admission cell" in stale
+    # A toy cell is never pinned: it is held to the rule, not to a row.
+    toy_cell = next(item for item in TOY_CELLS if SCENARIOS[item.scenario].admission)
+    (on_toy,) = cells.admission_pin_problems(TOY_CELLS, [{**row, "cell": toy_cell.id}])
+    assert "no generated admission cell of a real column" in on_toy
+    assert cells.admission_pin_problems(TOY_CELLS, []) == []
+    # What the cell is held to is its row, whole.
+    assert cells.expected_admission(cell, [row]) == {
+        name: row[name] for name in cells.ADMISSION_SUBJECTS
+    }
+    with pytest.raises(MatrixSetupError, match="has no pin"):
+        cells.expected_admission(cell, [])
+    # The shipped inventory pins every admission cell that is generated
+    # today, and without a pin the cells of the matrix are not generated at
+    # all: a collection error, never a cell that passes on nothing.
+    shipped = cells.load_inventory()
+    assert cells.admission_pin_problems(cells.behaviour_cells(), shipped.admission) == []
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(
+            cells, "load_inventory", lambda: dataclasses.replace(shipped, admission=())
+        )
+        with pytest.raises(MatrixSetupError, match="has no pin in inventory.yaml"):
+            cells.behaviour_cells.__wrapped__()
+    # A column-wide gap of a result clause is not owed on an admission cell:
+    # the cell calls nothing, by its definition, so it needs no pin for that.
+    known = _ledger(column_wide=True)
+    (scope,) = known.column_wide
+    assert contract.clause_of(scope.code) in RESULT_CLAUSES
+    plain_cell = ledger.cell_id(scope.kind, "S01", "primary", "raw")
+    admission_cell = ledger.cell_id(scope.kind, cell.scenario, "primary", "raw")
+    assert matrix_verify.ledgered(known, plain_cell)[1] == {scope.gap}
+    assert matrix_verify.ledgered(known, admission_cell) == (set(), set())
+
+    # The cell runs on the routing file of every product: a column as one
+    # product routes it names that product's file where a driver builds from.
+    column = matrix_columns.real_columns()[0]
+    files = {product: column.routing_path(product) for product in matrix_columns.PRODUCTS}
+    assert len(set(files.values())) == len(matrix_columns.PRODUCTS) > 1
+    for product, path in files.items():
+        view = column.routed_by(product)
+        assert view.routing == ((matrix_columns.COLUMN_PRODUCT, path),)
+        assert (view.id, view.profile, view.model) == (column.id, column.profile, column.model)
+    # The role table and the catalogs agree on which columns are blocked.
+    for real in matrix_columns.real_columns():
+        words = {
+            matrix_columns.catalog_availability(real, product)
+            for product in matrix_columns.PRODUCTS
+        }
+        assert len(words) == 1, real.id
+        assert (words == {"blocked"}) == real.role.startswith("blocked"), real.id
+
+    inventory = yaml.safe_load(cells.INVENTORY_PATH.read_text(encoding="utf-8"))
+    assert cells.parse_inventory({**inventory, "admission": [row]}).admission == (row,)
+    malformed: tuple[Any, ...] = (
+        {name: value for name, value in row.items() if name != "reason"},
+        {name: value for name, value in row.items() if name != "text"},
+        {**row, "read_only": " "},
+        {**row, "lens": "raw"},
+        row["cell"],
+    )
+    for wrong in malformed:
+        with pytest.raises(MatrixSetupError, match="admission row"):
+            cells.parse_inventory({**inventory, "admission": [wrong]})
+    with pytest.raises(MatrixSetupError, match="cell id"):
+        cells.parse_inventory({**inventory, "admission": [{**row, "cell": "S51"}]})
+    with pytest.raises(MatrixSetupError, match="pinned twice"):
+        cells.parse_inventory({**inventory, "admission": [row, dict(row)]})
+    with pytest.raises(MatrixSetupError, match="unknown shape"):
+        cells.parse_inventory(
+            {name: value for name, value in inventory.items() if name != "admission"}
+        )
+
+
+def test_a_route_budget_comes_from_the_routing_file_and_a_scenario_budget_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extra = matrix_columns.COST_BOUND_EXTRA
+    text_role = matrix_columns.ROLE_BY_CAPABILITY["text"]
+    plain = next(cell for cell in TOY_CELLS if cell.scenario == "S01" and cell.lens == "raw")
+    overrun = next(
+        cell
+        for cell in TOY_CELLS
+        if cell.scenario == "S13"
+        and declarations.routed(cell.column).usd_limit == "post_hoc"
+    )
+
+    # A column without a routing file asks for nothing.
+    assert declarations.route_extra(plain.column, text_role, extra) is None
+    assert declarations.route_budget(plain.column, text_role) is None
+    assert not declarations.cost_bounded(plain.column, text_role)
+    unbounded = runner.execute(plain, tmp_path / "none")
+    assert unbounded.route_budget is None and not unbounded.reference.cost_bounded
+    # The routes that opt in, read from the shipped routing files, are the
+    # ones that get the matrix's route budget, on every role a cell builds.
+    asked = {
+        column.id: {
+            declarations.route_budget(column, role)
+            for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+        }
+        for column in matrix_columns.real_columns()
+    }
+    assert set(map(frozenset, asked.values())) == {
+        frozenset({None}),
+        frozenset({matrix_columns.ROUTE_BUDGET_USD}),
+    }
+    for column in matrix_columns.real_columns():
+        opted = {
+            declarations.route_extra(column, role, extra)
+            for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+        }
+        assert asked[column.id] == (
+            {matrix_columns.ROUTE_BUDGET_USD} if opted == {True} else {None}
+        ), column.id
+        # The same extra says that the results of the route are cost intervals.
+        assert {
+            declarations.cost_bounded(column, role)
+            for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+        } == {opted == {True}}, column.id
+
+    # The runner passes it: a budget so small that the plain reply overruns
+    # it ends the plain cell as a budget stop, which the scenario does not
+    # expect ...
+    monkeypatch.setattr(declarations, "route_budget", lambda *_args, **_more: 1e-9)
+    budgeted = runner.execute(plain, tmp_path / "route")
+    assert budgeted.route_budget == 1e-9
+    assert "kind:budget_exhausted!=none" in budgeted.report.codes
+    # ... and a scenario that sets a budget of its own keeps it: with the
+    # route budget the overrun of that scenario would be no overrun at all.
+    monkeypatch.setattr(declarations, "route_budget", lambda *_args, **_more: 1000.0)
+    own = runner.execute(overrun, tmp_path / "own")
+    assert own.route_budget is None and own.plan.budget_usd == BUDGET_USD
+    assert own.report.codes == frozenset()
+    # The runner also tells the contract that the route's results are cost
+    # intervals: the toy returns none, and its honest cell says so.
+    with monkeypatch.context() as patched:
+        patched.setattr(declarations, "cost_bounded", lambda *_args, **_more: True)
+        interval_owed = runner.execute(plain, tmp_path / "bounded")
+    assert interval_owed.reference.cost_bounded
+    assert interval_owed.report.codes == {"usage.cost_bounds:none"}
 
 
 def test_inventory_is_exactly_what_this_module_collected(

@@ -51,6 +51,9 @@ GUARD_STOP_REASONS = frozenset({"limit_contract_violated", "limit_evidence_incom
 MAX_ERROR_TEXT = 2000
 # What C6 asks only of a result that flags its cost complete.
 PRICING_CODES = frozenset({"pricing:none", "pricing:unreconciled"})
+# What C5 reports of a result the limit guard let stand and does not call
+# rankable.
+NOT_RANKABLE = "guard:not_rankable"
 
 # The closed deviation vocabulary: every code a cell may emit, with the clause
 # it is booked under ("S" is the scenario contract, "D" the declaration lock).
@@ -68,6 +71,7 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"guard:\w+", "C5"),
     (r"flag:(token_usage_complete|cost_complete)=(True|False)", "C6"),
     (r"usage\.(input_tokens|output_tokens|cost_usd):(lt|gt)", "C6"),
+    (r"usage\.cost_bounds:(none|uncovered|segments)", "C6"),
     (r"pricing:(none|unreconciled)", "C6"),
     (r"digest\.(missing|mismatch):\w+", "C7"),
     (r"request\.content:model", "C7"),
@@ -81,6 +85,7 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"request\.content:\w+", SCENARIO),
     (r"context:over_budget", SCENARIO),
     (r"progress:write_not_credited", SCENARIO),
+    (r"admission:\w+:\w+!=\w+", SCENARIO),
     (r"decl\.(changed|over|under|mismatch):\w+", "D"),
     (r"static:\w+", "static"),
 )
@@ -188,6 +193,9 @@ class Reference:
     tool_authority_digest: str | None
     bindings: Mapping[str, ToolBinding]
     write_slot: str
+    # Whether that route opts into a cost upper bound in its routing file: a
+    # result of such a route is a cost interval, and C6 holds the interval.
+    cost_bounded: bool = False
 
 
 @dataclass(frozen=True)
@@ -273,9 +281,18 @@ class Report:
         return "\n".join(lines) or "  no deviation"
 
 
-def applicable(*, lens: str, toolset: bool, expects_result: bool) -> tuple[str, ...]:
-    """The clauses of a cell, from its definition alone."""
+def applicable(
+    *, lens: str, toolset: bool, expects_result: bool, call: bool = True
+) -> tuple[str, ...]:
+    """The clauses of a cell, from its definition alone.
 
+    ``call`` is false for a cell that builds backends and calls none (an
+    admission cell): the clauses about what ``invoke`` returns are then no
+    part of it.
+    """
+
+    if not call:
+        return ("C0", "C8", "C9")
     clauses = {"C0", "C1", "C8", "C9"}
     if expects_result:
         clauses.update(RESULT_CLAUSES)
@@ -452,16 +469,32 @@ def _c4(result: InvocationResult, exp: Expectation) -> list[Deviation]:
 
 def _c5(obs: Observation) -> list[Deviation]:
     out: list[Deviation] = []
+    terminal = obs.limit_terminal
     if _guard_rewrote(obs):
-        assert obs.result is not None and obs.limit_terminal is not None
+        assert obs.result is not None and terminal is not None
         out.append(
             Deviation(
                 f"guard:{obs.result.stop_reason}",
                 "the limit guard replaced the result (terminal reason "
-                f"{obs.limit_terminal.terminal_reason!r}, "
-                f"{obs.limit_terminal.physical_attempts} physical attempt(s) recorded)",
+                f"{terminal.terminal_reason!r}, "
+                f"{terminal.physical_attempts} physical attempt(s) recorded)",
             )
         )
+    elif obs.result is not None and obs.result.error is None:
+        # Read, never inferred from the absence of a rewrite: under a cost
+        # policy the guard lets a result stand that it never calls rankable.
+        # An error result is not rankable by its kind, which C2 judges.
+        assert terminal is not None
+        if not terminal.rankable:
+            out.append(
+                Deviation(
+                    NOT_RANKABLE,
+                    "the limit guard let the result stand and does not call it "
+                    f"rankable (terminal reason {terminal.terminal_reason!r}, cost "
+                    f"policy {terminal.resolution.diagnostic_cost_policy!r}, "
+                    f"{terminal.physical_attempts} physical attempt(s) recorded)",
+                )
+            )
     second = obs.second_call
     if second is not None and second.refused:
         out.append(
@@ -508,9 +541,14 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
                     "the provider reported usage for every response",
                 )
             )
+    # A route whose results are cost intervals flags its accounting incomplete
+    # even where every response is accounted for: the flags then excuse
+    # nothing, and where the scenario owes them the numbers are owed exactly.
+    exact_tokens = ref.cost_bounded and "token_usage_complete" in exp.flags
     for field_name in ("input_tokens", "output_tokens"):
         got, want = getattr(usage, field_name), getattr(billed, field_name)
-        if got == want or (not flags.token_usage_complete and got < want):
+        lower_bound = not flags.token_usage_complete and got < want and not exact_tokens
+        if got == want or lower_bound:
             continue  # exact, or an honest lower bound
         out.append(
             Deviation(
@@ -548,6 +586,57 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
                     "the pricing evidence does not explain the reported usage",
                 )
             )
+    if ref.cost_bounded and "cost_complete" in exp.flags:
+        out.extend(_cost_interval(obs))
+    return out
+
+
+def _cost_interval(obs: Observation) -> list[Deviation]:
+    """What C6 holds of the cost interval a cost-bounded route returns.
+
+    Such a route never reads a missing count of cache reads as zero, so its
+    results flag token usage and cost incomplete for the provider's ordinary
+    reply, and the flags alone would leave every number unasserted. The
+    interval is what is owed instead: it is there, it covers the reported
+    usage (full coverage, the token counts are the sums of its segments, the
+    reported cost is its lower bound), and it has one segment for every
+    response the provider billed, with the tokens of that response. What a
+    segment is priced at is the route's policy, not the rate card, and is
+    not compared here.
+    """
+
+    assert obs.result is not None
+    usage = obs.result.usage
+    bounds = usage.cost_bounds
+    if bounds is None:
+        return [
+            Deviation(
+                "usage.cost_bounds:none",
+                "the route's results are cost intervals and the result carries none",
+            )
+        ]
+    out: list[Deviation] = []
+    if not bounds.covers(usage):
+        out.append(
+            Deviation(
+                "usage.cost_bounds:uncovered",
+                "the interval does not cover the reported usage "
+                f"(coverage_complete={bounds.coverage_complete}, lower bound "
+                f"{bounds.lower_bound_usd:.9f} USD, reported cost "
+                f"{float(usage.cost_usd):.9f} USD)",
+            )
+        )
+    billed = [(item.input_tokens, item.output_tokens) for item in obs.provider.billed]
+    held = [(item.input_tokens, item.output_tokens) for item in bounds.segments]
+    if held != billed:
+        out.append(
+            Deviation(
+                "usage.cost_bounds:segments",
+                f"the interval has {len(held)} segment(s) with (input, output) "
+                f"tokens {held}; the provider billed {len(billed)} response(s) "
+                f"with {billed}",
+            )
+        )
     return out
 
 
@@ -566,8 +655,9 @@ def _unasked(obs: Observation) -> frozenset[str]:
 
 _CALL_RAISE = re.compile(r"raise:\w+@(before|after)_request/[\w.]+")
 _COST_FLAG_CLEARED = "flag:cost_complete=False"
-# The two C5 codes that are about the second call, not about a rewrite.
-_SECOND_CALL_CODES = frozenset({"guard:revoked", "guard:second_call_failed"})
+# The C5 codes that are not a rewrite: the two about the second call, and the
+# one about a result the guard let stand.
+_NOT_A_REWRITE = frozenset({"guard:revoked", "guard:second_call_failed", NOT_RANKABLE})
 
 
 def not_owed_given(code: str, cell_codes: Iterable[str]) -> bool:
@@ -592,7 +682,7 @@ def not_owed_given(code: str, cell_codes: Iterable[str]) -> bool:
         if (
             clause in ("C2", "C3")
             and own.startswith("guard:")
-            and own not in _SECOND_CALL_CODES
+            and own not in _NOT_A_REWRITE
         ):
             return True
         if code in PRICING_CODES and own == _COST_FLAG_CLEARED:
@@ -882,6 +972,66 @@ def _outcome(deviations: Sequence[Deviation]) -> ClauseOutcome:
     if deviations:
         return ClauseOutcome("deviation", tuple(deviations))
     return ClauseOutcome("ok")
+
+
+ADMITTED = "admitted"
+
+
+@dataclass(frozen=True)
+class Admitted:
+    """What an admission cell saw of one subject, and where.
+
+    A subject is a capability a workflow can ask routing for, or the word the
+    profile catalog has for the column. ``got`` is :data:`ADMITTED`, the type
+    of the exception routing refused with, or the catalog's word.
+    """
+
+    subject: str
+    got: str
+    where: str = ""
+
+
+def evaluate_admission(
+    obs: Observation,
+    seen: Sequence[Admitted],
+    expected: Mapping[str, str],
+    ref: Reference,
+    *,
+    lens: str,
+) -> Report:
+    """The verdict of an admission cell: routing did what the pin says it does.
+
+    The cell builds a backend for every capability and calls none, so its
+    clauses are C0 (no provider request), C8 and C9, and the scenario
+    contract: every subject was seen, and each as pinned.
+    """
+
+    clauses = applicable(lens=lens, toolset=False, expects_result=False, call=False)
+    evaluators: Mapping[str, Callable[[], list[Deviation]]] = {
+        "C0": lambda: _c0(obs),
+        "C8": lambda: _c8(obs),
+        "C9": lambda: _c9(obs, ref),
+    }
+    outcomes = {clause: _outcome(evaluators[clause]()) for clause in clauses}
+    deviations = [
+        Deviation(
+            f"admission:{item.subject}:{item.got}!={expected.get(item.subject, 'unpinned')}",
+            f"{item.where}: {item.subject} is {item.got}; the inventory pins "
+            f"{expected.get(item.subject, 'nothing')}",
+        )
+        for item in seen
+        if item.got != expected.get(item.subject)
+    ]
+    deviations.extend(
+        Deviation(
+            f"admission:{subject}:unseen!={want}",
+            f"the cell saw nothing of {subject}, which the inventory pins as {want}",
+        )
+        for subject, want in expected.items()
+        if subject not in {item.subject for item in seen}
+    )
+    outcomes[SCENARIO] = _outcome(deviations)
+    return Report(outcomes, tuple(obs.provider.seam_problems))
 
 
 def evaluate(

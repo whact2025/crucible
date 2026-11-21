@@ -35,11 +35,12 @@ import yaml  # type: ignore[import-untyped]
 from . import columns as matrix_columns
 from . import declarations, drivers, ledger
 from .columns import REAL_KINDS, TOY_KIND, Column
-from .contract import CLAUSES
+from .contract import ADMITTED, CLAUSES
 from .drivers import toy
 from .drivers.base import MatrixSetupError
 from .scenarios import (
     PACK_A,
+    PACK_B,
     SCENARIOS,
     STARTER,
     Scenario,
@@ -54,16 +55,23 @@ INVENTORY_SCHEMA = "crucible.backend-matrix.inventory.v1"
 # Which scenario sets run on which kind. A real kind gets the starter set with
 # its driver, pack A at the gate and pack B after it.
 ENABLEMENT: Mapping[str, tuple[str, ...]] = {
-    TOY_KIND: (STARTER, PACK_A),
+    TOY_KIND: (STARTER, PACK_A, PACK_B),
     **{kind: () for kind in REAL_KINDS},
     matrix_columns.HOSTED_GATEWAY_KIND: (STARTER,),
     matrix_columns.LOCAL_GATEWAY_KIND: (STARTER,),
     matrix_columns.CLAUDE_KIND: (STARTER,),
     matrix_columns.DEEPSEEK_KIND: (STARTER,),
+    matrix_columns.KIMI_KIND: (STARTER,),
 }
-# A secondary column runs these sets; a blocked column these scenarios.
+# A secondary column runs these sets. A blocked column runs these scenarios
+# as soon as its kind is driven, whatever sets the kind runs: what a blocked
+# profile shows is its seam, one plain call and what routing admits.
 SECONDARY_SETS: tuple[str, ...] = (STARTER, PACK_A)
 BLOCKED_SCENARIOS: tuple[str, ...] = ("S00", "S01", "S51")
+# What an admission cell reads from the profile catalog and asks routing for:
+# the subjects of its pin.
+AVAILABILITY = "availability"
+ADMISSION_SUBJECTS: tuple[str, ...] = (AVAILABILITY, *matrix_columns.ROLE_BY_CAPABILITY)
 STATIC_SCENARIOS: tuple[str, ...] = ("P01", "P02", "P04", "H01", "H02", "H03", "H04")
 
 # Where each cell is judged. One test module per driver family, because the
@@ -76,6 +84,7 @@ MODULE_BY_KIND: Mapping[str, str] = {
     matrix_columns.LOCAL_GATEWAY_KIND: "test_matrix_openai_compat",
     matrix_columns.CLAUDE_KIND: "test_matrix_claude",
     matrix_columns.DEEPSEEK_KIND: "test_matrix_deepseek",
+    matrix_columns.KIMI_KIND: "test_matrix_kimi",
 }
 STATIC_MODULE = "test_matrix_static"
 # Static scenario -> its test, and whether the test is parametrised by cell id.
@@ -95,10 +104,18 @@ STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
 # Proofs a module holds beside its cells, which the verifier requires by name:
 # product behaviour that no clause states, so no cell's verdict shows when it
 # stops. The DeepSeek adapter revalidates the pin of its worker before every
-# launch; only the launch journal of a tool round shows it.
+# launch; only the launch journal of a tool round shows it. The strict Kimi
+# route rejects the provider's plain reply for its missing count of cache
+# reads; the codes of its cells are those of any rejection after the request,
+# so only the text of the error shows the cause, and only the same cells
+# answered with the count show that nothing else is behind their entries.
 REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND]: (
         "test_the_probe_and_the_request_launch_run_under_the_harness",
+    ),
+    MODULE_BY_KIND[matrix_columns.KIMI_KIND]: (
+        "test_the_strict_route_rejects_the_plain_reply_for_its_missing_cache_read_count",
+        "test_the_strict_route_answers_once_the_reply_carries_a_cache_read_count",
     ),
 }
 
@@ -133,6 +150,8 @@ class Inventory:
     worker_skip_files: Mapping[str, frozenset[str]]
     # (cell, code) pairs on which a column-wide known gap is not owed.
     column_wide_not_owed: tuple[Mapping[str, str], ...] = ()
+    # What routing does today on each admission cell of a real column.
+    admission: tuple[Mapping[str, str], ...] = ()
 
 
 def parse_inventory(document: Any) -> Inventory:
@@ -143,6 +162,7 @@ def parse_inventory(document: Any) -> Inventory:
         "not_expressible",
         "worker_skip_files",
         "column_wide_not_owed",
+        "admission",
     }
     if (
         not isinstance(document, dict)
@@ -185,6 +205,20 @@ def parse_inventory(document: Any) -> Inventory:
             "worker_skip_files must map a worker kind "
             f"({sorted(worker_kinds)}) to a non-empty list of test files"
         )
+    admission = tuple(document["admission"] or ())
+    for row in admission:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"cell", *ADMISSION_SUBJECTS, "reason"}
+            or not all(isinstance(value, str) and value.strip() for value in row.values())
+        ):
+            raise MatrixSetupError(
+                f"admission row {row!r} must state a cell, {list(ADMISSION_SUBJECTS)} "
+                "and the reason"
+            )
+        ledger.parse_cell_id(row["cell"])
+    if len({row["cell"] for row in admission}) != len(admission):
+        raise MatrixSetupError("an admission cell is pinned twice")
     return Inventory(
         cell_counts={str(k): int(v) for k, v in document["cell_counts"].items()},
         not_evaluated=not_evaluated,
@@ -193,6 +227,7 @@ def parse_inventory(document: Any) -> Inventory:
             str(kind): frozenset(files) for kind, files in skip_files.items()
         },
         column_wide_not_owed=not_owed,
+        admission=admission,
     )
 
 
@@ -219,13 +254,16 @@ def pinned_not_evaluated(
     )
 
 
+def _is_blocked(column: Column) -> bool:
+    return column.kind != TOY_KIND and column.role.split("-", 1)[0] == "blocked"
+
+
 def _in_role_scope(column: Column, scenario: Scenario) -> bool:
     if column.kind == TOY_KIND:
         return True
-    role = column.role.split("-", 1)[0]
-    if role == "blocked":
+    if _is_blocked(column):
         return scenario.id in BLOCKED_SCENARIOS
-    return role == "primary" or scenario.set in SECONDARY_SETS
+    return column.role.split("-", 1)[0] == "primary" or scenario.set in SECONDARY_SETS
 
 
 def generate(
@@ -257,7 +295,9 @@ def generate(
         if column.kind not in registered:
             continue  # no driver yet: H02 reports static:no_driven_column
         for scenario in scenarios.values():
-            if scenario.set not in enablement[column.kind]:
+            # A blocked column runs its three scenarios whatever sets its
+            # kind runs; any other column a scenario of an enabled set.
+            if not _is_blocked(column) and scenario.set not in enablement[column.kind]:
                 continue
             if not _in_role_scope(column, scenario):
                 continue
@@ -295,15 +335,65 @@ def all_columns() -> tuple[Column, ...]:
     return (*matrix_columns.real_columns(), *toy_columns())
 
 
+def admission_pin_problems(
+    cells: Sequence[Cell],
+    pins: Sequence[Mapping[str, str]],
+    scenarios: Mapping[str, Scenario] = SCENARIOS,
+) -> list[str]:
+    """An admission cell of a real column has its pin, and a pin its cell."""
+
+    owed = {
+        cell.id
+        for cell in cells
+        if scenarios[cell.scenario].admission and cell.column.kind != TOY_KIND
+    }
+    pinned = {row["cell"] for row in pins}
+    return [
+        *(
+            f"admission cell {cell} has no pin in inventory.yaml: what routing "
+            "admits there today is not stated"
+            for cell in sorted(owed - pinned)
+        ),
+        *(
+            f"inventory.yaml pins the admission of {cell}, which is no generated "
+            "admission cell of a real column"
+            for cell in sorted(pinned - owed)
+        ),
+    ]
+
+
 @functools.cache
 def behaviour_cells() -> tuple[Cell, ...]:
     """Every behaviour cell of the matrix today."""
 
-    return generate(
+    generated = generate(
         all_columns(),
         registered=drivers.load(),
         not_expressible=load_inventory().not_expressible,
     )
+    problems = admission_pin_problems(generated, load_inventory().admission)
+    if problems:
+        raise MatrixSetupError("; ".join(problems))
+    return generated
+
+
+def expected_admission(
+    cell: Cell, pins: Sequence[Mapping[str, str]] | None = None
+) -> dict[str, str]:
+    """What an admission cell must see of each of its subjects.
+
+    A column that brings its own profile (a toy column) is built by its
+    driver and stands behind no routing gate: every capability is admitted,
+    and no catalog names it. A real column is held to its pin.
+    """
+
+    if cell.column.kind == TOY_KIND:
+        return {name: ADMITTED for name in matrix_columns.ROLE_BY_CAPABILITY}
+    rows = load_inventory().admission if pins is None else pins
+    for row in rows:
+        if row["cell"] == cell.id:
+            return {name: row[name] for name in ADMISSION_SUBJECTS}
+    raise MatrixSetupError(f"admission cell {cell.id} has no pin in inventory.yaml")
 
 
 def cells_of(kinds: Sequence[str]) -> tuple[Cell, ...]:

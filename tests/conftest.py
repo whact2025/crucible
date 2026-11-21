@@ -16,7 +16,10 @@ This module contains only fixtures shared across the current test suite:
   ``run`` or ``popen`` in place of ``subprocess``;
 - ``_contain_worker_adapter_network`` (autouse): the same network guard in
   the test process, for every test module whose file name names a worker
-  adapter (``kimi``, ``deepseek``).
+  adapter (``kimi``, ``deepseek``);
+- ``require_kimi_worker``: the interpreter of the locked Kimi worker
+  environment. A test that needs it takes this fixture instead of a skip
+  marker: a missing environment is an error that names the install command.
 
 """
 
@@ -34,6 +37,11 @@ from .backend_matrix.peers import launch
 # The adapters that run a locked worker environment. A test module is named
 # after the adapter it tests, so the rule is the file name, not a list.
 _WORKER_ADAPTERS = ("kimi", "deepseek")
+# The command of the CI step. Copy mode is the one shape both worker installs
+# have; the Kimi pin takes any regular file and does not require it.
+_KIMI_WORKER_INSTALL = (
+    "uv sync --frozen --reinstall --link-mode copy --project backends/kimi_worker"
+)
 _MATRIX_PACKAGE = Path(netguard.__file__).resolve().parent
 
 
@@ -89,3 +97,16 @@ def _contain_worker_adapter_network(request: pytest.FixtureRequest) -> Iterator[
         yield from netguard.watch(lambda reason: pytest.fail(reason, pytrace=False))
     else:
         yield
+
+
+@pytest.fixture()
+def require_kimi_worker() -> Path:
+    """The interpreter of the locked Kimi worker environment, or an error.
+
+    Never a skip: a test that needs the environment and does not find it did
+    not run, and the suite must say so.
+    """
+
+    return launch.require_environment(
+        "kimi", _KIMI_WORKER_INSTALL, lambda reason: pytest.fail(reason, pytrace=False)
+    )

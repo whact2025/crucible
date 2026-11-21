@@ -157,6 +157,45 @@ def _routing(column: Column, product: str) -> BackendRouting:
         return load_routing(config_path=column.routing_path(product))
 
 
+def route_extra(
+    column: Column, role: str, name: str, product: str = COLUMN_PRODUCT
+) -> Any:
+    """A closed extra of the route of ``role``, as its routing file states it.
+
+    ``None`` where the route has no such extra, and for a column without a
+    routing file (a toy column).
+    """
+
+    if not column.routing:
+        return None
+    return _routing(column, product).for_role(role).extra.get(name)
+
+
+def cost_bounded(column: Column, role: str, product: str = COLUMN_PRODUCT) -> bool:
+    """Whether the route of ``role`` opts into a diagnostic cost upper bound.
+
+    Read from the routing file, never from the adapter. A result of such a
+    route is a cost interval, which clause C6 then holds to what the
+    provider billed.
+    """
+
+    return route_extra(column, role, matrix_columns.COST_BOUND_EXTRA, product) is True
+
+
+def route_budget(column: Column, role: str, product: str = COLUMN_PRODUCT) -> float | None:
+    """The budget a cell passes because the route of ``role`` asks for one.
+
+    A route that opts into a diagnostic cost upper bound returns a result
+    only for an invocation with a finite positive budget. Its cells carry the
+    matrix's route budget, read from the routing file and never from the
+    adapter; every other route gets none.
+    """
+
+    if cost_bounded(column, role, product):
+        return matrix_columns.ROUTE_BUDGET_USD
+    return None
+
+
 def governing_values(profile: BackendFeatureSet, fields: Sequence[str]) -> dict[str, str]:
     return {name: str(getattr(profile, name)) for name in fields}
 

@@ -45,11 +45,14 @@ PRODUCTS: Mapping[str, Any] = {
     "swebench": load_swebench_backend_profile_catalog,
 }
 COLUMN_PRODUCT = "deepswe"
+# The profile catalog of a product, beside the routing files it names.
+CATALOG_FILE = "backend_profile_catalog.yaml"
 
 HOSTED_GATEWAY_KIND = "openai_compat:hosted"
 LOCAL_GATEWAY_KIND = "openai_compat:local"
 CLAUDE_KIND = "claude"
 DEEPSEEK_KIND = "deepseek"
+KIMI_KIND = "kimi"
 
 # (routing backend, adapter transport) of a catalog lane -> driver kind.
 KIND_TABLE: Mapping[tuple[str, str], str] = {
@@ -104,6 +107,9 @@ SCRIPTED_ENV: Mapping[str, str] = {
 ENDPOINT_ENV: Mapping[str, str] = {
     HOSTED_GATEWAY_KIND: "INFER_BASE_URL",
     LOCAL_GATEWAY_KIND: "CRUCIBLE_LOCAL_URL",
+    # The locked worker of the kind addresses this origin; the worker harness
+    # answers it on loopback.
+    KIMI_KIND: "KIMI_BASE_URL",
 }
 
 # A worker adapter names no endpoint in its route: its locked worker holds the
@@ -154,6 +160,13 @@ CLEARED_ENV: tuple[str, ...] = (
     "http_proxy",
     "https_proxy",
     "no_proxy",
+    # The Kimi adapter hands the TLS trust paths of its environment on to its
+    # worker, whose client reads them when it is built: one that names no
+    # file ends the worker before its first request.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
 )
 
 # Worker sub-project (``backends/<name>_worker``) -> the kind it serves. Static
@@ -183,6 +196,16 @@ ROLE_BY_CAPABILITY: Mapping[str, str] = {
 # cell's business (P05).
 MATRIX_RATE = ModelPricing(input_per_mtok=2.0, output_per_mtok=8.0)
 
+# The closed routing extra by which a route opts into a diagnostic cost upper
+# bound. Its routing file states what the route then asks of a caller: it
+# returns a result only for an invocation with a finite positive budget, and
+# its limit guard binds only with the cost policy the file names and a durable
+# ledger. A cell on such a route is called as the route asks: it carries this
+# budget, which no scripted exchange reaches, unless its scenario sets a
+# budget of its own, and its guarded lens binds that policy.
+COST_BOUND_EXTRA = "diagnostic_cost_upper_bound"
+ROUTE_BUDGET_USD = 1.0
+
 
 @dataclass(frozen=True)
 class Column:
@@ -206,6 +229,18 @@ class Column:
             if name == product:
                 return path
         raise MatrixSetupError(f"column {self.id} has no {product} routing file")
+
+    def routed_by(self, product: str) -> Column:
+        """This column as ``product`` routes it.
+
+        A driver builds from the routing file of the product the behaviour
+        columns come from. The returned column names the file of ``product``
+        there, for a cell that runs on the routing files of every product.
+        """
+
+        return dataclasses.replace(
+            self, routing=((COLUMN_PRODUCT, self.routing_path(product)),)
+        )
 
 
 def build_columns(
@@ -458,6 +493,18 @@ def overlaid_routing(
             for name, config in routing.roles.items()
         },
     )
+
+
+def catalog_availability(column: Column, product: str) -> str:
+    """The word the profile catalog of ``product`` has for a column.
+
+    Read from the catalog file itself, which lies beside the routing files
+    it names: the product loader validates the word and does not keep it.
+    """
+
+    catalog = column.routing_path(product).with_name(CATALOG_FILE)
+    profiles = yaml.safe_load(catalog.read_text(encoding="utf-8"))["profiles"]
+    return str(profiles[column.profile]["availability"])
 
 
 def catalog_literals() -> frozenset[str]:

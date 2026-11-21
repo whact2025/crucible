@@ -786,6 +786,91 @@ def test_a_target_the_harness_cannot_run_is_refused_before_a_process_starts(
 # -- a worker environment that is missing is an error ------------------------------
 
 
+_INNER_REQUIRE_CONFTEST = """
+    from pathlib import Path
+
+    import pytest
+
+    from crucible.tests.backend_matrix.peers import launch
+
+
+    @pytest.fixture()
+    def require_kimi_worker():
+        return launch.require_environment(
+            "kimi",
+            "the install command",
+            lambda reason: pytest.fail(reason, pytrace=False),
+            repository=Path(__file__).resolve().parent,
+        )
+"""
+_INNER_REQUIRE_MODULE = """
+    import pytest
+
+
+    @pytest.mark.usefixtures("require_kimi_worker")
+    def test_that_needs_the_worker_environment():
+        pass
+"""
+
+
+def test_a_test_that_requires_a_worker_environment_fails_without_it_and_never_skips(
+    tmp_path: Path,
+) -> None:
+    reasons: list[str] = []
+    interpreter = tmp_path / "backends" / "standin_worker" / ".venv" / "bin" / "python"
+
+    assert (
+        launch.require_environment(
+            "standin", "the install command", reasons.append, repository=tmp_path
+        )
+        == interpreter
+    )
+    (reason,) = reasons
+    assert "standin worker environment" in reason and "`the install command`" in reason
+    assert "matrix_worker" in reason and str(tmp_path) not in reason
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    assert (
+        launch.require_environment(
+            "standin", "the install command", reasons.append, repository=tmp_path
+        )
+        == interpreter
+    )
+    assert len(reasons) == 1
+
+    # As a fixture of a test: an error at set-up, with the command, no skip;
+    # and the test runs once the environment is there.
+    root = tmp_path / "inner"
+    root.mkdir()
+    (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    for name, source in (
+        ("conftest.py", _INNER_REQUIRE_CONFTEST),
+        ("test_inner_requires.py", _INNER_REQUIRE_MODULE),
+    ):
+        (root / name).write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+
+    def inner() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rsE"],
+            cwd=root,
+            env={**os.environ, "PYTEST_ADDOPTS": ""},
+            capture_output=True,
+            text=True,
+            timeout=100,
+            check=False,
+        )
+
+    absent = inner()
+    assert absent.returncode == 1, absent.stdout + absent.stderr
+    assert "1 error" in absent.stdout and "skipped" not in absent.stdout
+    assert "install it with `the install command`" in absent.stdout
+    installed = root / "backends" / "kimi_worker" / ".venv" / "bin" / "python"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("", encoding="utf-8")
+    present = inner()
+    assert present.returncode == 0 and "1 passed" in present.stdout, present.stdout
+
+
 class _NotInstalled(deepseek_driver.DeepSeekDriver):
     """The DeepSeek driver on a machine without its worker environment."""
 

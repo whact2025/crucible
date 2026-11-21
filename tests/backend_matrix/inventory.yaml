@@ -22,7 +22,8 @@
 #   gap. File names, not counts: static cell H01 reports a marker in a listed
 #   file as static:worker_skip and a marker in any other file as
 #   static:worker_skip_unpinned, which no entry covers. The list is emptied
-#   by the fix that deletes the H01 entry.
+#   by the fix that deletes the H01 entry. Empty today: no test skips on a
+#   missing worker runtime.
 # column_wide_not_owed: (cell, code) pairs on which a column-wide known gap of
 #   the ledger is not owed for a reason of the cell's definition that the
 #   cell's own entry cannot show: its variant expects no result, or its
@@ -34,18 +35,30 @@
 #   rewrite, the cost flagged incomplete) needs no row. Static cell H03
 #   rejects a row that is listed twice or names a cell that could not owe the
 #   gap. Empty today.
+# admission: for each admission cell (S51) of a real column, what the cell
+#   must see today: the word the profile catalogs of both products have for
+#   the column (availability), and for each capability a workflow can ask
+#   routing for (text, read_only, workspace_write) either `admitted` or the
+#   type of the exception routing refuses with before it builds the adapter.
+#   It pins today's gates, so it changes in the change that opens or closes
+#   one. Every admission cell of a real column has exactly one row and every
+#   row such a cell, or collection fails. A toy column stands behind no gate
+#   and has no row.
 
 schema_version: crucible.backend-matrix.inventory.v1
 
 cell_counts:
-  toy: 68
+  # The starter set and pack A (17 cells) and S51 on each toy column.
+  toy: 72
   # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
   claude: 14
   "codex:legacy": 0
   "codex:official": 0
   # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
   deepseek: 7
-  kimi: 0
+  # Starter set on the two diagnostic columns (7 each); S00, S01 in both
+  # lenses and S51 on the blocked column.
+  kimi: 18
   # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
   "openai_compat:hosted": 14
   "openai_compat:local": 7
@@ -64,9 +77,17 @@ not_expressible: []
 
 column_wide_not_owed: []
 
-worker_skip_files:
-  kimi:
-    - test_backends_kimi.py
-    - test_backends_kimi_k3.py
-    - test_backends_kimi_k3_cost_bounds.py
-    - test_backends_kimi_k3_stream_contract.py
+worker_skip_files: {}
+
+admission:
+  - cell: kimi/S51/blocked/raw
+    availability: blocked
+    text: admitted
+    read_only: admitted
+    workspace_write: FeatureAdmissionError
+    reason: >-
+      The route enforces feature admission and carries no diagnostic writer
+      opt-in, so routing refuses the writer role before it builds the adapter:
+      the qualification gate of gap G01, which is a gate and no code defect.
+      The text and the read-only role are built. The catalogs call the
+      profile blocked; routing itself does not act on that word.

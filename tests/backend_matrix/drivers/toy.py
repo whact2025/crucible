@@ -54,7 +54,7 @@ from assay import (
     UsagePricingSegment,
 )
 from crucible.backends.capabilities import validate_toolset_capability
-from crucible.backends.features import feature_profile_digest
+from crucible.backends.features import FeatureAdmissionError, feature_profile_digest
 from crucible.backends.pricing import pricing_for_model
 from crucible.backends.tool_authority import (
     APPROVAL_POLICY_PER_CALL_EXACT,
@@ -157,6 +157,11 @@ FINAL_SCHEMA_REQUEST = "final_schema_request"
 # is built for another model than the column's route names.
 GUARD_ON_OTHER_PROFILE = "guard_on_other_profile"
 BUILT_FOR_OTHER_MODEL = "built_for_other_model"
+# Faults of the build, for the admission scenario: the writer role is refused
+# although nothing gates the column, or a backend asks its provider something
+# while it is built.
+REFUSE_WRITER = "refuse_writer"
+REQUEST_AT_BUILD = "request_at_build"
 
 
 @dataclass
@@ -800,6 +805,10 @@ class ToyDriver:
             raise MatrixSetupError(
                 f"toy column {column.id}: no toy behaviour for {unsupported}"
             )
+        if REFUSE_WRITER in self.faults and capability == "workspace_write":
+            raise FeatureAdmissionError(
+                f"the toy route of column {column.id} refuses the writer role"
+            )
         log_dir = tmp_path / "toy-debug"
         with LoopbackProvider(script, credential=CANARY_CREDENTIAL) as provider:
             backend = HonestBackend(
@@ -821,6 +830,8 @@ class ToyDriver:
                 # Every open-weight route is diagnostic; the toy rehearses them.
                 admission="diagnostic",
             )
+            if REQUEST_AT_BUILD in self.faults:
+                backend._send("GET", "/toy/v1/models", None, 5.0)
             try:
                 yield _Bound(backend, provider, log_dirs=(log_dir,))
             finally:
@@ -1138,4 +1149,13 @@ LIARS: tuple[Liar, ...] = (
         rehearses=("G03",),
         composite=True,
     ),
+    # Admission: a capability the column's pin admits is refused, and a
+    # backend that is only built asks its provider something.
+    _liar(
+        "S51",
+        REFUSE_WRITER,
+        ("admission:workspace_write:FeatureAdmissionError!=admitted",),
+        ("S",),
+    ),
+    _liar("S51", REQUEST_AT_BUILD, ("request.extra",), ("C0",)),
 )

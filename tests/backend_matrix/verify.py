@@ -124,7 +124,8 @@ def _has_clause(code: str, scenario: str, lens: str) -> bool:
 
     From the cell's definition, as the contract decides it. Whether the
     selected variant expects a result at all depends on a declared value; a
-    cell whose variant expects none is pinned in the inventory.
+    cell whose variant expects none is pinned in the inventory. An admission
+    cell calls nothing, by its definition, so it has no clause about a call.
     """
 
     clause = contract.clause_of(code)
@@ -132,7 +133,10 @@ def _has_clause(code: str, scenario: str, lens: str) -> bool:
     if clause not in contract.CLAUSES or defined is None:
         return True
     return clause in contract.applicable(
-        lens=lens, toolset=defined.toolset is not None, expects_result=True
+        lens=lens,
+        toolset=defined.toolset is not None,
+        expects_result=not defined.admission,
+        call=not defined.admission,
     )
 
 

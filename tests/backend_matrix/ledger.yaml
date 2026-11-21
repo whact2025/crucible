@@ -27,6 +27,14 @@
 #   the scenario defines it and `cells` lists where it is in force. A declared
 #   difference replaces no contract clause and is counted apart from the
 #   known gaps.
+# ruling: a decision of the release owner. Where it is written decides what
+#   it does. On a known gap, cell by cell or column-wide, it records that
+#   the owner accepts the expected failure; an entry on a reference column
+#   must carry one, and it licenses nothing. On a registry record it is the
+#   licence to withdraw a cell of that record: H03 then accepts that the
+#   cell is pinned not expressible or is no longer generated. So a ruling
+#   that keeps a gap is written in the entries of the gap; written in its
+#   record it would also license the withdrawal of the record's cells.
 # ceilings: counts may not exceed them. They rise while entries land and are
 #   frozen at the gate (pack A) and at the end of pack B; after that they only
 #   fall.
@@ -37,7 +45,7 @@ schema_version: crucible.backend-matrix.ledger.v1
 
 ceilings:
   max_known_gaps:
-    pack_a: 25
+    pack_a: 34
     pack_b: 0
   max_declared_differences: 2
 
@@ -76,16 +84,20 @@ registry:
     origin: gap list
     severity: high
     cells:
-      # The skip markers sit in the test files inventory.yaml lists for the
-      # Kimi worker; a marker anywhere else is static:worker_skip_unpinned.
+      # Closed with the Kimi columns (part 5): the tests that need the worker
+      # runtime take a fixture that fails without it, CI installs the runtime
+      # in every test shard, and the cell has no entry any more. A skip marker
+      # on a worker interpreter is static:worker_skip_unpinned from now on.
       - cell: kimi/H01/-/static
         observed_under: {}
         closes_under: {}
         predicted: ["static:worker_skip"]
+      # static:no_driven_column until the driver landed (part 5); the cell
+      # stays red until pack A runs on the columns.
       - cell: kimi/H02/-/static
         observed_under: {}
         closes_under: {}
-        predicted: ["static:no_driven_column"]
+        predicted: ["static:pack_a_not_enabled"]
 
   G14:
     title: DeepSeek appends a limit event after the terminal event, so invoke raises
@@ -421,10 +433,146 @@ registry:
         observed_under: {structured_output: prompt_only}
         closes_under: {structured_output: prompt_only}
 
+  M06:
+    title: The Kimi routes flag token and cost accounting incomplete for every reply that carries no cache-read count
+    origin: matrix
+    severity: medium
+    # Not predicted: design section 9.2 was written for the release, whose
+    # Kimi routes accounted exactly for a plain reply. Seen at the first run
+    # of the columns (part 5), on the model every Kimi profile routes since
+    # the open-weight model update. The provider's final statistics carry no
+    # count of cache reads unless the request hit its cache (observed live on
+    # 2026-11-18; the envelopes of the columns are that reply), and the
+    # adapter never reads a missing count as zero. So no result of these
+    # routes flags its token usage or its cost complete: on the two
+    # diagnostic routes, which opt into the cost upper bound, a result is a
+    # cost interval (the lower bound as cost, the upper bound charged to the
+    # budget); on the strict route the reply is rejected (M07). On the cells
+    # of the blocked column the two flags are false because that result is
+    # an error without usage, not because of an interval: a ruling or a fix
+    # of this record alone leaves the two codes there, and M07's entries
+    # take them over.
+    # What the two codes do not hide on the diagnostic routes: where a route
+    # opts into the cost bound, clause C6 holds the interval itself (it is
+    # there, it covers the reported usage, the reported cost is its lower
+    # bound, the tokens are the billed ones, one segment per billed
+    # response), so accounting that is lost or partial is a deviation of its
+    # own. What they do hide: such a route prices a segment from the
+    # constants of its cost policy (crucible/backends/kimi.py,
+    # _cost_bound_amounts; crucible/backends/cost_bounds.py), never from the
+    # pricing file, so the matrix rate card does not govern its cost. The
+    # lower bound of today's reply lies below the rate-card price (it does
+    # while the output tokens are at most 0.9 of the input). With a
+    # cache-read count in the reply the flags are complete, the interval is
+    # exact and the cost is above the rate-card price: the cells then owe
+    # usage.cost_usd:gt. They also hide what a segment costs in the raw
+    # lens: C6 holds the reported cost to the interval's own lower bound and
+    # has no reference for the rates of the policy, so a result whose
+    # segments are priced at nothing, or whose upper bounds (what a budget
+    # is charged) are lowered to the lower ones, still shows the two codes
+    # only. The guarded cells of the same columns do not pass it: the limit
+    # guard replays the bound formula and rewrites the result. And on the
+    # guarded cells the result is not rankable, with or without the count:
+    # that is M08.
+    # Open for the release owner, and no ruling is recorded here. (a) Does a
+    # route that can only return an interval for the provider's ordinary
+    # reply meet the accounting the scenarios ask for (four flags true where
+    # the provider reported its usage)? (b) Which price is a cell on such a
+    # route held to: the matrix rate card, as on every other column, or the
+    # rates of the route's cost policy? (c) The question of M08. Until they
+    # are ruled the cells are carried under the contract as the design
+    # states it: C6 applies to every cell that expects a result, and no
+    # declared difference may replace it (design sections 3.1 and 8.4). If
+    # the flags bind, a fix has the product account for the reply and
+    # deletes the two column-wide entries. If they do not bind on such a
+    # route, the design changes first (C6 gets its scope in contract.py,
+    # with its liar), then the entries go. Reported for the gap list.
+    column_wide:
+      - {kind: kimi, code: "flag:token_usage_complete=False"}
+      - {kind: kimi, code: "flag:cost_complete=False"}
+
+  M07:
+    title: The strict Kimi route rejects a billed reply that carries no cache-read count and returns a transport error
+    origin: matrix
+    severity: medium
+    # Not predicted, and seen at the first run of the blocked column (part
+    # 5): the route enforces feature admission, so it cannot carry the cost
+    # upper bound, and its worker rejects the provider's ordinary reply after
+    # it was billed (the missing count of M06). The call ends as a
+    # non-retriable transport error with stop reason error: no served model,
+    # no usage, a terminal the result disowns. Under the diagnostic limit
+    # guard the incomplete evidence also revokes the next call. The live
+    # check of the model update saw the same on the production route
+    # (2026-11-19) and left it to the owner: accept it, refuse a routing file
+    # whose catalog entry is blocked, or redefine the arm. No ruling is
+    # recorded here. Reported for the gap list.
+    # The codes of the two cells are those of any rejection after the
+    # request; the cause is in the text of the error, which is no code. Two
+    # proofs of the Kimi module, which the verifier requires by name, hold
+    # it: the error names the missing counter (code=counter_missing, field
+    # R), where a reply that carries the count and lacks its closing message
+    # leaves the same codes under another text; and the same two cells,
+    # answered with a reply that carries the count, yield no code at all.
+    cells:
+      - cell: kimi/S01/blocked/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S01/blocked/guarded
+        observed_under: {}
+        closes_under: {}
+
+  M08:
+    title: A guarded result of a Kimi route under its cost policy is never rankable
+    origin: matrix
+    severity: medium
+    # Not predicted, and found by the review of part 5, not by its first
+    # run: until then "rankable" had no code and was inferred from the
+    # absence of a guard rewrite, which holds under the plain diagnostic
+    # limit policy only. A route that opts into the cost upper bound binds
+    # its limit guard with the cost policy its routing file names. Under
+    # that policy the guard lets the result stand (terminal reason
+    # diagnostic_cost_upper_bound, one physical attempt, authority kept, the
+    # second call answered) and never calls it rankable
+    # (crucible/backends/limits.py, _normalize_returned_result), and the
+    # routing files say so in their headers ("a cost interval: diagnostic,
+    # never rankable or promotable"). The guarded contract of S01, S03 and
+    # S04 says "rankable" (design section 7.1), so clause C5 reports
+    # guard:not_rankable on the six guarded cells of the two diagnostic
+    # columns. The code does not depend on the missing cache-read count:
+    # with the count in the reply the result is just as little rankable, so
+    # a resolution of M06 that leaves the policy bound does not close this
+    # record.
+    # Open for the release owner, with M06, and no ruling is recorded here:
+    # does "rankable" bind the guarded lens of a route that runs under its
+    # cost policy? If it binds, the six cells stay red until such a result
+    # can be ranked. If it does not, C5 is not among the clauses a declared
+    # difference may never replace (design sections 3.1 and 8.4): the ruling
+    # can be a declared difference whose alternative is asserted instead
+    # (terminal reason diagnostic_cost_upper_bound, the route's policy, one
+    # physical attempt, cost authority kept, the second call answered), with
+    # its liar first and the ceiling of declared differences raised by the
+    # same ruling. Reported for the gap list.
+    cells:
+      - cell: kimi/S01/primary/guarded
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S03/primary/guarded
+        observed_under: {event_detail: tool_calls}
+        closes_under: {event_detail: tool_calls}
+      - cell: kimi/S04/primary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+      - cell: kimi/S01/secondary/guarded
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S03/secondary/guarded
+        observed_under: {event_detail: tool_calls}
+        closes_under: {event_detail: tool_calls}
+      - cell: kimi/S04/secondary/guarded
+        observed_under: {structured_output: prompt_only}
+        closes_under: {structured_output: prompt_only}
+
 known_gaps:
-  - cell: kimi/H01/-/static
-    observed_under: {}
-    codes: {"static:worker_skip": G04}
   - cell: openai_compat:hosted/H02/-/static
     observed_under: {}
     codes: {"static:pack_a_not_enabled": G30}
@@ -436,7 +584,7 @@ known_gaps:
     codes: {"static:pack_a_not_enabled": G20}
   - cell: kimi/H02/-/static
     observed_under: {}
-    codes: {"static:no_driven_column": G04}
+    codes: {"static:pack_a_not_enabled": G04}
   - cell: claude/H02/-/static
     observed_under: {}
     codes: {"static:pack_a_not_enabled": M01}
@@ -541,6 +689,49 @@ known_gaps:
       "guard:revoked": G16
       "digest.mismatch:tool_authority": G24
   - column_wide: {kind: deepseek, code: "digest.missing:feature_profile", gap: G24}
+
+  # The Kimi columns, first run of part 5 (starter set on the two diagnostic
+  # columns; S00, S01 and S51 on the blocked column). No result of the kind
+  # flags its accounting complete (M06, column-wide): that is all the two
+  # diagnostic columns show in the raw lens. In the guarded lens the limit
+  # guard, bound with the route's cost policy, lets the result stand and
+  # does not call it rankable (M08). On the blocked column the plain call
+  # returns no result at all (M07); its canary and its admission cell pass.
+  - cell: kimi/S01/blocked/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=none": M07
+      "stop:error!=end_turn": M07
+      "flag:terminal_complete=False": M07
+      "digest.missing:served_model": M07
+  - cell: kimi/S01/blocked/guarded
+    observed_under: {}
+    codes:
+      "kind:transport!=none": M07
+      "stop:error!=end_turn": M07
+      "flag:terminal_complete=False": M07
+      "digest.missing:served_model": M07
+      "guard:revoked": M07
+  - cell: kimi/S01/primary/guarded
+    observed_under: {}
+    codes: {"guard:not_rankable": M08}
+  - cell: kimi/S03/primary/guarded
+    observed_under: {event_detail: tool_calls}
+    codes: {"guard:not_rankable": M08}
+  - cell: kimi/S04/primary/guarded
+    observed_under: {structured_output: prompt_only}
+    codes: {"guard:not_rankable": M08}
+  - cell: kimi/S01/secondary/guarded
+    observed_under: {}
+    codes: {"guard:not_rankable": M08}
+  - cell: kimi/S03/secondary/guarded
+    observed_under: {event_detail: tool_calls}
+    codes: {"guard:not_rankable": M08}
+  - cell: kimi/S04/secondary/guarded
+    observed_under: {structured_output: prompt_only}
+    codes: {"guard:not_rankable": M08}
+  - column_wide: {kind: kimi, code: "flag:token_usage_complete=False", gap: M06}
+  - column_wide: {kind: kimi, code: "flag:cost_complete=False", gap: M06}
 
 declared_differences:
   - id: D-STRUCT-UNQUALIFIED

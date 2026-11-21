@@ -140,6 +140,41 @@ ran, the request carries the pinned SDK's user agent, the credential and the
 production host, and the route was built with the fingerprint captured in the
 cell.
 
+The Kimi routes are driven the same way, and nothing is overlaid on their
+routing files: the endpoint variable expands to the production endpoint, so
+routing admission, the writer gate and the route's feature profile apply. The
+adapter starts its worker through `subprocess`, where the same harness is put
+in front of the worker: the vendor's client inside the locked interpreter
+asks the production origin and is answered by the scripted provider, and the
+tool bridge of the call stays on loopback. The canary fails unless the
+harness journalled a redirected launch of that interpreter and the request
+names the pinned runtime and client, the credential and the production host.
+The two diagnostic routes opt into a cost upper bound in their routing files.
+Such a route returns a result only for an invocation with a budget, and its
+limit guard binds only with the cost policy the file names. Their cells are
+called as the route asks: with the matrix's route budget, which no scripted
+exchange reaches, unless the scenario sets a budget of its own, and with
+that policy in the guarded lens. A result of such a route is a cost interval
+whose accounting flags are cleared whenever the provider's reply carries no
+count of cache reads, so the flags alone would leave its numbers unasserted.
+Where a scenario owes complete accounting, clause C6 therefore holds the
+interval itself: it is there, it covers the reported usage, its lower bound
+is the reported cost, it has one segment for every response the provider
+billed, and the reported tokens are the billed ones. In the guarded lens
+clause C5 reads from the limit guard's terminal whether a result the guard
+let stand is rankable, and reports `guard:not_rankable` where it is not;
+under the cost policy it never is.
+
+A column whose profile the catalogs call blocked runs three scenarios as soon
+as its kind is driven: the canary, the plain call and the admission scenario
+`S51`. An admission cell builds a backend for every capability a workflow can
+ask routing for, on the routing files of both products, and calls none. What
+routing does with each capability today, and the word the catalogs have for
+the column, are pinned for the cell in
+[the inventory](backend_matrix/inventory.yaml): the cell passes while routing
+does exactly that and no provider request is made, so a gate that opens or
+closes changes the pin in the same change.
+
 The scripted provider picks a reply by position and tool-call ids, never by
 what a request contains. Where a wire keeps no conversation, the dialect of
 the column states what each request must replay of the earlier rounds, and
@@ -147,9 +182,12 @@ every scenario with a ToolSet reports a request that does not as
 `request.content:replay`. For the DeepSeek route that is the reasoning item,
 the function call and its output, in order. For the gateway routes it is,
 after the opening messages, the assistant turn that asked for a tool directly
-followed by the tool message that answers it, round by round. A rule holds
-the shape of the conversation (kinds, order, call ids), not its text. The
-Claude session keeps its conversation itself, so its dialect states no rule.
+followed by the tool message that answers it, round by round. For the Kimi
+routes it is the same, and an assistant turn that asked for a tool comes back
+with the reasoning content the provider sent with it. A rule holds the shape
+of the conversation (kinds, order, call ids, whether reasoning is there), not
+its text. The Claude session keeps its conversation itself, so its dialect
+states no rule.
 
 Every interpreter of a worker environment (`backends/<name>_worker/.venv`)
 that any test starts runs under the same harness. A suite-wide fixture in
@@ -171,26 +209,34 @@ contract that is asserted instead; it replaces no contract clause.
 
 ```bash
 uv sync --frozen --reinstall --link-mode copy --project backends/deepseek_worker
+uv sync --frozen --reinstall --link-mode copy --project backends/kimi_worker
 uv run python -m pytest -q tests/backend_matrix
 ```
 
-The first command installs the locked DeepSeek worker environment, which the
-DeepSeek column and the tests marked `matrix_worker` need. A missing or
-drifted environment is an error with that command in its message, never a
-skip. Whether a column can be driven is asked once per run, under the same
-cleared environment as its cells: a credential, a proxy or a
-`CRUCIBLE_*_WORKER_PYTHON` override of the machine decides nothing. Clone
-inside the Linux filesystem: the DeepSeek pin hashes its lock byte
-for byte and every installed file with its mode, so a checkout on a Windows
-filesystem reached through WSL can fail it. The pin also covers the worker's
-source directory with any bytecode in it, and it is checked again before
-every launch: a test that loads worker source in its own process loads it
-without writing bytecode (as `tests/test_backends_deepseek.py` does), or it
-would change the pin under the tests that run beside it in the same checkout.
-CI installs the environment in every test shard. The Kimi worker environment
-(`uv sync --frozen --project backends/kimi_worker`) is not installed in CI yet:
-the tests that need it still skip without it, which is the known gap of cell
-`kimi/H01/-/static`.
+The first two commands install the locked DeepSeek and Kimi worker
+environments, which their columns and the tests marked `matrix_worker` need.
+A missing or drifted environment is an error with its command in the
+message, never a skip. Both commands install in copy mode. The DeepSeek pin
+requires it: it refuses an installed file with more than one link, which an
+install that links from uv's cache leaves. The Kimi pin takes any regular
+file and does not require it; its command has the same shape so that both
+environments are installed one way. Whether a column can be driven is asked
+once per run, under the same cleared environment as its cells: a credential,
+a proxy, a TLS trust path or a `CRUCIBLE_*_WORKER_PYTHON` override of the
+machine decides nothing. Clone inside the Linux filesystem: the DeepSeek pin
+hashes its lock byte for byte and every installed file with its mode, so a
+checkout on a Windows filesystem reached through WSL can fail it. The pin
+also covers the worker's source directory with any bytecode in it, and it is
+checked again before every launch: a test that loads worker source in its
+own process loads it without writing bytecode (as
+`tests/test_backends_deepseek.py` and `tests/test_backends_kimi.py` do), or
+it would change the pin under the tests that run beside it in the same
+checkout. The Kimi pin hashes its source directory and its installed tree
+the same way, without the rule about links. CI installs both environments in
+every test shard. A test outside the matrix that needs the Kimi environment
+takes the `require_kimi_worker` fixture, which fails without it, and the
+`matrix_worker` marker; no test skips on a missing worker runtime (static
+cell `H01`).
 
 On a machine without the worker environment, leave these tests out explicitly
 and keep the configured expression:

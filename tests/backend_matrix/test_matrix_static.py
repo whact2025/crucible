@@ -5,8 +5,8 @@
 
 A static cell needs no driver and computes deviation codes like any cell. H01
 and H02 report product gaps and go through the comparator, so the ones that
-are red today (H01 for the Kimi worker, H02 for every kind that has no driver
-yet) are strict expected failures tied to their gap ids. The other static
+are red today (H02 for every kind that has no driver yet or does not run pack
+A yet) are strict expected failures tied to their gap ids. The other static
 cells check the matrix itself and must be clean whatever the ledger says.
 """
 
@@ -396,24 +396,76 @@ def _calls(node: ast.AST, name: str) -> bool:
     )
 
 
-def _handed_interpreters(tests_root: Path, worker: str, workers: AbstractSet[str]) -> list[str]:
+def _launcher_fixture(conftest: ast.Module) -> str | None:
+    """The suite fixture whose ``run`` and ``popen`` start a worker under the harness."""
+
+    for fixture in _autouse_fixtures(conftest):
+        if _calls(fixture, "launch.suite_guard"):
+            return fixture.name
+    return None
+
+
+def _through_the_launcher(tree: ast.Module, launcher: str | None) -> set[int]:
+    """The calls of ``tree`` that are a method of the suite's launcher fixture.
+
+    Only where the function the call is in takes the fixture by its own name
+    as a parameter and never rebinds that name: anything else is a name the
+    test chose, which may be ``subprocess`` itself.
+    """
+
+    through: set[int] = set()
+    if launcher is None:
+        return through
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = function.args
+        taken = {item.arg for item in (*arguments.args, *arguments.kwonlyargs)}
+        rebound = any(
+            isinstance(node, ast.Name) and node.id == launcher and isinstance(node.ctx, ast.Store)
+            for node in ast.walk(function)
+        )
+        if launcher not in taken or rebound:
+            continue
+        through.update(
+            id(node)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == launcher
+        )
+    return through
+
+
+def _handed_interpreters(
+    tests_root: Path,
+    worker: str,
+    workers: AbstractSet[str],
+    launcher: str | None = None,
+) -> list[str]:
     """Test modules that hand a worker interpreter to ``subprocess`` themselves.
 
     A launch belongs to the worker that its file name or its argument names,
-    and to every worker when it names none.
+    and to every worker when it names none. A launch through the launcher of
+    the suite fixture (``launcher`` is the fixture's name) runs under the
+    harness and is not one.
     """
 
     found: set[str] = set()
     for path in _python_files(tests_root):
         if tests_root / "backend_matrix" in path.parents:
             continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        guarded = _through_the_launcher(tree, launcher)
+        for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr in _LAUNCHERS
                 and node.args
                 and "WORKER_PYTHON" in ast.unparse(node.args[0]).upper()
+                and id(node) not in guarded
             ):
                 continue
             text = f"{path.name} {ast.unparse(node.args[0])}".lower()
@@ -466,7 +518,9 @@ def worker_environment_problems(ci_text: str, tests_root: Path) -> list[Deviatio
         missing = [name for name, present in guard.items() if not present]
         if not rule or worker not in adapters:
             missing.append(f"the file-name rule for {worker!r}")
-        handed = _handed_interpreters(tests_root, worker, set(WORKER_KINDS))
+        handed = _handed_interpreters(
+            tests_root, worker, set(WORKER_KINDS), _launcher_fixture(tree)
+        )
         if missing or handed:
             problems.append(
                 Deviation(
@@ -507,10 +561,25 @@ def _guarded_tests_root(root: Path, conftest: str) -> Path:
     return root
 
 
+def _without_install_step(ci_text: str, worker: str) -> str:
+    """The CI workflow without the step that installs one worker environment."""
+
+    ci = yaml.safe_load(ci_text)
+    ci["jobs"]["tests"]["steps"] = [
+        step
+        for step in ci["jobs"]["tests"]["steps"]
+        if f"backends/{worker}_worker" not in str(step.get("run"))
+    ]
+    return str(yaml.safe_dump(ci))
+
+
 def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
     tmp_path: Path,
 ) -> None:
-    ci_text = CI_WORKFLOW.read_text(encoding="utf-8")
+    both = CI_WORKFLOW.read_text(encoding="utf-8")
+    # The cases up to the Kimi ones are about one environment, the DeepSeek one.
+    ci_text = _without_install_step(both, "kimi")
+    assert installed_worker_environments(ci_text) == ["deepseek"]
     conftest = (TESTS / "conftest.py").read_text(encoding="utf-8")
 
     def problems(name: str, text: str = conftest, ci: str = ci_text) -> list[str]:
@@ -554,15 +623,48 @@ def test_h04_fails_when_ci_installs_a_worker_environment_before_the_guard(
     (root / "test_other.py").write_text(source.format("deepseek_mod"), encoding="utf-8")
     (handed,) = worker_environment_problems(ci_text, root)
     assert "['test_other.py'] start its interpreter themselves" in handed.detail
-    # An install step for the Kimi worker on the real tree: its test modules
-    # still start the interpreter themselves, so the step cannot merge yet.
-    ci = yaml.safe_load(ci_text)
-    ci["jobs"]["tests"]["steps"].append(
-        {"run": "uv sync --frozen --project backends/kimi_worker"}
+    # With the install step of the Kimi worker: on the real tree its test
+    # modules start that interpreter through the launcher of the suite
+    # fixture, which runs it under the harness, so the step is behind the
+    # guard.
+    assert installed_worker_environments(both) == ["deepseek", "kimi"]
+    assert worker_environment_problems(both, TESTS) == []
+    launch_line = "{}.run([str(parent._DEFAULT_WORKER_PYTHON), '-c', ''])\n"
+    through = "def test_x(locked_worker_launch):\n    " + launch_line.format(
+        "locked_worker_launch"
     )
-    (kimi,) = worker_environment_problems(yaml.safe_dump(ci), TESTS)
-    assert kimi.code == "static:worker_env_unguarded" and "the kimi worker" in kimi.detail
-    assert "test_backends_kimi.py" in kimi.detail and "test_backends_kimi_k3.py" in kimi.detail
+    root = _guarded_tests_root(tmp_path / "launcher", conftest)
+    (root / "test_backends_kimi_own.py").write_text(through, encoding="utf-8")
+    assert worker_environment_problems(both, root) == []
+    # Not behind it: the same line under a name the fixture is not (a helper
+    # that takes it under another name), under the fixture's name where no
+    # function takes the fixture, and where the function rebinds the name.
+    for name, source in (
+        ("alias", through.replace("locked_worker_launch", "starter")),
+        ("no-fixture", launch_line.format("locked_worker_launch")),
+        (
+            "rebound",
+            "import subprocess\n\n\ndef test_x(locked_worker_launch):\n"
+            "    locked_worker_launch = subprocess\n    "
+            + launch_line.format("locked_worker_launch"),
+        ),
+        ("subprocess", "import subprocess\n\n" + launch_line.format("subprocess")),
+    ):
+        root = _guarded_tests_root(tmp_path / f"handed-{name}", conftest)
+        (root / "test_backends_kimi_own.py").write_text(source, encoding="utf-8")
+        (kimi,) = worker_environment_problems(both, root)
+        assert kimi.code == "static:worker_env_unguarded" and "the kimi worker" in kimi.detail
+        assert "['test_backends_kimi_own.py'] start its interpreter themselves" in kimi.detail
+    # Without the fixture in the suite conftest nothing is its launcher.
+    root = _guarded_tests_root(
+        tmp_path / "launcher-without-fixture",
+        conftest.replace("launch.suite_guard(", "launch.other("),
+    )
+    (root / "test_backends_kimi_own.py").write_text(through, encoding="utf-8")
+    assert any(
+        "['test_backends_kimi_own.py'] start its interpreter" in item.detail
+        for item in worker_environment_problems(both, root)
+    )
     # No install step, no demand.
     ci = yaml.safe_load(ci_text)
     ci["jobs"]["tests"]["steps"] = [
@@ -840,6 +942,88 @@ def test_deepseek_driver_patches_one_private_name_through_the_launch_interposer(
     # The seams the suite fixture interposes at exist as the adapters name them.
     for module, name in (*launch.SUPERVISOR_SEAMS, *launch.SUBPROCESS_SEAMS):
         assert hasattr(importlib.import_module(module), name), (module, name)
+
+
+def test_kimi_driver_touches_two_private_names_and_patches_through_the_interposer() -> None:
+    tree = _tree("drivers/kimi.py")
+    imported = sorted(
+        f"{node.module}.{alias.name}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and not node.level
+        for alias in node.names
+        if (node.module or "").startswith(("crucible", "assay"))
+    )
+    driver = drivers.get(matrix_columns.KIMI_KIND)
+
+    # Routing is the boundary: the driver calls what a workflow calls. It
+    # takes the adapter module for its public capture function, its two
+    # public error types and its two seams, and the public names of the limit
+    # policy that a route with the cost upper bound must be bound with.
+    assert imported == [
+        "crucible.backends.config.load_routing",
+        "crucible.backends.config.resolve_for_role",
+        "crucible.backends.cost_bounds.DIAGNOSTIC_COST_POLICY",
+        "crucible.backends.kimi",
+        "crucible.backends.limits.INVOCATION_LIMIT_LEDGER_LEAF",
+        "crucible.backends.limits.InvocationLimitLedger",
+    ]
+    from crucible.backends import kimi as adapter  # noqa: PLC0415
+
+    used = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "adapter"
+    }
+    assert not {name for name in used - {"__name__"} if name.startswith("_")}
+    assert all(hasattr(adapter, name) for name in used)
+    # The two private names are reached by name only: the launch seam, which
+    # the driver hands to the launch interposer and never sets itself, and the
+    # adapter's memory of a passed probe, which it clears and never replaces.
+    seam, probe_cache = driver.private_seams
+    module, _, name = seam.rpartition(".")
+    assert (module, name) in launch.SUBPROCESS_SEAMS and module == adapter.__name__
+    module, _, name = probe_cache.rpartition(".")
+    assert module == adapter.__name__ and name.startswith("_")
+    assert callable(getattr(adapter, name)) and callable(getattr(adapter, name).cache_clear)
+    called = {
+        ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)
+    }
+    assert not {item for item in called if "setattr" in item or "patch" in item}
+    assert "launch.at_subprocess" in called
+    assert driver.fidelity == "wire" and driver.dialect == "moonshot_chat"
+    assert len(driver.bypassed_layers) == 3 and driver.inexpressible == {}
+    # The driver overlays nothing on the shipped routes.
+    assert matrix_columns.KIMI_KIND not in matrix_columns.ALLOWED_OVERLAY
+
+
+def test_a_test_that_requires_a_worker_environment_carries_the_marker() -> None:
+    # A test outside the package that needs a locked worker environment takes
+    # the fixture that fails without it, and the marker the documented
+    # deselection leaves out: both or neither, so that a machine without the
+    # environment gets an error or a counted deselection, never a quiet pass.
+    fixture, marker = "require_kimi_worker", "matrix_worker"
+    conftest = _tree("../conftest.py")
+    assert fixture in {
+        node.name for node in conftest.body if isinstance(node, ast.FunctionDef)
+    }
+    paired = 0
+    for path in _python_files(TESTS):
+        if PACKAGE in path.parents:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+                continue
+            decorators = [ast.unparse(item) for item in node.decorator_list]
+            requires = fixture in {item.arg for item in node.args.args} or any(
+                "usefixtures" in item and fixture in item for item in decorators
+            )
+            marked = any(item.endswith(f"mark.{marker}") for item in decorators)
+            assert requires == marked, f"{path.name}::{node.name}"
+            paired += requires
+    assert paired > 0
 
 
 def test_every_envelope_is_rendered_by_a_dialect_and_exists() -> None:

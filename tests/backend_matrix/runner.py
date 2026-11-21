@@ -42,7 +42,16 @@ from . import report as matrix_report
 from . import verify as matrix_verify
 from .cells import Cell
 from .columns import Column
-from .contract import Deviation, Observation, Raised, Reference, Report, SecondCall
+from .contract import (
+    ADMITTED,
+    Admitted,
+    Deviation,
+    Observation,
+    Raised,
+    Reference,
+    Report,
+    SecondCall,
+)
 from .drivers.base import GUARD_POLICY, Bound, Driver
 from .provider import ProviderLedger
 from .scenarios import BASE_POLICY, SCENARIOS, SYSTEM, USER, Plan, plan_for
@@ -65,6 +74,9 @@ class Execution:
     # envelope the provider answered from (``None``: no envelope was used).
     differences: tuple[str, ...] = ()
     grade: str | None = None
+    # The budget the cell passed because its route asks for one, where the
+    # scenario sets none of its own (``None``: the route asks for none).
+    route_budget: float | None = None
 
 
 class _LogCapture(logging.Handler):
@@ -170,16 +182,21 @@ def execute(
     *,
     driver: Driver | None = None,
     differences: Sequence[str] = (),
+    admission: Mapping[str, str] | None = None,
 ) -> Execution:
     """Play one cell and evaluate it. Never consults the ledger.
 
     ``differences`` are the declared differences in force on the cell; the
-    caller takes them from the ledger.
+    caller takes them from the ledger. ``admission`` is what an admission
+    cell is held to: the pin of the inventory unless a self-test passes its
+    own.
     """
 
     scenario = SCENARIOS[cell.scenario]
     column = cell.column
     played_by = driver if driver is not None else drivers.get(column.kind)
+    if scenario.admission:
+        return _execute_admission(cell, tmp_path, played_by, expected=admission)
     routed = declarations.routed(column)
     # The route the cell runs through is the one of its capability's role.
     role = matrix_columns.ROLE_BY_CAPABILITY[scenario.capability]
@@ -192,16 +209,20 @@ def execute(
         if scenario.toolset is None
         else toolsets.build(scenario.toolset, tmp_path / "workspace")
     )
+    # A route may ask a budget of every invocation (a closed extra of its
+    # routing file). The cell is then called as the route asks, unless the
+    # scenario is about a budget of its own.
+    route_budget = declarations.route_budget(column, role)
     invocation = Invocation(
         system=SYSTEM,
         user=USER,
         tools=None,
         max_turns=plan.max_turns,
-        budget_usd=plan.budget_usd,
+        budget_usd=route_budget if plan.budget_usd is None else plan.budget_usd,
         policy=scenario.policy,
         response_schema=plan.response_schema,
     )
-    probe = replace(invocation, max_turns=1, budget_usd=None, response_schema=None)
+    probe = replace(invocation, max_turns=1, budget_usd=route_budget, response_schema=None)
     capture = _LogCapture()
     baseline = contract.settlement_baseline()
     started = time.monotonic()
@@ -314,6 +335,9 @@ def execute(
         ),
         bindings=toolsets.BINDINGS,
         write_slot=WRITE,
+        # Whether the results of that route are cost intervals: a closed
+        # extra of its routing file, as the route budget above.
+        cost_bounded=declarations.cost_bounded(column, role),
     )
     report = contract.evaluate(
         observation,
@@ -334,6 +358,146 @@ def execute(
         current,
         differences=tuple(differences),
         grade=envelopes.weakest(provider_ledger.envelopes),
+        route_budget=route_budget if plan.budget_usd is None else None,
+    )
+
+
+def _execute_admission(
+    cell: Cell,
+    tmp_path: Path,
+    played_by: Driver,
+    *,
+    expected: Mapping[str, str] | None = None,
+) -> Execution:
+    """Play an admission cell: build a backend for every capability, call none.
+
+    On the routing file of every product the column has, through the driver
+    of its kind, so what is built is what a workflow would get. A refusal by
+    routing is what the cell is about and is recorded with its type; nothing
+    is invoked, so the provider must see no request at all.
+    """
+
+    scenario = SCENARIOS[cell.scenario]
+    column = cell.column
+    plan = plan_for(scenario, {})
+    wanted = dict(matrix_cells.expected_admission(cell) if expected is None else expected)
+    capture = _LogCapture()
+    baseline = contract.settlement_baseline()
+    started = time.monotonic()
+    seen: list[Admitted] = []
+    texts: list[str] = []
+    secrets: list[str] = []
+    children: list[int] = []
+    ports: list[int] = []
+    close_raised: Raised | None = None
+    provider_ledger = ProviderLedger()
+    late = 0
+    # A column without a routing file (a toy column) is built once.
+    products: list[str | None] = [name for name, _path in column.routing] or [None]
+    root_logger = logging.getLogger()
+    root_level = root_logger.level
+    root_logger.addHandler(capture)
+    root_logger.setLevel(logging.DEBUG)
+    try:
+        for product in products:
+            view = column if product is None else column.routed_by(product)
+            where = "the column" if product is None else f"the {product} routing file"
+            if product is not None:
+                seen.append(
+                    Admitted(
+                        matrix_cells.AVAILABILITY,
+                        matrix_columns.catalog_availability(column, product),
+                        f"the {product} profile catalog",
+                    )
+                )
+            for capability in matrix_columns.ROLE_BY_CAPABILITY:
+                directory = tmp_path / (product or "column") / capability
+                directory.mkdir(parents=True)
+                got = ADMITTED
+                try:
+                    with played_by.open(
+                        view,
+                        capability=capability,
+                        lens=cell.lens,  # type: ignore[arg-type]
+                        script=plan.script,
+                        tmp_path=directory,
+                    ) as bound:
+                        frozen = bound.provider.freeze()
+                        # From here on every provider request is a late request.
+                        bound.provider.end_of_cell()
+                        for _ in range(2):  # a second close() must be a no-op
+                            try:
+                                bound.backend.close()
+                            except Exception as exc:  # noqa: BLE001 - observed as C8
+                                close_raised = Raised.from_exception(exc, phase="close")
+                                break
+                        provider_ledger.requests.extend(frozen.requests)
+                        provider_ledger.extra += frozen.extra
+                        provider_ledger.seam_problems.extend(frozen.seam_problems)
+                        late += bound.provider.final_counts()[1]
+                        children.extend(bound.children())
+                        ports.append(bound.provider.port)
+                        secrets.extend(bound.secrets)
+                        texts.append(_debug_text(bound.log_dirs, _LogCapture()))
+                except (netguard.NetworkGuardViolation, drivers.MatrixSetupError):
+                    raise  # the matrix's own failures are not observations
+                except Exception as exc:  # noqa: BLE001 - a refusal is the observation
+                    raised = Raised.from_exception(exc, phase="before_request")
+                    got = raised.type
+                    # A workflow logs the text of a refusal: clause C9 reads it.
+                    texts.append(raised.message)
+                seen.append(Admitted(capability, got, where))
+        settlement = replace(
+            contract.settle(
+                baseline,
+                driver_children=tuple(children),
+                own_ports=tuple(ports),
+                close_raised=close_raised,
+            ),
+            late_requests=late,
+        )
+    finally:
+        root_logger.setLevel(root_level)
+        root_logger.removeHandler(capture)
+    # A request during a build matched no step: the script of the cell is empty.
+    provider_ledger.late_requests = late
+    observation = Observation(
+        result=None,
+        raised=None,
+        provider=provider_ledger,
+        toolset_log=(),
+        wrapper_snapshot=None,
+        write_applied=None,
+        declarations=None,
+        backend_name="",
+        backend_model="",
+        limit_terminal=None,
+        second_call=None,
+        settlement=settlement,
+        wall_seconds=time.monotonic() - started,
+        debug_dump_text="\n".join([*capture.lines, *texts]),
+    )
+    routed = declarations.routed(column)
+    reference = Reference(
+        routed=routed,
+        model=column.model,
+        endpoint=None,
+        pricing=matrix_columns.matrix_rate(column.model),
+        secrets=(matrix_columns.CANARY_CREDENTIAL, *secrets),
+        tool_authority_digest=None,
+        bindings=toolsets.BINDINGS,
+        write_slot=WRITE,
+    )
+    report = contract.evaluate_admission(
+        observation, seen, wanted, reference, lens=cell.lens
+    )
+    return Execution(
+        cell,
+        plan,
+        observation,
+        reference,
+        report,
+        declarations.governing_values(routed, scenario.governing),
     )
 
 

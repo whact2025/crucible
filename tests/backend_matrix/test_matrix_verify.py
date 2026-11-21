@@ -429,6 +429,9 @@ def test_a_column_wide_gap_is_owed_exactly_where_its_check_ran() -> None:
     assert contract.not_owed_given("stop:error!=end_turn", rewritten)
     assert not contract.not_owed_given(_WIDE_CODE, rewritten)
     assert not contract.not_owed_given("kind:transport!=none", ["guard:revoked"])
+    # Neither does a result the guard let stand without calling it rankable.
+    assert not contract.not_owed_given("kind:transport!=none", [contract.NOT_RANKABLE])
+    assert not contract.not_owed_given("stop:error!=end_turn", [contract.NOT_RANKABLE])
     # A clause the cell's definition does not have is owed nowhere: the guard
     # clause in the raw lens, the dispatch clause of a scenario without a ToolSet.
     for code in ("guard:revoked", "dispatch.extra:read_a"):

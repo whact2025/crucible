@@ -39,7 +39,8 @@ from .toolsets import READ, READ_BOUNDED, WRITER, ToolsetSpec, capability_of
 
 STARTER = "starter"
 PACK_A = "pack_a"
-SETS = (STARTER, PACK_A)
+PACK_B = "pack_b"
+SETS = (STARTER, PACK_A, PACK_B)
 
 SYSTEM = "You are the matrix system prompt [canary-system-4f1c]."
 USER = "Answer the matrix user prompt [canary-user-9b2e]."
@@ -103,6 +104,10 @@ class Scenario:
     # Alternative contracts of declared differences no feature field selects,
     # by difference id. The ledger says on which cells one is in force.
     alternatives: Mapping[str, Callable[[Plan], Plan]] = field(default_factory=dict)
+    # An admission scenario builds a backend for every capability a workflow
+    # can ask routing for and calls none. What routing does with each is
+    # pinned per cell in the inventory, never derived from a declared value.
+    admission: bool = False
 
     @property
     def capability(self) -> str:
@@ -881,6 +886,16 @@ _ALL: tuple[Scenario, ...] = (
             max_turns=24,
             checks=(write_is_progress, history_replayed),
         ),
+    ),
+    Scenario(
+        id="S51",
+        set=PACK_B,
+        title="Admission",
+        toolset=None,
+        lenses=("raw",),
+        # No provider behaviour: nothing is called, so nothing may be asked.
+        plan=lambda: Plan(ProviderScript(())),
+        admission=True,
     ),
 )
 
