@@ -74,12 +74,12 @@ _OPENAI_SOURCE_SHA256 = (
     "baf5802ad08980e1d9d561e1b996e800c8bcd14af5847c6d0e7a5cc59e4d4116"
 )
 _WORKER_LOCK_SHA256 = (
-    "c2622cb4b213068c3db4e1e39abc419a975df5a4e3113b5b2ab4a9625d3137e3"
+    "eea1c2ebb8d53d57881c8f0f7d3ea7c1f001e11c696969195ec29a96a6340e3e"
 )
 _LOCKED_LINUX_COMPONENT_VERSIONS = (
     ("annotated-types", "0.8.0"),
     ("anyio", "4.14.2"),
-    ("certifi", "2026.7.22"),
+    ("certifi", "2026.10.18"),
     ("crucible-deepseek-worker", "0.1.0"),
     ("distro", "1.9.0"),
     ("h11", "0.16.0"),
