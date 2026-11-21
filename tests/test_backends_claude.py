@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7307,6 +7308,369 @@ def test_workflow_external_stale_session_is_typed_and_not_retried(
     assert result.conversation is not None
     assert result.conversation.state == "stale"
     assert result.conversation.opaque_id is None
+
+
+# The adapter keeps at most this many of the CLI's stderr lines per attempt.
+_CLI_STDERR_BOUND = 200
+
+
+def _failing_cli_query(stderr_lines, raised, *, after_handshake=False):
+    """Fake ``query``: feed the stderr callback, then fail as the CLI does.
+
+    The SDK transport hands the CLI's stderr to ``options.stderr`` one line
+    at a time. It reports a non-zero exit as a ``ProcessError`` that carries
+    a placeholder, never the stderr text: a caller waiting for the handshake
+    receives that error itself, and once the handshake is done the SDK's
+    message reader re-raises its text as a bare ``Exception``.
+    """
+    from claude_agent_sdk import ProcessError
+
+    def fake_query(*, prompt, options):  # noqa: ARG001
+        async def _gen():
+            for line in stderr_lines:
+                options.stderr(line)
+            error: Exception = ProcessError(
+                "Command failed with exit code 1",
+                exit_code=1,
+                stderr="Check stderr output for details",
+            )
+            if after_handshake:
+                error = Exception(str(error))
+            raised.append(error)
+            raise error
+            yield  # pragma: no cover
+
+        return _gen()
+
+    return fake_query
+
+
+def _attempt_with_failing_cli(
+    monkeypatch,
+    stderr_lines,
+    *,
+    after_handshake=False,
+):
+    """Run one attempt without a conversation request against a failing CLI."""
+    import claude_agent_sdk
+
+    raised: list[Exception] = []
+    monkeypatch.setattr(
+        claude_agent_sdk,
+        "query",
+        _failing_cli_query(
+            stderr_lines,
+            raised,
+            after_handshake=after_handshake,
+        ),
+    )
+    invocation = Invocation(
+        system="s",
+        user="u",
+        tools=None,
+        max_turns=1,
+        budget_usd=None,
+    )
+    policy = BackendPolicy(
+        retry_budget=1,
+        timeout_seconds=10.0,
+        on_cancellation="raise",
+        on_max_turns="raise",
+    )
+    result = asyncio.run(ClaudeBackend()._invoke_once(invocation, policy))
+    (error,) = raised
+    return result, error
+
+
+def _fail_once_with_cli_stderr(monkeypatch, caplog, stderr_lines):
+    """Run one failing attempt; return every reader's view of the stderr.
+
+    The views are the redacted lines attached to the raised exception, the
+    header of the ERROR record, and the lines of the tail that record logs.
+    """
+    with caplog.at_level(logging.ERROR, logger="crucible.backends.claude"):
+        result, error = _attempt_with_failing_cli(monkeypatch, stderr_lines)
+
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    (logged,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "stderr tail" in record.getMessage()
+    ]
+    header, _, tail = logged.partition("\n")
+    return error.cli_stderr.split("\n"), header, tail.split("\n")
+
+
+@pytest.mark.parametrize("after_handshake", [False, True])
+@pytest.mark.parametrize("lines_before_reason", [3, 199, 200, 250, 1000])
+def test_workflow_external_stale_reason_survives_any_amount_of_stderr(
+    monkeypatch,
+    lines_before_reason,
+    after_handshake,
+):
+    """A rejected handle is typed as stale however much stderr precedes it.
+
+    The SDK's error for a failed CLI carries no stderr, so the reason for
+    the rejection has to be among the lines the adapter keeps, also when
+    more lines than the bound were written before it.
+    """
+    import claude_agent_sdk
+    from crucible.backends import claude as claude_mod
+
+    stderr_lines = [
+        f"cli stderr line {index}" for index in range(lines_before_reason)
+    ]
+    stderr_lines.append("No conversation found with session ID: session-stale")
+    resumes: list[str | None] = []
+    failing_query = _failing_cli_query(
+        stderr_lines,
+        [],
+        after_handshake=after_handshake,
+    )
+
+    def fake_query(*, prompt, options):
+        resumes.append(options.resume)
+        return failing_query(prompt=prompt, options=options)
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    result = claude_mod.ClaudeBackend().invoke(
+        Invocation(
+            system="sys",
+            user="correction",
+            tools=(),
+            max_turns=2,
+            budget_usd=1.0,
+            policy=BackendPolicy(
+                retry_budget=3,
+                timeout_seconds=10.0,
+                on_cancellation="convert_to_backend_error",
+                on_max_turns="raise",
+            ),
+            conversation=_conversation_request(
+                action="reuse",
+                opaque_id="session-stale",
+            ),
+        )
+    )
+
+    assert resumes == ["session-stale"]
+    assert result.error is not None
+    assert result.error.kind == "stale_conversation"
+    assert result.error.retriable is False
+    assert result.stop_reason == "stale_conversation"
+    assert result.conversation is not None
+    assert result.conversation.state == "stale"
+    assert result.conversation.opaque_id is None
+
+
+@pytest.mark.parametrize(
+    ("after_handshake", "message", "retriable"),
+    [
+        (
+            False,
+            "ProcessError: Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details",
+            True,
+        ),
+        (
+            True,
+            "sdk_transport: Command failed with exit code 1 (exit code: 1)",
+            False,
+        ),
+    ],
+)
+def test_cli_stderr_reason_without_a_resumed_handle_stays_an_ordinary_error(
+    monkeypatch,
+    after_handshake,
+    message,
+    retriable,
+):
+    """Kept stderr decides nothing but the staleness of a resumed handle."""
+    stderr_lines = [f"cli stderr line {index}" for index in range(250)]
+    stderr_lines.append("No conversation found with session ID: session-stale")
+
+    result, _error = _attempt_with_failing_cli(
+        monkeypatch,
+        stderr_lines,
+        after_handshake=after_handshake,
+    )
+
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert result.error.message == message
+    assert result.error.retriable is retriable
+    assert result.stop_reason == "error"
+    assert result.conversation is None
+
+
+@pytest.mark.parametrize("line_count", [201, 250, 1000])
+def test_cli_stderr_beyond_the_bound_keeps_the_last_lines(
+    monkeypatch,
+    caplog,
+    line_count,
+):
+    lines = [f"cli stderr line {index}" for index in range(line_count)]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert len(kept) == _CLI_STDERR_BOUND
+    assert kept == lines[-_CLI_STDERR_BOUND:]
+    assert header.endswith("stderr tail (last 50 of 200 lines):")
+    assert tail == lines[-50:]
+
+
+@pytest.mark.parametrize("line_count", [1, 50, 51, 199, 200])
+def test_cli_stderr_within_the_bound_is_kept_whole(
+    monkeypatch,
+    caplog,
+    line_count,
+):
+    lines = [f"cli stderr line {index}" for index in range(line_count)]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == lines
+    assert header.endswith(
+        f"stderr tail (last {min(line_count, 50)} of {line_count} lines):"
+    )
+    assert tail == lines[-50:]
+
+
+def test_cli_stderr_bound_counts_entries_however_long_the_lines(
+    monkeypatch,
+    caplog,
+):
+    """Kept stderr is at most the bound times the longest line handed over.
+
+    Each line here is as long as one pipe read. The SDK transport caps the
+    length of a line it hands over; the session transport tests pin that cap.
+    """
+    line_chars = 64 * 1024
+    lines = [
+        f"{index:04d}:".ljust(line_chars, "x")
+        for index in range(_CLI_STDERR_BOUND + 30)
+    ]
+
+    kept, _header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert len(kept) == _CLI_STDERR_BOUND
+    assert kept == lines[-_CLI_STDERR_BOUND:]
+    assert sum(len(line) for line in kept) == _CLI_STDERR_BOUND * line_chars
+    assert tail == lines[-50:]
+
+
+def test_cli_stderr_written_after_the_bound_is_redacted(monkeypatch, caplog):
+    token = "offline-stderr-token-0123456789"
+    lines = [f"cli stderr line {index}" for index in range(260)]
+    lines.append(f"upstream rejected Bearer {token}")
+
+    kept, _header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept[-1] == "upstream rejected Bearer [REDACTED]"
+    assert tail[-1] == "upstream rejected Bearer [REDACTED]"
+    assert token not in "\n".join(kept)
+    assert token not in caplog.text
+
+
+def _stderr_then_exit_cli_double(tmp_path, stderr_text):
+    """Create a CLI double that writes ``stderr_text`` and exits 1.
+
+    It answers the SDK's version probe, records the arguments of every
+    other start, and never reads its input.
+    """
+    from crucible.backends._claude_session_transport import (
+        REVIEWED_CLAUDE_FABLE_CODE_VERSION,
+    )
+
+    starts = tmp_path / "claude-starts.jsonl"
+    cli = tmp_path / "stderr-claude"
+    cli.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:] == ["-v"]:
+    print({f"{REVIEWED_CLAUDE_FABLE_CODE_VERSION} (Claude Code)"!r}, flush=True)
+    raise SystemExit(0)
+with open({str(starts)!r}, "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\\n")
+sys.stderr.write({stderr_text!r})
+sys.stderr.flush()
+raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    return str(cli.resolve()), starts
+
+
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_workflow_external_stale_reason_is_kept_on_the_sdk_delivery_path(
+    tmp_path,
+    caplog,
+    final_newline,
+):
+    """The reason reaches the adapter when the SDK itself delivers stderr.
+
+    Nothing of the SDK is replaced here. It starts the CLI double, reads its
+    stderr in a task of its own, reports the non-zero exit from another, and
+    cancels the stderr reader when it closes. The double writes more lines
+    than the bound and then the reason as its last output, with or without
+    a final newline, and exits 1.
+    """
+    reason = "No conversation found with session ID: session-stale"
+    written = [
+        f"cli stderr line {index}" for index in range(_CLI_STDERR_BOUND + 50)
+    ]
+    written.append(reason)
+    cli_path, starts = _stderr_then_exit_cli_double(
+        tmp_path,
+        "\n".join(written) + ("\n" if final_newline else ""),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="crucible.backends.claude"):
+        result = ClaudeBackend(cli_path=cli_path, cwd=str(tmp_path)).invoke(
+            Invocation(
+                system="sys",
+                user="correction",
+                tools=(),
+                max_turns=2,
+                budget_usd=1.0,
+                policy=BackendPolicy(
+                    retry_budget=3,
+                    timeout_seconds=30.0,
+                    on_cancellation="convert_to_backend_error",
+                    on_max_turns="raise",
+                ),
+                conversation=_conversation_request(
+                    action="reuse",
+                    opaque_id="session-stale",
+                ),
+            )
+        )
+
+    assert result.error is not None
+    assert result.error.kind == "stale_conversation"
+    assert result.error.retriable is False
+    assert result.stop_reason == "stale_conversation"
+    assert result.conversation is not None
+    assert result.conversation.state == "stale"
+    assert result.conversation.opaque_id is None
+    # The model process was started once, with the workflow's handle.
+    (model_argv,) = [
+        json.loads(line)
+        for line in starts.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum("session-stale" in token for token in model_argv) == 1
+    (logged,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "stderr tail" in record.getMessage()
+    ]
+    header, _, tail = logged.partition("\n")
+    assert header.endswith("stderr tail (last 50 of 200 lines):")
+    assert tail.split("\n") == written[-50:]
 
 
 def test_workflow_external_transport_failure_is_not_retried(

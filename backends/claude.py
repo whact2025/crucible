@@ -3792,13 +3792,16 @@ class ClaudeBackend:
         # placeholder. Without this callback the SDK silently drops the
         # subprocess's stderr; we'd see ``re_raised: True`` in the
         # debug dump with no diagnostic context. Bounded to avoid an
-        # accidentally-chatty CLI bloating the in-memory buffer.
+        # accidentally-chatty CLI bloating the in-memory buffer: only the
+        # last lines are kept, so that what the CLI writes before it exits
+        # (the reason for a rejected ``--resume``, for one) is among them.
         cli_stderr_lines: list[str] = []
         _CLI_STDERR_MAX_LINES = 200
 
         def _on_cli_stderr(line: str) -> None:
-            if len(cli_stderr_lines) < _CLI_STDERR_MAX_LINES:
-                cli_stderr_lines.append(line)
+            if len(cli_stderr_lines) >= _CLI_STDERR_MAX_LINES:
+                del cli_stderr_lines[0]
+            cli_stderr_lines.append(line)
 
         effective_max_turns = (
             invocation.max_turns
