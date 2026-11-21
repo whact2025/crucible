@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The frame that opens a session of the command-line tool. Nothing was
+# observed of the real tool: no vendor command-line tool is installed where
+# this package is built, and the package may not install or contact one.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: init
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.SystemMessage, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "system":
+    the subtype is required, the whole frame becomes the message data)
+  sdk_version: claude-agent-sdk 0.2.110
+  reason: >-
+    The pinned SDK types a system frame only as a subtype with free data. That
+    such a frame carries a session id and a frame id is taken from the frame
+    the SDK itself builds in claude_agent_sdk._internal.query
+    (Query.report_mirror_error). That the tool opens a session with the
+    subtype "init", and when it sends it, is not stated by any source in
+    reach: the frame proves that the SDK parses it, not that the tool sends
+    it.
+
+status: 200
+
+body:
+  type: system
+  subtype: init
+  session_id: {slot: session_id}
+  uuid: {slot: frame_id}

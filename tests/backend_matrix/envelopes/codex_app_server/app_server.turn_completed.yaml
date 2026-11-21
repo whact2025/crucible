@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal of a turn that ended without an error. Nothing was observed of
+# the real tool (see app_server.agent_message).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: turn_completed
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai_codex.generated.v2_all.TurnCompletedNotification with a Turn whose
+    status is the TurnStatus value completed (method turn/completed in
+    openai_codex.generated.notification_registry); the method is one of
+    codex_app_server_sdk.protocol.TURN_COMPLETED_METHODS
+  sdk_version: openai-codex 0.144.4, codex-app-server-sdk 0.3.2
+  reason: >-
+    The notification holds exactly the required fields of the generated type
+    of the vendor (threadId, turn) and the turn its required fields (id,
+    items, status) with a null error; the optional timestamps and the items
+    view are left out. The items of the turn travel in their own
+    notifications, so the list here is empty; whether the real tool repeats
+    them in the terminal is not known.
+
+status: 200
+
+body:
+  method: turn/completed
+  params:
+    threadId: {slot: thread_id}
+    turn:
+      id: {slot: turn_id}
+      items: []
+      status: completed
+      error: null
