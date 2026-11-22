@@ -51,13 +51,17 @@ def host_route_write_root_refusal(
     discovers it, and only when the root can collide at all.
     """
 
-    # No workflow sets this field, so its default is the value every write
-    # context carries; the host drops the root name only while it is set.
-    if not ToolContext.workspace_relative_paths:
+    write_root = Path(root)
+    # No workflow passes ``workspace_relative_paths``, so a context built for
+    # the root as the workflows build theirs carries what their write
+    # contexts carry; the host drops the root name only while it is set.
+    if not ToolContext(
+        workspace_root=write_root, repo_root=write_root,
+    ).workspace_relative_paths:
         return None
     # The host names its root after resolving links. ``is_dir`` follows a
     # link, so a link to a directory counts and a regular file does not.
-    resolved = Path(root).resolve()
+    resolved = write_root.resolve()
     if not resolved.name or not (resolved / resolved.name).is_dir():
         return None
     routing = load_routing(config_path=args.backend_config, spec_dir=args.spec)

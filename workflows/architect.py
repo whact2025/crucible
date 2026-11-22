@@ -146,6 +146,7 @@ from .plan import (
     run_plan,
 )
 from .tier import (
+    _load_spec_yaml_policies,
     _resolve_cli_breach_policy,
     run_tier,
 )
@@ -3452,15 +3453,19 @@ def run_architect(
     if not args.worktree:
         # Every tier writes in ``cwd``. With --worktree it writes in a fresh
         # worktree instead, and run_tier asks about that root itself. A tier
-        # reads the Spec's breach policy when none is passed, so only an
-        # explicit disabled policy rules the Defender's route out here.
+        # that is passed no breach policy resolves the Spec's own, so the
+        # same resolution decides here whether the Defender will write.
+        tier_breach_policy = (
+            args.breach_policy
+            if args.breach_policy is not None
+            else _load_spec_yaml_policies(args.spec).breach
+        )
         refusal = host_route_write_root_refusal(
             args,
             cwd,
-            ("implementer",)
-            if args.breach_policy is not None
-            and not args.breach_policy.enabled
-            else ("implementer", "breach_defender"),
+            ("implementer", "breach_defender")
+            if tier_breach_policy.enabled
+            else ("implementer",),
         )
         if refusal is not None:
             record_handled_terminal(

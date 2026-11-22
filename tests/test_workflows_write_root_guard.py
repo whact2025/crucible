@@ -15,6 +15,7 @@ OpenAI-compatible or local route, and a ``--worktree`` root are not refused.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -568,10 +569,10 @@ def test_roots_and_routes_that_cannot_collide_are_not_refused(
             id="architect_with_breach_follows_the_defender_route",
         ),
         pytest.param(
-            # Without a policy each tier reads the Spec's own; Architect
-            # cannot rule the Defender out and therefore counts its route.
-            "architect", "codex", {"implementer": "openai_compat"}, {}, True,
-            id="architect_with_tier_resolved_breach_counts_the_defender",
+            # Without a policy Architect resolves the one its tiers will
+            # resolve. This Spec authors none, so Breach is off in both.
+            "architect", "codex", {"implementer": "openai_compat"}, {}, False,
+            id="architect_without_a_policy_resolves_breach_off_like_a_tier",
         ),
         pytest.param(
             "architect", "openai_compat", {"implementer": "kimi"},
@@ -606,6 +607,54 @@ def test_refusal_follows_the_routes_of_the_roles_that_write(
         _assert_refused(outcome, corpus, workflow, root, before)
     else:
         _assert_proceeded(outcome, corpus)
+
+
+def _authored_breach_corpus(tmp_path: Path, enabled: bool) -> Corpus:
+    """Return a Corpus whose ``spec.yaml`` authors the breach policy."""
+
+    corpus = _corpus(tmp_path, (f"{NAME}/x.py",))
+    (Path(corpus.spec_dir) / "spec.yaml").write_text(
+        yaml.safe_dump({"breach_policy": {"enabled": enabled}}),
+        encoding="utf-8",
+    )
+    return corpus
+
+
+@pytest.mark.parametrize("workflow", ("architect", "tier"))
+def test_the_spec_decides_the_defender_route_when_no_policy_is_passed(
+    tmp_path: Path,
+    monkeypatch,
+    workflow: str,
+) -> None:
+    root = _tree(tmp_path, "nested")
+    # The only writer on a host route is the Defender.
+    config = _routing(tmp_path, "codex", implementer="openai_compat")
+
+    # Without a policy argument a tier reads the Spec's authored block, and
+    # Architect resolves the block its tiers will read, so the roles the
+    # guard is asked about follow that block in both.
+    corpus = _authored_breach_corpus(tmp_path / "spec-enables-breach", True)
+    before = _snapshot(root)
+    message = _assert_refused(
+        _run(workflow, corpus, root, config, monkeypatch),
+        corpus, workflow, root, before,
+    )
+    assert "Write roles breach_defender (codex) reach" in message
+
+    corpus = _authored_breach_corpus(tmp_path / "spec-disables-breach", False)
+    _assert_proceeded(
+        _run(workflow, corpus, root, config, monkeypatch), corpus,
+    )
+
+    # A policy that is passed outranks the authored block, as in the run.
+    corpus = _authored_breach_corpus(tmp_path / "policy-disables-breach", True)
+    _assert_proceeded(
+        _run(
+            workflow, corpus, root, config, monkeypatch,
+            breach_policy=BreachPolicy(enabled=False),
+        ),
+        corpus,
+    )
 
 
 def test_explicit_routing_outranks_the_environment_route(
@@ -873,6 +922,49 @@ def test_predicate_reads_no_routing_for_a_root_that_cannot_collide(
     ) is None
 
 
+def test_predicate_reads_routing_with_the_call_the_backend_pool_makes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from crucible.workflows import _backends
+
+    root = _tree(tmp_path, "nested_only")
+    corpus = _corpus(tmp_path)
+    arguments = _arguments(corpus, _routing(tmp_path, "codex"))
+    guard = _guard()
+    loaded: dict[str, tuple[dict[str, Any], Any]] = {}
+
+    def recording(reader: str, load: Any) -> Any:
+        def load_and_record(**kwargs: Any) -> Any:
+            routing = load(**kwargs)
+            loaded[reader] = (kwargs, routing)
+            return routing
+
+        return load_and_record
+
+    monkeypatch.setattr(
+        guard, "load_routing", recording("guard", guard.load_routing),
+    )
+    monkeypatch.setattr(
+        _backends, "load_routing", recording("pool", _backends.load_routing),
+    )
+
+    assert guard.host_route_write_root_refusal(
+        arguments, root, ("implementer",),
+    ) is not None
+    with _backends.backend_pool(arguments, None) as pool:
+        pooled = pool.routing
+
+    # Same discovery arguments, and so the same routing table, as the pool
+    # every guarded workflow then resolves its roles through.
+    assert loaded["guard"][0] == loaded["pool"][0] == {
+        "config_path": arguments.backend_config,
+        "spec_dir": arguments.spec,
+    }
+    assert loaded["guard"][1] == loaded["pool"][1] == pooled
+    assert pooled.for_role("implementer").backend == "codex"
+
+
 def test_predicate_fails_closed_when_the_routing_cannot_be_read(
     tmp_path: Path,
 ) -> None:
@@ -887,19 +979,136 @@ def test_predicate_fails_closed_when_the_routing_cannot_be_read(
         )
 
 
-def test_predicate_refuses_only_while_the_host_drops_the_root_name(
+def test_predicate_refuses_only_while_a_write_context_carries_the_name_drop(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from crucible.tools import _isolated_mutation_host as host
     from crucible.tools._context import ToolContext
 
     root = _tree(tmp_path, "nested_only")
     corpus = _corpus(tmp_path)
     arguments = _arguments(corpus, _routing(tmp_path, "codex"))
     guard = _guard().host_route_write_root_refusal
+    declared = f"{NAME}/x.py"
 
-    assert ToolContext(workspace_root=root, repo_root=root).workspace_relative_paths
+    def hosted() -> Any:
+        # A context built as the workflows build theirs, as the host takes it.
+        return host._snapshot_context(ToolContext(
+            workspace_root=root, repo_root=root, write_scope=(declared,),
+        ))
+
+    # The drop is on: the host names the root-level twin; the guard refuses.
+    snapshot = hosted()
+    assert snapshot.workspace_relative_paths is True
+    assert host._write_is_authorized(snapshot, declared) == "x.py"
     assert guard(arguments, root, ("implementer",)) is not None
 
-    monkeypatch.setattr(ToolContext, "workspace_relative_paths", False)
+    # The class attribute is not what a context carries. Assigning it leaves
+    # the drop on in the host, so the guard has to keep refusing.
+    with monkeypatch.context() as patch:
+        patch.setattr(ToolContext, "workspace_relative_paths", False)
+        snapshot = hosted()
+        assert snapshot.workspace_relative_paths is True
+        assert host._write_is_authorized(snapshot, declared) == "x.py"
+        assert guard(arguments, root, ("implementer",)) is not None
+
+    # The drop is off where a context gets it: the host names the declared
+    # file, and only then does the guard stop refusing.
+    construct = ToolContext.__init__
+
+    def without_the_drop(self: Any, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("workspace_relative_paths", False)
+        construct(self, *args, **kwargs)
+
+    monkeypatch.setattr(ToolContext, "__init__", without_the_drop)
+    snapshot = hosted()
+    assert snapshot.workspace_relative_paths is False
+    assert host._write_is_authorized(snapshot, declared) == declared
     assert guard(arguments, root, ("implementer",)) is None
+
+
+# ----------------------------------------------------------------------
+# Coverage
+# ----------------------------------------------------------------------
+
+_WRITE_TOOLSET_BUILDERS = frozenset({
+    "build_autonomous_implementer_profile",
+    "build_breach_defender_profile",
+    "build_exact_create_recovery_profile",
+    "build_exact_create_tools",
+    "build_implementer_profile",
+    "build_write_tools",
+})
+# Every production module outside ``tools`` that constructs a ToolContext,
+# with the reason no write context built there reaches the isolated host in
+# a root that holds its own name.
+_CONTEXT_MODULES = {
+    "workflows/implement.py": "refused in main",
+    "workflows/tier.py": "refused in run_tier, after any worktree rebinding",
+    "workflows/breach.py": "refused in _main",
+    "workflows/architect.py": "read-only planner context; refused for its tiers",
+    "workflows/_writer_scheduler.py": "a fresh worktree root for every lane",
+    "workflows/plan.py": "read-only source tools",
+    "workflows/_readonly_scheduler.py": "validated read-only",
+    "workflows/_write_root_guard.py": "read for the name-drop flag only",
+}
+_WRITE_TOOLSET_MODULES = {
+    "workflows/breach.py",
+    "workflows/implement.py",
+    "workflows/tier.py",
+}
+
+
+def _called_names(path: Path) -> set[str]:
+    """Return the name of every function or constructor ``path`` calls."""
+
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                names.add(node.func.attr)
+    return names
+
+
+def test_every_module_that_builds_a_tool_context_is_covered() -> None:
+    import crucible
+
+    package = Path(crucible.__file__).resolve().parent
+    watched = ("ToolContext", *_WRITE_TOOLSET_BUILDERS)
+    contexts: set[str] = set()
+    writers: set[str] = set()
+    unguarded: set[str] = set()
+    for area in (
+        "backends", "common", "products", "rubrics", "rules", "scripts",
+        "workflows",
+    ):
+        for current, directories, files in os.walk(package / area):
+            directories[:] = [
+                name for name in directories
+                if not name.startswith(".")
+                and name not in {"__pycache__", "tests"}
+            ]
+            for name in files:
+                path = Path(current) / name
+                if path.suffix != ".py":
+                    continue
+                source = path.read_text(encoding="utf-8")
+                if not any(word in source for word in watched):
+                    continue
+                called = _called_names(path)
+                relative = path.relative_to(package).as_posix()
+                if "ToolContext" in called:
+                    contexts.add(relative)
+                if called & _WRITE_TOOLSET_BUILDERS:
+                    writers.add(relative)
+                    if "host_route_write_root_refusal" not in called:
+                        unguarded.add(relative)
+
+    # A new site has to say how the guard covers it before it is listed.
+    assert contexts == set(_CONTEXT_MODULES)
+    assert writers == _WRITE_TOOLSET_MODULES
+    # A module that builds a write-capable ToolSet asks the guard itself.
+    assert unguarded == set()
