@@ -16,10 +16,12 @@ not redirected, a redirect for another origin, a dialect that does not see
 the worker launches, that answers under a fixed model id or does not read the
 model on the wire. They show that a route which opts into the cost upper
 bound is called as its routing file asks, and what happens when it is not;
-that a guarded result of such a route is not called rankable and its cell
-says so, with or without a cache-read count in the reply; that the cost
-interval of such a route is held to what the provider billed, and that
-accounting which loses a response is a deviation of the cell; why the strict
+that a guarded result of such a route is held to the marks of a diagnostic
+result and never called rankable, with or without a cache-read count in the
+reply, and that a mark which is missing is a deviation; that the cost
+interval of such a route is held to what the provider billed and to the
+shipped price of the route's model, and that accounting which loses a
+response or misprices one is a deviation of the cell; why the strict
 route rejects the plain reply, and that it answers once the reply carries a
 cache-read count; that the probe and the request launch run under the
 harness and leave the environment as it was; that a TLS trust path of the
@@ -44,9 +46,9 @@ import pytest
 
 from assay import Usage
 from crucible.backends import kimi as adapter
-from crucible.backends.cost_bounds import DIAGNOSTIC_COST_POLICY
+from crucible.backends.cost_bounds import DIAGNOSTIC_COST_POLICY, valid_diagnostic_cost_bounds
 
-from . import cells, declarations, envelopes, ledger, netguard, runner
+from . import cells, contract, declarations, envelopes, ledger, netguard, runner
 from . import columns as matrix_columns
 from .cells import Cell
 from .columns import KIMI_KIND
@@ -57,7 +59,7 @@ from .drivers import openai_compat as chat
 from .drivers.base import GUARD_POLICY
 from .peers import launch, worker_harness
 from .provider import LoopbackProvider, Reply, SeenRequest, SentCall
-from .scenarios import SCENARIOS, history_replayed
+from .scenarios import D_COST_BOUND_UNRANKED, SCENARIOS, history_replayed
 from .script import READ_A, Call, ProviderScript, Say, ServedAs, Step
 
 # Every test here runs the locked worker: a missing environment is an error.
@@ -92,8 +94,11 @@ def _played(
 # A cell takes several seconds here: the worker imports the vendor's stack
 # without bytecode. The proofs below read one play of a cell.
 _PLAYED: dict[tuple[str, str, str], runner.Execution] = {}
-# The code of a result the limit guard let stand and does not call rankable.
+# The code of a result the limit guard let stand and does not call rankable,
+# on a route that does not opt into a cost upper bound.
 UNRANKED = "guard:not_rankable"
+# The code of an interval whose bounds are not the shipped price of its usage.
+MISPRICED = "usage.cost_bounds:amounts"
 
 
 @pytest.fixture()
@@ -129,6 +134,20 @@ def _verdict(execution: runner.Execution, known: ledger.Ledger = LEDGER) -> str:
             report=report.describe(),
         )
     return str(refused.value).splitlines()[0]
+
+
+def _rejudged(execution: runner.Execution, **changes: Any) -> frozenset[str]:
+    """The codes of a play with facts of its observation or its reference changed."""
+
+    reference = changes.pop("reference", execution.reference)
+    return contract.evaluate(
+        dataclasses.replace(execution.observation, **changes),
+        execution.plan.expect,
+        reference,
+        lens=execution.cell.lens,
+        toolset=SCENARIOS[execution.cell.scenario].toolset is not None,
+        checks=execution.plan.checks,
+    ).codes
 
 
 def _matched(execution: runner.Execution) -> list[SeenRequest]:
@@ -424,9 +443,22 @@ def test_a_route_with_the_cost_bound_gets_its_budget_and_its_policy(
             assert declarations.route_extra(column, name, extra) is opted, (column.id, name)
         budget = matrix_columns.ROUTE_BUDGET_USD if opted else None
         assert declarations.route_budget(column, role) == budget
+        # The file that opts in names the cost policy a caller has to pass,
+        # on both products, and it is the one policy the product knows.
+        for product, _path in column.routing:
+            named = declarations.cost_policy(column, role, product)
+            assert named == (DIAGNOSTIC_COST_POLICY if opted else None), (column.id, product)
 
     raw, guarded = played("S01"), played("S01", "guarded")
     assert raw.route_budget == guarded.route_budget == matrix_columns.ROUTE_BUDGET_USD
+    # What the contract is handed of such a route, none of it from the
+    # adapter: the opt-in, the policy the file names and the shipped price
+    # row of the route's model, which is not the rate card of the matrix.
+    for execution in (raw, guarded):
+        reference = execution.reference
+        assert reference.cost_bounded and reference.cost_policy == DIAGNOSTIC_COST_POLICY
+        assert reference.bound_pricing == matrix_columns.shipped_price(reference.model)
+        assert reference.bound_pricing not in (None, reference.pricing)
     # The guard was bound with the policy the routing file names and kept its
     # authority: one physical attempt, a settled bound, a second call answered.
     terminal = guarded.observation.limit_terminal
@@ -441,9 +473,9 @@ def test_a_route_with_the_cost_bound_gets_its_budget_and_its_policy(
         assert bounds is not None and bounds.coverage_complete
         assert result.usage.cost_usd == bounds.lower_bound_usd < bounds.upper_bound_usd
         assert [segment.cache_read_tokens for segment in bounds.segments] == [None]
-    # The flags of the interval, and in the guarded lens what the guard says
-    # of a result under this policy (the tests below).
-    assert raw.report.codes == WIDE and guarded.report.codes == WIDE | {UNRANKED}
+    # The flags of the interval, in both lenses: what the guard says of a
+    # result under this policy is no deviation (the tests below).
+    assert raw.report.codes == guarded.report.codes == WIDE
 
     # Called without the budget the route asks for, the adapter refuses
     # before transport: no request, and a raise where a result is owed.
@@ -469,9 +501,10 @@ def test_a_route_with_the_cost_bound_gets_its_budget_and_its_policy(
     assert strict.route_budget is None
     assert strict.observation.limit_terminal is not None
     assert strict.observation.limit_terminal.resolution.diagnostic_cost_policy is None
+    assert not strict.reference.cost_bounded and strict.reference.cost_policy is None
 
 
-# -- under the cost policy the guard never calls a result rankable -----------------
+# -- under the cost policy a guarded result is diagnostic, never rankable ----------
 
 
 class _WithCacheReadCount(driver.MoonshotChatDialect):
@@ -510,11 +543,12 @@ class _CountedWithoutDone(_WithCacheReadCount):
 
 
 @pytest.mark.parametrize("scenario", ["S01", "S03", "S04"])
-def test_a_guarded_result_under_the_cost_policy_is_not_rankable_and_the_cell_says_so(
+def test_a_guarded_result_under_the_cost_policy_is_held_to_the_marks_of_a_diagnostic_result(
     scenario: str, played: Callable[..., runner.Execution]
 ) -> None:
     guarded = played(scenario, "guarded")
     result, terminal = guarded.observation.result, guarded.observation.limit_terminal
+    reference = guarded.reference
     assert result is not None and terminal is not None
 
     # The guard let the result stand: no error, the provider's own stop, no
@@ -522,23 +556,65 @@ def test_a_guarded_result_under_the_cost_policy_is_not_rankable_and_the_cell_say
     # result; under the cost policy of the route the guard never says so.
     assert result.error is None and result.stop_reason == "end_turn"
     assert terminal.overshoots == () and not terminal.rankable
-    assert terminal.resolution.diagnostic_cost_policy == DIAGNOSTIC_COST_POLICY
-    # The guarded contract of the scenario says "rankable": clause C5 reads
-    # it from the terminal and reports the one code, beside the two flags.
-    c5 = guarded.report.outcomes["C5"]
-    assert c5.status == "deviation" and [item.code for item in c5.deviations] == [UNRANKED]
-    assert guarded.report.codes == WIDE | {UNRANKED}
-    entry = LEDGER.entry(guarded.cell.id)
-    assert entry is not None and dict(entry.codes) == {UNRANKED: "M08"}
-    # What the guard does say of such a result, and what stays true of the
-    # backend: the terminal of the cost policy, one physical attempt, the
-    # authority kept, a second call answered from one request.
-    assert terminal.terminal_reason == "diagnostic_cost_upper_bound"
+    # The routing file opts into the cost upper bound, so the ledger lists
+    # the cell under the declared difference of such routes, and clause C5
+    # does not ask "rankable" there: it holds the result to the marks of a
+    # diagnostic one and names nothing. The cell has no entry of its own;
+    # what is left are the two flags of M06.
+    assert reference.cost_bounded and reference.cost_policy == DIAGNOSTIC_COST_POLICY
+    assert guarded.differences == LEDGER.differences_for(guarded.cell.id)
+    assert guarded.differences == (D_COST_BOUND_UNRANKED,)
+    assert guarded.report.outcomes["C5"].status == "ok"
+    assert guarded.report.codes == WIDE and LEDGER.entry(guarded.cell.id) is None
+    # The marks, each as the terminal has it: the terminal of the cost
+    # policy under the policy the routing file names, one physical attempt,
+    # the authority kept, and a second call answered from one request.
+    assert terminal.terminal_reason == contract.COST_BOUND_REASON
+    assert terminal.resolution.diagnostic_cost_policy == reference.cost_policy
     assert terminal.physical_attempts == 1 and terminal.diagnostic_cost_authority
     assert guarded.observation.second_call == SecondCall(requests=1)
 
+    # Each mark is asserted, not waived: with one fact of the terminal
+    # changed, C5 names the mark that is missing. (A terminal that calls the
+    # result rankable cannot be built under the policy: the type refuses it.
+    # The self-test holds a rankable terminal against such a route.)
+    def marks(**changed: Any) -> frozenset[str]:
+        changed_terminal = dataclasses.replace(terminal, **changed)
+        return _rejudged(guarded, limit_terminal=changed_terminal) - WIDE
 
-def test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_unrankable(
+    late = terminal.resolution.deadline_seconds + 1.0
+    assert marks() == frozenset()
+    assert marks(elapsed_seconds=late) == {contract.COST_BOUND_AUTHORITY}
+    assert marks(physical_attempts=2) == {
+        contract.COST_BOUND_ATTEMPTS,
+        contract.COST_BOUND_AUTHORITY,
+    }
+    assert marks(terminal_reason="end_turn") == {
+        contract.COST_BOUND_TERMINAL,
+        contract.COST_BOUND_AUTHORITY,
+    }
+    # The policy is the one the routing file names, not whichever is bound.
+    renamed = dataclasses.replace(reference, cost_policy="another-cost-policy")
+    assert _rejudged(guarded, reference=renamed) - WIDE == {contract.COST_BOUND_TERMINAL}
+    # As a test item a result that lost a mark fails: no entry describes it.
+    lost = dataclasses.replace(terminal, elapsed_seconds=late)
+    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation"):
+        ledger.compare(
+            LEDGER,
+            guarded.cell.id,
+            _rejudged(guarded, limit_terminal=lost),
+            current=guarded.current,
+            evaluated=guarded.report.evaluated(),
+            unasked=guarded.report.unasked,
+        )
+    # The selector is the routing file's opt-in and nothing else: held as a
+    # route without it, the same result owes "rankable", as on every other
+    # column, and the interval is not asked for.
+    plain = dataclasses.replace(reference, cost_bounded=False, cost_policy=None)
+    assert _rejudged(guarded, reference=plain) == WIDE | {UNRANKED}
+
+
+def test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_diagnostic(
     tmp_path: Path, played: Callable[..., runner.Execution]
 ) -> None:
     # The reply of a request that hit the cache carries the count: the
@@ -549,35 +625,48 @@ def test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_unrankable(
     assert execution.report.seam_problems == ()
     assert result.completeness.complete
 
-    # The guard under the cost policy still does not call the result
-    # rankable, and the cell still says so: a resolution of M06 that leaves
-    # the policy bound turns no guarded cell green.
-    assert not terminal.rankable
-    assert terminal.terminal_reason == "diagnostic_cost_upper_bound"
-    assert UNRANKED in execution.report.codes
+    # The route still opts into the cost upper bound, so its guard still
+    # runs under the cost policy and still does not call the result
+    # rankable: a resolution of M06 that leaves the opt-in set leaves every
+    # result of the route diagnostic. Clause C5 holds the result to the
+    # marks of a diagnostic one, as the declared difference of such routes
+    # says, and names nothing. So no code of a cell shows this state; this
+    # proof does, and the verifier requires it by name.
+    assert execution.reference.cost_bounded
+    assert execution.differences == (D_COST_BOUND_UNRANKED,)
+    assert not terminal.rankable and terminal.diagnostic_cost_authority
+    assert terminal.terminal_reason == contract.COST_BOUND_REASON
+    assert terminal.resolution.diagnostic_cost_policy == DIAGNOSTIC_COST_POLICY
+    assert execution.report.outcomes["C5"].status == "ok"
     # The interval is exact now, and it is priced with the rates of the
-    # route's cost policy, not with the rate card of the matrix: the cost is
-    # above what the rate card prices the billed usage at.
-    bounds = result.usage.cost_bounds
-    assert bounds is not None and bounds.covers(result.usage)
+    # route's cost policy, which are the shipped price row of its model, not
+    # with the rate card of the matrix: the cost is above what the rate card
+    # prices the billed usage at.
+    bounds, row = result.usage.cost_bounds, execution.reference.bound_pricing
+    assert bounds is not None and bounds.covers(result.usage) and row is not None
     assert result.usage.cost_usd == bounds.lower_bound_usd == bounds.upper_bound_usd
+    for segment in bounds.segments:
+        assert segment.cache_read_tokens == 0
+        assert (segment.lower_bound_usd, segment.upper_bound_usd) == pytest.approx(
+            contract.bound_amounts(row, segment), rel=1e-12
+        )
     billed = execution.observation.provider.billed_total()
     assert result.usage.cost_usd > execution.reference.pricing.compute_cost(
         input_tokens=billed.input_tokens, output_tokens=billed.output_tokens
     )
-    assert execution.report.codes == {UNRANKED, "usage.cost_usd:gt"}
+    assert execution.report.codes == {"usage.cost_usd:gt"}
     # As a test item the cell fails either way: with the ledger as it is the
-    # flags of M06 are gone, and without M06 the rest is not what M08 lists.
+    # flags of M06 are gone, and without M06 no entry describes the price.
     assert "gap fixed: column-wide code" in _verdict(execution) and "(M06)" in _verdict(execution)
     without_m06 = dataclasses.replace(
         LEDGER, column_wide=tuple(scope for scope in LEDGER.column_wide if scope.gap != "M06")
     )
     assert _verdict(execution, without_m06).endswith(
-        "different deviation: missing [], unexpected ['usage.cost_usd:gt']"
+        "unexpected deviation ['usage.cost_usd:gt']"
     )
     # The honest play of the cell has neither that code nor complete flags.
     honest = played("S01", "guarded")
-    assert honest.report.codes == WIDE | {UNRANKED}
+    assert honest.report.codes == WIDE
 
 
 # -- the cost interval is held to what the provider billed ---------------------------
@@ -612,6 +701,17 @@ def test_the_cost_interval_of_a_tool_loop_covers_every_response_the_provider_bil
     ] == [(item.input_tokens, item.output_tokens, None) for item in billed]
     assert usage.cost_usd == bounds.lower_bound_usd < bounds.upper_bound_usd
     assert usage.budget_cost_usd == bounds.upper_bound_usd
+    # Each segment is priced as the matrix states the bound formula, at the
+    # shipped price row of the route's model, and the product's public replay
+    # of the formula accepts the same interval: the rule of the cells and
+    # the replay of the limit guard cannot drift apart unseen.
+    row = execution.reference.bound_pricing
+    assert row is not None
+    for segment in bounds.segments:
+        assert (segment.lower_bound_usd, segment.upper_bound_usd) == pytest.approx(
+            contract.bound_amounts(row, segment), rel=1e-12
+        )
+    assert valid_diagnostic_cost_bounds(usage)
     # The cell holds all of it: the route opts into the cost bound, so clause
     # C6 asks for the interval, and names nothing but the two flags of M06.
     assert execution.reference.cost_bounded
@@ -692,6 +792,155 @@ def test_accounting_that_loses_a_response_is_a_deviation_of_the_cell(
     }
     verdict = _verdict(execution)
     assert "unexpected" in verdict and named in verdict
+
+
+# -- what a segment of the interval costs ------------------------------------------------
+
+
+def _repriced(result: Any, *, cost: Callable[[Any], float] | None = None, **changed: Any) -> Any:
+    """``result`` with fields of every segment of its interval recomputed."""
+
+    bounds = result.usage.cost_bounds
+    assert bounds is not None
+    repriced = type(bounds)(
+        tuple(
+            dataclasses.replace(
+                item, **{name: value(item) for name, value in changed.items()}
+            )
+            for item in bounds.segments
+        ),
+        bounds.coverage_complete,
+    )
+    usage = dataclasses.replace(result.usage, cost_bounds=repriced)
+    if cost is not None:
+        usage = dataclasses.replace(usage, cost_usd=cost(repriced))
+    return dataclasses.replace(result, usage=usage)
+
+
+# Three ways to state amounts the provider's bill does not give. Every lower
+# bound and the reported cost at nothing; every upper bound, which is what a
+# budget is charged, lowered to the lower one; and the missing count of cache
+# reads read as zero, so that every segment is exact at the price without a
+# read and that is the reported cost. Each leaves the accounting flags as the
+# adapter set them (cleared), the tokens and the segments as billed and the
+# reported cost the lower bound of the interval.
+_MISPRICED: Mapping[str, Callable[[Any], Any]] = {
+    "priced-at-nothing": lambda result: _repriced(
+        result, cost=lambda _bounds: 0.0, lower_bound_usd=lambda _item: 0.0
+    ),
+    "upper-bound-at-the-lower": lambda result: _repriced(
+        result, upper_bound_usd=lambda item: item.lower_bound_usd
+    ),
+    "missing-count-read-as-zero": lambda result: _repriced(
+        result,
+        cost=lambda bounds: bounds.lower_bound_usd,
+        cache_read_tokens=lambda _item: 0,
+        lower_bound_usd=lambda item: item.upper_bound_usd,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("fault", "named"),
+    [
+        ("priced-at-nothing", MISPRICED),
+        ("upper-bound-at-the-lower", MISPRICED),
+        ("missing-count-read-as-zero", "usage.cost_usd:gt"),
+    ],
+)
+def test_an_interval_that_states_other_amounts_is_a_deviation_of_the_cell(
+    fault: str,
+    named: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    played: Callable[..., runner.Execution],
+) -> None:
+    honest = played("S03")
+    built = adapter.KimiBackend._result_from_outcome
+
+    # One fault in the parent adapter, in this process: the worker and its
+    # requests are untouched.
+    def faulty(self: Any, invocation: Any, policy: Any, outcome: Any, **more: Any) -> Any:
+        return _MISPRICED[fault](built(self, invocation, policy, outcome, **more))
+
+    monkeypatch.setattr(adapter.KimiBackend, "_result_from_outcome", faulty)
+    execution = _played("S03", tmp_path)
+
+    result = execution.observation.result
+    assert result is not None and result.error is None
+    assert execution.report.seam_problems == ()
+    usage, bounds = result.usage, result.usage.cost_bounds
+    billed = execution.observation.provider.billed
+    # Everything the clause held before it held the amounts is in order: the
+    # flags are cleared as on every result of the route, the tokens are the
+    # billed ones, the interval covers the usage and has the billed segments.
+    assert not result.completeness.token_usage_complete
+    assert not result.completeness.cost_complete
+    assert bounds is not None and bounds.covers(usage)
+    assert [(item.input_tokens, item.output_tokens) for item in bounds.segments] == [
+        (item.input_tokens, item.output_tokens) for item in billed
+    ]
+    # The raw cell names it, in clause C6, beside the two flags of M06: as a
+    # test item it is no expected failure any more.
+    assert execution.report.codes == honest.report.codes | {named} == WIDE | {named}
+    assert named in {item.code for item in execution.report.outcomes["C6"].deviations}
+    assert _verdict(execution).endswith(f"unexpected deviation ['{named}']")
+    if named == MISPRICED:
+        # The limit guard's replay of the formula refuses the same interval.
+        assert not valid_diagnostic_cost_bounds(usage)
+        return
+    # A count the provider never sent is part of the usage the segment
+    # records, and the rule on the bounds prices that record: it names
+    # nothing, and the product's replay accepts the interval. What shows a
+    # missing count read as zero is the rate card of the matrix, which the
+    # reported cost is held to on every column: the cost is above it, with
+    # the flags left cleared.
+    assert valid_diagnostic_cost_bounds(usage)
+    assert [item.cache_read_tokens for item in bounds.segments] == [0] * len(billed)
+    assert usage.cost_usd == bounds.upper_bound_usd > execution.reference.pricing.compute_cost(
+        input_tokens=usage.input_tokens, output_tokens=usage.output_tokens
+    )
+
+
+def test_the_bounds_of_an_honest_interval_are_the_shipped_price_of_what_was_billed(
+    played: Callable[..., runner.Execution],
+) -> None:
+    execution = played("S03")
+    result = execution.observation.result
+    assert result is not None and result.error is None
+    usage, bounds = result.usage, result.usage.cost_bounds
+    assert bounds is not None
+
+    # The rates the bounds are held to are the price row the product ships
+    # for the model of the route: read where the matrix reads prices, handed
+    # to the contract by the runner, typed nowhere in the matrix.
+    reference = execution.reference
+    row = reference.bound_pricing
+    assert row is not None and row == matrix_columns.shipped_price(reference.model)
+    assert reference.model == declarations.routed_model(
+        PRIMARY, matrix_columns.ROLE_BY_CAPABILITY["read_only"]
+    )
+    # The interval of the honest play is what the matrix's statement of the
+    # formula gives at that row, segment by segment, and the product's
+    # public replay of the formula accepts it.
+    for segment in bounds.segments:
+        assert segment.cache_read_tokens is None and segment.cache_creation_tokens == 0
+        assert (segment.lower_bound_usd, segment.upper_bound_usd) == pytest.approx(
+            contract.bound_amounts(row, segment), rel=1e-12
+        )
+    assert valid_diagnostic_cost_bounds(usage)
+    assert MISPRICED not in execution.report.codes
+    # And as numbers. The provider billed three responses of 120 input and
+    # 30 output tokens: with no count of cache reads the interval runs from
+    # 972 to 1620 millionths of a dollar. The rule above reads the shipped
+    # row, so a change that the adapter's constants and that row make
+    # together moves no cell; it moves these two numbers.
+    billed = execution.observation.provider.billed
+    assert [(item.input_tokens, item.output_tokens) for item in billed] == [(120, 30)] * 3
+    assert bounds.lower_bound_usd == pytest.approx(972e-6, rel=1e-12)
+    assert bounds.upper_bound_usd == pytest.approx(1620e-6, rel=1e-12)
+    assert usage.cost_usd == bounds.lower_bound_usd
+    assert usage.budget_cost_usd == bounds.upper_bound_usd
 
 
 # -- the strict route: why its plain call is rejected, and when it is not ------------
@@ -776,9 +1025,23 @@ def test_the_verifier_requires_the_two_proofs_of_the_strict_route_by_name() -> N
     # No clause states why the strict route rejects a reply, so no cell's
     # verdict shows when the cause changes: a run without these two proofs is
     # not a complete run.
-    assert set(cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[KIMI_KIND]]) == {
+    required = set(cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[KIMI_KIND]])
+    assert {
         test_the_strict_route_rejects_the_plain_reply_for_its_missing_cache_read_count.__name__,
         test_the_strict_route_answers_once_the_reply_carries_a_cache_read_count.__name__,
+    } <= required
+    # Nor does a cell show what the declared difference of the cost-bounded
+    # routes rests on: that such a route is called as its routing file asks
+    # and refuses to run otherwise, and that its guarded result stays
+    # diagnostic once the accounting is complete. And the rule on the bounds
+    # of a segment reads the shipped price row, so only the proof with the
+    # amounts as numbers shows a change of that row and the adapter together.
+    assert required == {
+        test_the_strict_route_rejects_the_plain_reply_for_its_missing_cache_read_count.__name__,
+        test_the_strict_route_answers_once_the_reply_carries_a_cache_read_count.__name__,
+        test_a_route_with_the_cost_bound_gets_its_budget_and_its_policy.__name__,
+        test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_diagnostic.__name__,
+        test_the_bounds_of_an_honest_interval_are_the_shipped_price_of_what_was_billed.__name__,
     }
 
 
@@ -1133,17 +1396,13 @@ def test_a_replay_without_the_reasoning_is_a_deviation_of_the_cell(
     assert not any(item["reasoning"] for item in second.evidence["messages"])
     # Nothing else of the cell changed, so the codes are those of the honest
     # play and the one of the replay rule, which names the request. As a test
-    # item the cell fails: the ledger does not describe it (the raw cell has
-    # no entry of its own; the guarded one has the entry of M08).
+    # item the cell fails: the ledger does not describe it (neither cell has
+    # an entry of its own).
     assert report.codes == honest.report.codes | {"request.content:replay"}
     (problem, *_later) = execution.observation.provider.replay_problems
     assert problem.startswith("request 2 carries") and "without their reasoning" in problem
-    assert _verdict(execution).endswith(
-        "unexpected deviation ['request.content:replay']"
-        if LEDGER.entry(execution.cell.id) is None
-        else "different deviation: missing [], unexpected ['request.content:replay']"
-    )
-    assert (LEDGER.entry(execution.cell.id) is None) == (lens == "raw")
+    assert _verdict(execution).endswith("unexpected deviation ['request.content:replay']")
+    assert LEDGER.entry(execution.cell.id) is None
 
 
 def _request(shapes: Sequence[tuple[str, Any, bool]], *, matched: bool = True) -> SeenRequest:

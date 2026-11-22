@@ -196,6 +196,13 @@ def execute(
     column = cell.column
     played_by = driver if driver is not None else drivers.get(column.kind)
     if scenario.admission:
+        if differences:
+            # An admission cell calls nothing and asserts no result, so no
+            # alternative of a declared difference can be asserted on it.
+            raise drivers.MatrixSetupError(
+                f"cell {cell.id}: the declared differences {list(differences)} are "
+                "listed for an admission cell, which applies none"
+            )
         return _execute_admission(cell, tmp_path, played_by, expected=admission)
     routed = declarations.routed(column)
     # The route the cell runs through is the one of its capability's role.
@@ -213,6 +220,19 @@ def execute(
     # routing file). The cell is then called as the route asks, unless the
     # scenario is about a budget of its own.
     route_budget = declarations.route_budget(column, role)
+    # Whether the results of that route are cost intervals: the same closed
+    # extra. Such a route names the cost policy of its limit guard in its
+    # routing file, and the product ships the price row of its model, which
+    # is the rate table of that policy; the contract holds a result to both.
+    cost_bounded = declarations.cost_bounded(column, role)
+    cost_policy = declarations.cost_policy(column, role)
+    bound_pricing = matrix_columns.shipped_price(routed_model)
+    if cost_bounded and column.routing and bound_pricing is None:
+        raise drivers.MatrixSetupError(
+            f"cell {cell.id}: the route opts into a cost upper bound and the "
+            f"product ships no price row for its model {routed_model!r}: the "
+            "bounds of its cost interval would be held to nothing"
+        )
     invocation = Invocation(
         system=SYSTEM,
         user=USER,
@@ -335,9 +355,9 @@ def execute(
         ),
         bindings=toolsets.BINDINGS,
         write_slot=WRITE,
-        # Whether the results of that route are cost intervals: a closed
-        # extra of its routing file, as the route budget above.
-        cost_bounded=declarations.cost_bounded(column, role),
+        cost_bounded=cost_bounded,
+        cost_policy=cost_policy,
+        bound_pricing=bound_pricing,
     )
     report = contract.evaluate(
         observation,

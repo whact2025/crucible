@@ -124,7 +124,11 @@ the three the canary reads. Nothing was observed of the real tool, so every
 frame of the peer is `constructed` and its session accounting is an emulation.
 What the peer does not emulate ends the cell as a setup error, never as an
 observation. A known gap on a reference column needs the owner's ruling in its
-ledger entry.
+ledger entry. A ruling that keeps a gap is always written in the entries of
+the gap: on a registry record a ruling is the licence to withdraw a cell of
+that record, and static cell `H03` refuses one that withdraws none. A ruling
+may be a decision panel's under the owner's standing instruction; its text
+says so.
 
 The Codex app-server route is driven the same way: `extra.cli_path` points at
 [a scripted peer](backend_matrix/peers/codex_app_server.py), which the pinned
@@ -186,10 +190,23 @@ count of cache reads, so the flags alone would leave its numbers unasserted.
 Where a scenario owes complete accounting, clause C6 therefore holds the
 interval itself: it is there, it covers the reported usage, its lower bound
 is the reported cost, it has one segment for every response the provider
-billed, and the reported tokens are the billed ones. In the guarded lens
-clause C5 reads from the limit guard's terminal whether a result the guard
-let stand is rankable, and reports `guard:not_rankable` where it is not;
-under the cost policy it never is.
+billed, and the reported tokens are the billed ones. It also holds the two
+bounds of every segment to what the price row the product ships for the
+route's model gives for the usage the segment records
+(`usage.cost_bounds:amounts`): that row is the rate table of the route's
+cost policy. The reported cost is held to the matrix rate card, as on every
+column. In the guarded lens clause C5 reads from the limit guard's terminal
+whether a result the guard let stand is rankable, and reports
+`guard:not_rankable` where it is not. Under a cost policy the guard never
+calls a result rankable, so on a route whose routing file opts into the cost
+upper bound C5 asks something else, by declared difference
+`D-COST-BOUND-UNRANKED`: the marks of a diagnostic result (the terminal of
+the cost policy the file names, one physical attempt, the cost authority
+kept, not rankable), each with a code of its own when it is missing. The
+ledger lists the cells of such routes and `H03` holds the list to exactly
+them. The accounting flags stay owed there, so the Kimi result cells are
+expected failures for as long as the provider's reply carries no count of
+cache reads.
 
 The Codex official-SDK route runs its locked worker too, and it has no
 provider origin to redirect: the SDK in the worker starts the vendor's
@@ -247,7 +264,10 @@ from: `recorded` from the provider, `documented` by the vendor or a live
 observation, or `constructed` to satisfy the SDK's types. The weakest envelope
 a cell used is its grade. A difference that no feature field expresses is a
 declared difference of the ledger, with a product citation and the alternative
-contract that is asserted instead; it replaces no contract clause.
+contract that is asserted instead. One of them restates a line of a clause
+(what C5 asks of a route under a cost policy, above), and there the clause
+asserts the alternative itself; no other one touches a clause, and none may
+touch the accounting clause C6.
 
 ```bash
 uv sync --frozen --reinstall --link-mode copy --project backends/deepseek_worker

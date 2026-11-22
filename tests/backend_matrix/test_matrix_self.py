@@ -47,6 +47,7 @@ from assay import (
 )
 
 from crucible.backends.config import BackendRouting, RoleConfig, load_routing
+from crucible.backends.pricing import ModelPricing
 
 from . import cells, contract, declarations, ledger, netguard, runner
 from . import columns as matrix_columns
@@ -76,8 +77,10 @@ from .provider import (
 from .scenarios import (
     BUDGET_USD,
     D_CDX_SERVED,
+    D_COST_BOUND_UNRANKED,
     D_OAI_SCHEMA_FINAL,
     D_STRUCT_UNQUALIFIED,
+    GUARDED,
     PACK_A,
     SCENARIOS,
     SCHEMA_ANSWER,
@@ -618,23 +621,43 @@ def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
     billed = execution.observation.provider.billed
     rate = execution.reference.pricing
     assert len(billed) == 3 and not execution.reference.cost_bounded
-    bounded = dataclasses.replace(execution.reference, cost_bounded=True)
+    assert execution.reference.bound_pricing is None
+    # A toy column has no shipped price row, so the reference of this test
+    # carries rates of its own for the bounds: those of the rate card, and a
+    # cache read at a tenth of the input rate, as a route with such a policy
+    # has it.
+    reads_per_mtok = rate.input_per_mtok / 10
+    rates = ModelPricing(
+        input_per_mtok=rate.input_per_mtok,
+        output_per_mtok=rate.output_per_mtok,
+        cache_write_per_mtok=rate.input_per_mtok,
+        cache_read_per_mtok=reads_per_mtok,
+    )
+    bounded = dataclasses.replace(execution.reference, cost_bounded=True, bound_pricing=rates)
     # What a result of such a route flags for a reply without a count of
     # cache reads: token usage and cost incomplete, on purpose.
     untold = {"flag:token_usage_complete=False", "flag:cost_complete=False"}
     unaccounted = dataclasses.replace(flags, token_usage_complete=False, cost_complete=False)
+    mispriced = "usage.cost_bounds:amounts"
+
+    def price(tokens: Any, read: int) -> float:
+        # The bound formula, written out here and not taken from the contract.
+        unread = tokens.input_tokens - read
+        return (
+            unread * rate.input_per_mtok
+            + read * reads_per_mtok
+            + tokens.output_tokens * rate.output_per_mtok
+        ) / 1_000_000
 
     def segment(tokens: Any, *, read: int | None = None) -> UsageCostBoundSegment:
-        upper = rate.compute_cost(
-            input_tokens=tokens.input_tokens, output_tokens=tokens.output_tokens
-        )
+        # Unknown count: every input token may have been read, or none.
         return UsageCostBoundSegment(
             input_tokens=tokens.input_tokens,
             output_tokens=tokens.output_tokens,
             cache_creation_tokens=0,
             cache_read_tokens=read,
-            lower_bound_usd=upper / 2 if read is None else upper,
-            upper_bound_usd=upper,
+            lower_bound_usd=price(tokens, tokens.input_tokens if read is None else read),
+            upper_bound_usd=price(tokens, 0 if read is None else read),
             policy="a-cost-policy",
         )
 
@@ -658,8 +681,50 @@ def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
 
     whole = interval(*(segment(item) for item in billed))
     # The interval of an honest result: one segment per billed response with
-    # its tokens, the reported cost its lower bound. Only the flags are named.
+    # its tokens, each priced by the formula at the rates of the reference,
+    # the reported cost its lower bound. Only the flags are named.
     assert judged(whole) == untold
+    assert whole.lower_bound_usd < whole.upper_bound_usd
+    for item in whole.segments:
+        assert (item.lower_bound_usd, item.upper_bound_usd) == pytest.approx(
+            contract.bound_amounts(rates, item), rel=1e-12
+        )
+    # What a segment costs is held. Every lower bound and the reported cost
+    # at nothing; every upper bound, which is what a budget is charged,
+    # lowered to the lower one; one bound of one segment a little off; a
+    # segment whose count is known and whose bounds are those of an unknown
+    # one. Each leaves coverage, tokens and segments in order.
+    free = interval(
+        *(dataclasses.replace(item, lower_bound_usd=0.0) for item in whole.segments)
+    )
+    narrow = interval(
+        *(
+            dataclasses.replace(item, upper_bound_usd=item.lower_bound_usd)
+            for item in whole.segments
+        )
+    )
+    first, *others = whole.segments
+
+    def nudged(factor: float) -> UsageCostBounds:
+        moved_bound = dataclasses.replace(first, upper_bound_usd=first.upper_bound_usd * factor)
+        return interval(moved_bound, *others)
+
+    counted = interval(dataclasses.replace(first, cache_read_tokens=0), *others)
+    for wrong in (free, narrow, nudged(1 + 1e-6), counted):
+        assert judged(wrong) == untold | {mispriced}
+    assert contract.clause_of(mispriced) == "C6"
+    # Within the tolerance of the product's own replay (a millionth of a
+    # millionth of a dollar, or of the amount) nothing is named.
+    assert judged(nudged(1 + 1e-10)) == untold
+    # The reference decides, not the interval: at another price row the same
+    # interval is mispriced (the rate card has no cheaper cache read, so its
+    # lower bound is its upper one).
+    at_rate_card = dataclasses.replace(bounded, bound_pricing=rate)
+    assert judged(whole, reference=at_rate_card) == untold | {mispriced}
+    # A cost-bounded reference without a price row cannot judge an interval:
+    # the runner refuses such a route before the cell is played.
+    with pytest.raises(AssertionError, match="carries no price row"):
+        judged(whole, reference=dataclasses.replace(bounded, bound_pricing=None))
     # Nothing is reported at all. Without the opt-in the cleared flags excuse
     # it as a lower bound; with it the tokens and the interval are owed.
     silent = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
@@ -845,6 +910,58 @@ def test_c5_and_optional_tool_events_report_on_their_own(tmp_path: Path) -> None
     failing = dataclasses.replace(guarded.plan.expect, kind="transport", retriable=False)
     assert _judge(guarded, limit_terminal=unranked, error=failed, expect=failing) == frozenset()
     assert _judge(guarded, limit_terminal=unranked, error=failed) == {"kind:transport!=none"}
+
+    # Where the route opts into a cost upper bound, C5 does not ask
+    # "rankable": the guard never calls a result of such a route rankable,
+    # and the result is held to the marks of a diagnostic one instead (a
+    # declared difference of the ledger). The selector is the reference's,
+    # read from the routing file. The terminal of the plain limit policy,
+    # which the toy's is, has none of the marks: it calls the result
+    # rankable, it is no terminal of a cost policy and it holds no cost
+    # authority. (The toy returns no interval either, which is C6's code.)
+    bounded = dataclasses.replace(
+        guarded.reference, cost_bounded=True, cost_policy="a-cost-policy"
+    )
+    no_interval = {"usage.cost_bounds:none"}
+    assert _judge(guarded, reference=bounded) == no_interval | {
+        contract.COST_BOUND_RANKABLE,
+        contract.COST_BOUND_TERMINAL,
+        contract.COST_BOUND_AUTHORITY,
+    }
+    # One that is not rankable for another reason is no diagnostic result.
+    assert _judge(guarded, reference=bounded, limit_terminal=unranked) == no_interval | {
+        contract.COST_BOUND_TERMINAL,
+        contract.COST_BOUND_AUTHORITY,
+    }
+    # Nor is one that needed a second physical attempt.
+    retried = dataclasses.replace(unranked, physical_attempts=2)
+    assert _judge(guarded, reference=bounded, limit_terminal=retried) == no_interval | {
+        contract.COST_BOUND_TERMINAL,
+        contract.COST_BOUND_ATTEMPTS,
+        contract.COST_BOUND_AUTHORITY,
+    }
+    assert contract.COST_BOUND_MARKS == {
+        contract.COST_BOUND_TERMINAL,
+        contract.COST_BOUND_ATTEMPTS,
+        contract.COST_BOUND_AUTHORITY,
+        contract.COST_BOUND_RANKABLE,
+    }
+    assert {contract.clause_of(code) for code in contract.COST_BOUND_MARKS} == {"C5"}
+    # What C5 asks of every route it asks there too: a second call answered.
+    assert "guard:revoked" in _judge(
+        guarded, reference=bounded, second_call=SecondCall(refused=True)
+    )
+    # An error result is asked for no mark, as it is asked for no "rankable".
+    assert _judge(
+        guarded, reference=bounded, limit_terminal=unranked, error=failed, expect=failing
+    ) == no_interval
+    # On a route without the opt-in nothing of this applies: "rankable" is
+    # read as before, whatever policy the reference might name.
+    named_only = dataclasses.replace(guarded.reference, cost_policy="a-cost-policy")
+    assert _judge(guarded, reference=named_only) == frozenset()
+    assert _judge(guarded, reference=named_only, limit_terminal=unranked) == {
+        "guard:not_rankable"
+    }
 
     raw = _honest(tmp_path / "raw", "S03")
     _result, trace = _result_and_trace(raw)
@@ -2141,6 +2258,53 @@ def test_h03_rejects_a_not_expressible_row_on_a_registry_cell_without_a_ruling()
     assert "static:not_expressible_pack_a" in _problem_codes(ruled, not_expressible=(row,))
 
 
+def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
+    # A ruling on a registry record is the licence to withdraw a cell of the
+    # record, whatever its text says. One that keeps the gap withdraws
+    # nothing and is refused: on a record with cells of its own, and on one
+    # that is column-wide only, where it would license nothing at all.
+    accepted = "the gap is accepted as it stands"
+    for gap in ("M07", "M08", "R04", "M06"):
+        kept = _document()
+        kept["registry"][gap]["ruling"] = accepted
+        assert _problem_codes(kept) == {"static:registry_ruling_unused"}, gap
+    # In the entries of the gap the same words license nothing: that is
+    # where the shipped ledger carries every ruling it has.
+    assert _problem_codes() == set()
+    assert not [record.id for record in LEDGER.registry.values() if record.ruling]
+    ruled: list[ledger.Entry | ledger.ColumnWide] = [*LEDGER.entries, *LEDGER.column_wide]
+    assert {gap for item in ruled if item.ruling for gap in _gaps_of(item)} == {
+        "M06",
+        "M07",
+        "R04",
+        "R05",
+    }
+    # With a cell of the record withdrawn the ruling is what H03 asks for.
+    # Either the cell is pinned not expressible ...
+    row = {"scenario": "S01", "kind": "kimi", "step": "Say", "reason": "r", "checklist": "c"}
+    withdrawing = _document()
+    withdrawing["registry"]["M07"]["ruling"] = "the two cells are withdrawn"
+    pinned = _problem_codes(withdrawing, not_expressible=(row,))
+    assert "static:registry_ruling_unused" not in pinned
+    # ... or it is no longer generated although its kind runs the set: with
+    # the entries of the two cells deleted, nothing is left to object to.
+    gone = {item["cell"] for item in withdrawing["registry"]["M07"]["cells"]}
+    withdrawing["known_gaps"] = [
+        item for item in withdrawing["known_gaps"] if item.get("cell") not in gone
+    ]
+    fewer = cells.world().generated - gone
+    assert _problem_codes(withdrawing, generated=fewer) == set()
+    # Without the ruling the same withdrawal is refused, cell by cell.
+    del withdrawing["registry"]["M07"]["ruling"]
+    assert _problem_codes(withdrawing, generated=fewer) == {
+        "static:registry_cell_not_generated"
+    }
+
+
+def _gaps_of(item: ledger.Entry | ledger.ColumnWide) -> set[str]:
+    return {item.gap} if isinstance(item, ledger.ColumnWide) else set(item.codes.values())
+
+
 def test_h03_keeps_one_form_of_a_multi_form_pack_a_scenario_on_open_weight_kinds() -> None:
     def rows(*forms: str) -> tuple[dict[str, str], ...]:
         return tuple(
@@ -2331,23 +2495,40 @@ def test_h03_declared_difference_rules() -> None:
     hosted = matrix_columns.HOSTED_GATEWAY_KIND
     in_force = f"{hosted}/S04/primary/raw"
 
-    # Those of today: one a declared value selects, two in force on listed cells.
-    assert set(shipped) == {D_STRUCT_UNQUALIFIED, D_OAI_SCHEMA_FINAL, D_CDX_SERVED}
+    # Those of today: one a declared value selects, three in force on listed
+    # cells.
+    assert set(shipped) == {
+        D_STRUCT_UNQUALIFIED,
+        D_OAI_SCHEMA_FINAL,
+        D_CDX_SERVED,
+        D_COST_BOUND_UNRANKED,
+    }
+    assert len(shipped) == LEDGER.max_declared_differences
     assert shipped[D_STRUCT_UNQUALIFIED].cells == ()
     assert LEDGER.differences_for(in_force) == (D_OAI_SCHEMA_FINAL,)
     assert LEDGER.differences_for(f"{hosted}/S03/primary/raw") == ()
     assert cells.world().difference_variants == {D_STRUCT_UNQUALIFIED}
-    # One is a scenario's own; the other belongs to a wire and so to every
+    # One is a scenario's own; one belongs to a wire and so to every
     # scenario that asserts a result: not the canary, and not the admission
-    # scenario, which calls nothing.
+    # scenario, which calls nothing. One belongs to the routes that opt into
+    # a cost upper bound and so to every such scenario that runs guarded.
+    results = {
+        name for name, item in SCENARIOS.items() if not item.canary and not item.admission
+    }
     assert cells.world().difference_alternatives == {
         D_OAI_SCHEMA_FINAL: {"S04"},
-        D_CDX_SERVED: {
-            name
-            for name, item in SCENARIOS.items()
-            if not item.canary and not item.admission
-        },
+        D_CDX_SERVED: results,
+        D_COST_BOUND_UNRANKED: {name for name in results if GUARDED in SCENARIOS[name].lenses},
     }
+    # An admission cell is played on a path of its own, which applies no
+    # declared difference, so its scenario defines no alternative and no
+    # list may name such a cell (below); the runner refuses one that does.
+    for name, item in SCENARIOS.items():
+        if item.canary or item.admission:
+            assert item.alternatives == {}, name
+    admission = next(cell for cell in TOY_CELLS if SCENARIOS[cell.scenario].admission)
+    with pytest.raises(MatrixSetupError, match="listed for an admission cell"):
+        runner.execute(admission, Path("unused"), differences=(D_CDX_SERVED,))
 
     # A scenario may assert an alternative only when the ledger declares it...
     for name in shipped:
@@ -2412,8 +2593,56 @@ def test_h03_declared_difference_rules() -> None:
     document = _document()
     _difference(document, D_CDX_SERVED)["cells"] = served[1:]
     assert _problem_codes(document, wire_differences={}) == set()
+    # No list may name an admission cell: nothing could assert it there.
+    assert scoped(D_CDX_SERVED, [*served, "kimi/S51/blocked/raw"]) == {
+        "static:difference_cell_invalid"
+    }
+    # One that a clause asserts itself, for the routes a closed extra of the
+    # routing file selects, is in force on exactly the cells of those routes:
+    # the clause decides by the routing file alone, so the list has to say
+    # where that is. Today those are the guarded result cells of the two
+    # routes that opt into the cost upper bound.
+    selected = cells.world().route_differences
+    unranked = list(shipped[D_COST_BOUND_UNRANKED].cells)
+    assert set(selected) == {D_COST_BOUND_UNRANKED}
+    assert set(unranked) == selected[D_COST_BOUND_UNRANKED] == cells.cost_bounded_guarded_cells()
+    assert len(unranked) == 6 and all(
+        ledger.parse_cell_id(cell)[2:] in (("primary", GUARDED), ("secondary", GUARDED))
+        and declarations.cost_bounded(
+            column,
+            matrix_columns.ROLE_BY_CAPABILITY[SCENARIOS[ledger.parse_cell_id(cell)[1]].capability],
+        )
+        for cell in unranked
+        for column in matrix_columns.real_columns()
+        if column.id == "/".join(ledger.parse_cell_id(cell)[::2])
+    )
+    for left_out in unranked:
+        assert scoped(D_COST_BOUND_UNRANKED, [cell for cell in unranked if cell != left_out]) == {
+            "static:difference_cell_missing"
+        }, left_out
+    # A guarded cell of a route without the opt-in, a raw cell of one with it.
+    for elsewhere in ("kimi/S01/blocked/guarded", f"{hosted}/S01/primary/guarded"):
+        assert scoped(D_COST_BOUND_UNRANKED, [*unranked, elsewhere]) == {
+            "static:difference_cell_invalid"
+        }, elsewhere
+    assert scoped(D_COST_BOUND_UNRANKED, [*unranked, "kimi/S01/primary/raw"]) == {
+        "static:difference_cell_invalid"
+    }
+    # A new guarded cell of such a route is owed in the list from the day it
+    # is generated: it would be held to the alternative without the ledger
+    # saying so.
+    wider = {D_COST_BOUND_UNRANKED: selected[D_COST_BOUND_UNRANKED] | {"kimi/S01/blocked/guarded"}}
+    assert _problem_codes(route_differences=wider) == {"static:difference_cell_missing"}
+    # A route that stops opting in leaves the difference in force on no cell.
+    assert _problem_codes(route_differences={D_COST_BOUND_UNRANKED: frozenset()}) == {
+        "static:difference_cell_invalid"
+    }
+    # Without the rule a shorter list is taken.
+    document = _document()
+    _difference(document, D_COST_BOUND_UNRANKED)["cells"] = unranked[1:]
+    assert _problem_codes(document, route_differences={}) == set()
     # A scenario's own difference stays where the ledger lists it.
-    assert D_OAI_SCHEMA_FINAL not in wire
+    assert D_OAI_SCHEMA_FINAL not in wire and D_OAI_SCHEMA_FINAL not in selected
     malformed = _document()
     _difference(malformed, D_OAI_SCHEMA_FINAL)["cells"] = ["S04"]
     with pytest.raises(MatrixSetupError, match="cell id"):
@@ -3026,6 +3255,17 @@ def test_a_route_budget_comes_from_the_routing_file_and_a_scenario_budget_wins(
             declarations.cost_bounded(column, role)
             for role in matrix_columns.ROLE_BY_CAPABILITY.values()
         } == {opted == {True}}, column.id
+        # A file that opts in names one cost policy for its callers, the same
+        # on every role, and the product ships a price row for its model.
+        named = {
+            declarations.cost_policy(column, role)
+            for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+        }
+        assert len(named) == 1 and (named != {None}) == (opted == {True}), column.id
+        if opted == {True}:
+            assert matrix_columns.shipped_price(
+                declarations.routed_model(column, text_role)
+            ) not in (None, matrix_columns.MATRIX_RATE), column.id
 
     # The runner passes it: a budget so small that the plain reply overruns
     # it ends the plain cell as a budget stop, which the scenario does not
@@ -3047,6 +3287,35 @@ def test_a_route_budget_comes_from_the_routing_file_and_a_scenario_budget_wins(
         interval_owed = runner.execute(plain, tmp_path / "bounded")
     assert interval_owed.reference.cost_bounded
     assert interval_owed.report.codes == {"usage.cost_bounds:none"}
+    # A column without a routing file names no policy and has no shipped row.
+    assert interval_owed.reference.cost_policy is None
+    assert interval_owed.reference.bound_pricing is None
+    assert matrix_columns.shipped_price(matrix_columns.TOY_MODEL) is None
+    # A routing file that opts in and does not say which policy its callers
+    # pass is an error, and so is a route that opts in for a model without a
+    # shipped price row: the cell would be held to nothing.
+    opted_in = next(
+        column
+        for column in matrix_columns.real_columns()
+        if declarations.cost_bounded(column, text_role)
+    )
+    shipped_file = opted_in.routing_path(matrix_columns.COLUMN_PRODUCT)
+    silent = tmp_path / shipped_file.name
+    silent.write_text(
+        shipped_file.read_text(encoding="utf-8").replace("--diagnostic-cost-policy", "--a-policy"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    unnamed = dataclasses.replace(
+        opted_in, routing=((matrix_columns.COLUMN_PRODUCT, silent),)
+    )
+    assert declarations.cost_bounded(unnamed, text_role)
+    with pytest.raises(MatrixSetupError, match="names no cost policy"):
+        declarations.cost_policy(unnamed, text_role)
+    with monkeypatch.context() as patched:
+        patched.setattr(matrix_columns, "shipped_price", lambda _model: None)
+        with pytest.raises(MatrixSetupError, match="ships no price row"):
+            runner.execute(Cell(opted_in, "S01", "raw"), tmp_path / "no-row")
 
 
 def test_inventory_is_exactly_what_this_module_collected(

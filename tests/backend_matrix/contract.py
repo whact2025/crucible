@@ -54,6 +54,19 @@ PRICING_CODES = frozenset({"pricing:none", "pricing:unreconciled"})
 # What C5 reports of a result the limit guard let stand and does not call
 # rankable.
 NOT_RANKABLE = "guard:not_rankable"
+# What the limit guard names the terminal of a result it let stand under a
+# cost policy (crucible/backends/limits.py).
+COST_BOUND_REASON = "diagnostic_cost_upper_bound"
+# What C5 reports instead where the route opts into a cost upper bound: the
+# guard never calls a result of such a route rankable, so the result is held
+# to the marks of a diagnostic one, and each mark that is missing has a code.
+COST_BOUND_TERMINAL = "guard:cost_bound_terminal"
+COST_BOUND_ATTEMPTS = "guard:cost_bound_attempts"
+COST_BOUND_AUTHORITY = "guard:cost_bound_authority"
+COST_BOUND_RANKABLE = "guard:cost_bound_rankable"
+COST_BOUND_MARKS = frozenset(
+    {COST_BOUND_TERMINAL, COST_BOUND_ATTEMPTS, COST_BOUND_AUTHORITY, COST_BOUND_RANKABLE}
+)
 
 # The closed deviation vocabulary: every code a cell may emit, with the clause
 # it is booked under ("S" is the scenario contract, "D" the declaration lock).
@@ -71,7 +84,7 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"guard:\w+", "C5"),
     (r"flag:(token_usage_complete|cost_complete)=(True|False)", "C6"),
     (r"usage\.(input_tokens|output_tokens|cost_usd):(lt|gt)", "C6"),
-    (r"usage\.cost_bounds:(none|uncovered|segments)", "C6"),
+    (r"usage\.cost_bounds:(none|uncovered|segments|amounts)", "C6"),
     (r"pricing:(none|unreconciled)", "C6"),
     (r"digest\.(missing|mismatch):\w+", "C7"),
     (r"request\.content:model", "C7"),
@@ -195,7 +208,17 @@ class Reference:
     write_slot: str
     # Whether that route opts into a cost upper bound in its routing file: a
     # result of such a route is a cost interval, and C6 holds the interval.
+    # The one selector of everything the contract asks of such a route.
     cost_bounded: bool = False
+    # The cost policy that routing file names for a caller of the route: what
+    # C5 holds the terminal of a guarded result to. ``None`` where the route
+    # does not opt in.
+    cost_policy: str | None = None
+    # The shipped price row of the route's model, which is the rate table of
+    # that policy: what C6 holds the two bounds of every segment of the
+    # interval to. Never the matrix rate card, which stays the reference of
+    # the reported cost on every route. ``None`` where no row is shipped.
+    bound_pricing: ModelPricing | None = None
 
 
 @dataclass(frozen=True)
@@ -467,7 +490,61 @@ def _c4(result: InvocationResult, exp: Expectation) -> list[Deviation]:
     return out
 
 
-def _c5(obs: Observation) -> list[Deviation]:
+def _diagnostic_marks(terminal: InvocationLimitTerminal, ref: Reference) -> list[Deviation]:
+    """What C5 holds a guarded result to where the route opts into a cost bound.
+
+    The limit guard never calls a result of such a route rankable, and the
+    route's results are diagnostic by the product's own rule, so C5 does not
+    ask "rankable" there. It asks for the marks of a diagnostic result
+    instead, each read from the terminal the guard left: the terminal of the
+    cost policy, under the policy the routing file names; exactly one
+    physical attempt; the cost authority kept; and a result that is not
+    called rankable. That the guard let the result stand and that a second
+    call is answered are asked on every route alike.
+    """
+
+    policy = terminal.resolution.diagnostic_cost_policy
+    seen = (
+        f"terminal reason {terminal.terminal_reason!r}, cost policy {policy!r}, "
+        f"{terminal.physical_attempts} physical attempt(s) recorded, cost authority "
+        f"{terminal.diagnostic_cost_authority}, rankable {terminal.rankable}"
+    )
+    out: list[Deviation] = []
+    if terminal.terminal_reason != COST_BOUND_REASON or policy != ref.cost_policy:
+        out.append(
+            Deviation(
+                COST_BOUND_TERMINAL,
+                "the route opts into a cost upper bound under policy "
+                f"{ref.cost_policy!r} and the limit guard did not leave the "
+                f"terminal of that policy ({seen})",
+            )
+        )
+    if terminal.physical_attempts != 1:
+        out.append(
+            Deviation(
+                COST_BOUND_ATTEMPTS,
+                f"a diagnostic result rests on exactly one physical attempt ({seen})",
+            )
+        )
+    if not terminal.diagnostic_cost_authority:
+        out.append(
+            Deviation(
+                COST_BOUND_AUTHORITY,
+                f"the terminal does not keep the cost authority of a settled bound ({seen})",
+            )
+        )
+    if terminal.rankable:
+        out.append(
+            Deviation(
+                COST_BOUND_RANKABLE,
+                "the limit guard calls a result rankable on a route whose results "
+                f"are cost intervals ({seen})",
+            )
+        )
+    return out
+
+
+def _c5(obs: Observation, ref: Reference) -> list[Deviation]:
     out: list[Deviation] = []
     terminal = obs.limit_terminal
     if _guard_rewrote(obs):
@@ -483,9 +560,14 @@ def _c5(obs: Observation) -> list[Deviation]:
     elif obs.result is not None and obs.result.error is None:
         # Read, never inferred from the absence of a rewrite: under a cost
         # policy the guard lets a result stand that it never calls rankable.
-        # An error result is not rankable by its kind, which C2 judges.
+        # An error result is not rankable by its kind, which C2 judges. Where
+        # the route opts into a cost upper bound the result is held to the
+        # marks of a diagnostic result instead (a declared difference of the
+        # ledger); the selector is the routing file's, never the terminal's.
         assert terminal is not None
-        if not terminal.rankable:
+        if ref.cost_bounded:
+            out.extend(_diagnostic_marks(terminal, ref))
+        elif not terminal.rankable:
             out.append(
                 Deviation(
                     NOT_RANKABLE,
@@ -587,11 +669,42 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
                 )
             )
     if ref.cost_bounded and "cost_complete" in exp.flags:
-        out.extend(_cost_interval(obs))
+        out.extend(_cost_interval(obs, ref))
     return out
 
 
-def _cost_interval(obs: Observation) -> list[Deviation]:
+def bound_amounts(pricing: ModelPricing, segment: Any) -> tuple[float, float]:
+    """The lower and the upper bound of one segment of a cost interval.
+
+    The one statement of the bound formula in the matrix, from the usage the
+    segment records and one price row. With the count of cache reads unknown
+    the lower bound prices every input token that was not written to the
+    cache as read from it, and the upper bound prices none as read; with the
+    count known both are the exact price.
+    """
+
+    read = segment.cache_read_tokens
+
+    def priced(cache_read_tokens: int) -> float:
+        return pricing.compute_cost(
+            input_tokens=segment.input_tokens,
+            output_tokens=segment.output_tokens,
+            cache_creation_tokens=segment.cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
+
+    if read is None:
+        return priced(segment.input_tokens - segment.cache_creation_tokens), priced(0)
+    return priced(read), priced(read)
+
+
+def _same_amount(got: float, want: float) -> bool:
+    # The tolerance of the product's own replay of the formula
+    # (crucible/backends/cost_bounds.py).
+    return math.isclose(got, want, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def _cost_interval(obs: Observation, ref: Reference) -> list[Deviation]:
     """What C6 holds of the cost interval a cost-bounded route returns.
 
     Such a route never reads a missing count of cache reads as zero, so its
@@ -599,10 +712,12 @@ def _cost_interval(obs: Observation) -> list[Deviation]:
     reply, and the flags alone would leave every number unasserted. The
     interval is what is owed instead: it is there, it covers the reported
     usage (full coverage, the token counts are the sums of its segments, the
-    reported cost is its lower bound), and it has one segment for every
-    response the provider billed, with the tokens of that response. What a
-    segment is priced at is the route's policy, not the rate card, and is
-    not compared here.
+    reported cost is its lower bound), it has one segment for every response
+    the provider billed, with the tokens of that response, and the two
+    bounds of every segment are what the shipped price row of the route's
+    model gives for the usage the segment records. That row is the rate
+    table of the route's cost policy; the matrix rate card is not, and stays
+    the reference of the reported cost.
     """
 
     assert obs.result is not None
@@ -637,6 +752,27 @@ def _cost_interval(obs: Observation) -> list[Deviation]:
                 f"with {billed}",
             )
         )
+    # The runner refuses a cost-bounded route whose model has no shipped row.
+    assert ref.bound_pricing is not None, "a cost-bounded reference carries no price row"
+    mispriced = [
+        f"segment {index + 1} states {item.lower_bound_usd:.9f} to "
+        f"{item.upper_bound_usd:.9f} USD, the price row gives {lower:.9f} to {upper:.9f}"
+        for index, item in enumerate(bounds.segments)
+        for lower, upper in (bound_amounts(ref.bound_pricing, item),)
+        if not (
+            _same_amount(item.lower_bound_usd, lower)
+            and _same_amount(item.upper_bound_usd, upper)
+        )
+    ]
+    if mispriced:
+        out.append(
+            Deviation(
+                "usage.cost_bounds:amounts",
+                "the bounds of the interval are not what the shipped price row of "
+                "the route's model gives for the usage each segment records: "
+                + "; ".join(mispriced),
+            )
+        )
     return out
 
 
@@ -655,9 +791,11 @@ def _unasked(obs: Observation) -> frozenset[str]:
 
 _CALL_RAISE = re.compile(r"raise:\w+@(before|after)_request/[\w.]+")
 _COST_FLAG_CLEARED = "flag:cost_complete=False"
-# The C5 codes that are not a rewrite: the two about the second call, and the
-# one about a result the guard let stand.
-_NOT_A_REWRITE = frozenset({"guard:revoked", "guard:second_call_failed", NOT_RANKABLE})
+# The C5 codes that are not a rewrite: the two about the second call, and
+# those about a result the guard let stand.
+_NOT_A_REWRITE = (
+    frozenset({"guard:revoked", "guard:second_call_failed", NOT_RANKABLE}) | COST_BOUND_MARKS
+)
 
 
 def not_owed_given(code: str, cell_codes: Iterable[str]) -> bool:
@@ -1099,7 +1237,7 @@ def evaluate(
         elif clause == "C4":
             outcomes[clause] = _outcome(_c4(result, exp))  # type: ignore[arg-type]
         elif clause == "C5":
-            outcomes[clause] = _outcome(_c5(obs))
+            outcomes[clause] = _outcome(_c5(obs, ref))
         elif clause == "C6":
             outcomes[clause] = _outcome(_c6(obs, exp, ref))
         elif clause == "C7":

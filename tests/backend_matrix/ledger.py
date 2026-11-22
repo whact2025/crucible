@@ -18,7 +18,10 @@ A cell computes its deviation codes; ``ledger.yaml`` says what is expected.
   citation, an owner and a date. Either a variant of a difference table
   asserts it (a declared value selects it), or a scenario defines it and the
   entry lists the cells on which it is in force. It is counted apart from
-  the known gaps and replaces no contract clause.
+  the known gaps. One restates a line of a clause, for the routes a closed
+  extra of their routing file selects: the clause asserts the alternative
+  itself there, and the entry lists exactly the cells of those routes. No
+  other one touches a clause.
 - ``integrity_problems`` is static cell H03: registry, entries, declared
   differences, inventory and oracle rules, over a :class:`World` that tests
   may build synthetically.
@@ -467,12 +470,34 @@ class World:
     # a difference is in force on every result cell of those kinds and on no
     # cell of another kind.
     wire_differences: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Declared differences a clause asserts itself wherever a closed extra of
+    # the routing file selects the route (id -> the generated cells of such
+    # routes that the clause holds to the alternative). Such a difference is
+    # in force on exactly those cells.
+    route_differences: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 def _pack(world: World, scenario: str) -> str:
     if scenario in world.static_scenarios:
         return "pack_a"
     return "pack_a" if world.scenario_sets.get(scenario) in H02_SETS else "pack_b"
+
+
+def _withdrawn(world: World, cell: str, pinned: AbstractSet[tuple[Any, Any]]) -> bool:
+    """Whether a registry cell is one that only a ruling on its record lets go.
+
+    The two withdrawals a record-level ruling licenses: the cell is pinned
+    not expressible, or it is a behaviour cell that is not generated although
+    its kind runs the set of its scenario.
+    """
+
+    kind, scenario, _role, _lens = parse_cell_id(cell)
+    if (kind, scenario) in pinned:
+        return True
+    if scenario in world.static_scenarios or scenario not in world.scenario_sets:
+        return False
+    runs = world.scenario_sets[scenario] in world.enabled_sets.get(kind, ())
+    return runs and cell not in world.generated
 
 
 def _registry_problems(ledger: Ledger, world: World) -> list[Deviation]:
@@ -490,6 +515,21 @@ def _registry_problems(ledger: Ledger, world: World) -> list[Deviation]:
         (row.get("kind"), row.get("scenario")) for row in world.not_expressible
     }
     for record in ledger.registry.values():
+        # A ruling on a record is the licence to withdraw a cell of it, and
+        # nothing else: one that withdraws none keeps a gap under a licence
+        # nobody asked for. A ruling that keeps a gap belongs in its entries.
+        if record.ruling is not None and not any(
+            _withdrawn(world, item.cell, pinned) for item in record.cells
+        ):
+            out.append(
+                Deviation(
+                    "static:registry_ruling_unused",
+                    f"{record.id} carries a ruling and no cell of the record is "
+                    "withdrawn (pinned not expressible, or no longer generated "
+                    "although its kind runs the set): a ruling that keeps a gap "
+                    "is written in the entries of the gap",
+                )
+            )
         for item in record.cells:
             kind, scenario, role, lens = parse_cell_id(item.cell)
             where = f"{record.id} cell {item.cell}"
@@ -714,7 +754,8 @@ def _difference_problems(ledger: Ledger, world: World) -> list[Deviation]:
     """A declared difference is asserted by a scenario, and only where listed.
 
     One that belongs to the wire of a kind is listed on every result cell of
-    that kind.
+    that kind. One that a clause asserts itself for the routes a routing
+    extra selects is listed on exactly the cells of those routes.
     """
 
     out: list[Deviation] = []
@@ -770,6 +811,30 @@ def _difference_problems(ledger: Ledger, world: World) -> list[Deviation]:
                         f"{where} lists {cell}: it must be listed once, be a "
                         "generated cell of a real kind, not the canary, and its "
                         "scenario must define the alternative",
+                    )
+                )
+        selected = world.route_differences.get(item.id)
+        if selected is not None:
+            # A difference of a route. The clause decides by the routing file
+            # alone where it asserts the alternative, so the list here
+            # decides nothing: it has to say exactly where that is. A cell of
+            # such a route that the list leaves out would be held to the
+            # alternative without the ledger saying so; a listed cell of
+            # another route is held to the clause as it stands.
+            for cell in sorted(selected - set(item.cells)):
+                out.append(
+                    Deviation(
+                        "static:difference_cell_missing",
+                        f"{where} is asserted on every cell of a route that its "
+                        f"routing file selects and does not list {cell}",
+                    )
+                )
+            for cell in sorted(set(item.cells) - selected):
+                out.append(
+                    Deviation(
+                        "static:difference_cell_invalid",
+                        f"{where} lists {cell}, which is no cell of a route that "
+                        "its routing file selects for it",
                     )
                 )
         kinds = world.wire_differences.get(item.id)

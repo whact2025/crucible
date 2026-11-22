@@ -24,17 +24,23 @@
 #   product citation, an owner, a date and the alternative contract asserted
 #   instead; a cell passes only if the alternative holds. Either a variant of
 #   a scenario's difference table asserts it (a declared value selects it), or
-#   the scenario defines it and `cells` lists where it is in force. A declared
-#   difference replaces no contract clause and is counted apart from the
-#   known gaps.
-# ruling: a decision of the release owner. Where it is written decides what
-#   it does. On a known gap, cell by cell or column-wide, it records that
-#   the owner accepts the expected failure; an entry on a reference column
-#   must carry one, and it licenses nothing. On a registry record it is the
-#   licence to withdraw a cell of that record: H03 then accepts that the
-#   cell is pinned not expressible or is no longer generated. So a ruling
-#   that keeps a gap is written in the entries of the gap; written in its
-#   record it would also license the withdrawal of the record's cells.
+#   the scenario defines it and `cells` lists where it is in force. One
+#   restates a line of a clause: where a routing file opts into a cost upper
+#   bound, clause C5 holds a guarded result to the marks of a diagnostic
+#   result instead of to "rankable", and asserts each mark itself; `cells`
+#   then lists exactly the cells of such routes (static cell H03). No other
+#   declared difference touches a clause, and none may touch clause C6, the
+#   accounting. They are counted apart from the known gaps.
+# ruling: a decision of the release owner, or of a decision panel that acts
+#   under a standing instruction of the owner; its text says which, and the
+#   owner may overrule a panel. Where it is written decides what it does.
+#   On a known gap, cell by cell or column-wide, it records that the
+#   expected failure is accepted; an entry on a reference column must carry
+#   one, and it licenses nothing. On a registry record it is the licence to
+#   withdraw a cell of that record: H03 then accepts that the cell is
+#   pinned not expressible or is no longer generated, and H03 refuses a
+#   ruling on a record none of whose cells is withdrawn. So a ruling that
+#   keeps a gap is written in the entries of the gap, never in its record.
 # ceilings: counts may not exceed them. They rise while entries land and are
 #   frozen at the gate (pack A) and at the end of pack B; after that they only
 #   fall.
@@ -45,9 +51,9 @@ schema_version: crucible.backend-matrix.ledger.v1
 
 ceilings:
   max_known_gaps:
-    pack_a: 41
+    pack_a: 35
     pack_b: 0
-  max_declared_differences: 3
+  max_declared_differences: 4
 
 registry:
   G02:
@@ -469,28 +475,45 @@ registry:
     # while the output tokens are at most 0.9 of the input). With a
     # cache-read count in the reply the flags are complete, the interval is
     # exact and the cost is above the rate-card price: the cells then owe
-    # usage.cost_usd:gt. They also hide what a segment costs in the raw
-    # lens: C6 holds the reported cost to the interval's own lower bound and
-    # has no reference for the rates of the policy, so a result whose
-    # segments are priced at nothing, or whose upper bounds (what a budget
-    # is charged) are lowered to the lower ones, still shows the two codes
-    # only. The guarded cells of the same columns do not pass it: the limit
-    # guard replays the bound formula and rewrites the result. And on the
-    # guarded cells the result is not rankable, with or without the count:
-    # that is M08.
-    # Open for the release owner, and no ruling is recorded here. (a) Does a
-    # route that can only return an interval for the provider's ordinary
-    # reply meet the accounting the scenarios ask for (four flags true where
-    # the provider reported its usage)? (b) Which price is a cell on such a
-    # route held to: the matrix rate card, as on every other column, or the
-    # rates of the route's cost policy? (c) The question of M08. Until they
-    # are ruled the cells are carried under the contract as the design
-    # states it: C6 applies to every cell that expects a result, and no
-    # declared difference may replace it (design sections 3.1 and 8.4). If
-    # the flags bind, a fix has the product account for the reply and
-    # deletes the two column-wide entries. If they do not bind on such a
-    # route, the design changes first (C6 gets its scope in contract.py,
-    # with its liar), then the entries go. Reported for the gap list.
+    # usage.cost_usd:gt.
+    # What a segment costs is held as well, wherever C6 asks for the
+    # interval (a result of a scenario that owes the cost flag, a limit exit
+    # included, in both lenses): the lower and the upper bound of every
+    # segment are what the shipped price row of the route's model
+    # (crucible/backends/pricing.py, DEFAULT_PRICING; the rate table of the
+    # cost policy by the product's own replay) gives for the usage the
+    # segment records, or the cell names usage.cost_bounds:amounts. A
+    # result whose segments are priced at nothing, or whose upper bounds
+    # (what a budget is charged) are lowered to the lower ones, is a
+    # deviation of its own in the raw lens; in the guarded lens of a clean
+    # finish the limit guard replays the formula and rewrites such a result
+    # first. Two things that rule does not hold. A change that the
+    # adapter's constants and the shipped row make together: one proof of
+    # the Kimi module pins the amounts of one cell as numbers and the
+    # verifier requires it by name; the product's own tests pin more. And a
+    # count of cache reads or writes that the provider never sent: the
+    # provider side of a cell records input and output tokens only, so the
+    # usage a segment is priced on is the segment's own. A missing count
+    # read as zero shows against the rate card, as usage.cost_usd:gt (the
+    # same module plays it), not through this rule.
+    # Ruled on 2026-11-21 by a decision panel under the release owner's
+    # standing instruction, 2 of 3 (the owner may overrule). (a) The two
+    # accounting flags bind every route, so the gap stays. (b) The matrix
+    # rate card is the reference of the reported cost on every column; the
+    # shipped price row of the route's model is the reference of the two
+    # bounds of a segment, and of nothing else. That ruling is the `ruling`
+    # of the two column-wide entries of this record. The record itself
+    # carries none: a ruling on a record is the licence to withdraw its
+    # cells. (c), whether "rankable" binds such a route, was M08's question
+    # and is decided there. Not closable by code alone: reading a missing
+    # count of cache reads needs a recorded provider fact. A fix of this
+    # record is accepted only when the opt-in of the route into the cost
+    # upper bound is decided with it (removed, or kept by a recorded
+    # ruling): while a route opts in, its results stay diagnostic whatever
+    # their accounting says, and the Kimi diagnostic routes return no
+    # rankable result. That is a limit of the route, with no fix sketch
+    # (declared difference D-COST-BOUND-UNRANKED). Reported for the gap
+    # list.
     column_wide:
       - {kind: kimi, code: "flag:token_usage_complete=False"}
       - {kind: kimi, code: "flag:cost_complete=False"}
@@ -508,8 +531,13 @@ registry:
     # guard the incomplete evidence also revokes the next call. The live
     # check of the model update saw the same on the production route
     # (2026-11-19) and left it to the owner: accept it, refuse a routing file
-    # whose catalog entry is blocked, or redefine the arm. No ruling is
-    # recorded here. Reported for the gap list.
+    # whose catalog entry is blocked, or redefine the arm. Ruled on
+    # 2026-11-21 by a decision panel under the owner's standing instruction:
+    # accepted as a known gap; a refusal at binding is planned with the gap
+    # fixes and does not turn these cells green. That ruling is the `ruling`
+    # of the two known-gap entries of this record. The record itself carries
+    # none, because a ruling here would license withdrawing its cells.
+    # Reported for the gap list.
     # The codes of the two cells are those of any rejection after the
     # request; the cause is in the text of the error, which is no code. Two
     # proofs of the Kimi module, which the verifier requires by name, hold
@@ -540,22 +568,28 @@ registry:
     # (crucible/backends/limits.py, _normalize_returned_result), and the
     # routing files say so in their headers ("a cost interval: diagnostic,
     # never rankable or promotable"). The guarded contract of S01, S03 and
-    # S04 says "rankable" (design section 7.1), so clause C5 reports
+    # S04 says "rankable" (design section 7.1), so clause C5 reported
     # guard:not_rankable on the six guarded cells of the two diagnostic
-    # columns. The code does not depend on the missing cache-read count:
-    # with the count in the reply the result is just as little rankable, so
-    # a resolution of M06 that leaves the policy bound does not close this
-    # record.
-    # Open for the release owner, with M06, and no ruling is recorded here:
-    # does "rankable" bind the guarded lens of a route that runs under its
-    # cost policy? If it binds, the six cells stay red until such a result
-    # can be ranked. If it does not, C5 is not among the clauses a declared
-    # difference may never replace (design sections 3.1 and 8.4): the ruling
-    # can be a declared difference whose alternative is asserted instead
-    # (terminal reason diagnostic_cost_upper_bound, the route's policy, one
-    # physical attempt, cost authority kept, the second call answered), with
-    # its liar first and the ceiling of declared differences raised by the
-    # same ruling. Reported for the gap list.
+    # columns, and those cells were known gaps of this record. The code did
+    # not depend on the missing cache-read count: with the count in the
+    # reply the result is just as little rankable.
+    # No code of this record is owed any more, and no fix was made. Decided
+    # on 2026-11-21 by a decision panel under the release owner's standing
+    # instruction (2 of 3; the owner may overrule): "rankable" does not bind
+    # the guarded lens of a route that runs under its cost policy. Not
+    # rankable there is what the release means to do, enforced twice in
+    # crucible/backends/limits.py and pinned by
+    # tests/test_backend_limits_cost_bounds.py, so no change of the product
+    # closes it. It is declared difference D-COST-BOUND-UNRANKED of this
+    # ledger: C5 holds such a result to the marks of a diagnostic one and
+    # asserts each of them. The record stays, as every record does, and its
+    # six cells stay pinned, here and in the list of that difference. They
+    # are still expected failures, under M06 alone. The record carries no
+    # ruling: a ruling here would license withdrawing its cells. What the
+    # difference cannot show on a cell: with complete accounting and the
+    # opt-in still set, the result stays diagnostic and C5 names nothing.
+    # A proof of the Kimi module that the verifier requires by name plays
+    # that state. Reported for the gap list.
     cells:
       - cell: kimi/S01/primary/guarded
         observed_under: {}
@@ -806,10 +840,14 @@ known_gaps:
   # The Kimi columns, first run of part 5 (starter set on the two diagnostic
   # columns; S00, S01 and S51 on the blocked column). No result of the kind
   # flags its accounting complete (M06, column-wide): that is all the two
-  # diagnostic columns show in the raw lens. In the guarded lens the limit
+  # diagnostic columns show, in both lenses. In the guarded lens the limit
   # guard, bound with the route's cost policy, lets the result stand and
-  # does not call it rankable (M08). On the blocked column the plain call
-  # returns no result at all (M07); its canary and its admission cell pass.
+  # does not call it rankable: that is declared difference
+  # D-COST-BOUND-UNRANKED and no gap (the six entries of M08 went when it
+  # was declared). On the blocked column the plain call returns no result
+  # at all (M07); its canary and its admission cell pass. The entries of
+  # M06 and M07 carry the ruling of a decision panel, not an answer of the
+  # owner in person; each text says so.
   - cell: kimi/S01/blocked/raw
     observed_under: {}
     codes:
@@ -817,6 +855,18 @@ known_gaps:
       "stop:error!=end_turn": M07
       "flag:terminal_complete=False": M07
       "digest.missing:served_model": M07
+    ruling: >-
+      Decision panel, 2026-11-21, under the owner's standing instruction of
+      that day ("Do an adversarial assessment of the options and proceed with
+      the consensus choice"); not the owner's own answer, and the owner may
+      overrule. Asked: what to do about the strict Kimi route that bills a
+      reply and then rejects it. Decided, 3 of 3: accepted as a known gap as
+      it stands (the route is blocked in the catalog, E12 refuses it at
+      preflight, its header states the behaviour). A refusal at binding of a
+      route whose catalog entry is blocked is planned with the gap fixes. It
+      does not turn this cell green, and it is built only after a design
+      amendment of the matrix with its own decision; without one this
+      acceptance stands.
   - cell: kimi/S01/blocked/guarded
     observed_under: {}
     codes:
@@ -825,26 +875,52 @@ known_gaps:
       "flag:terminal_complete=False": M07
       "digest.missing:served_model": M07
       "guard:revoked": M07
-  - cell: kimi/S01/primary/guarded
-    observed_under: {}
-    codes: {"guard:not_rankable": M08}
-  - cell: kimi/S03/primary/guarded
-    observed_under: {event_detail: tool_calls}
-    codes: {"guard:not_rankable": M08}
-  - cell: kimi/S04/primary/guarded
-    observed_under: {structured_output: prompt_only}
-    codes: {"guard:not_rankable": M08}
-  - cell: kimi/S01/secondary/guarded
-    observed_under: {}
-    codes: {"guard:not_rankable": M08}
-  - cell: kimi/S03/secondary/guarded
-    observed_under: {event_detail: tool_calls}
-    codes: {"guard:not_rankable": M08}
-  - cell: kimi/S04/secondary/guarded
-    observed_under: {structured_output: prompt_only}
-    codes: {"guard:not_rankable": M08}
+    ruling: >-
+      Decision panel, 2026-11-21, under the owner's standing instruction of
+      that day ("Do an adversarial assessment of the options and proceed with
+      the consensus choice"); not the owner's own answer, and the owner may
+      overrule. Asked: what to do about the strict Kimi route that bills a
+      reply and then rejects it. Decided, 3 of 3: accepted as a known gap as
+      it stands (the route is blocked in the catalog, E12 refuses it at
+      preflight, its header states the behaviour). A refusal at binding of a
+      route whose catalog entry is blocked is planned with the gap fixes. It
+      does not turn this cell green, and it is built only after a design
+      amendment of the matrix with its own decision; without one this
+      acceptance stands.
   - column_wide: {kind: kimi, code: "flag:token_usage_complete=False", gap: M06}
+    ruling: >-
+      Decision panel, 2026-11-21, under the owner's standing instruction of
+      that day ("Do an adversarial assessment of the options and proceed with
+      the consensus choice"); not the owner's own answer, and the owner may
+      overrule. Asked: (a) do the two accounting flags of clause C6 bind a
+      route that can only return a cost interval for the provider's ordinary
+      reply; (b) which price is a cell on such a route held to. Decided, 2
+      of 3: (a) they bind every route, so this code is a known gap wherever
+      the accounting is evaluated; it is not closable by code alone, because
+      reading a missing count of cache reads needs a recorded provider fact.
+      (b) The matrix rate card is the reference for the reported cost on
+      every column; the shipped price row of the route's model is the
+      reference for the two bounds of a segment of the cost interval, and
+      for nothing else. The rule that holds those two bounds was added to
+      clause C6 in the round that entered this ruling; the record of M06
+      says what is held and what is not.
   - column_wide: {kind: kimi, code: "flag:cost_complete=False", gap: M06}
+    ruling: >-
+      Decision panel, 2026-11-21, under the owner's standing instruction of
+      that day ("Do an adversarial assessment of the options and proceed with
+      the consensus choice"); not the owner's own answer, and the owner may
+      overrule. Asked: (a) do the two accounting flags of clause C6 bind a
+      route that can only return a cost interval for the provider's ordinary
+      reply; (b) which price is a cell on such a route held to. Decided, 2
+      of 3: (a) they bind every route, so this code is a known gap wherever
+      the accounting is evaluated; it is not closable by code alone, because
+      reading a missing count of cache reads needs a recorded provider fact.
+      (b) The matrix rate card is the reference for the reported cost on
+      every column; the shipped price row of the route's model is the
+      reference for the two bounds of a segment of the cost interval, and
+      for nothing else. The rule that holds those two bounds was added to
+      clause C6 in the round that entered this ruling; the record of M06
+      says what is held and what is not.
 
   # The official-SDK Codex column, first run of part 6 (starter set). A
   # reference column: every entry carries the owner's ruling, word for word
@@ -977,3 +1053,42 @@ declared_differences:
       - codex:official/S03/primary/guarded
       - codex:official/S04/primary/raw
       - codex:official/S04/primary/guarded
+  - id: D-COST-BOUND-UNRANKED
+    citation: >-
+      crucible/backends/limits.py (_normalize_returned_result: a result under
+      a bound cost policy, or one that carries a cost interval, is never
+      called rankable; InvocationLimitTerminal refuses a rankable terminal
+      with a cost policy or cost bounds); the headers of the routing files
+      that opt into the cost upper bound ("A result is a cost interval:
+      diagnostic, never rankable or promotable"); pinned by
+      tests/test_backend_limits_cost_bounds.py
+    owner: >-
+      decision panel under the release owner's standing instruction of
+      2026-11-21 ("Do an adversarial assessment of the options and proceed
+      with the consensus choice"), decision record matrix-kimi-rankable, 2 of
+      3; not an answer of the owner in person, and the owner may overrule
+    date: "2026-11-21"
+    alternative: >-
+      On a route whose routing file opts into the cost upper bound, a guarded
+      result that ends without an error is held to the marks of a diagnostic
+      result instead of to "rankable": the limit guard let it stand, the
+      terminal it left has the reason diagnostic_cost_upper_bound under the
+      cost policy the routing file names, records exactly one physical
+      attempt and keeps its cost authority, the guard does not call the
+      result rankable, and a second plain call is answered from one request.
+      Clause C5 asserts each of these itself wherever the routing file opts
+      in (the one selector, read from the file and never from the adapter,
+      the guard or the terminal), and names the mark that is missing; on
+      every other route it asserts "rankable" as before. An error result and
+      a result the guard replaced are judged as on every route. The
+      difference waives nothing of clause C6: the accounting flags and the
+      cost interval are owed in full, so the listed cells stay expected
+      failures while known gap M06 is open. The list is exactly the guarded
+      result cells of such routes; static cell H03 holds it to them.
+    cells:
+      - kimi/S01/primary/guarded
+      - kimi/S03/primary/guarded
+      - kimi/S04/primary/guarded
+      - kimi/S01/secondary/guarded
+      - kimi/S03/secondary/guarded
+      - kimi/S04/secondary/guarded

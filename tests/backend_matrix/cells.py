@@ -40,6 +40,8 @@ from .drivers import toy
 from .drivers.base import MatrixSetupError
 from .scenarios import (
     D_CDX_SERVED,
+    D_COST_BOUND_UNRANKED,
+    GUARDED,
     PACK_A,
     PACK_B,
     SCENARIOS,
@@ -114,6 +116,14 @@ STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
 # reads; the codes of its cells are those of any rejection after the request,
 # so only the text of the error shows the cause, and only the same cells
 # answered with the count show that nothing else is behind their entries.
+# The two diagnostic Kimi routes run under a cost policy: that they are
+# called as their routing files ask and refuse to run otherwise, and that a
+# guarded result stays diagnostic (not rankable) once the reply carries the
+# count, is what the declared difference of those routes rests on, and no
+# cell's verdict shows either. What a segment of their cost interval costs is
+# held by a rule that reads the shipped price row; only the proof that pins
+# the amounts of one cell as numbers shows a change that the adapter and that
+# row make together.
 # The official Codex route never flags its token usage complete on a reply
 # that reads nothing from a cache, and the accounting clause holds a result
 # that is flagged incomplete to no number: only this proof compares what the
@@ -130,6 +140,9 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     MODULE_BY_KIND[matrix_columns.KIMI_KIND]: (
         "test_the_strict_route_rejects_the_plain_reply_for_its_missing_cache_read_count",
         "test_the_strict_route_answers_once_the_reply_carries_a_cache_read_count",
+        "test_a_route_with_the_cost_bound_gets_its_budget_and_its_policy",
+        "test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_diagnostic",
+        "test_the_bounds_of_an_honest_interval_are_the_shipped_price_of_what_was_billed",
     ),
     MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]: (
         "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
@@ -415,6 +428,27 @@ def expected_admission(
     raise MatrixSetupError(f"admission cell {cell.id} has no pin in inventory.yaml")
 
 
+@functools.cache
+def cost_bounded_guarded_cells() -> frozenset[str]:
+    """The guarded result cells whose route opts into a cost upper bound.
+
+    Where clause C5 holds a result to the marks of a diagnostic one: read
+    from the routing file of each cell's role, as the runner reads it.
+    """
+
+    return frozenset(
+        cell.id
+        for cell in behaviour_cells()
+        if cell.lens == GUARDED
+        and not SCENARIOS[cell.scenario].canary
+        and not SCENARIOS[cell.scenario].admission
+        and declarations.cost_bounded(
+            cell.column,
+            matrix_columns.ROLE_BY_CAPABILITY[SCENARIOS[cell.scenario].capability],
+        )
+    )
+
+
 def cells_of(kinds: Sequence[str]) -> tuple[Cell, ...]:
     """The cells a test module of these kinds parametrises over; never empty."""
 
@@ -577,4 +611,5 @@ def world() -> ledger.World:
         difference_variants=difference_variants(),
         difference_alternatives=difference_alternatives(),
         wire_differences={D_CDX_SERVED: matrix_columns.UNNAMED_SERVED_MODEL_KINDS},
+        route_differences={D_COST_BOUND_UNRANKED: cost_bounded_guarded_cells()},
     )

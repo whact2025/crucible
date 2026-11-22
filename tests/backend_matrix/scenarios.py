@@ -16,6 +16,10 @@ the ledger: the scenario defines its alternative contract under the id of the
 difference, and the ledger says on which cells it is in force. An alternative
 may add the optional tail of the script and change the assertions the
 scenario itself makes, nothing else: it never stands in for a contract clause.
+Where a declared difference restates a line of a clause (one does: what the
+guarded lens asks of a route that opts into a cost upper bound), the clause
+asserts the alternative itself, under a selector read from the routing file,
+and the scenario's alternative leaves the plan as it is.
 
 Every scenario lands with a lying counterpart on the toy driver
 (:mod:`.drivers.toy`); a scenario without a liar cannot be enabled anywhere.
@@ -37,6 +41,7 @@ from .drivers.base import LENSES, MatrixSetupError
 from .script import READ_A, READ_B, WRITE, Call, Loop, ProviderScript, Refuse, Say, TokenUsage
 from .toolsets import READ, READ_BOUNDED, WRITER, ToolsetSpec, capability_of
 
+GUARDED = "guarded"
 STARTER = "starter"
 PACK_A = "pack_a"
 PACK_B = "pack_b"
@@ -550,6 +555,7 @@ def _cost_reported_only(plan: Plan) -> Plan:
 D_STRUCT_UNQUALIFIED = "D-STRUCT-UNQUALIFIED"
 D_OAI_SCHEMA_FINAL = "D-OAI-SCHEMA-FINAL"
 D_CDX_SERVED = "D-CDX-SERVED"
+D_COST_BOUND_UNRANKED = "D-COST-BOUND-UNRANKED"
 
 
 def _schema_in_one_final_request(plan: Plan) -> Plan:
@@ -596,6 +602,19 @@ def _trace_names_no_served_model(plan: Plan) -> Plan:
     """
 
     return replace(plan, checks=(*plan.checks, served_model_unnamed))
+
+
+def _held_to_the_diagnostic_marks(plan: Plan) -> Plan:
+    """A guarded result of a cost-bounded route is diagnostic, not rankable.
+
+    The alternative is asserted by clause C5 itself, wherever the routing
+    file of the cell's route opts into the cost upper bound: the plan of the
+    scenario does not change. It is defined here so that the ledger can list
+    the cells it is in force on, and static cell H03 holds that list to
+    exactly the guarded cells of such routes.
+    """
+
+    return plan
 
 
 # -- the catalogue -----------------------------------------------------------
@@ -939,6 +958,23 @@ _ALL = tuple(
         scenario,
         alternatives={**scenario.alternatives, D_CDX_SERVED: _trace_names_no_served_model},
     )
+    for scenario in _ALL
+)
+
+# What the guarded lens asks of a route that opts into a cost upper bound is
+# a property of the route, not of one scenario either: every scenario that
+# runs guarded and asserts a result defines the alternative of that declared
+# difference, and the ledger lists the cells of such routes.
+_ALL = tuple(
+    replace(
+        scenario,
+        alternatives={
+            **scenario.alternatives,
+            D_COST_BOUND_UNRANKED: _held_to_the_diagnostic_marks,
+        },
+    )
+    if GUARDED in scenario.lenses and not scenario.canary and not scenario.admission
+    else scenario
     for scenario in _ALL
 )
 

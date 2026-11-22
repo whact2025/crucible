@@ -18,6 +18,7 @@ Checking declarations against observed behaviour arrives with pack B.
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
@@ -180,6 +181,35 @@ def cost_bounded(column: Column, role: str, product: str = COLUMN_PRODUCT) -> bo
     """
 
     return route_extra(column, role, matrix_columns.COST_BOUND_EXTRA, product) is True
+
+
+# How a routing file that opts into the cost upper bound names the policy a
+# caller of the route has to pass: the option of the run, with its value.
+_COST_POLICY_OPTION = re.compile(r"--diagnostic-cost-policy[ =](\S+)")
+
+
+def cost_policy(column: Column, role: str, product: str = COLUMN_PRODUCT) -> str | None:
+    """The cost policy a route that opts into the cost upper bound names.
+
+    Its routing file states, where it states the opt-in, which policy a run
+    on the route has to pass to get a result at all. Read from that file,
+    never from the adapter or the limit guard: it is what clause C5 holds the
+    terminal of a guarded result to. ``None`` for a route that does not opt
+    in and for a column without a routing file; a file that opts in and
+    names no policy, or more than one, is an error.
+    """
+
+    if not column.routing or not cost_bounded(column, role, product):
+        return None
+    path = column.routing_path(product)
+    named = set(_COST_POLICY_OPTION.findall(path.read_text(encoding="utf-8")))
+    if len(named) != 1:
+        raise MatrixSetupError(
+            f"column {column.id}: the {product} routing file opts into the cost "
+            f"upper bound and names {sorted(named) or 'no'} cost policy for its "
+            "callers; exactly one is expected"
+        )
+    return named.pop()
 
 
 def route_budget(column: Column, role: str, product: str = COLUMN_PRODUCT) -> float | None:

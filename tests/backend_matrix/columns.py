@@ -201,7 +201,11 @@ ROLE_BY_CAPABILITY: Mapping[str, str] = {
 }
 
 # One uniform matrix rate for behaviour cells; shipped prices are a static
-# cell's business (P05).
+# cell's business (P05). One exception, on a route that opts into a cost
+# upper bound: the two bounds of a segment of its cost interval are held to
+# the shipped price row of the route's model (``shipped_price``), which is
+# the rate table of the route's cost policy. The reported cost is held to
+# this rate there too.
 MATRIX_RATE = ModelPricing(input_per_mtok=2.0, output_per_mtok=8.0)
 
 # The closed routing extra by which a route opts into a diagnostic cost upper
@@ -389,6 +393,16 @@ def matrix_rate(model: str) -> ModelPricing:
         long_context_cache_write_per_mtok=MATRIX_RATE.input_per_mtok,
         long_context_cache_read_per_mtok=MATRIX_RATE.input_per_mtok,
     )
+
+
+def shipped_price(model: str) -> ModelPricing | None:
+    """The price row the product ships for ``model``; ``None`` where it has none.
+
+    The built-in table, which no pricing file changes: the matrix rate card
+    of a test never reaches it.
+    """
+
+    return DEFAULT_PRICING.get(model)
 
 
 def rate_card() -> dict[str, ModelPricing]:
