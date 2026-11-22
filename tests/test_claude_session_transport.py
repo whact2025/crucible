@@ -13,12 +13,13 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import anyio
 from claude_agent_sdk import ClaudeAgentOptions
-from claude_agent_sdk._errors import CLIConnectionError
+from claude_agent_sdk._errors import CLIConnectionError, ProcessError
 from claude_agent_sdk._internal.transport import subprocess_cli as _sdk_cli
 
 from crucible.backends._claude_session_transport import (
@@ -169,6 +170,49 @@ for line in sys.stdin:
     return cli.resolve(), frames
 
 
+def _stderr_then_exit_cli(
+    tmp_path: Path,
+    *,
+    unterminated_chars: int,
+    last_line: str,
+) -> Path:
+    """Create a CLI double whose model process only writes stderr and fails.
+
+    It answers the identity and version probes, then writes one run of
+    ``unterminated_chars`` characters without a newline, then ``last_line``,
+    and exits 1 without reading its input.
+    """
+
+    cli = tmp_path / "stderr-claude"
+    cli.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:] == ["auth", "status", "--json"]:
+    print(json.dumps({{
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "orgId": {CLAUDE_NVIDIA_ORG_ID!r},
+        "orgName": {CLAUDE_NVIDIA_ORG_NAME!r},
+    }}), flush=True)
+    raise SystemExit(0)
+if sys.argv[1:] == ["-v"]:
+    print({f"{REVIEWED_CLAUDE_FABLE_CODE_VERSION} (Claude Code)"!r}, flush=True)
+    raise SystemExit(0)
+
+sys.stderr.write("x" * {unterminated_chars})
+sys.stderr.write("\\n" + {last_line!r} + "\\n")
+sys.stderr.flush()
+raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    return cli.resolve()
+
+
 def _transport(
     tmp_path: Path,
     cli_path: Path,
@@ -176,6 +220,7 @@ def _transport(
     extra_env: dict[str, str] | None = None,
     model: str = "claude-fable-5-1",
     resume: str | None = None,
+    stderr: Callable[[str], None] | None = None,
 ) -> SanitizedClaudeSessionTransport:
     home = tmp_path / "session-home"
     home.mkdir(exist_ok=True)
@@ -204,6 +249,7 @@ def _transport(
         plugins=[],
         disallowed_tools=["Task", "Agent"],
         resume=resume,
+        stderr=stderr,
     )
     return SanitizedClaudeSessionTransport(
         prompt="offline transport test",
@@ -848,6 +894,62 @@ def test_session_resume_value_cannot_become_a_flag_of_its_own(tmp_path):
     assert not [
         token for token in model_argv if token.startswith("--mcp-config")
     ]
+
+
+def test_session_stderr_reaches_the_callback_in_lines_of_bounded_length(
+    tmp_path,
+):
+    """Every stderr entry the callback receives has a bounded length.
+
+    The adapter bounds the stderr it keeps by counting entries, so its
+    memory bound rests on the length of one entry. The reviewed SDK hands
+    over a run without a newline in pieces of at most ``max_buffer_size``
+    plus one pipe read, and the line that follows the run stays intact.
+    """
+    reason = "No conversation found with session ID: offline-session"
+    max_buffer_size = _sdk_cli._DEFAULT_MAX_BUFFER_SIZE
+    one_pipe_read = 64 * 1024
+    unterminated_chars = 2 * max_buffer_size + 300_000
+    cli = _stderr_then_exit_cli(
+        tmp_path,
+        unterminated_chars=unterminated_chars,
+        last_line=reason,
+    )
+    entries: list[str] = []
+    transport = _transport(tmp_path, cli, stderr=entries.append)
+    baseline_children = set(_sdk_cli._ACTIVE_CHILDREN)
+
+    async def exercise() -> None:
+        await transport.connect()
+        try:
+            with pytest.raises(ProcessError):
+                async for _message in transport.read_messages():
+                    pytest.fail("the failing CLI double produced a message")
+            # The SDK reads stderr in a task of its own; let it reach EOF.
+            with anyio.fail_after(30):
+                while reason not in entries:
+                    await anyio.sleep(0.01)
+        finally:
+            await transport.close()
+
+    asyncio.run(exercise())
+
+    assert transport._max_buffer_size == max_buffer_size
+    assert entries[-1] == reason
+    # Two full pieces, the rest of the run, and the line after it.
+    assert [len(entry) > max_buffer_size for entry in entries] == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert max(len(entry) for entry in entries) <= (
+        max_buffer_size + one_pipe_read
+    )
+    # Nothing of the run is lost or repeated at the seams.
+    assert sum(len(entry) for entry in entries[:-1]) == unterminated_chars
+    assert {char for entry in entries[:-1] for char in entry} == {"x"}
+    assert set(_sdk_cli._ACTIVE_CHILDREN) == baseline_children
 
 
 @pytest.mark.parametrize(

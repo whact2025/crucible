@@ -41,18 +41,29 @@ logger = logging.getLogger(__name__)
 # still owed. Everything this module replaces (``connect``,
 # ``_check_claude_version``), copies, or reads from ``SubprocessCLITransport``
 # is the same text in both releases. Four inherited behaviors differ and are
-# part of what this version admits:
+# part of what this version admits; the owner accepted them on 2026-11-21:
 # - ``--resume`` and ``--session-id`` reach the CLI as one ``--flag=value``
 #   token, so a value that begins with a dash is no longer read as a flag
 #   of its own (the fix for CVE-2026-96620);
 # - the stderr callback receives complete lines instead of raw read chunks,
-#   so the adapter's 200-entry stderr bound now counts lines: only the first
-#   200 lines are kept, and a rejected-resume reason the CLI writes after
-#   them is not seen and is not reported as ``stale_conversation``;
+#   so the adapter's 200-entry stderr bound counts lines. The adapter keeps
+#   the last 200 lines and drops earlier ones: a rejected-resume reason is
+#   seen, and reported as ``stale_conversation``, unless the CLI writes 200
+#   or more lines after it. One kept line is at most ``max_buffer_size``
+#   plus one pipe read long, because a longer run without a newline is
+#   handed over in pieces;
 # - ``close()`` is shielded against cancellation, bounds every wait, and
 #   keeps a child it could not reap tracked for the exit-time reaper;
 # - stdout is framed by line: a large frame no longer loses whitespace at a
 #   read boundary, and a malformed JSON line fails the turn at once.
+# A further consequence of the second point, recorded on 2026-11-21 after
+# that acceptance: the adapter redacts each kept stderr entry on its own,
+# and an entry is now one line. A credential shape that spans a line break
+# (a name and its value, ``Bearer`` and its token, a quoted value, or a
+# secret that itself holds a newline) is not matched and stays readable in
+# the adapter's ERROR record and in ``cli_stderr``. On 0.2.110 an entry was
+# one pipe read, so such a shape was matched when both lines arrived in one
+# read.
 REVIEWED_CLAUDE_AGENT_SDK_VERSION = "0.2.121"
 REVIEWED_CLAUDE_LEGACY_CODE_VERSION = "2.1.220"
 REVIEWED_CLAUDE_CODE_VERSION = "2.1.261"
