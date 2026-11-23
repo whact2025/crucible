@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The exact usage of one upstream model response, as the app-server sends it
+# to a client that asked for raw events. Nothing was observed of the real
+# tool, and no vendor type in reach states this notification.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: raw_response_completed
+
+provenance:
+  grade: constructed
+  reason: >-
+    Written to the adapter, because no other source is in reach. The
+    generated types of the vendor that the worker's lock pins (openai-codex)
+    do not hold this notification: their registry has
+    rawResponseItem/completed and no rawResponse/completed. The method name,
+    that it is sent only to a client that declared experimentalApi and
+    started its thread with experimentalRawEvents, and its fields (threadId,
+    turnId, a responseId that is unique within the turn, and a usage object
+    with inputTokens, cachedInputTokens and outputTokens) are those the
+    app-server adapter reads and describes as the generated protocol of a
+    later tool version (crucible/backends/codex.py:
+    _codex_initialize_params, _start_codex_thread_with_exact_usage,
+    _capture_codex_evidence_event, _exact_raw_response_usage_evidence). The
+    envelope therefore shows only that the adapter accepts what it was
+    written to accept. No cache-write counter is sent: the usage breakdown of
+    the installed vendor types names none.
+
+status: 200
+
+body:
+  method: rawResponse/completed
+  params:
+    threadId: {slot: thread_id}
+    turnId: {slot: turn_id}
+    responseId: {slot: response_id}
+    usage:
+      inputTokens: {slot: input_tokens}
+      cachedInputTokens: 0
+      outputTokens: {slot: output_tokens}

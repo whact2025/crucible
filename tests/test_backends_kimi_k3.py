@@ -8,7 +8,6 @@ from __future__ import annotations
 import http.server
 import copy
 import json
-import subprocess
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -130,10 +129,15 @@ def test_k3_context_bound_is_explicit_without_widening_default_response_cap():
         worker._Request.from_wire({**payload, "max_response_tokens": 1_048_577})
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("drift", ["model", "effort", "cache-ttl", "temperature"])
-def test_real_native_generator_rejects_post_qualification_request_drift(drift):
+def test_real_native_generator_rejects_post_qualification_request_drift(
+    drift, locked_worker_launch,
+):
     # The local, unbound port must never be contacted: rejection precedes HTTP.
+    # The locked interpreter is started through the launcher of the suite
+    # fixture: it runs under the worker harness, with the network guard.
     script = '''
 import asyncio, sys
 from kosong.chat_provider.kimi import Kimi
@@ -164,7 +168,7 @@ async def main():
         await provider.client.close()
 asyncio.run(main())
 '''
-    completed = subprocess.run(
+    completed = locked_worker_launch.run(
         [str(parent._DEFAULT_WORKER_PYTHON), "-c", script, drift],
         env=parent._worker_environment(), capture_output=True, text=True, timeout=10,
     )
@@ -322,7 +326,8 @@ def _invoke_real_worker(
     return result, endpoint.requests, toolset
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_k3_multi_step_replay_preserves_reasoning_and_each_priced_step(monkeypatch):
     chunks = _k3_chunks(tool=True)
     chunks[0]["choices"][0]["delta"]["reasoning_content"] = "Use the confined tool."
@@ -349,7 +354,8 @@ def test_real_k3_multi_step_replay_preserves_reasoning_and_each_priced_step(monk
     assert result.completeness.terminal_complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("field", [
     "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_write_tokens",
 ])
@@ -368,7 +374,8 @@ def test_real_worker_rejects_all_k3_counter_types_before_sdk_coercion(
     assert not result.completeness.terminal_complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("target", ["output.txt", "outside.txt"])
 def test_real_k3_coding_worker_preserves_scoped_mutation_authority(
     monkeypatch, tmp_path, target,
@@ -394,7 +401,8 @@ def test_real_k3_coding_worker_preserves_scoped_mutation_authority(
     assert not result.completeness.terminal_complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("tool", [False, True], ids=["text-terminal", "settled-max-turns"])
 def test_real_k3_worker_preserves_exact_request_usage_and_cost(monkeypatch, tool):
     model, cost = PRO, 0.000292
@@ -436,7 +444,8 @@ def test_real_k3_worker_preserves_exact_request_usage_and_cost(monkeypatch, tool
         assert result.final_message == "qualified K3 answer"
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("malformation", [
     "missing-write", "missing-read", "missing-details", "cache-overlap", "boolean-write",
     "negative-write", "string-write", "wrong-total", "early-usage", "duplicate-usage",

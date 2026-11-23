@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The frame in which the command-line tool shows the result of a tool call
+# it ran. Nothing was observed of the real tool (see cli.init).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: tool_result
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.UserMessage with one ToolResultBlock, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "user",
+    block type "tool_result")
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    Of this frame the pinned SDK reads the content of the inner message, the
+    parent tool-use id and the frame id. The session id and the role of the
+    inner message are carried as the other frames carry them and are not read
+    by that parser; its optional tool_use_result key is absent. The result
+    content is written as the list of text blocks that a tool
+    server hosted by the SDK returns (claude_agent_sdk._internal.query, method
+    tools/call), one of the two forms ToolResultBlock.content is typed with.
+    That the real tool emits this frame between two model turns is not stated
+    by any source in reach.
+
+status: 200
+
+body:
+  type: user
+  message:
+    role: user
+    content:
+      - type: tool_result
+        tool_use_id: {slot: call_id}
+        content:
+          - type: text
+            text: {slot: tool_result}
+        is_error: {slot: tool_is_error}
+  parent_tool_use_id: null
+  session_id: {slot: session_id}
+  uuid: {slot: frame_id}

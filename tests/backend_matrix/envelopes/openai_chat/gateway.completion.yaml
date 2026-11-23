@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A chat completion that ends cleanly with visible text, as the hosted
+# gateway answers a plain request.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: gateway
+behaviour: completion
+
+provenance:
+  grade: documented
+  sources:
+    - source: >-
+        port note open-weight-live-facts.md, section "One request per id":
+        the four rows of the production hub that were answered (lines 23-25
+        and 27 of the note as it stood on 2026-11-19), and the sentence under
+        the table that the requests were plain chat-completions requests
+      retrieved: "2026-11-18"
+      states: >-
+        One plain chat-completions request per model id against the
+        production hub, live on 2026-11-18. Four ids were answered with HTTP
+        200, three of the GLM family and one of the DeepSeek family, and each
+        response named the model that was asked for. For one of the GLM ids
+        the note says that usage came in the OpenAI shape; for the other
+        three it says nothing about usage. No body was stored. The fifth hub
+        id that was asked, of the Kimi family, was answered with HTTP 429 and
+        is "listed but not confirmed to answer": it grounds nothing here.
+  notes: >-
+    Only the facts above were observed. The keys they do not name (id,
+    object, created, choices[].index, message.role, finish_reason "stop",
+    usage.total_tokens) are the required fields of
+    openai.types.chat.ChatCompletion in the root SDK, which is what
+    "the OpenAI shape" refers to. Optional fields seen in the same run
+    (reasoning content, token details) are left out on purpose: they belong
+    to the scenario about documented optional fields.
+    Not observed: a reply of the hub's Kimi route. The model of the hosted
+    primary column is one of the four ids that answered; no row is about the
+    model of the hosted secondary column, which is of the Kimi family, and
+    the adapter-level check in the same note says of a hub Kimi model "works;
+    one usage counter is not recorded", so the usage block of that family is
+    known to differ in some way. The grade is per envelope, so the cell
+    report shows "documented" on both hosted columns; on the secondary column
+    read it as documented for other model families of the same gateway.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices:
+    - index: 0
+      message:
+        role: assistant
+        content: {slot: text}
+      finish_reason: stop
+  usage:
+    prompt_tokens: {slot: input_tokens}
+    completion_tokens: {slot: output_tokens}
+    total_tokens: {slot: total_tokens}

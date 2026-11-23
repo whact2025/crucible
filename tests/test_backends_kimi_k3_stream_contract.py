@@ -83,7 +83,8 @@ def _run(monkeypatch, chunks, *, tool=False, done="[DONE]", **kwargs):
     return fixtures._invoke_real_worker(monkeypatch, chunks, tool=tool, **kwargs)
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("shape", [
     "finish-top-level", "partial-progress", "partial-finish", "null-finish-details",
     "choice-local-progress", "matching-finish-and-stats",
@@ -119,7 +120,8 @@ def test_real_worker_admits_documented_final_usage_once(monkeypatch, shape):
     assert result.usage.cost_usd == pytest.approx(0.000292)
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("shape,code", [
     ("missing-done", "missing_done"), ("invalid-done", "invalid_done"),
     ("partial-finish-without-stats", "missing_terminal_usage"),
@@ -174,7 +176,8 @@ def test_real_worker_rejects_incomplete_or_ambiguous_final_before_tools(
     assert not result.pricing_evidence.complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("tool", [False, True], ids=["observed-stop", "tool-dispatch-denied"])
 def test_real_worker_rejects_observed_missing_cache_read(monkeypatch, tool):
     # Numeric-only shape observed with kimi-k3 on 2026-09-24 and again with
@@ -270,7 +273,8 @@ def test_recorded_k31_pro_final_usage_is_exact_only_with_a_read_count(module, sh
         }
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_accepts_recorded_cache_hit_with_equal_alias(monkeypatch):
     # The hit shape through the pinned SDK and its SSE parser, under strict
     # accounting: nested read count, equal top-level alias, W=0.

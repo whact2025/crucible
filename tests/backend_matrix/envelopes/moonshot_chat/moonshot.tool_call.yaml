@@ -1,0 +1,124 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed chat completion that reasons and then asks for one function tool
+# call, as Moonshot answers a request of the K3 series that advertises tools
+# and for which nothing was read from its cache.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: tool_call
+
+provenance:
+  grade: documented
+  sources:
+    - source: >-
+        port note open-weight-research.json, topic "kimi", api_changes[4]:
+        the vendor's chat reference and its guide to streaming output
+        (platform.kimi.ai/docs/api/chat.md), primary source
+      retrieved: "2026-11-18"
+      states: >-
+        In a stream of the K3 series delta.reasoning_content arrives before
+        delta.tool_calls. The fragments of one tool call share an index, and
+        its id and function.name travel in the first fragment only. Usage
+        appears only in the final chunk, which has an empty choices list.
+    - source: >-
+        port note open-weight-research.json, topic "kimi", api_changes[5]:
+        the vendor's model overview and its guide to reasoning effort,
+        primary source
+      retrieved: "2026-11-18"
+      states: >-
+        On the K3 series the full assistant message, with its
+        reasoning_content, must be sent back with the result of a tool call.
+    - source: >-
+        port note open-weight-models.live.md, section 2.5: the adapter-level
+        checks of the Kimi route through the locked worker, with one tool
+      retrieved: "2026-11-18"
+      states: >-
+        Live on 2026-11-18, twice: the model reasoned and called the tool,
+        the call was dispatched once with its argument, and the next request
+        (the assistant turn with its reasoning and tool call, then the tool
+        result) was accepted and answered. Both responses named the model
+        that was asked for, and neither carried a count of cache reads. The
+        worker accepts a tool call only from a stream that ends with the
+        finish reason "tool_calls", so that is what the provider sent. No
+        body was stored.
+    - source: >-
+        port note open-weight-models.live.md, section 2.3, and the crucible
+        test module test_backends_kimi_k3_stream_contract.py: the recorded
+        final statistics of four raw streamed requests
+      retrieved: "2026-11-18"
+      states: >-
+        The keys of the final statistics of a reply without a cache read,
+        the usage block that the finish choice repeats, and "[DONE]" last,
+        as stated for the completion envelope.
+  notes: >-
+    Observed or documented: that a reply which calls a tool reasons first,
+    how a tool call travels, the finish reason, where the usage travels and
+    its keys. Constructed, as stated for the completion envelope: id, object,
+    created, the index of the choice and a null finish_reason before the
+    finish chunk (fields of openai.types.chat.ChatCompletionChunk in the SDK
+    the worker pins);
+    the type "function" of the call is the one value of the pinned SDK's
+    ChoiceDeltaToolCall. That the call arrives in one fragment with its whole
+    argument document is a choice of this envelope. The reasoning text is a
+    slot.
+
+status: 200
+body:
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          role: assistant
+          reasoning_content: {slot: reasoning_text}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          tool_calls:
+            - index: 0
+              id: {slot: call_id}
+              type: function
+              function:
+                name: {slot: tool_name}
+                arguments: {slot: tool_arguments}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta: {}
+        finish_reason: tool_calls
+        usage:
+          prompt_tokens: {slot: input_tokens}
+          completion_tokens: {slot: output_tokens}
+          total_tokens: {slot: total_tokens}
+          prompt_tokens_details:
+            cache_write_tokens: 0
+          completion_tokens_details:
+            reasoning_tokens: {slot: reasoning_tokens}
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices: []
+    usage:
+      prompt_tokens: {slot: input_tokens}
+      completion_tokens: {slot: output_tokens}
+      total_tokens: {slot: total_tokens}
+      prompt_tokens_details:
+        cache_write_tokens: 0
+      completion_tokens_details:
+        reasoning_tokens: {slot: reasoning_tokens}
+  - "[DONE]"

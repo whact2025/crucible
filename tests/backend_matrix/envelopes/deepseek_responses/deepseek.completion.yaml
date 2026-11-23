@@ -1,0 +1,181 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed response that ends cleanly with visible text, as the DeepSeek
+# Responses route answers a request: the server-sent events of one response,
+# in order, the last of them the terminal.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: deepseek_responses
+provider: deepseek
+behaviour: completion
+
+provenance:
+  grade: documented
+  sources:
+    - source: >-
+        port note open-weight-research.json, topic "deepseek", api_changes[9]:
+        the vendor's guide to its Responses route
+        (api-docs.deepseek.com/guides/responses_api), primary source
+      retrieved: "2026-11-18"
+      states: >-
+        The streaming events of the route: response.created,
+        response.in_progress, response.output_item.added and .done,
+        response.content_part.added and .done, response.output_text.delta
+        and .done, and the terminals response.completed, .incomplete and
+        .failed. There is no closing "[DONE]" message. Usage is null until
+        the terminal event.
+    - source: >-
+        port note open-weight-research.json, topic "deepseek", api_changes[3]:
+        the vendor's guide and its reference of the create-response call
+        (api-docs.deepseek.com/api/create-response), primary source
+      retrieved: "2026-11-18"
+      states: >-
+        Usage of a response: input_tokens, of which
+        input_tokens_details.cached_tokens hit the context cache;
+        output_tokens, of which output_tokens_details.reasoning_tokens were
+        reasoning; no cache-write counter is documented.
+    - source: >-
+        port note open-weight-models.live.md, section 3 "DeepSeek native
+        Responses route": the adapter-level check of the shipped route
+        through the locked worker
+      retrieved: "2026-11-18"
+      states: >-
+        Three streamed responses of the production route, live on
+        2026-11-18. Each named the model that was asked for and ended with
+        the terminal response.completed. Each carried the cached-input and
+        the reasoning-output counter and no cache-write counter; the last of
+        them, the text answer that ended a tool round, had no reasoning
+        tokens, and two had no cached tokens. No body was stored.
+  notes: >-
+    Documented or observed: which events exist, that the terminal carries the
+    usage and the others carry none, the three usage fields with their two
+    detail counters, the echoed model and the terminal type. Everything else
+    is constructed. The keys those sources do not name are the fields without
+    a default of the event and item types of the worker's pinned SDK
+    (openai.types.responses: Response, ResponseOutputMessage,
+    ResponseOutputText and the event types named above), which is what
+    parses this stream in every cell. Three of them are fillers whose real
+    values are not known: parallel_tool_calls, tool_choice and tools, which
+    the service is expected to echo from the request. One field of the
+    pinned SDK's usage type is left out on purpose, the cache-write counter
+    of input_tokens_details: the vendor documents none and none was sent
+    live. Which of the documented events a plain answer emits, and in which
+    order, is the order in which the pinned SDK's types build an output
+    item up; it was not observed. The frame of an event on the wire
+    ("event:" with the type, "data:" with the JSON object, a blank line) is
+    the server-sent-event form the SDK's decoder reads; the vendor guide
+    states only that there is no closing message. Optional fields the vendor
+    documents (a reasoning item before the text, the phase of an output
+    message, the title of a response) are left out on purpose: they belong
+    to the scenario about documented optional fields.
+
+status: 200
+body:
+  - type: response.created
+    sequence_number: 0
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.in_progress
+    sequence_number: 1
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.output_item.added
+    sequence_number: 2
+    output_index: 0
+    item:
+      id: {slot: item_id}
+      type: message
+      role: assistant
+      status: in_progress
+      content: []
+  - type: response.content_part.added
+    sequence_number: 3
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    part:
+      type: output_text
+      text: ""
+      annotations: []
+  - type: response.output_text.delta
+    sequence_number: 4
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    delta: {slot: text}
+    logprobs: []
+  - type: response.output_text.done
+    sequence_number: 5
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    text: {slot: text}
+    logprobs: []
+  - type: response.content_part.done
+    sequence_number: 6
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    part:
+      type: output_text
+      text: {slot: text}
+      annotations: []
+  - type: response.output_item.done
+    sequence_number: 7
+    output_index: 0
+    item:
+      id: {slot: item_id}
+      type: message
+      role: assistant
+      status: completed
+      content:
+        - type: output_text
+          text: {slot: text}
+          annotations: []
+  - type: response.completed
+    sequence_number: 8
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: completed
+      model: {slot: served_model}
+      output:
+        - id: {slot: item_id}
+          type: message
+          role: assistant
+          status: completed
+          content:
+            - type: output_text
+              text: {slot: text}
+              annotations: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage:
+        input_tokens: {slot: input_tokens}
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: {slot: output_tokens}
+        output_tokens_details:
+          reasoning_tokens: 0
+        total_tokens: {slot: total_tokens}

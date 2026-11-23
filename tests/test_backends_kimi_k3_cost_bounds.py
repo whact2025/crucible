@@ -61,7 +61,8 @@ def test_bound_ledger_stops_at_cap_before_a_later_generation(module):
     assert emitted[0]["segment"]["cache_read_tokens"] is None
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("missing", [False, True])
 def test_real_worker_bounded_response_retains_unknown_as_unknown(monkeypatch, missing):
     chunks = _missing_read() if missing else fixtures._k3_chunks()
@@ -87,7 +88,8 @@ def test_real_worker_bounded_response_retains_unknown_as_unknown(monkeypatch, mi
     assert result.completeness.trace_complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_upper_bound_exhaustion_denies_tool_and_preserves_bound(monkeypatch):
     result, requests, toolset = fixtures._invoke_real_worker(
         monkeypatch, _missing_read(tool=True), tool=True,
@@ -104,7 +106,8 @@ def test_real_worker_upper_bound_exhaustion_denies_tool_and_preserves_bound(monk
     assert not result.completeness.terminal_complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_multi_step_bounds_cover_each_response(monkeypatch):
     result, requests, toolset = fixtures._invoke_real_worker(
         monkeypatch, _missing_read(tool=True), tool=True,
@@ -190,7 +193,8 @@ def test_parent_missing_finite_budget_denies_before_worker(budget):
     assert called == []
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("fault", [
     "null-read", "top-only-read", "missing-write", "malformed-write",
     "cache-overlap", "wrong-model", "no-done", "missing-final", "conflicting-final",
@@ -233,7 +237,8 @@ def test_real_worker_opt_in_does_not_admit_other_incomplete_or_unsafe_evidence(m
     assert result.cost_bounds is not None and not result.cost_bounds.coverage_complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_budget_is_cumulative_and_denies_second_step_tools(monkeypatch):
     second = _missing_read(tool=True)
     second[0]["choices"][0]["delta"]["tool_calls"][0]["id"] = "second-tool"
@@ -249,7 +254,8 @@ def test_real_worker_budget_is_cumulative_and_denies_second_step_tools(monkeypat
     assert result.cost_bounds.upper_bound_usd == pytest.approx(0.0008)
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_exactly_exhausted_budget_stops_before_next_step(monkeypatch):
     result, requests, toolset = fixtures._invoke_real_worker(
         monkeypatch, _missing_read(tool=True), tool=True,
@@ -263,7 +269,8 @@ def test_real_worker_exactly_exhausted_budget_stops_before_next_step(monkeypatch
     assert result.cost_bounds.coverage_complete
 
 
-@pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("budget,target", [
     (1.0, "output.txt"), (1.0, "outside.txt"), (0.0003, "output.txt"),
 ])
