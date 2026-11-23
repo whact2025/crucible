@@ -40,6 +40,12 @@ phases independently covered. A shared successful cascade can own multiple
 assertions. Gate doubles settle their exact writer epoch so a dispatch
 regression fails its behavior assertion with cleanup still intact.
 
+A shared guard fails any test that ends with a workspace lock chain or a
+registered workspace authority that appeared during it, and names what the
+test left. Settle the lock owner a test caught with `retry_cleanup`, exit
+every lock it entered, and join every thread that takes a lock before the
+test returns.
+
 | Area | Representative tests |
 |---|---|
 | Current product and docs | `test_axioms.py`, `test_documentation.py`, `test_workflows_dispatcher.py` |

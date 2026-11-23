@@ -2523,6 +2523,25 @@ def _read_bounded_control_file(
         os.close(descriptor)
 
 
+def _thread_workspace_authorities() -> tuple[_WorkspaceMutationAuthority, ...]:
+    """Return a snapshot of the authorities this thread holds in this process.
+
+    An owner that was dropped unexited stays registered until a garbage
+    collection finalizes its lock generators, and that release removes its
+    keys from this registry.  A collection can begin at any call a caller
+    makes, so no caller iterates the registry itself: one C call copies its
+    values, and a collection cannot begin inside that call.
+    """
+
+    return tuple(
+        authority
+        for authority in tuple(
+            getattr(_LOCK_STATE, "authorities", {}).values()
+        )
+        if authority.owner_pid == os.getpid()
+    )
+
+
 def _lexical_absolute_control_path(base: Path, rendered: str) -> Path:
     if not rendered or "\0" in rendered or "\n" in rendered or "\r" in rendered:
         raise MutationJournalError("Git control path is malformed")
@@ -2541,9 +2560,7 @@ def _lexical_absolute_control_path(base: Path, rendered: str) -> Path:
     if descriptor_binding is not None:
         descriptor, _alias, relative = descriptor_binding
         logical_roots: set[Path] = set()
-        for authority in getattr(_LOCK_STATE, "authorities", {}).values():
-            if authority.owner_pid != os.getpid():
-                continue
+        for authority in _thread_workspace_authorities():
             for logical_root, held_descriptor in (
                 (authority.root, authority.root_descriptor),
                 (authority.common_dir, authority.common_descriptor),
@@ -2953,32 +2970,66 @@ def _held_authority_descriptor_path(
     would make an arbitrary fd alias an authority grant.  Recognize only
     descriptors that this process currently holds for workspace authority and
     reject lexical parent traversal in the suffix.
+
+    Only the descriptor that the path itself names is inspected, and only
+    while an authority registered in this thread holds it.  The descriptors
+    of another owner of the thread are never touched: a garbage collection
+    may release a dropped owner during this call, and that release must
+    neither fail this caller nor let a closed or reused number through.
     """
 
-    authorities = getattr(_LOCK_STATE, "authorities", {})
-    descriptors = {
-        descriptor
-        for authority in authorities.values()
-        if authority.owner_pid == os.getpid()
+    parts = path.parts
+    if parts[:4] == ("/", "proc", "self", "fd") and len(parts) > 4:
+        name = parts[4]
+    elif parts[:3] == ("/", "dev", "fd") and len(parts) > 3:
+        name = parts[3]
+    else:
+        return None
+    for authority in _thread_workspace_authorities():
         for descriptor in (
             authority.root_descriptor,
             authority.common_descriptor,
             authority.git_common_descriptor,
             authority.git_dir_descriptor,
-        )
-        if descriptor in _HELD_AUTHORITY_DESCRIPTORS
-    }
-    for descriptor in descriptors:
-        alias = Path(_authority_descriptor_cwd(descriptor))
-        try:
-            relative = path.relative_to(alias)
-        except ValueError:
-            continue
-        if any(part == ".." for part in relative.parts):
-            raise MutationJournalError(
-                f"held authority descriptor path escapes its root: {path}"
-            )
-        return descriptor, alias, relative
+        ):
+            # The number is never parsed from the path: the path's text must
+            # equal the canonical decimal of a number this thread holds.
+            if (
+                str(descriptor) != name
+                or descriptor not in _HELD_AUTHORITY_DESCRIPTORS
+            ):
+                continue
+            alias = Path(_authority_descriptor_cwd(descriptor))
+            try:
+                relative = path.relative_to(alias)
+            except ValueError:
+                return None
+            if any(part == ".." for part in relative.parts):
+                raise MutationJournalError(
+                    f"held authority descriptor path escapes its root: {path}"
+                )
+            # Last step before the number is handed out: this thread still
+            # registers the same authority and the number is still held.  A
+            # release removes the registration, then discards the number,
+            # then closes it.  The registry is read by one subscript and no
+            # call follows it before the return, so neither a collection nor
+            # another thread can release the owner, or reuse its number, in
+            # between.
+            try:
+                registered = getattr(_LOCK_STATE, "authorities", {})[
+                    authority.root
+                ]
+            except KeyError:
+                registered = None
+            if (
+                registered is not authority
+                or descriptor not in _HELD_AUTHORITY_DESCRIPTORS
+            ):
+                raise MutationJournalError(
+                    "held workspace authority descriptor was released "
+                    f"during inspection: {path}"
+                )
+            return descriptor, alias, relative
     return None
 
 
@@ -3541,12 +3592,15 @@ def _external_file_lock(
 
     with _IN_PROCESS_LOCKS_GUARD:
         process_lock = process_locks.setdefault(key, threading.RLock())
+    # A garbage collection that releases a dropped owner of this thread pops
+    # that owner's entries from the per-thread lock tables, so every loop
+    # over such a table reads a snapshot.
     held_before = getattr(_LOCK_STATE, state_name, {})
     nested_independent_common = kind == "common" and any(
         held_key != key
         and depth
         and held_authority.owner_pid == os.getpid()
-        for held_key, (depth, held_authority, _bound_common) in (
+        for held_key, (depth, held_authority, _bound_common) in tuple(
             held_before.items()
         )
     )
@@ -3593,7 +3647,9 @@ def _external_file_lock(
         if kind == "common":
             held_keys = [
                 held_key
-                for held_key, (depth, held_authority, _bound_common) in held.items()
+                for held_key, (depth, held_authority, _bound_common) in tuple(
+                    held.items()
+                )
                 if depth and held_authority.owner_pid == os.getpid()
             ]
             nested_independent_common = bool(held_keys)
@@ -3917,7 +3973,16 @@ def _external_workspace_coordination(
         finally:
             if os.getpid() == creator_pid:
                 for index in range(len(authorities) - 1, -1, -1):
-                    if authorities[index] is authority:
+                    try:
+                        candidate = authorities[index]
+                    except IndexError:
+                        # A dropped owner of this thread was released by a
+                        # garbage collection after the length was read and
+                        # removed its own entry.  Entries only move to lower
+                        # indexes, so this downward walk still reaches the
+                        # entry of this owner.
+                        continue
+                    if candidate is authority:
                         authorities.pop(index)
                         break
 
@@ -3974,11 +4039,13 @@ def _active_external_workspace_coordination(
     cwd: str | Path,
 ) -> _ExternalWorkspaceCoordination | None:
     lexical = _lexical_workspace_path(cwd)
-    for authority in reversed(getattr(
+    # A reversed walk of the list itself ends early when a released owner's
+    # entry leaves it, before the entry of a live owner is reached.
+    for authority in reversed(tuple(getattr(
         _LOCK_STATE,
         "external_workspace_authorities",
         (),
-    )):
+    ))):
         if authority.owner_pid != os.getpid():
             continue
         if lexical == authority.binding.root:
@@ -4288,7 +4355,7 @@ def _canonical_workspace_mutation_lock(
             held_before_acquire = getattr(_LOCK_STATE, "held", {})
             held_independent_keys = [
                 key
-                for key, (depth, _descriptor, owner_pid) in (
+                for key, (depth, _descriptor, owner_pid) in tuple(
                     held_before_acquire.items()
                 )
                 if depth and owner_pid == os.getpid() and key != lock_key
@@ -4512,8 +4579,8 @@ def _canonical_workspace_mutation_lock(
                     if os.getpid() == creator_pid:
                         if locked:
                             fcntl.flock(descriptor, fcntl.LOCK_UN)
-                        os.close(descriptor)
                         _HELD_LOCK_DESCRIPTORS.discard(descriptor)
+                        os.close(descriptor)
         finally:
             if os.getpid() == creator_pid:
                 if git_dir_fd is not None:
@@ -14391,10 +14458,9 @@ class WorkspaceMutationJournal:
         candidates: list[_WorkspaceMutationAuthority] = []
         if exact is not None:
             candidates.append(exact)
-        for authority in getattr(_LOCK_STATE, "authorities", {}).values():
+        for authority in _thread_workspace_authorities():
             if (
-                authority.owner_pid != os.getpid()
-                or authority is exact
+                authority is exact
                 or _lexical_workspace_path(authority.git_common_dir)
                 != captured_common
             ):
@@ -14776,16 +14842,13 @@ class WorkspaceMutationJournal:
         if expected_identity is None:
             return False
         return any(
-            candidate.owner_pid == os.getpid()
-            and _lexical_workspace_path(candidate.git_common_dir)
+            _lexical_workspace_path(candidate.git_common_dir)
             == captured_common
             and (
                 os.fstat(candidate.git_common_descriptor).st_dev,
                 os.fstat(candidate.git_common_descriptor).st_ino,
             ) == expected_identity
-            for candidate in getattr(
-                _LOCK_STATE, "authorities", {}
-            ).values()
+            for candidate in _thread_workspace_authorities()
         )
 
     def _ensure_git_admin_parent_chain(
