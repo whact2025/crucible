@@ -655,6 +655,9 @@ def suite_default_max_turns() -> int:
     return max(defaults)
 
 
+# A FALLBACK cites the product by file and line. The line numbers of the
+# citations in this module are those of the initial release of each
+# repository; the words in parentheses say what is cited there.
 _OPTIONAL_TOOL_EVENTS = FALLBACK(
     "tool_events_optional",
     "assay/src/assay/backend/features.py:26 (usage and terminal_only promise no "
@@ -837,7 +840,9 @@ _ALL: tuple[Scenario, ...] = (
             ProviderScript((Call(READ_A), Call(READ_B))),
             expect=Expectation(
                 kind="max_turns",
-                # Both spellings are accepted (owner decision 14).
+                # Both spellings are accepted, by a decision of the release
+                # owner taken at its recommended default: the adapters do
+                # not agree on one, and the matrix leaves them as they are.
                 stop=("tool_budget_exhausted", "tool_dispatch_budget_exhausted"),
                 retriable=False,
                 events=("limit/tool_dispatch_budget",),

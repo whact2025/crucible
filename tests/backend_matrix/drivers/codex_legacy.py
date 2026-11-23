@@ -21,7 +21,7 @@ So the provider ledger, the replay rules and clause C0 are the same as on
 every other column. The app-server keeps the conversation of a thread itself,
 so the dialect states no replay rule.
 
-The session checks of the adapter are met as the design lists them:
+The session checks of the adapter are met as follows:
 
 - the route accepts only a native executable. The peer is a script, so for as
   long as a backend is open the driver replaces the adapter's native-binary

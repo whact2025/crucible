@@ -69,8 +69,16 @@ A cell is one scenario on one column in one lens. Its id reads
 backend and transport, or `toy`), the scenario (`S01`) or static check (`H02`),
 the column's role within its kind (`primary`, `secondary`, `blocked`) and the
 lens (`raw`, `guarded` with the diagnostic limit guard bound, or `static`).
-Columns come from the shipped profile catalogs; profile names and model ids
-live in `backend_matrix/columns.py` only.
+Columns come from the shipped profile catalogs; profile names live in
+`backend_matrix/columns.py` only, and model ids are read from the catalogs at
+run time and typed nowhere in the package.
+
+The scenarios come in three sets (`backend_matrix/scenarios.py`): the starter
+set (`S00`, `S01`, `S03`, `S04`), pack A (limits on turns, tool dispatch, cost
+and tool-result bytes, refusals, a write as progress) and pack B (the
+admission scenario `S51` so far). The toy columns run all three. A real kind
+runs the starter set today (`ENABLEMENT` in `backend_matrix/cells.py`), and
+its static cell `H02` is a known gap until it runs pack A.
 
 A cell computes deviation codes from a closed vocabulary
 (`backend_matrix/contract.py`), and
@@ -269,14 +277,15 @@ observation, or `constructed` to satisfy the SDK's types. The weakest envelope
 a cell used is its grade. An envelope names the SDK release it was built for
 in one field, `sdk_version`, as `<distribution> <version>`. A static test
 holds each to what reads the dialect, the test environment or a worker's
-lock, and refuses a release typed anywhere else in an envelope or a module
-docstring, so a lock that moves fails there until the envelope was read
-against the new release. A difference that no feature field expresses is a
-declared difference of the ledger, with a product citation and the alternative
-contract that is asserted instead. One of them restates a line of a clause
-(what C5 asks of a route under a cost policy, above), and there the clause
-asserts the alternative itself; no other one touches a clause, and none may
-touch the accounting clause C6.
+lock, so a lock that moves fails there until the envelope was read against
+the new release. The same test refuses a release of three dotted numbers in
+the comment lines of an envelope, in its provenance outside `sdk_version`
+and in the docstring of a module; it reads no other text. A difference that
+no feature field expresses is a declared difference of the ledger, with a
+product citation and the alternative contract that is asserted instead. One
+of them restates a line of a clause (what C5 asks of a route under a cost
+policy, above), and there the clause asserts the alternative itself; no
+other one touches a clause, and none may touch the accounting clause C6.
 
 ```bash
 uv sync --frozen --reinstall --link-mode copy --project backends/deepseek_worker
@@ -311,8 +320,8 @@ that run beside it in the same checkout. The Kimi pin hashes its source
 directory and its installed tree the same way, without the rule about links.
 CI installs each of them in every test shard. A test outside the matrix that
 needs the Kimi environment takes the `require_kimi_worker` fixture, which
-fails without it, and the `matrix_worker` marker; no test skips on a missing
-worker runtime (static cell `H01`).
+fails without it, and the `matrix_worker` marker; static cell `H01` fails
+when a `skipif` marker on a worker interpreter returns to a test file.
 
 On a machine without the worker environment, leave these tests out explicitly
 and keep the configured expression:

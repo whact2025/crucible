@@ -18,11 +18,11 @@ takes every model turn from the scripted loopback provider, in the
 the tool emits for that turn, each rendered from an envelope. So the provider
 ledger, the replay rules and clause C0 are the same as on every other column.
 
-The two session checks of the adapter are met as the design lists them and no
-product name is patched: ``-v`` is answered with a version the adapter has
-reviewed for the route's model (read from the adapter's own table, the one
-private name this driver touches) and ``auth status --json`` with the
-organisation the routing file names.
+The two session checks of the adapter are met and no product name is patched:
+``-v`` is answered with a version the adapter has reviewed for the route's
+model (read from the adapter's own table, the one private name this driver
+touches) and ``auth status --json`` with the organisation the routing file
+names.
 
 The seam canary of a column fails unless the SDK started the peer: a child of
 the test process with the stream-json command line, the SDK's entry-point

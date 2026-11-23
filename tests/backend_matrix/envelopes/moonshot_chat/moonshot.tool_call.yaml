@@ -14,7 +14,6 @@ provenance:
   grade: documented
   sources:
     - source: >-
-        port note open-weight-research.json, topic "kimi", api_changes[4]:
         the vendor's chat reference and its guide to streaming output
         (platform.kimi.ai/docs/api/chat.md), primary source
       retrieved: "2026-11-18"
@@ -24,7 +23,6 @@ provenance:
         its id and function.name travel in the first fragment only. Usage
         appears only in the final chunk, which has an empty choices list.
     - source: >-
-        port note open-weight-research.json, topic "kimi", api_changes[5]:
         the vendor's model overview and its guide to reasoning effort,
         primary source
       retrieved: "2026-11-18"
@@ -32,7 +30,7 @@ provenance:
         On the K3 series the full assistant message, with its
         reasoning_content, must be sent back with the result of a tool call.
     - source: >-
-        port note open-weight-models.live.md, section 2.5: the adapter-level
+        a live observation, not a published document: the adapter-level
         checks of the Kimi route through the locked worker, with one tool
       retrieved: "2026-11-18"
       states: >-
@@ -45,9 +43,10 @@ provenance:
         finish reason "tool_calls", so that is what the provider sent. No
         body was stored.
     - source: >-
-        port note open-weight-models.live.md, section 2.3, and the crucible
-        test module test_backends_kimi_k3_stream_contract.py: the recorded
-        final statistics of four raw streamed requests
+        the live observation of four raw streamed requests that the
+        completion envelope cites, and the crucible test module
+        test_backends_kimi_k3_stream_contract.py: the recorded final
+        statistics of those requests
       retrieved: "2026-11-18"
       states: >-
         The keys of the final statistics of a reply without a cache read,

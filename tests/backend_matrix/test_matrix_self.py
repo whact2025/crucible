@@ -189,8 +189,9 @@ def test_each_behavioural_high_gap_is_rehearsed_as_predicted(gap: str) -> None:
 
 
 def test_a_rehearsed_gap_of_the_matrix_is_a_registry_record() -> None:
-    # A gap of the gap list (G..) may be rehearsed before any cell of it is
-    # recorded. A gap the matrix found itself exists in the registry only, so
+    # A gap that was known before the matrix was built (G.., origin
+    # ``gap list``) may be rehearsed before any cell of it is recorded. A
+    # gap the matrix found itself exists in the registry only, so
     # a liar that names one names a record, and yields what the ledger
     # attributes to that gap wherever an entry still does.
     own = [
@@ -357,7 +358,7 @@ def test_ledger_rejects_a_declared_difference_without_an_alternative() -> None:
         ledger.parse(document)
 
 
-# -- the contract on what part 1 has no honest play for -------------------------
+# -- the contract on what no scenario plays honestly ----------------------------
 
 
 def _observation(**changes: Any) -> contract.Observation:

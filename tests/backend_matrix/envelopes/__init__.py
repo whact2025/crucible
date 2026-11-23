@@ -30,8 +30,9 @@ load-time parse: a cell that uses an envelope parses it through the real SDK.
 A version is stated in one place: ``sdk_version``, as ``<distribution>
 <version>`` pairs separated by ``, ``. That is the form a static test holds
 to the environment that reads the dialect, so a lock that moves fails there
-until the envelope was read against the new release. No other line of an
-envelope types a version.
+until the envelope was read against the new release. The same test refuses a
+release of three dotted numbers in the comment lines of an envelope and in
+its provenance outside ``sdk_version``. It does not read the body.
 """
 
 from __future__ import annotations

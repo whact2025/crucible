@@ -17,10 +17,8 @@ provenance:
   sdk_version: openai 2.44.0
   notes: >-
     Nothing was observed: the live requests of 2026-11-18 were plain
-    completions and exercised no tool call (port note
-    open-weight-live-facts.md, line 34). The public catalog page of the model
-    family says that its tool calls are OpenAI-compatible (port note
-    open-weight-research.json, topic "catalogs", api_changes[7], primary
+    completions and exercised no tool call. The public catalog page of the
+    model family says that its tool calls are OpenAI-compatible (primary
     source, read 2026-11-18); that page is not this gateway and shows no
     body. So this envelope proves that the reply parses through the SDK, not
     that the gateway sends it.

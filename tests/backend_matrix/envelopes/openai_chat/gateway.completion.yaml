@@ -13,20 +13,21 @@ provenance:
   grade: documented
   sources:
     - source: >-
-        port note open-weight-live-facts.md, section "One request per id":
-        the four rows of the production hub that were answered (lines 23-25
-        and 27 of the note as it stood on 2026-11-19), and the sentence under
-        the table that the requests were plain chat-completions requests
+        a live observation of the production hub, not a published document:
+        one plain chat-completions request per model id, with the result,
+        the model name in the response and a remark noted for each; the four
+        ids that were answered are the source of this envelope
       retrieved: "2026-11-18"
       states: >-
         One plain chat-completions request per model id against the
         production hub, live on 2026-11-18. Four ids were answered with HTTP
         200, three of the GLM family and one of the DeepSeek family, and each
         response named the model that was asked for. For one of the GLM ids
-        the note says that usage came in the OpenAI shape; for the other
-        three it says nothing about usage. No body was stored. The fifth hub
-        id that was asked, of the Kimi family, was answered with HTTP 429 and
-        is "listed but not confirmed to answer": it grounds nothing here.
+        it was noted that usage came in the OpenAI shape; for the other
+        three nothing was noted about usage. No body was stored. The fifth
+        hub id that was asked, of the Kimi family, was answered with HTTP 429:
+        it is listed and not confirmed to answer, and it grounds nothing
+        here.
   notes: >-
     Only the facts above were observed. The keys they do not name (id,
     object, created, choices[].index, message.role, finish_reason "stop",
@@ -36,13 +37,14 @@ provenance:
     (reasoning content, token details) are left out on purpose: they belong
     to the scenario about documented optional fields.
     Not observed: a reply of the hub's Kimi route. The model of the hosted
-    primary column is one of the four ids that answered; no row is about the
-    model of the hosted secondary column, which is of the Kimi family, and
-    the adapter-level check in the same note says of a hub Kimi model "works;
-    one usage counter is not recorded", so the usage block of that family is
-    known to differ in some way. The grade is per envelope, so the cell
-    report shows "documented" on both hosted columns; on the secondary column
-    read it as documented for other model families of the same gateway.
+    primary column is one of the four ids that answered; none of the four is
+    the model of the hosted secondary column, which is of the Kimi family,
+    and an adapter-level live check of the same day found that a hub Kimi
+    model works and that one of its usage counters is not recorded, so the
+    usage block of that family is known to differ in some way. The grade is
+    per envelope, so the cell report shows "documented" on both hosted
+    columns; on the secondary column read it as documented for other model
+    families of the same gateway.
 
 status: 200
 body:

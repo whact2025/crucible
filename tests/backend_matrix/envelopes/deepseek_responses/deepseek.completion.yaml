@@ -14,7 +14,6 @@ provenance:
   grade: documented
   sources:
     - source: >-
-        port note open-weight-research.json, topic "deepseek", api_changes[9]:
         the vendor's guide to its Responses route
         (api-docs.deepseek.com/guides/responses_api), primary source
       retrieved: "2026-11-18"
@@ -26,9 +25,9 @@ provenance:
         .failed. There is no closing "[DONE]" message. Usage is null until
         the terminal event.
     - source: >-
-        port note open-weight-research.json, topic "deepseek", api_changes[3]:
-        the vendor's guide and its reference of the create-response call
-        (api-docs.deepseek.com/api/create-response), primary source
+        the vendor's guide to its Responses route and its reference of the
+        create-response call (api-docs.deepseek.com/api/create-response),
+        primary source
       retrieved: "2026-11-18"
       states: >-
         Usage of a response: input_tokens, of which
@@ -36,9 +35,8 @@ provenance:
         output_tokens, of which output_tokens_details.reasoning_tokens were
         reasoning; no cache-write counter is documented.
     - source: >-
-        port note open-weight-models.live.md, section 3 "DeepSeek native
-        Responses route": the adapter-level check of the shipped route
-        through the locked worker
+        a live observation, not a published document: the adapter-level
+        check of the shipped route through the locked worker
       retrieved: "2026-11-18"
       states: >-
         Three streamed responses of the production route, live on

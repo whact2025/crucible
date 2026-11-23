@@ -16,6 +16,9 @@
 #   names the `declaration_change` (field, from, to, citation) that is the
 #   gap's listed resolution. `predicted` holds the codes expected of the cell
 #   before the first run of its column; the first run corrects them.
+#   `origin` says where a gap comes from: `gap list` for one that was known
+#   before the matrix was built, `matrix` for one the matrix raised and
+#   `reference` for one found on a reference column.
 #   A `column_wide` entry is one clause code that shows on every cell of a
 #   kind where its clause was evaluated and its check was asked (C6 asks for
 #   pricing evidence only of a result that flags its cost complete). It is
@@ -41,9 +44,21 @@
 #   pinned not expressible or is no longer generated, and H03 refuses a
 #   ruling on a record none of whose cells is withdrawn. So a ruling that
 #   keeps a gap is written in the entries of the gap, never in its record.
-# ceilings: counts may not exceed them. They rise while entries land and are
-#   frozen at the gate (pack A) and at the end of pack B; after that they only
-#   fall.
+# scenario sets: the scenarios (scenarios.py) come in three sets. The starter
+#   set is S00 (the seam canary), S01, S03 and S04. Pack A is S10a, S11, S12,
+#   S13, S18, S23a to S23c and S40: the limits (turns, tool dispatch, USD,
+#   tool-result bytes), the refusals and a write as progress. Pack B is the
+#   admission scenario S51 so far. The toy kind runs all three. A real kind
+#   runs the starter set today (`ENABLEMENT` in cells.py), and the static
+#   cell H02 of a driven kind reports static:pack_a_not_enabled until the
+#   kind runs pack A. A blocked column runs S00, S01 and S51 whatever sets
+#   its kind runs.
+# ceilings: counts may not exceed them. `pack_a` counts the entries on
+#   static cells and on scenarios of the starter set and of pack A, and
+#   every column-wide entry; `pack_b` counts those on scenarios of pack B.
+#   They rise while entries land and are frozen once pack A runs on every
+#   real kind (pack A) and once pack B is complete (pack B); after that they
+#   only fall.
 #
 # Cell ids read <kind>/<scenario>/<role>/<lens>.
 
@@ -90,16 +105,16 @@ registry:
     origin: gap list
     severity: high
     cells:
-      # Closed with the Kimi columns (part 5): the tests that need the worker
-      # runtime take a fixture that fails without it, CI installs the runtime
-      # in every test shard, and the cell has no entry any more. A skip marker
+      # Closed with the Kimi columns: the tests that need the worker runtime
+      # take a fixture that fails without it, CI installs the runtime in
+      # every test shard, and the cell has no entry any more. A skip marker
       # on a worker interpreter is static:worker_skip_unpinned from now on.
       - cell: kimi/H01/-/static
         observed_under: {}
         closes_under: {}
         predicted: ["static:worker_skip"]
-      # static:no_driven_column until the driver landed (part 5); the cell
-      # stays red until pack A runs on the columns.
+      # static:no_driven_column until the driver landed; the cell stays red
+      # until pack A runs on the columns.
       - cell: kimi/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -111,13 +126,14 @@ registry:
     severity: high
     # The gap is the limit exits (turn limit, USD budget, tool-result byte
     # budget), and its cells are of pack A. Their predictions were made for
-    # the release, where a limit event after the terminal made invoke raise.
-    # On the base the column was first driven on (part 4) that raise is gone:
-    # the open-weight model update gave each limit exit a terminal of its
-    # own, so no cell of the matrix has seen this gap red as predicted. The
-    # predictions stay as written until the first run of pack A on the column
-    # corrects them. What the starter set shows about the terminal of an exit
-    # without a limit is another record, M05.
+    # the initial release, where a limit event after the terminal made
+    # invoke raise. When the column was first driven that raise was gone:
+    # the update that moved the open-weight routes to their current models
+    # had given each limit exit a terminal of its own, so no cell of the
+    # matrix has seen this gap red as predicted. The predictions stay as
+    # written until the first run of pack A on the column corrects them.
+    # What the starter set shows about the terminal of an exit without a
+    # limit is another record, M05.
     cells:
       - cell: deepseek/S10a/primary/raw
         observed_under: {turn_limit: hard}
@@ -200,8 +216,8 @@ registry:
     origin: gap list
     severity: high
     cells:
-      # static:no_driven_column until the driver landed (part 4); the cell
-      # stays red until pack A runs on the column.
+      # static:no_driven_column until the driver landed; the cell stays red
+      # until pack A runs on the column.
       - cell: deepseek/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -257,7 +273,7 @@ registry:
         observed_under: {structured_output: unsupported}
         closes_under: {structured_output: unsupported}
         predicted: ["guard:limit_contract_violated", "guard:revoked"]
-      # Observed at the first run of the secondary column (part 2).
+      # Observed at the first run of the secondary column.
       - cell: openai_compat:hosted/S03/secondary/guarded
         observed_under: {event_detail: usage}
         closes_under: {event_detail: usage}
@@ -296,7 +312,7 @@ registry:
         observed_under: {turn_limit: round_boundary}
         closes_under: {turn_limit: round_boundary}
         predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
-      # Observed at the first run of the secondary column (part 2).
+      # Observed at the first run of the secondary column.
       - cell: openai_compat:hosted/S04/secondary/raw
         observed_under: {structured_output: unsupported}
         closes_under: {structured_output: unsupported}
@@ -311,8 +327,8 @@ registry:
     origin: gap list
     severity: high
     cells:
-      # static:no_driven_column until the drivers landed (part 2); the cells
-      # stay red until pack A runs on the columns.
+      # static:no_driven_column until the drivers landed; the cells stay red
+      # until pack A runs on the columns.
       - cell: openai_compat:hosted/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -337,8 +353,8 @@ registry:
     origin: matrix
     severity: medium
     cells:
-      # static:no_driven_column until the driver landed (part 3); the cell
-      # stays red until pack A runs on the columns.
+      # static:no_driven_column until the driver landed; the cell stays red
+      # until pack A runs on the columns.
       - cell: claude/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -349,8 +365,8 @@ registry:
     origin: matrix
     severity: medium
     cells:
-      # static:no_driven_column until the driver landed (part 6); the cell
-      # stays red until pack A runs on the column.
+      # static:no_driven_column until the driver landed; the cell stays red
+      # until pack A runs on the column.
       - cell: codex:legacy/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -361,8 +377,8 @@ registry:
     origin: matrix
     severity: medium
     cells:
-      # static:no_driven_column until the driver landed (part 6); the cell
-      # stays red until pack A runs on the column.
+      # static:no_driven_column until the driver landed; the cell stays red
+      # until pack A runs on the column.
       - cell: codex:official/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -372,13 +388,14 @@ registry:
     title: The gateway adapter writes no schema text into the prompt of a prompt_only route
     origin: matrix
     severity: medium
-    # Not predicted: design section 9.2 expected the hosted routes to confirm
-    # their declaration. Seen at the first run of the columns (part 2): at a
-    # bare invocation the adapter sends the schema as response_format on the
-    # finalisation request and writes no schema text into the system prompt,
-    # while the two other adapters that declare prompt_only bind the schema
-    # into the prompt themselves (crucible/backends/deepseek.py:1803-1830,
-    # crucible/backends/kimi.py:2041-2064). Reported for the gap list.
+    # Not predicted when the matrix was designed: the hosted routes were
+    # expected to confirm their declaration. Seen at the first run of the
+    # columns: at a bare invocation the adapter sends the schema as
+    # response_format on the finalisation request and writes no schema text
+    # into the system prompt, while the two other adapters that declare
+    # prompt_only bind the schema into the prompt themselves
+    # (_prompt_system_text in both: crucible/backends/deepseek.py:1803-1830
+    # in the initial release, crucible/backends/kimi.py:2041-2064 today).
     # The prompt half of the placement has a code of its own, so this gap
     # covers nothing a wrong finalisation request would show
     # (request.content:schema).
@@ -387,11 +404,12 @@ registry:
       from: prompt_only
       to: unsupported
       citation: >-
-        Owner decision OD-7 of the open-weight model update, taken at its
-        default: the two route-qualified hub profiles
-        (crucible/backends/features.py:103-115) are removed and both hub
-        routes carry the generic gateway profile (features.py:78-81), which
-        claims no schema placement.
+        A decision of the release owner, taken at its recommended default in
+        the update that moved the open-weight routes to their current
+        models: the two route-qualified hub profiles
+        (crucible/backends/features.py:103-115 in the initial release) are
+        removed and both hub routes carry the generic gateway profile
+        (features.py:78-81), which claims no schema placement.
     cells:
       - cell: openai_compat:hosted/S04/primary/raw
         observed_under: {structured_output: prompt_only}
@@ -410,9 +428,9 @@ registry:
     title: The DeepSeek trace names the terminal event of a clean finish after the provider's terminal type, not after stop_reason
     origin: matrix
     severity: low
-    # Not predicted: design section 9.2 expected the raw starter cells of the
-    # column to be red for G24 only. Seen at the first run of the column
-    # (part 4): on an exit without a limit the adapter names the terminal
+    # Not predicted when the matrix was designed: the raw starter cells of
+    # the column were expected to be red for G24 only. Seen at the first run
+    # of the column: on an exit without a limit the adapter names the terminal
     # event of each provider response after the provider's terminal type and
     # the result keeps the last of them (crucible/backends/deepseek.py), so a
     # clean finish has stop_reason end_turn under a terminal event named
@@ -430,8 +448,7 @@ registry:
     # applies to every cell that expects a result, and no declared difference
     # may replace it). If it binds, the fix names the one terminal after
     # stop_reason and deletes the three codes below; if it does not, the
-    # contract changes first and this record goes with the codes. Reported
-    # for the gap list.
+    # contract changes first and this record goes with the codes.
     cells:
       - cell: deepseek/S01/primary/raw
         observed_under: {}
@@ -447,13 +464,14 @@ registry:
     title: The Kimi routes flag token and cost accounting incomplete for every reply that carries no cache-read count
     origin: matrix
     severity: medium
-    # Not predicted: design section 9.2 was written for the release, whose
-    # Kimi routes accounted exactly for a plain reply. Seen at the first run
-    # of the columns (part 5), on the model every Kimi profile routes since
-    # the open-weight model update. The provider's final statistics carry no
-    # count of cache reads unless the request hit its cache (observed live on
-    # 2026-11-18; the envelopes of the columns are that reply), and the
-    # adapter never reads a missing count as zero. So no result of these
+    # Not predicted when the matrix was designed: the predictions were
+    # written for the initial release, whose Kimi routes accounted exactly
+    # for a plain reply. Seen at the first run of the columns, on the model
+    # every Kimi profile routes since the update that moved the open-weight
+    # routes to their current models. The provider's final statistics carry
+    # no count of cache reads unless the request hit its cache (observed
+    # live on 2026-11-18; the envelopes of the columns are that reply), and
+    # the adapter never reads a missing count as zero. So no result of these
     # routes flags its token usage or its cost complete: on the two
     # diagnostic routes, which opt into the cost upper bound, a result is a
     # cost interval (the lower bound as cost, the upper bound charged to the
@@ -523,9 +541,8 @@ registry:
     # upper bound is decided with it (removed, or kept by a recorded
     # ruling): while a route opts in, its results stay diagnostic whatever
     # their accounting says, and the Kimi diagnostic routes return no
-    # rankable result. That is a limit of the route, with no fix sketch
-    # (declared difference D-COST-BOUND-UNRANKED). Reported for the gap
-    # list.
+    # rankable result. That is a limit of the route, for which no fix is
+    # proposed (declared difference D-COST-BOUND-UNRANKED).
     column_wide:
       - {kind: kimi, code: "flag:token_usage_complete=False"}
       - {kind: kimi, code: "flag:cost_complete=False"}
@@ -534,22 +551,23 @@ registry:
     title: The strict Kimi route rejects a billed reply that carries no cache-read count and returns a transport error
     origin: matrix
     severity: medium
-    # Not predicted, and seen at the first run of the blocked column (part
-    # 5): the route enforces feature admission, so it cannot carry the cost
-    # upper bound, and its worker rejects the provider's ordinary reply after
-    # it was billed (the missing count of M06). The call ends as a
+    # Not predicted, and seen at the first run of the blocked column: the
+    # route enforces feature admission, so it cannot carry the cost upper
+    # bound, and its worker rejects the provider's ordinary reply after it
+    # was billed (the missing count of M06). The call ends as a
     # non-retriable transport error with stop reason error: no served model,
     # no usage, a terminal the result disowns. Under the diagnostic limit
-    # guard the incomplete evidence also revokes the next call. The live
-    # check of the model update saw the same on the production route
+    # guard the incomplete evidence also revokes the next call. A live
+    # check of the shipped profiles saw the same on the production route
     # (2026-11-19) and left it to the owner: accept it, refuse a routing file
-    # whose catalog entry is blocked, or redefine the arm. Ruled on
-    # 2026-11-21 by a decision panel under the owner's standing instruction:
-    # accepted as a known gap; a refusal at binding is planned with the gap
-    # fixes and does not turn these cells green. That ruling is the `ruling`
-    # of the two known-gap entries of this record. The record itself carries
-    # none, because a ruling here would license withdrawing its cells.
-    # Reported for the gap list.
+    # whose catalog entry is blocked, or redefine the comparison arm that
+    # uses this route (arm C of the E12 provider-lane comparison,
+    # products/<product>/e12_arms.yaml). Ruled on 2026-11-21 by a decision
+    # panel under the owner's standing instruction: accepted as a known gap;
+    # a refusal at binding is planned with the gap fixes and does not turn
+    # these cells green. That ruling is the `ruling` of the two known-gap
+    # entries of this record. The record itself carries none, because a
+    # ruling here would license withdrawing its cells.
     # The codes of the two cells are those of any rejection after the
     # request; the cause is in the text of the error, which is no code. Two
     # proofs of the Kimi module, which the verifier requires by name, hold
@@ -569,28 +587,28 @@ registry:
     title: A guarded result of a Kimi route under its cost policy is never rankable
     origin: matrix
     severity: medium
-    # Not predicted, and found by the review of part 5, not by its first
-    # run: until then "rankable" had no code and was inferred from the
-    # absence of a guard rewrite, which holds under the plain diagnostic
-    # limit policy only. A route that opts into the cost upper bound binds
-    # its limit guard with the cost policy its routing file names. Under
-    # that policy the guard lets the result stand (terminal reason
-    # diagnostic_cost_upper_bound, one physical attempt, authority kept, the
-    # second call answered) and never calls it rankable
+    # Not predicted, and found in review after the first run of the Kimi
+    # columns, not by that run: until then "rankable" had no code and was
+    # inferred from the absence of a guard rewrite, which holds under the
+    # plain diagnostic limit policy only. A route that opts into the cost
+    # upper bound binds its limit guard with the cost policy its routing
+    # file names. Under that policy the guard lets the result stand
+    # (terminal reason diagnostic_cost_upper_bound, one physical attempt,
+    # authority kept, the second call answered) and never calls it rankable
     # (crucible/backends/limits.py, _normalize_returned_result), and the
     # routing files say so in their headers ("a cost interval: diagnostic,
-    # never rankable or promotable"). The guarded contract of S01, S03 and
-    # S04 says "rankable" (design section 7.1), so clause C5 reported
-    # guard:not_rankable on the six guarded cells of the two diagnostic
-    # columns, and those cells were known gaps of this record. The code did
-    # not depend on the missing cache-read count: with the count in the
-    # reply the result is just as little rankable.
+    # never rankable or promotable"). In the guarded lens S01, S03 and S04
+    # ask that a result without an error is rankable (clause C5), so C5
+    # reported guard:not_rankable on the six guarded cells of the two
+    # diagnostic columns, and those cells were known gaps of this record.
+    # The code did not depend on the missing cache-read count: with the
+    # count in the reply the result is just as little rankable.
     # No code of this record is owed any more, and no fix was made. Decided
     # on 2026-11-21 by a decision panel under the release owner's standing
-    # instruction (2 of 3; the owner may overrule): "rankable" does not bind
-    # the guarded lens of a route that runs under its cost policy. Not
-    # rankable there is what the release means to do, enforced twice in
-    # crucible/backends/limits.py and pinned by
+    # instruction (2 of 3; not the owner's own answer, and the owner may
+    # overrule): "rankable" does not bind the guarded lens of a route that
+    # runs under its cost policy. Not rankable there is what the release
+    # means to do, enforced twice in crucible/backends/limits.py and pinned by
     # tests/test_backend_limits_cost_bounds.py, so no change of the product
     # closes it. It is declared difference D-COST-BOUND-UNRANKED of this
     # ledger: C5 holds such a result to the marks of a diagnostic one and
@@ -601,7 +619,7 @@ registry:
     # difference cannot show on a cell: with complete accounting and the
     # opt-in still set, the result stays diagnostic and C5 names nothing.
     # A proof of the Kimi module that the verifier requires by name plays
-    # that state. Reported for the gap list.
+    # that state.
     cells:
       - cell: kimi/S01/primary/guarded
         observed_under: {}
@@ -626,16 +644,17 @@ registry:
     title: The official Codex route flags its token usage incomplete on a reply that is not all cache-read, and its cost complete without pricing evidence
     origin: reference
     severity: medium
-    # First run of the column (part 6), not predicted. Accepted by the owner
+    # First run of the column, not predicted. Accepted by the release owner
     # as a known gap of the official-SDK route; a strict expected failure
-    # until the product is fixed. Owner, 2026-11-21, asked "Accept the two
-    # Codex official-route findings as known gaps and keep the real worker?":
-    # "Yes, accept both". That ruling is the `ruling` of every known-gap
-    # entry that names this record. Here it is quoted and is not a field of
-    # the record: a ruling on a registry record is leave to withdraw the
-    # record's cells (H03 then accepts a cell that is pinned not expressible
-    # or no longer generated), which was not ruled. The severity is the one
-    # proposed with the finding; the ruling names none.
+    # until the product is fixed. Ruled by the release owner in person on
+    # 2026-11-21: asked whether to accept the two findings on the official
+    # Codex route as known gaps and keep the real worker, the owner accepted
+    # both. That ruling is the `ruling` of every known-gap entry that names
+    # this record. Here it is restated and is not a field of the record: a
+    # ruling on a registry record is leave to withdraw the record's cells
+    # (H03 then accepts a cell that is pinned not expressible or no longer
+    # generated), which was not ruled. The severity is the one proposed with
+    # the finding; the ruling names none.
     # One accounting rule of both Codex transports for usage without a
     # cache-write counter, not a quirk of this route: on the same
     # notifications, without the exact usage notification, the app-server
@@ -676,14 +695,15 @@ registry:
     title: On the official Codex route a turn of several model responses reports the usage of its last response (unconfirmed, reference emulated)
     origin: reference
     severity: medium
-    # Unconfirmed. First run of the column (part 6), not predicted; the codes
-    # below are as observed. Accepted by the owner as a second known gap of
-    # the route; a strict expected failure until it is settled and, if it is
-    # a defect, fixed. Owner, 2026-11-21, asked "Accept the two Codex
-    # official-route findings as known gaps and keep the real worker?": "Yes,
-    # accept both". That ruling is the `ruling` of every known-gap entry that
-    # names this record. Here it is quoted and is not a field of the record:
-    # a ruling on a registry record is leave to withdraw the record's cells
+    # Unconfirmed. First run of the column, not predicted; the codes below
+    # are as observed. Accepted by the release owner as a second known gap
+    # of the route; a strict expected failure until it is settled and, if it
+    # is a defect, fixed. Ruled by the release owner in person on
+    # 2026-11-21: asked whether to accept the two findings on the official
+    # Codex route as known gaps and keep the real worker, the owner accepted
+    # both. That ruling is the `ruling` of every known-gap entry that names
+    # this record. Here it is restated and is not a field of the record: a
+    # ruling on a registry record is leave to withdraw the record's cells
     # (H03 then accepts a cell that is pinned not expressible or no longer
     # generated), which was not ruled.
     # It rests on the reading of the last-response usage field. The worker
@@ -704,9 +724,9 @@ registry:
     # a budget on this route is compared with the cost of the last response
     # only; if it sends the turn so far, there is no gap, the envelope
     # changes and this record's codes go.
-    # The severity is the integrator's, not the owner's (the ruling names
-    # none): medium while the record is unconfirmed, to be raised if a
-    # recording confirms an under-count.
+    # The severity was set when the record was written, not by the owner
+    # (the ruling names none): medium while the record is unconfirmed, to be
+    # raised if a recording confirms an under-count.
     # Never closed or dropped because usage.cost_usd:lt went away. That code
     # shows only while the adapter flags the cost complete (R04's second
     # behaviour, under a rate without a cache-write premium): a change of
@@ -754,12 +774,12 @@ known_gaps:
     observed_under: {}
     codes: {"static:pack_a_not_enabled": M03}
 
-  # The gateway columns, first run of part 2 (starter set). On S04 guarded the
-  # guard codes are G28's today; once G28 is fixed the guard reports the
-  # incomplete accounting of G29 instead, and that fix edits the entry. On
-  # the hosted S04 cells the code for the schema text in the prompt is M04's:
-  # it leaves with the declaration change that record names, not with the G28
-  # or G29 fix.
+  # The gateway columns, first run (starter set). On S04 guarded the guard
+  # codes are G28's today; once G28 is fixed the guard reports the
+  # incomplete accounting of G29 instead, and that fix edits the entry. The
+  # hosted S04 cells owe no code for schema text in the prompt any more, and
+  # no entry names M04: the hosted routes declare structured_output
+  # unsupported, which is the declaration change that record names.
   - cell: openai_compat:hosted/S03/primary/guarded
     observed_under: {event_detail: usage}
     codes:
@@ -814,7 +834,7 @@ known_gaps:
   - column_wide: {kind: "openai_compat:hosted", code: "pricing:none", gap: G32}
   - column_wide: {kind: "openai_compat:local", code: "pricing:none", gap: G32}
 
-  # The DeepSeek column, first run of part 4 (starter set). The missing
+  # The DeepSeek column, first run (starter set). The missing
   # feature-profile digest is column-wide; the tool-authority digest shows on
   # the cells that attach a ToolSet. In the raw lens the terminal event of a
   # clean finish is named after the provider's terminal type (M05, found at
@@ -849,7 +869,7 @@ known_gaps:
       "digest.mismatch:tool_authority": G24
   - column_wide: {kind: deepseek, code: "digest.missing:feature_profile", gap: G24}
 
-  # The Kimi columns, first run of part 5 (starter set on the two diagnostic
+  # The Kimi columns, first run (starter set on the two diagnostic
   # columns; S00, S01 and S51 on the blocked column). No result of the kind
   # flags its accounting complete (M06, column-wide): that is all the two
   # diagnostic columns show, in both lenses. In the guarded lens the limit
@@ -868,17 +888,17 @@ known_gaps:
       "flag:terminal_complete=False": M07
       "digest.missing:served_model": M07
     ruling: >-
-      Decision panel, 2026-11-21, under the owner's standing instruction of
-      that day ("Do an adversarial assessment of the options and proceed with
-      the consensus choice"); not the owner's own answer, and the owner may
-      overrule. Asked: what to do about the strict Kimi route that bills a
-      reply and then rejects it. Decided, 3 of 3: accepted as a known gap as
-      it stands (the route is blocked in the catalog, E12 refuses it at
-      preflight, its header states the behaviour). A refusal at binding of a
-      route whose catalog entry is blocked is planned with the gap fixes. It
-      does not turn this cell green, and it is built only after a design
-      amendment of the matrix with its own decision; without one this
-      acceptance stands.
+      Decision panel, 2026-11-21, acting under a standing instruction the
+      release owner gave that day; not the owner's own answer, and the owner
+      may overrule. Asked: what to do about the strict Kimi route that bills
+      a reply and then rejects it. Decided, 3 of 3: accepted as a known gap
+      as it stands (the route is blocked in the catalog, the E12
+      provider-lane comparison refuses it at preflight, its header states
+      the behaviour). A refusal at binding of a route whose catalog entry is
+      blocked is planned with the gap fixes. It does not turn this cell
+      green, and it is built only after a decision of its own on how the
+      matrix plays the blocked column once binding is refused; without one
+      this acceptance stands.
   - cell: kimi/S01/blocked/guarded
     observed_under: {}
     codes:
@@ -888,55 +908,53 @@ known_gaps:
       "digest.missing:served_model": M07
       "guard:revoked": M07
     ruling: >-
-      Decision panel, 2026-11-21, under the owner's standing instruction of
-      that day ("Do an adversarial assessment of the options and proceed with
-      the consensus choice"); not the owner's own answer, and the owner may
-      overrule. Asked: what to do about the strict Kimi route that bills a
-      reply and then rejects it. Decided, 3 of 3: accepted as a known gap as
-      it stands (the route is blocked in the catalog, E12 refuses it at
-      preflight, its header states the behaviour). A refusal at binding of a
-      route whose catalog entry is blocked is planned with the gap fixes. It
-      does not turn this cell green, and it is built only after a design
-      amendment of the matrix with its own decision; without one this
-      acceptance stands.
+      Decision panel, 2026-11-21, acting under a standing instruction the
+      release owner gave that day; not the owner's own answer, and the owner
+      may overrule. Asked: what to do about the strict Kimi route that bills
+      a reply and then rejects it. Decided, 3 of 3: accepted as a known gap
+      as it stands (the route is blocked in the catalog, the E12
+      provider-lane comparison refuses it at preflight, its header states
+      the behaviour). A refusal at binding of a route whose catalog entry is
+      blocked is planned with the gap fixes. It does not turn this cell
+      green, and it is built only after a decision of its own on how the
+      matrix plays the blocked column once binding is refused; without one
+      this acceptance stands.
   - column_wide: {kind: kimi, code: "flag:token_usage_complete=False", gap: M06}
     ruling: >-
-      Decision panel, 2026-11-21, under the owner's standing instruction of
-      that day ("Do an adversarial assessment of the options and proceed with
-      the consensus choice"); not the owner's own answer, and the owner may
-      overrule. Asked: (a) do the two accounting flags of clause C6 bind a
-      route that can only return a cost interval for the provider's ordinary
-      reply; (b) which price is a cell on such a route held to. Decided, 2
-      of 3: (a) they bind every route, so this code is a known gap wherever
-      the accounting is evaluated; it is not closable by code alone, because
-      reading a missing count of cache reads needs a recorded provider fact.
-      (b) The matrix rate card is the reference for the reported cost on
-      every column; the shipped price row of the route's model is the
-      reference for the two bounds of a segment of the cost interval, and
-      for nothing else. The rule that holds those two bounds was added to
-      clause C6 in the round that entered this ruling; the record of M06
+      Decision panel, 2026-11-21, acting under a standing instruction the
+      release owner gave that day; not the owner's own answer, and the owner
+      may overrule. Asked: (a) do the two accounting flags of clause C6 bind
+      a route that can only return a cost interval for the provider's
+      ordinary reply; (b) which price is a cell on such a route held to.
+      Decided, 2 of 3: (a) they bind every route, so this code is a known
+      gap wherever the accounting is evaluated; it is not closable by code
+      alone, because reading a missing count of cache reads needs a recorded
+      provider fact. (b) The matrix rate card is the reference for the
+      reported cost on every column; the shipped price row of the route's
+      model is the reference for the two bounds of a segment of the cost
+      interval, and for nothing else. The rule that holds those two bounds
+      was added to clause C6 when this ruling was entered; the record of M06
       says what is held and what is not.
   - column_wide: {kind: kimi, code: "flag:cost_complete=False", gap: M06}
     ruling: >-
-      Decision panel, 2026-11-21, under the owner's standing instruction of
-      that day ("Do an adversarial assessment of the options and proceed with
-      the consensus choice"); not the owner's own answer, and the owner may
-      overrule. Asked: (a) do the two accounting flags of clause C6 bind a
-      route that can only return a cost interval for the provider's ordinary
-      reply; (b) which price is a cell on such a route held to. Decided, 2
-      of 3: (a) they bind every route, so this code is a known gap wherever
-      the accounting is evaluated; it is not closable by code alone, because
-      reading a missing count of cache reads needs a recorded provider fact.
-      (b) The matrix rate card is the reference for the reported cost on
-      every column; the shipped price row of the route's model is the
-      reference for the two bounds of a segment of the cost interval, and
-      for nothing else. The rule that holds those two bounds was added to
-      clause C6 in the round that entered this ruling; the record of M06
+      Decision panel, 2026-11-21, acting under a standing instruction the
+      release owner gave that day; not the owner's own answer, and the owner
+      may overrule. Asked: (a) do the two accounting flags of clause C6 bind
+      a route that can only return a cost interval for the provider's
+      ordinary reply; (b) which price is a cell on such a route held to.
+      Decided, 2 of 3: (a) they bind every route, so this code is a known
+      gap wherever the accounting is evaluated; it is not closable by code
+      alone, because reading a missing count of cache reads needs a recorded
+      provider fact. (b) The matrix rate card is the reference for the
+      reported cost on every column; the shipped price row of the route's
+      model is the reference for the two bounds of a segment of the cost
+      interval, and for nothing else. The rule that holds those two bounds
+      was added to clause C6 when this ruling was entered; the record of M06
       says what is held and what is not.
 
-  # The official-SDK Codex column, first run of part 6 (starter set). A
-  # reference column: every entry carries the owner's ruling, word for word
-  # the same. The two accounting codes of R04 are column-wide; in the guarded
+  # The official-SDK Codex column, first run (starter set). A reference
+  # column: every entry carries the release owner's ruling, the same text
+  # in each. The two accounting codes of R04 are column-wide; in the guarded
   # lens the limit guard replaces the result for its incomplete evidence and
   # revokes the backend. On a turn of several model responses the reported
   # cost is that of the last response (R05, unconfirmed: decided by the
@@ -948,15 +966,17 @@ known_gaps:
       "guard:limit_evidence_incomplete": R04
       "guard:revoked": R04
     ruling: >-
-      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
-      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+      Release owner in person, 2026-11-21. Asked: whether to accept the two
+      findings on the official Codex route (records R04 and R05) as known
+      gaps and keep the real worker. Decided: yes, both are accepted.
   - cell: codex:official/S03/primary/raw
     observed_under: {event_detail: usage}
     codes:
       "usage.cost_usd:lt": R05
     ruling: >-
-      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
-      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+      Release owner in person, 2026-11-21. Asked: whether to accept the two
+      findings on the official Codex route (records R04 and R05) as known
+      gaps and keep the real worker. Decided: yes, both are accepted.
   - cell: codex:official/S03/primary/guarded
     observed_under: {event_detail: usage}
     codes:
@@ -964,15 +984,17 @@ known_gaps:
       "guard:revoked": R04
       "usage.cost_usd:lt": R05
     ruling: >-
-      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
-      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+      Release owner in person, 2026-11-21. Asked: whether to accept the two
+      findings on the official Codex route (records R04 and R05) as known
+      gaps and keep the real worker. Decided: yes, both are accepted.
   - cell: codex:official/S04/primary/raw
     observed_under: {structured_output: native}
     codes:
       "usage.cost_usd:lt": R05
     ruling: >-
-      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
-      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+      Release owner in person, 2026-11-21. Asked: whether to accept the two
+      findings on the official Codex route (records R04 and R05) as known
+      gaps and keep the real worker. Decided: yes, both are accepted.
   - cell: codex:official/S04/primary/guarded
     observed_under: {structured_output: native}
     codes:
@@ -980,16 +1002,19 @@ known_gaps:
       "guard:revoked": R04
       "usage.cost_usd:lt": R05
     ruling: >-
-      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
-      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+      Release owner in person, 2026-11-21. Asked: whether to accept the two
+      findings on the official Codex route (records R04 and R05) as known
+      gaps and keep the real worker. Decided: yes, both are accepted.
   - column_wide: {kind: "codex:official", code: "flag:token_usage_complete=False", gap: R04}
     ruling: >-
-      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
-      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+      Release owner in person, 2026-11-21. Asked: whether to accept the two
+      findings on the official Codex route (records R04 and R05) as known
+      gaps and keep the real worker. Decided: yes, both are accepted.
   - column_wide: {kind: "codex:official", code: "pricing:unreconciled", gap: R04}
     ruling: >-
-      Owner, 2026-11-21. Asked: "Accept the two Codex official-route findings
-      as known gaps and keep the real worker?" Answer: "Yes, accept both".
+      Release owner in person, 2026-11-21. Asked: whether to accept the two
+      findings on the official Codex route (records R04 and R05) as known
+      gaps and keep the real worker. Decided: yes, both are accepted.
 
 declared_differences:
   - id: D-STRUCT-UNQUALIFIED
@@ -997,7 +1022,10 @@ declared_differences:
       crucible/backends/features.py:78-81 (the generic gateway profile: the
       adapter sends response_format when requested, but an arbitrary
       compatible gateway has not earned a native-schema conformance claim)
-    owner: release owner (design section 15, decisions taken at their defaults)
+    owner: >-
+      release owner (not a ruling on this difference alone: the open
+      decisions of the matrix were taken at their recommended defaults when
+      it was designed)
     date: "2026-11-19"
     alternative: >-
       A route that declares structured_output=unsupported makes no claim about
@@ -1008,10 +1036,15 @@ declared_differences:
       declared value (the `unsupported` variant of the scenario).
   - id: D-OAI-SCHEMA-FINAL
     citation: >-
-      crucible/backends/openai_compat.py:1619-1646 (tool-enabled turns run
-      without the response schema; once exploration ends naturally, one
+      crucible/backends/openai_compat.py:1619-1646 in the initial release;
+      today the comment in _invoke_with_tools above the forced finalisation
+      of a tool loop that ends naturally, and that call (tool-enabled turns
+      run without the response schema; once exploration ends naturally, one
       no-tools completion turns the draft into the schema-constrained answer)
-    owner: release owner (design section 15, decisions taken at their defaults)
+    owner: >-
+      release owner (not a ruling on this difference alone: the open
+      decisions of the matrix were taken at their recommended defaults when
+      it was designed)
     date: "2026-11-19"
     alternative: >-
       After a tool loop that ends naturally the adapter sends exactly one
@@ -1025,7 +1058,8 @@ declared_differences:
       the schema field travels and nothing else: what the declared
       structured_output value says about the prompt is still asserted, so a
       route that declares prompt_only owes the schema text once in the system
-      prompt (known gap M04 on the hosted cells).
+      prompt (the subject of registry record M04; no gateway route declares
+      prompt_only today, so no listed cell owes it).
     cells:
       - openai_compat:hosted/S04/primary/raw
       - openai_compat:hosted/S04/primary/guarded
@@ -1041,7 +1075,10 @@ declared_differences:
       presenting it as observed); the notifications of the app-server
       protocol name no served model either (the vendor types of the pinned
       official SDK)
-    owner: release owner (design section 15, decisions taken at their defaults)
+    owner: >-
+      release owner (not a ruling on this difference alone: the open
+      decisions of the matrix were taken at their recommended defaults when
+      it was designed)
     date: "2026-11-21"
     alternative: >-
       The wire of the two Codex kinds names no served model, so the provider
@@ -1075,10 +1112,11 @@ declared_differences:
       diagnostic, never rankable or promotable"); pinned by
       tests/test_backend_limits_cost_bounds.py
     owner: >-
-      decision panel under the release owner's standing instruction of
-      2026-11-21 ("Do an adversarial assessment of the options and proceed
-      with the consensus choice"), decision record matrix-kimi-rankable, 2 of
-      3; not an answer of the owner in person, and the owner may overrule
+      decision panel acting under a standing instruction the release owner
+      gave on 2026-11-21, 2 of 3; not an answer of the owner in person, and
+      the owner may overrule. Asked whether "rankable" binds the guarded
+      lens of a route that runs under its cost policy, it decided that it
+      does not (registry record M08 of this ledger)
     date: "2026-11-21"
     alternative: >-
       On a route whose routing file opts into the cost upper bound, a guarded
