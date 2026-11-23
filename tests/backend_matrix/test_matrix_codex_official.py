@@ -22,8 +22,8 @@ request launch without the stage never starts the bundled runtime. They show
 that a trace which presents a served model fails a cell of this column too,
 on every cell that asserts a result.
 
-What the cells of this column show today is the ledger's business and the
-log's, not this module's: a test here asserts shapes and rules, never a gap.
+What the cells of this column show today is the ledger's business, not this
+module's: a test here asserts shapes and rules, never a gap.
 One rule is held by name for the verifier, because no cell shows when it
 stops: a turn of one response reports the tokens the provider billed.
 One test holds an open point instead of a rule: what the column reports for a

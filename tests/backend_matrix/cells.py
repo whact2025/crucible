@@ -56,7 +56,7 @@ INVENTORY_PATH = Path(__file__).with_name("inventory.yaml")
 INVENTORY_SCHEMA = "crucible.backend-matrix.inventory.v1"
 
 # Which scenario sets run on which kind. A real kind gets the starter set with
-# its driver, pack A at the gate and pack B after it.
+# its driver, then pack A, and pack B after it.
 ENABLEMENT: Mapping[str, tuple[str, ...]] = {
     TOY_KIND: (STARTER, PACK_A, PACK_B),
     **{kind: () for kind in REAL_KINDS},

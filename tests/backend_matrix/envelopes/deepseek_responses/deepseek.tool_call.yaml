@@ -13,7 +13,6 @@ provenance:
   grade: documented
   sources:
     - source: >-
-        port note open-weight-research.json, topic "deepseek", api_changes[9]:
         the vendor's guide to its Responses route
         (api-docs.deepseek.com/guides/responses_api), primary source
       retrieved: "2026-11-18"
@@ -24,16 +23,14 @@ provenance:
         of the completion envelope. There is no closing "[DONE]" message.
         Usage is null until the terminal event.
     - source: >-
-        port note open-weight-research.json, topic "deepseek", api_changes[5]
-        and api_changes[7]: the vendor's guides to thinking mode and to its
-        Responses route, primary source
+        the vendor's guides to thinking mode and to its Responses route,
+        primary source
       retrieved: "2026-11-18"
       states: >-
         Thinking is on by default. The chain of thought arrives as reasoning
         items with reasoning_text parts; no summary is generated. Function
         tools are supported on the route.
     - source: >-
-        port note open-weight-research.json, topic "deepseek", api_changes[8]:
         the vendor's reference of the create-response call, primary source
       retrieved: "2026-11-18"
       states: >-
@@ -41,9 +38,8 @@ provenance:
         call_id of a function_call must be non-empty and unique, and every
         function_call must have a matching function_call_output.
     - source: >-
-        port note open-weight-models.live.md, section 3 "DeepSeek native
-        Responses route": the adapter-level check of the shipped route
-        through the locked worker, with one tool
+        a live observation, not a published document: the adapter-level
+        check of the shipped route through the locked worker, with one tool
       retrieved: "2026-11-18"
       states: >-
         Live on 2026-11-18, the response that called the tool reasoned (33

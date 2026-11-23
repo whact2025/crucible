@@ -18,11 +18,11 @@ provenance:
   notes: >-
     No local model server was run or observed. One serving guide says that
     without the tool-call parser a call "would be left as raw text in
-    content" and the finish reason stays "stop" (port note
-    open-weight-research.json, topic "glm", api_changes[6], primary source,
-    read 2026-11-18): with the parser the call travels in tool_calls, but no
-    body is documented. So this envelope proves that the reply parses through
-    the SDK, not that a given server sends it.
+    content" and the finish reason stays "stop" (the guide of one such
+    server for the model family, primary source, read 2026-11-18): with the
+    parser the call travels in tool_calls, but no body is documented. So
+    this envelope proves that the reply parses through the SDK, not that a
+    given server sends it.
 
 status: 200
 body:

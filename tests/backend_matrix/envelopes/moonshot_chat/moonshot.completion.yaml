@@ -14,10 +14,9 @@ provenance:
   grade: documented
   sources:
     - source: >-
-        port note open-weight-models.live.md, section 2.3 "Diagnosis: the
-        provider's reply shape": four raw streamed chat completions against
-        the production endpoint with the request fields the locked worker
-        sends, key names and counters only
+        a live observation, not a published document: four raw streamed chat
+        completions against the production endpoint with the request fields
+        the locked worker sends, key names and counters only
       retrieved: "2026-11-18"
       states: >-
         Live on 2026-11-18, for the model of the Kimi columns: HTTP 200, the
@@ -41,7 +40,6 @@ provenance:
         reasoning_tokens, and the finish choice repeated the same counters
         (a usage block inside the choice) in each recorded stream.
     - source: >-
-        port note open-weight-research.json, topic "kimi", api_changes[4]:
         the vendor's chat reference and its guide to streaming output
         (platform.kimi.ai/docs/api/chat.md), primary source
       retrieved: "2026-11-18"
@@ -51,7 +49,6 @@ provenance:
         final chunk, which has an empty choices list and is sent when the
         request asks for it with stream_options.include_usage.
     - source: >-
-        port note open-weight-research.json, topic "kimi", api_changes[2]:
         the vendor's guide to context caching and its chat reference, primary
         source
       retrieved: "2026-11-18"

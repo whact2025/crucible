@@ -15,10 +15,9 @@ provenance:
   sdk_version: openai 2.44.0
   notes: >-
     No local model server was run or observed. The servers the route is meant
-    for implement the OpenAI chat-completions API (port note
-    open-weight-research.json, topic "glm", packages and api_changes[3] and
-    [6]: the serving recipes, primary sources, read 2026-11-18), and those
-    sources document launch flags and parsers, not a reply body. So this
+    for implement the OpenAI chat-completions API (their serving recipes for
+    the model family, primary sources, read 2026-11-18), and those sources
+    document launch flags and parsers, not a reply body. So this
     envelope holds the required fields of the SDK type and proves that the
     reply parses, not that a given server sends it.
 

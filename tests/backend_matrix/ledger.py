@@ -49,7 +49,9 @@ LEDGER_SCHEMA = "crucible.backend-matrix.ledger.v1"
 STATIC_LENS = "static"
 ALL_KINDS = "all"
 NO_ROLE = "-"
-# The code-fixable high-severity gaps of the gap list (design section 9.2).
+# The code-fixable high-severity gaps that were known before the matrix was
+# built (origin ``gap list``). Static cell H03 requires a registry record with
+# a defined cell for each.
 CODE_FIXABLE_HIGH_GAPS: tuple[str, ...] = (
     "G02", "G03", "G04", "G14", "G15", "G16",
     "G17", "G18", "G20", "G28", "G29", "G30",
