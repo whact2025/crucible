@@ -67,6 +67,8 @@ from .contract import (
 from .drivers import MatrixSetupError, registered_kinds, toy
 from .provider import (
     UNSCRIPTED_STATUS,
+    CacheCountingDialect,
+    CacheCounts,
     LoopbackProvider,
     ProviderLedger,
     Reply,
@@ -94,7 +96,7 @@ from .scenarios import (
     plan_for,
     tool_events_paired,
 )
-from .script import READ_A, Call, Loop, ProviderScript, Say, ServedAs, Step
+from .script import READ_A, Call, Loop, ProviderScript, Refuse, Say, ServedAs, Step
 from .toolsets import BINDINGS
 
 LEDGER = ledger.load()
@@ -638,26 +640,42 @@ def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
     # cache reads: token usage and cost incomplete, on purpose.
     untold = {"flag:token_usage_complete=False", "flag:cost_complete=False"}
     unaccounted = dataclasses.replace(flags, token_usage_complete=False, cost_complete=False)
-    mispriced = "usage.cost_bounds:amounts"
+    mispriced, miscounted = "usage.cost_bounds:amounts", "usage.cost_bounds:counts"
+    # The toy wire states no cache count and its dialect reads none back, so
+    # the ledger of the play holds none. What the replies of such a route
+    # say is set here: nothing written to the cache, and no count of reads.
+    ledger_of_the_play = execution.observation.provider
+    assert ledger_of_the_play.cache_counts is None
+    unread = CacheCounts(read_tokens=None, write_tokens=0)
 
-    def price(tokens: Any, read: int) -> float:
+    def replies(*counts: CacheCounts) -> ProviderLedger:
+        return dataclasses.replace(ledger_of_the_play, cache_counts=list(counts))
+
+    def price(tokens: Any, read: int, write: int = 0) -> float:
         # The bound formula, written out here and not taken from the contract.
-        unread = tokens.input_tokens - read
+        # A cache write is priced as input at the rates of this test.
+        unread_tokens = tokens.input_tokens - read
+        assert write <= unread_tokens
         return (
-            unread * rate.input_per_mtok
+            unread_tokens * rate.input_per_mtok
             + read * reads_per_mtok
             + tokens.output_tokens * rate.output_per_mtok
         ) / 1_000_000
 
-    def segment(tokens: Any, *, read: int | None = None) -> UsageCostBoundSegment:
-        # Unknown count: every input token may have been read, or none.
+    def segment(
+        tokens: Any, *, read: int | None = None, write: int = 0
+    ) -> UsageCostBoundSegment:
+        # Unknown count: every input token that was not written may have
+        # been read, or none.
         return UsageCostBoundSegment(
             input_tokens=tokens.input_tokens,
             output_tokens=tokens.output_tokens,
-            cache_creation_tokens=0,
+            cache_creation_tokens=write,
             cache_read_tokens=read,
-            lower_bound_usd=price(tokens, tokens.input_tokens if read is None else read),
-            upper_bound_usd=price(tokens, 0 if read is None else read),
+            lower_bound_usd=price(
+                tokens, tokens.input_tokens - write if read is None else read, write
+            ),
+            upper_bound_usd=price(tokens, 0 if read is None else read, write),
             policy="a-cost-policy",
         )
 
@@ -665,15 +683,24 @@ def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
         return UsageCostBounds(tuple(segments), coverage)
 
     def judged(
-        bounds: UsageCostBounds | None, *, reference: Any = bounded, **fields: Any
+        bounds: UsageCostBounds | None,
+        *,
+        reference: Any = bounded,
+        stated: ProviderLedger | None = None,
+        **fields: Any,
     ) -> frozenset[str]:
         cost = usage.cost_usd if bounds is None else bounds.lower_bound_usd
+        counted = {} if bounds is None else {
+            "cache_read_tokens": sum(item.cache_read_tokens or 0 for item in bounds.segments),
+            "cache_creation_tokens": sum(item.cache_creation_tokens for item in bounds.segments),
+        }
         reported = dataclasses.replace(
-            usage, **{"cost_usd": cost, "cost_bounds": bounds, **fields}
+            usage, **{"cost_usd": cost, "cost_bounds": bounds, **counted, **fields}
         )
         return _judge(
             execution,
             reference=reference,
+            provider=replies(*[unread] * len(billed)) if stated is None else stated,
             usage=reported,
             completeness=unaccounted,
             pricing_evidence=None,
@@ -709,10 +736,16 @@ def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
         moved_bound = dataclasses.replace(first, upper_bound_usd=first.upper_bound_usd * factor)
         return interval(moved_bound, *others)
 
-    counted = interval(dataclasses.replace(first, cache_read_tokens=0), *others)
-    for wrong in (free, narrow, nudged(1 + 1e-6), counted):
+    for wrong in (free, narrow, nudged(1 + 1e-6)):
         assert judged(wrong) == untold | {mispriced}
-    assert contract.clause_of(mispriced) == "C6"
+    # The segment with a known count: its reply carried a count of zero, and
+    # its bounds are those of an unknown one. Where no reply carried the
+    # count, the count is named as well.
+    counted = interval(dataclasses.replace(first, cache_read_tokens=0), *others)
+    first_counted = replies(CacheCounts(0, 0), unread, unread)
+    assert judged(counted, stated=first_counted) == untold | {mispriced}
+    assert judged(counted) == untold | {mispriced, miscounted}
+    assert contract.clause_of(mispriced) == contract.clause_of(miscounted) == "C6"
     # Within the tolerance of the product's own replay (a millionth of a
     # millionth of a dollar, or of the amount) nothing is named.
     assert judged(nudged(1 + 1e-10)) == untold
@@ -725,9 +758,57 @@ def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
     # the runner refuses such a route before the cell is played.
     with pytest.raises(AssertionError, match="carries no price row"):
         judged(whole, reference=dataclasses.replace(bounded, bound_pricing=None))
+    # The cache counts a segment records are held to what the reply of its
+    # response carried, because the bounds follow from them. Each interval
+    # below is priced by the formula for exactly the counts it states, so
+    # the rule on the amounts names nothing; no reply carried a count of
+    # reads or wrote to the cache. Every input token said to be read, which
+    # lowers what a budget is charged to the honest lower bound; one read in
+    # one response; a missing count read as zero, which at these rates is
+    # the rate-card price and so shows nowhere else; one token said to be
+    # written.
+    all_read = interval(*(segment(item, read=item.input_tokens) for item in billed))
+    assert all_read.upper_bound_usd == pytest.approx(whole.lower_bound_usd, rel=1e-12)
+    one_read = interval(segment(billed[0], read=1), *others)
+    none_read = interval(*(segment(item, read=0) for item in billed))
+    assert math.isclose(none_read.lower_bound_usd, usage.cost_usd, rel_tol=1e-12)
+    written = interval(*(segment(item, write=1) for item in billed))
+    for told in (all_read, one_read, none_read, written):
+        for item in told.segments:
+            assert (item.lower_bound_usd, item.upper_bound_usd) == pytest.approx(
+                contract.bound_amounts(rates, item), rel=1e-12
+            )
+        assert judged(told) == untold | {miscounted}
+    # The other way round: a count a reply carried and the segment calls
+    # unknown, a reply that carried no count of writes, one response of
+    # three. What the replies said is the provider ledger's, not the result's.
+    assert judged(whole, stated=replies(*[CacheCounts(0, 0)] * 3)) == untold | {miscounted}
+    assert judged(whole, stated=replies(*[CacheCounts(None, None)] * 3)) == untold | {
+        miscounted
+    }
+    assert judged(whole, stated=replies(unread, CacheCounts(3, 0), unread)) == untold | {
+        miscounted
+    }
+    assert judged(one_read, stated=replies(CacheCounts(1, 0), unread, unread)) == untold
+    # The counts are compared response by response, so only where the
+    # interval has a segment for every response: an interval that lost its
+    # first response is named for that, and its segments are not held to the
+    # replies of other responses.
+    first_read = replies(CacheCounts(1, 0), unread, unread)
+    assert judged(interval(*others), stated=first_read) == untold | {
+        "usage.cost_bounds:uncovered",
+        "usage.cost_bounds:segments",
+    }
+    # A provider side that recorded no counts, or not one statement for
+    # every billed response, cannot judge an interval: an error of the
+    # matrix, no deviation and no pass.
+    with pytest.raises(AssertionError, match="recorded no cache counts"):
+        judged(whole, stated=ledger_of_the_play)
+    with pytest.raises(AssertionError, match="for 2 of 3 billed"):
+        judged(whole, stated=replies(unread, unread))
     # Nothing is reported at all. Without the opt-in the cleared flags excuse
     # it as a lower bound; with it the tokens and the interval are owed.
-    silent = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    silent: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     short = {"usage.input_tokens:lt", "usage.output_tokens:lt"}
     assert judged(None, reference=execution.reference, **silent) == untold
     assert judged(None, **silent) == untold | short | {"usage.cost_bounds:none"}
@@ -761,12 +842,21 @@ def test_c6_holds_the_cost_interval_of_a_route_that_opts_into_a_cost_bound(
         "usage.cost_bounds:uncovered"
     }
     # With every count of cache reads known the interval is exact and the
-    # result may flag its accounting complete: nothing is named.
+    # result may flag its accounting complete: nothing is named, where the
+    # replies carried those counts. Where they carried none, a result that
+    # flags its accounting complete on a count of its own names the count.
     exact = interval(*(segment(item, read=0) for item in billed))
     assert math.isclose(exact.lower_bound_usd, usage.cost_usd, rel_tol=1e-12)
+    complete = dataclasses.replace(usage, cost_bounds=exact)
     assert _judge(
-        execution, reference=bounded, usage=dataclasses.replace(usage, cost_bounds=exact)
+        execution,
+        reference=bounded,
+        provider=replies(*[CacheCounts(0, 0)] * 3),
+        usage=complete,
     ) == frozenset()
+    assert _judge(
+        execution, reference=bounded, provider=replies(*[unread] * 3), usage=complete
+    ) == {miscounted}
     assert _judge(execution, reference=bounded) == {"usage.cost_bounds:none"}
     # A scenario that does not owe the accounting flags asks for no interval.
     unowed = dataclasses.replace(execution.plan.expect, flags=())
@@ -1445,6 +1535,63 @@ def test_a_reply_of_several_frames_records_every_envelope_it_was_rendered_from()
     assert matrix_envelopes.weakest(seen.envelopes) == "constructed"
     # A dialect that knows nothing about how a request was sent says nothing.
     assert seen.requests[0].evidence == {}
+
+
+_FROM_THE_CACHE = "answered from the cache"
+
+
+class _CountsTheCache(ToyDialect):
+    """Reads back what each reply says of the provider's cache.
+
+    The toy wire states no cache count. This one states a count of cache
+    reads in the usage of one reply, as a provider does for a request that
+    hit its cache, and says of every reply what its usage carried.
+    """
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        reply = super().render(step, seen, call_id)
+        if isinstance(step, Say) and step.text == _FROM_THE_CACHE:
+            usage = {**reply.body["usage"], "cache_read_tokens": 7}
+            reply = dataclasses.replace(reply, body={**reply.body, "usage": usage})
+        return reply
+
+    def cache_counts(self, reply: Reply) -> CacheCounts:
+        usage = reply.body["usage"]
+        return CacheCounts(usage.get("cache_read_tokens"), usage.get("cache_write_tokens"))
+
+
+class _CannotReadItsReplies(_CountsTheCache):
+    def cache_counts(self, reply: Reply) -> CacheCounts:
+        raise MatrixSetupError("a reply whose cache counts cannot be read back")
+
+
+def test_the_ledger_keeps_what_each_billed_reply_said_of_the_cache() -> None:
+    script = ProviderScript((Say("one"), Refuse("http_policy"), Say(_FROM_THE_CACHE)))
+    # A dialect that reads no counts back leaves the ledger without any: that
+    # is not the statement that the replies carried none.
+    assert not isinstance(ToyDialect(), CacheCountingDialect)
+    with LoopbackProvider(script, credential="c") as provider:
+        assert _ask(provider, {})[0] == 200
+        assert provider.freeze().cache_counts is None
+    assert ProviderLedger().cache_counts is None
+
+    assert isinstance(_CountsTheCache(), CacheCountingDialect)
+    with LoopbackProvider(script, credential="c", dialect=_CountsTheCache()) as provider:
+        assert [_ask(provider, {})[0] for _ in script.steps] == [200, 400, 200]
+        seen = provider.freeze()
+        # The second call of the guarded lens is no part of the exchange.
+        provider.begin_probe()
+        assert _ask(provider, {})[0] == 200
+        assert provider.freeze() is seen and provider.final_counts() == (1, 0)
+    # One statement for every billed response, in the order billed, read
+    # from the reply as it was sent: a count that is not there is missing,
+    # not zero. The refusal by HTTP policy bills nothing and states nothing.
+    assert seen.billed == [Say("one").usage, Say(_FROM_THE_CACHE).usage]
+    assert seen.cache_counts == [CacheCounts(None, None), CacheCounts(7, None)]
+    # A reply the dialect cannot read back is a setup error when the provider
+    # is built, in the thread of the test.
+    with pytest.raises(MatrixSetupError, match="cannot be read back"):
+        LoopbackProvider(script, credential="c", dialect=_CannotReadItsReplies())
 
 
 def test_an_envelope_key_slot_is_a_whole_key_filled_with_a_string() -> None:

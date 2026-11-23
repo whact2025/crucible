@@ -194,9 +194,13 @@ billed, and the reported tokens are the billed ones. It also holds the two
 bounds of every segment to what the price row the product ships for the
 route's model gives for the usage the segment records
 (`usage.cost_bounds:amounts`): that row is the rate table of the route's
-cost policy. The reported cost is held to the matrix rate card, as on every
-column. In the guarded lens clause C5 reads from the limit guard's terminal
-whether a result the guard let stand is rankable, and reports
+cost policy. The bounds follow from the cache counts a segment records, so
+C6 holds those as well, to what the reply of the segment's response carried
+(`usage.cost_bounds:counts`): the scripted provider reads the counts back
+from the bytes of every billed reply, and a count a reply did not carry is
+unknown, never zero. The reported cost is held to the matrix rate card, as
+on every column. In the guarded lens clause C5 reads from the limit guard's
+terminal whether a result the guard let stand is rankable, and reports
 `guard:not_rankable` where it is not. Under a cost policy the guard never
 calls a result rankable, so on a route whose routing file opts into the cost
 upper bound C5 asks something else, by declared difference

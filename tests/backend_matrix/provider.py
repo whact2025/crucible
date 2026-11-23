@@ -28,6 +28,12 @@ A dialect may name a served model that differs from the requested one only
 for a ``ServedAs`` step. Anything else is a seam problem: a dialect that
 answers under a fixed id would switch off the "served equals requested"
 check for its whole kind.
+
+Where a route prices a response by what the reply says of the provider's
+cache, that statement is part of the bill. A dialect of such a wire reads the
+cache counts back from every billed reply as it is sent
+(:class:`CacheCountingDialect`), and the ledger keeps them beside the tokens:
+a count the reply did not carry is recorded as missing, never as zero.
 """
 
 from __future__ import annotations
@@ -95,12 +101,33 @@ class SentCall:
     arguments: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class CacheCounts:
+    """What one billed reply stated of the provider's cache, as it travelled.
+
+    ``None`` is a count the reply did not carry. It is never zero: a route
+    whose results are cost intervals prices a response with an unknown count
+    of cache reads as a range and one with a known count exactly, so the two
+    are different bills.
+    """
+
+    read_tokens: int | None
+    write_tokens: int | None
+
+
 @dataclass
 class ProviderLedger:
     """What the provider side saw and billed during the scripted exchange."""
 
     requests: list[SeenRequest] = field(default_factory=list)
     billed: list[TokenUsage] = field(default_factory=list)
+    # The cache counts the reply of every billed response stated, in the order
+    # of ``billed``: read back from the reply as it was sent, by a dialect
+    # that can (:class:`CacheCountingDialect`). ``None`` where the dialect of
+    # the exchange reads none back; clause C6 then refuses to judge a cost
+    # interval, because it could not tell a count the provider sent from one
+    # nobody sent.
+    cache_counts: list[CacheCounts] | None = None
     served_models: list[str] = field(default_factory=list)
     sent_calls: list[SentCall] = field(default_factory=list)
     # The envelope each matched reply was rendered from (vendor dialects).
@@ -187,6 +214,21 @@ class StatelessDialect(Protocol):
         ``requests`` are all requests of the scripted exchange, in order;
         ``calls`` name the request each tool call answered by its index there.
         """
+
+
+@runtime_checkable
+class CacheCountingDialect(Protocol):
+    """A dialect that says which cache counts a reply of its wire carried.
+
+    The dialect reads them from the reply as it is sent, never from the step
+    it rendered or from an envelope: a reply that a test dialect changes on
+    its way out is recorded as it travelled. The provider asks for every
+    billed reply and the ledger keeps the answers
+    (:attr:`ProviderLedger.cache_counts`).
+    """
+
+    def cache_counts(self, reply: Reply) -> CacheCounts:
+        """The counts of cache reads and writes ``reply`` states; ``None`` for none."""
 
 
 class ToyDialect:
@@ -385,11 +427,16 @@ class LoopbackProvider:
         self._closed_for_cell = False
         self._served_seam_reported = False
         self._frozen: ProviderLedger | None = None
-        # A step the dialect cannot render is a setup error here, in the test's
-        # thread, not a dropped connection inside the server's.
+        if isinstance(self._dialect, CacheCountingDialect):
+            self._ledger.cache_counts = []
+        # A step the dialect cannot render, or a reply whose cache counts it
+        # cannot read back, is a setup error here, in the test's thread, not a
+        # dropped connection inside the server's.
         blank = self._dialect.parse("POST", self._dialect.path, {}, b"{}", credential="")
         for step in (*script.steps, *((script.tail,) if script.tail else ())):
-            self._dialect.render(step.step if isinstance(step, Loop) else step, blank, "")
+            self._stated(
+                self._dialect.render(step.step if isinstance(step, Loop) else step, blank, "")
+            )
         provider = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -441,6 +488,13 @@ class LoopbackProvider:
         return f"http://127.0.0.1:{self.port}"
 
     # -- replay ----------------------------------------------------------
+
+    def _stated(self, reply: Reply) -> CacheCounts | None:
+        """What a billed reply says of the cache, where the dialect reads it back."""
+
+        if reply.usage is None or not isinstance(self._dialect, CacheCountingDialect):
+            return None
+        return self._dialect.cache_counts(reply)
 
     def _next_step(self, seen: SeenRequest) -> Step | None:
         """Return the step this request consumes, or ``None`` when unscripted."""
@@ -511,6 +565,11 @@ class LoopbackProvider:
                 )
             if reply.usage is not None:
                 self._ledger.billed.append(reply.usage)
+            stated = self._stated(reply)
+            if stated is not None and self._ledger.cache_counts is not None:
+                # One for every billed response: read from the reply that is
+                # about to be sent, whatever rendered it.
+                self._ledger.cache_counts.append(stated)
             if reply.served_model is not None:
                 self._ledger.served_models.append(reply.served_model)
             if reply.envelope is not None:
@@ -561,6 +620,11 @@ class LoopbackProvider:
                     self._ledger,
                     requests=list(self._ledger.requests),
                     billed=list(self._ledger.billed),
+                    cache_counts=(
+                        None
+                        if self._ledger.cache_counts is None
+                        else list(self._ledger.cache_counts)
+                    ),
                     served_models=list(self._ledger.served_models),
                     sent_calls=list(self._ledger.sent_calls),
                     envelopes=list(self._ledger.envelopes),

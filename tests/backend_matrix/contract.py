@@ -84,7 +84,7 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"guard:\w+", "C5"),
     (r"flag:(token_usage_complete|cost_complete)=(True|False)", "C6"),
     (r"usage\.(input_tokens|output_tokens|cost_usd):(lt|gt)", "C6"),
-    (r"usage\.cost_bounds:(none|uncovered|segments|amounts)", "C6"),
+    (r"usage\.cost_bounds:(none|uncovered|segments|counts|amounts)", "C6"),
     (r"pricing:(none|unreconciled)", "C6"),
     (r"digest\.(missing|mismatch):\w+", "C7"),
     (r"request\.content:model", "C7"),
@@ -680,7 +680,10 @@ def bound_amounts(pricing: ModelPricing, segment: Any) -> tuple[float, float]:
     segment records and one price row. With the count of cache reads unknown
     the lower bound prices every input token that was not written to the
     cache as read from it, and the upper bound prices none as read; with the
-    count known both are the exact price.
+    count known both are the exact price. Whether the counts a segment
+    records are the ones the provider's reply carried is not this
+    function's to say: :func:`_cost_interval` holds them to the provider
+    ledger.
     """
 
     read = segment.cache_read_tokens
@@ -698,6 +701,10 @@ def bound_amounts(pricing: ModelPricing, segment: Any) -> tuple[float, float]:
     return priced(read), priced(read)
 
 
+def _count_text(count: int | None) -> str:
+    return "unknown" if count is None else str(count)
+
+
 def _same_amount(got: float, want: float) -> bool:
     # The tolerance of the product's own replay of the formula
     # (crucible/backends/cost_bounds.py).
@@ -713,11 +720,20 @@ def _cost_interval(obs: Observation, ref: Reference) -> list[Deviation]:
     interval is what is owed instead: it is there, it covers the reported
     usage (full coverage, the token counts are the sums of its segments, the
     reported cost is its lower bound), it has one segment for every response
-    the provider billed, with the tokens of that response, and the two
-    bounds of every segment are what the shipped price row of the route's
-    model gives for the usage the segment records. That row is the rate
-    table of the route's cost policy; the matrix rate card is not, and stays
-    the reference of the reported cost.
+    the provider billed, with the tokens of that response and with the
+    counts of cache reads and of cache writes that the reply of that
+    response carried, and the two bounds of every segment are what the
+    shipped price row of the route's model gives for the usage the segment
+    records. That row is the rate table of the route's cost policy; the
+    matrix rate card is not, and stays the reference of the reported cost.
+
+    The counts are held because the bounds follow from them: a segment that
+    states a count of cache reads is priced exactly, and at the lowest price
+    when it says that every input token was read. A count nobody sent would
+    so lower what a budget is charged, with bounds that are right for the
+    usage the segment records. What the reply said is the provider ledger's
+    to know: its dialect reads the counts back from the bytes it sent, and a
+    count the reply did not carry is missing there, never zero.
     """
 
     assert obs.result is not None
@@ -750,6 +766,38 @@ def _cost_interval(obs: Observation, ref: Reference) -> list[Deviation]:
                 f"the interval has {len(held)} segment(s) with (input, output) "
                 f"tokens {held}; the provider billed {len(billed)} response(s) "
                 f"with {billed}",
+            )
+        )
+    # A dialect that does not read the cache counts back from its replies
+    # leaves the counts of an interval to the result's own word: the cell
+    # cannot be judged, which is an error of the matrix and no deviation.
+    stated = obs.provider.cache_counts
+    assert stated is not None, (
+        "the provider side of a cost-bounded route recorded no cache counts: its "
+        "dialect must read them back from the replies it sends"
+    )
+    assert len(stated) == len(billed), (
+        f"the provider ledger states cache counts for {len(stated)} of "
+        f"{len(billed)} billed response(s)"
+    )
+    # Compared response by response, so only where the interval has one
+    # segment for each: an interval of other segments is named above.
+    miscounted = [
+        f"segment {index + 1} records cache reads {_count_text(item.cache_read_tokens)} "
+        f"and cache writes {_count_text(item.cache_creation_tokens)}, the reply stated "
+        f"cache reads {_count_text(sent.read_tokens)} and cache writes "
+        f"{_count_text(sent.write_tokens)}"
+        for index, (item, sent) in enumerate(zip(bounds.segments, stated, strict=False))
+        if (item.cache_read_tokens, item.cache_creation_tokens)
+        != (sent.read_tokens, sent.write_tokens)
+    ]
+    if len(bounds.segments) == len(stated) and miscounted:
+        out.append(
+            Deviation(
+                "usage.cost_bounds:counts",
+                "the cache counts of the interval are not the ones the provider's "
+                "replies carried (a count a reply did not carry is unknown, never "
+                "zero): " + "; ".join(miscounted),
             )
         )
     # The runner refuses a cost-bounded route whose model has no shipped row.

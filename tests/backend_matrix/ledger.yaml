@@ -484,18 +484,30 @@ registry:
     # cost policy by the product's own replay) gives for the usage the
     # segment records, or the cell names usage.cost_bounds:amounts. A
     # result whose segments are priced at nothing, or whose upper bounds
-    # (what a budget is charged) are lowered to the lower ones, is a
-    # deviation of its own in the raw lens; in the guarded lens of a clean
-    # finish the limit guard replays the formula and rewrites such a result
-    # first. Two things that rule does not hold. A change that the
-    # adapter's constants and the shipped row make together: one proof of
-    # the Kimi module pins the amounts of one cell as numbers and the
-    # verifier requires it by name; the product's own tests pin more. And a
-    # count of cache reads or writes that the provider never sent: the
-    # provider side of a cell records input and output tokens only, so the
-    # usage a segment is priced on is the segment's own. A missing count
-    # read as zero shows against the rate card, as usage.cost_usd:gt (the
-    # same module plays it), not through this rule.
+    # (what a budget is charged) are lowered to the lower ones while its
+    # segments call their count of cache reads unknown, is a deviation of
+    # its own in the raw lens; in the guarded lens of a clean finish the
+    # limit guard replays the formula and rewrites such a result first.
+    # That rule prices the usage a segment records, so by itself it holds
+    # nothing of a segment that states a count: with a count of cache reads
+    # stated beside them the same lowered amounts are right for the record.
+    # Such a result lowers what a budget is charged, down to the lower
+    # bound when every input token is said to be read; the limit guard's
+    # replay accepts it and keeps its cost authority; and at today's rates
+    # the rate card names its reported cost (usage.cost_usd:gt) only while
+    # the stated counts add up to less than ten ninths of the output
+    # tokens, a missing count read as zero being the loudest of them. From
+    # there up it showed in neither lens. So the counts are held too: the
+    # provider side of a cell records for every billed response which count
+    # of cache reads and of cache writes the reply carried, read back from
+    # the bytes it sent (a count that is not there is missing, never zero),
+    # and C6 holds every segment to it, in both lenses and on a limit exit,
+    # or the cell names usage.cost_bounds:counts. Where the dialect of a
+    # route reads no counts back, C6 refuses to judge an interval. What the
+    # two rules do not hold is a change that the adapter's constants and
+    # the shipped row make together: one proof of the Kimi module pins the
+    # amounts of one cell as numbers and the verifier requires it by name;
+    # the product's own tests pin more.
     # Ruled on 2026-11-21 by a decision panel under the release owner's
     # standing instruction, 2 of 3 (the owner may overrule). (a) The two
     # accounting flags bind every route, so the gap stays. (b) The matrix

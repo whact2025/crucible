@@ -29,7 +29,11 @@ A route that opts into the diagnostic cost upper bound is called as its
 routing file says it must be: the guarded lens binds the cost policy that
 file names, with a durable ledger, where every other route gets the plain
 diagnostic limit policy. (The budget such a route asks of every invocation is
-the runner's business: the invocation is not a driver's to write.)
+the runner's business: the invocation is not a driver's to write.) Such a
+route prices a response by what its reply says of the provider's cache, so
+the dialect reads the cache counts back from the bytes of every reply it
+sends, for the provider ledger of the cell: a count a reply does not carry
+is missing there, never zero.
 
 The seam canary of a column fails unless the request came from the locked
 worker behind the redirect: the harness journalled a redirected launch of the
@@ -65,7 +69,7 @@ from .. import declarations
 from .. import envelopes as envelope_files
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import launch
-from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall
+from ..provider import CacheCounts, LoopbackProvider, Reply, SeenRequest, SentCall
 from ..script import Call, ProviderScript, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from . import openai_compat as chat
@@ -324,6 +328,17 @@ class MoonshotChatDialect:
 
         return replay_problems(requests, calls)
 
+    def cache_counts(self, reply: Reply) -> CacheCounts:
+        """The cache counts a reply states, for the provider ledger of a cell.
+
+        The diagnostic routes of the kind price a response by whether its
+        statistics carry a count of cache reads, so clause C6 holds the
+        counts a result records to what the reply said. Read from the bytes
+        of the reply, whichever dialect rendered them.
+        """
+
+        return stated_cache_counts(reply.raw or b"")
+
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
         served = seen.model
         if isinstance(step, ServedAs):
@@ -384,6 +399,71 @@ def server_sent_events(chunks: Sequence[Any]) -> bytes:
         ).encode()
         for chunk in chunks
     )
+
+
+_EVENT = b"data: "
+# Where a usage block states its counts of cache reads and of cache writes.
+_READS, _WRITES, _DETAILS = "cached_tokens", "cache_write_tokens", "prompt_tokens_details"
+
+
+def _count(holder: Mapping[str, Any], key: str) -> int | None:
+    """One cache count as a usage block states it; ``None`` where the key is absent."""
+
+    if key not in holder:
+        return None
+    if type(holder[key]) is not int:
+        raise MatrixSetupError(
+            f"a reply states {key!r} as {type(holder[key]).__name__}, which the "
+            "provider ledger cannot record as a count; the scenario that needs "
+            "such a reply adds the reading with its liar"
+        )
+    return int(holder[key])
+
+
+def stated_cache_counts(stream: bytes) -> CacheCounts:
+    """What the usage blocks of one streamed reply say of the provider's cache.
+
+    Read from the events as they travel. A reply states its usage in the
+    statistics chunk and again inside the finish choice. Each block states
+    the count of cache writes under the prompt details and, only for a
+    request that read from the cache, the count of cache reads there and as
+    an equal alias beside the totals. A count the reply does not carry is
+    ``None``, never zero. A reply whose blocks disagree states no count the
+    ledger could record, and is no reply of this wire.
+    """
+
+    stated: set[CacheCounts] = set()
+    for event in stream.split(b"\n\n"):
+        if not event.startswith(_EVENT):
+            continue
+        try:
+            chunk = json.loads(event[len(_EVENT) :])
+        except json.JSONDecodeError:
+            continue  # the closing message of the stream
+        if not isinstance(chunk, dict):
+            continue
+        for holder in (chunk, *(chunk.get("choices") or ())):
+            usage = holder.get("usage") if isinstance(holder, dict) else None
+            if not isinstance(usage, dict):
+                continue
+            details = usage.get(_DETAILS)
+            details = details if isinstance(details, dict) else {}
+            reads = {
+                count
+                for count in (_count(details, _READS), _count(usage, _READS))
+                if count is not None
+            }
+            if len(reads) > 1:
+                raise MatrixSetupError(
+                    f"a usage block of a reply states two counts of cache reads: {sorted(reads)}"
+                )
+            stated.add(CacheCounts(next(iter(reads), None), _count(details, _WRITES)))
+    if len(stated) > 1:
+        raise MatrixSetupError(
+            "the usage blocks of one reply state different cache counts: "
+            f"{sorted(map(repr, stated))}"
+        )
+    return next(iter(stated), CacheCounts(None, None))
 
 
 def reasons_before_a_call(envelope: str) -> bool:
