@@ -35,6 +35,7 @@ from assay.corpus.store import Corpus
 
 from crucible.products.deepswe.runners import deepswe_dev_verify as dv
 from crucible.workflows import _deepswe_baseline_preflight as baseline_preflight
+from crucible.workflows import _mutation_journal as journals
 from crucible.workflows import deepswe as wf
 from crucible.workflows._build_verify import BuildVerifyOutcome, RunnerResult
 from crucible.workflows._mutation_journal import MutationJournalError
@@ -571,6 +572,38 @@ def _slice_classification(
     return phase["classification"]
 
 
+def _held_by_the_journal() -> tuple[frozenset[object], ...]:
+    """The lock descriptors the journal holds and its live transactions."""
+
+    return (
+        frozenset(journals._HELD_AUTHORITY_DESCRIPTORS),
+        frozenset(journals._HELD_LOCK_DESCRIPTORS),
+        frozenset(journals._LIVE_TRANSACTIONS),
+    )
+
+
+def _newly_held_by_the_journal(
+    before: tuple[frozenset[object], ...],
+) -> tuple[frozenset[object], ...]:
+    """What the journal holds now and did not hold ``before``."""
+
+    return tuple(
+        now - then for now, then in zip(_held_by_the_journal(), before)
+    )
+
+
+def _uncommitted(repo: Path) -> list[str]:
+    """What Git reports besides the commit, ignored paths included."""
+
+    return subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--ignored"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+
+
 def _retained_scope_escapes(tmp_path: Path) -> tuple[str, ...]:
     """The paths the tier charged to the slice it rolled back."""
 
@@ -610,16 +643,39 @@ def test_slice_gate_charges_every_recorded_kind_to_the_slice(
 
     # For a new directory the tier does not classify the slice: its journal
     # refuses the changed topology, directly or while settling the slice.
+    held_before = _held_by_the_journal()
     with pytest.raises(
         (MutationJournalError, ProviderSettlementCleanupError)
     ) as caught:
         _slice_classification(tmp_path, monkeypatch, residue.create)
+    # Rendered before the owner is settled: a retry rebinds the cause.
+    refusal = _exception_chain(caught.value)
+    repo = tmp_path / "repo"
+    nothing = (frozenset(), frozenset(), frozenset())
+
+    if isinstance(caught.value, ProviderSettlementCleanupError):
+        # Refused while settling: the rollback does not remove a directory
+        # that is not empty, so the tier ended with its cleanup owner still
+        # holding the journal and the workspace lock.  Whoever catches that
+        # owner settles it; a dropped owner keeps its lock chain until some
+        # later garbage collection.
+        owner = caught.value.owner
+        assert not owner.cleanup_complete
+        assert _newly_held_by_the_journal(held_before) != nothing
+        residue.remove(repo)
+        caught.value.retry_cleanup()
+        assert owner.cleanup_complete
+
+    # Either way the slice is rolled back and the journal holds nothing new.
+    assert repo.joinpath("target.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert _uncommitted(repo) == []
+    assert _newly_held_by_the_journal(held_before) == nothing
 
     # The recorded root, and nothing else, is what the journal objects to.
     assert (
         "changed guarded worktree directory topology or modes: "
         f"[{recorded!r}]"
-    ) in _exception_chain(caught.value)
+    ) in refusal
 
 
 @pytest.mark.parametrize(
