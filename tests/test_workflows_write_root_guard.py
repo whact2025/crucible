@@ -458,7 +458,7 @@ def test_a_link_to_a_directory_and_an_empty_directory_are_refused(
 
 
 @pytest.mark.parametrize("workflow", _WORKFLOWS)
-def test_refusal_names_the_reason_and_both_ways_out(
+def test_refusal_names_the_reason_and_the_spec_each_way_out_is_for(
     tmp_path: Path,
     monkeypatch,
     workflow: str,
@@ -474,15 +474,38 @@ def test_refusal_names_the_reason_and_both_ways_out(
     message = _assert_refused(outcome, corpus, workflow, root, before)
     write_role = "breach_defender" if workflow == "breach" else "implementer"
     for needle in (
+        # The reason.
         str(root.resolve()),
         f"directory named like itself ({NAME!r})",
         f"{write_role} (claude)",
         "isolated mutation host",
-        f"{NAME}/<path>",
-        "tier or architect with --worktree",
-        "another name",
+        f"would write {NAME}/<path> to <path>",
+        # Both ways out hold only for a Spec written against this root.
+        "If the Spec's paths are relative to this root, run tier or "
+        "architect with --worktree, or give the checkout directory another "
+        "name.",
+        # A Spec written against the directory above takes neither: there
+        # its paths would name files below the same-named directory.
+        "If the Spec was planned from the directory above this root, so "
+        f"that it writes {NAME}/<path> for <path> in this root, do neither",
+        f"read {NAME}/<path> as a path below {NAME}/, and a write creates "
+        "files there",
     ):
         assert needle in message, (needle, message)
+    # What is left for such a Spec is planning it again, and the message ends
+    # there. It names no route for it: the in-process handlers keep a leading
+    # root name whenever the path's parent exists, so in a root refused here
+    # they too would write a file meant for the root below the same-named
+    # directory. The host is named once, as the reason.
+    assert message.endswith(
+        "a write creates files there. Such a Spec runs only after it is "
+        "planned again relative to this root."
+    ), message
+    assert message.count("isolated mutation host") == 1, message
+    # The only option the message names is one that exists.
+    assert [
+        word.strip(".,:;") for word in message.split() if word.startswith("--")
+    ] == ["--worktree"]
 
 
 # ----------------------------------------------------------------------

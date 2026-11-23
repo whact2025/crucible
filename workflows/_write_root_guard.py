@@ -73,13 +73,27 @@ def host_route_write_root_refusal(
     if not host_routed:
         return None
     name = resolved.name
+    # In a worktree and in a renamed checkout no path begins with the name of
+    # the root. Both are ways out for a Spec written against this root, and
+    # wrong for one written against the directory above it, whose
+    # ``<name>/<path>`` would there name a file below the same-named
+    # directory. No route is named for that Spec either: the in-process
+    # handlers keep the leading name whenever the path's parent exists, and
+    # in a root refused here that parent exists for every file directly in
+    # the root, so they too would write it below the same-named directory.
     return (
         f"write root {resolved} holds a directory named like itself "
         f"({name!r}). Write roles {', '.join(host_routed)} reach it through "
         f"the isolated mutation host, which reads a leading {name!r} path "
         f"component as the root itself and would write {name}/<path> to "
-        "<path>. Run tier or architect with --worktree, or give the "
-        "checkout directory another name."
+        "<path>. If the Spec's paths are relative to this root, run tier or "
+        "architect with --worktree, or give the checkout directory another "
+        "name. If the Spec was planned from the directory above this root, "
+        f"so that it writes {name}/<path> for <path> in this root, do "
+        "neither: a worktree and a renamed checkout both read "
+        f"{name}/<path> as a path below {name}/, and a write creates files "
+        "there. Such a Spec runs only after it is planned again relative "
+        "to this root."
     )
 
 
