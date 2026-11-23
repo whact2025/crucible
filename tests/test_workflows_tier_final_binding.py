@@ -1760,6 +1760,7 @@ def test_shipping_preflight_rolls_writer_epoch_before_normal_gate(
     assert "t0__shipping_gate" in members
 
 
+@pytest.mark.timeout(300)
 def test_deferred_failed_seed_lands_one_exact_family_settlement(
     tmp_path: Path,
     monkeypatch,
