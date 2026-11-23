@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal frame of a session that was started with a response schema
+# and ended on an answer that is a JSON object. Nothing was observed of the
+# real tool (see cli.init); the accounting and the extraction are emulated.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: result_structured
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.ResultMessage with structured_output, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "result")
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    As cli.result for the keys, the accounting, and the two parts that have no
+    source but the adapter: the four counters of the terminal usage mapping
+    (named after anthropic.types.Usage by analogy, stated for the terminal
+    frame by no source in reach, all four required by the adapter) and the
+    usage record per model. The structured output is the decoded final answer
+    of the model, and it is the only place of the session that holds it: the
+    dialect fills the result text of this frame, and the text of the last
+    model turn before it, with a fixed note of its own. A cell therefore
+    tells an adapter that reads the structured output from one that reads
+    either text. How the real tool obtains an answer that conforms to the
+    schema, which frames it emits on the way and what it writes as text
+    beside the structured output is not known: selecting this envelope by the
+    schema option on the command line, the extraction and the note are an
+    emulation.
+
+status: 200
+
+body:
+  type: result
+  subtype: success
+  is_error: false
+  duration_ms: 1
+  duration_api_ms: 1
+  num_turns: {slot: turns}
+  result: {slot: text}
+  structured_output: {slot: structured_output}
+  stop_reason: end_turn
+  session_id: {slot: session_id}
+  total_cost_usd: {slot: cost_usd}
+  usage:
+    input_tokens: {slot: input_tokens}
+    output_tokens: {slot: output_tokens}
+    cache_creation_input_tokens: 0
+    cache_read_input_tokens: 0
+  modelUsage:
+    "${slot:served_model}":
+      inputTokens: {slot: input_tokens}
+      outputTokens: {slot: output_tokens}
+      cacheReadInputTokens: 0
+      cacheCreationInputTokens: 0
+      webSearchRequests: 0
+      costUSD: {slot: cost_usd}
+      contextWindow: 200000
+      maxOutputTokens: 64000
+      canonicalModel: {slot: served_model}
+      provider: firstParty
+  uuid: {slot: frame_id}

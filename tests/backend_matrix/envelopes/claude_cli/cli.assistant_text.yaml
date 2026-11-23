@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# One model turn that answers in text, as the command-line tool relays it.
+# Nothing was observed of the real tool (see cli.init).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: assistant_text
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.AssistantMessage with one TextBlock, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case
+    "assistant"); the inner message validates as anthropic.types.Message
+  sdk_version: claude-agent-sdk 0.2.121, anthropic 0.112.0
+  reason: >-
+    The outer frame holds exactly the keys the pinned SDK reads for an
+    assistant frame, without its optional error key. The inner message is the
+    message object of the provider, which the tool passes on: its required
+    fields are those of anthropic.types.Message, and the usage record names
+    the four counters of anthropic.types.Usage that the accounting of the
+    tool adds up (the two cache counters are optional there and written as
+    zero here). Whether the real tool fills the stop reason of a relayed
+    frame is not known. In a session with a response schema the text of the
+    last turn is not the model's answer but a fixed note of the dialect: the
+    answer travels in the structured output of the terminal frame only (see
+    cli.result_structured, where that emulation is stated).
+
+status: 200
+
+body:
+  type: assistant
+  message:
+    id: {slot: response_id}
+    type: message
+    role: assistant
+    model: {slot: served_model}
+    content:
+      - type: text
+        text: {slot: text}
+    stop_reason: end_turn
+    stop_sequence: null
+    usage:
+      input_tokens: {slot: input_tokens}
+      output_tokens: {slot: output_tokens}
+      cache_creation_input_tokens: 0
+      cache_read_input_tokens: 0
+  parent_tool_use_id: null
+  session_id: {slot: session_id}
+  uuid: {slot: frame_id}

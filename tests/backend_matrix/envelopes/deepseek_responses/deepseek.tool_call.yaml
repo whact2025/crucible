@@ -1,0 +1,193 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed response that reasons and then asks for one function tool call,
+# as the DeepSeek Responses route answers a request that advertises tools.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: deepseek_responses
+provider: deepseek
+behaviour: tool_call
+
+provenance:
+  grade: documented
+  sources:
+    - source: >-
+        port note open-weight-research.json, topic "deepseek", api_changes[9]:
+        the vendor's guide to its Responses route
+        (api-docs.deepseek.com/guides/responses_api), primary source
+      retrieved: "2026-11-18"
+      states: >-
+        The streaming events of the route, among them
+        response.reasoning_text.delta and .done and
+        response.function_call_arguments.delta and .done beside the events
+        of the completion envelope. There is no closing "[DONE]" message.
+        Usage is null until the terminal event.
+    - source: >-
+        port note open-weight-research.json, topic "deepseek", api_changes[5]
+        and api_changes[7]: the vendor's guides to thinking mode and to its
+        Responses route, primary source
+      retrieved: "2026-11-18"
+      states: >-
+        Thinking is on by default. The chain of thought arrives as reasoning
+        items with reasoning_text parts; no summary is generated. Function
+        tools are supported on the route.
+    - source: >-
+        port note open-weight-research.json, topic "deepseek", api_changes[8]:
+        the vendor's reference of the create-response call, primary source
+      retrieved: "2026-11-18"
+      states: >-
+        The route is stateless: a client resends every prior item. The
+        call_id of a function_call must be non-empty and unique, and every
+        function_call must have a matching function_call_output.
+    - source: >-
+        port note open-weight-models.live.md, section 3 "DeepSeek native
+        Responses route": the adapter-level check of the shipped route
+        through the locked worker, with one tool
+      retrieved: "2026-11-18"
+      states: >-
+        Live on 2026-11-18, the response that called the tool reasoned (33
+        reasoning tokens of 71 output tokens), named the model that was
+        asked for and ended with the terminal response.completed. Its
+        reasoning item and its function call were replayed in the next
+        request (input item types: system, user, reasoning, function_call,
+        function_call_output), which the route accepted. No body was stored.
+  notes: >-
+    Documented or observed: that a response which calls a function holds a
+    reasoning item with reasoning_text parts and a function_call item with a
+    call id, which events exist, where the usage travels and its fields.
+    Everything else is constructed, as stated for the completion envelope:
+    the remaining keys are the fields without a default of the pinned SDK's
+    types (openai.types.responses: ResponseReasoningItem with an
+    empty summary, ResponseFunctionToolCall and the event types named
+    above), the three echoed request fields are fillers, the cache-write
+    counter is left out as documented, and the order of the events within a
+    response was not observed. That the function call has an item id beside
+    its call id, and that its arguments arrive in one delta, are choices of
+    this envelope. The reasoning text is a slot: raw reasoning is text of
+    the provider, not shape.
+
+status: 200
+body:
+  - type: response.created
+    sequence_number: 0
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.in_progress
+    sequence_number: 1
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.output_item.added
+    sequence_number: 2
+    output_index: 0
+    item:
+      id: {slot: reasoning_item_id}
+      type: reasoning
+      summary: []
+      content: []
+      status: in_progress
+  - type: response.reasoning_text.delta
+    sequence_number: 3
+    item_id: {slot: reasoning_item_id}
+    output_index: 0
+    content_index: 0
+    delta: {slot: reasoning_text}
+  - type: response.reasoning_text.done
+    sequence_number: 4
+    item_id: {slot: reasoning_item_id}
+    output_index: 0
+    content_index: 0
+    text: {slot: reasoning_text}
+  - type: response.output_item.done
+    sequence_number: 5
+    output_index: 0
+    item:
+      id: {slot: reasoning_item_id}
+      type: reasoning
+      summary: []
+      content:
+        - type: reasoning_text
+          text: {slot: reasoning_text}
+      status: completed
+  - type: response.output_item.added
+    sequence_number: 6
+    output_index: 1
+    item:
+      id: {slot: item_id}
+      type: function_call
+      call_id: {slot: call_id}
+      name: {slot: tool_name}
+      arguments: ""
+      status: in_progress
+  - type: response.function_call_arguments.delta
+    sequence_number: 7
+    item_id: {slot: item_id}
+    output_index: 1
+    delta: {slot: tool_arguments}
+  - type: response.function_call_arguments.done
+    sequence_number: 8
+    item_id: {slot: item_id}
+    output_index: 1
+    name: {slot: tool_name}
+    arguments: {slot: tool_arguments}
+  - type: response.output_item.done
+    sequence_number: 9
+    output_index: 1
+    item:
+      id: {slot: item_id}
+      type: function_call
+      call_id: {slot: call_id}
+      name: {slot: tool_name}
+      arguments: {slot: tool_arguments}
+      status: completed
+  - type: response.completed
+    sequence_number: 10
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: completed
+      model: {slot: served_model}
+      output:
+        - id: {slot: reasoning_item_id}
+          type: reasoning
+          summary: []
+          content:
+            - type: reasoning_text
+              text: {slot: reasoning_text}
+          status: completed
+        - id: {slot: item_id}
+          type: function_call
+          call_id: {slot: call_id}
+          name: {slot: tool_name}
+          arguments: {slot: tool_arguments}
+          status: completed
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage:
+        input_tokens: {slot: input_tokens}
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: {slot: output_tokens}
+        output_tokens_details:
+          reasoning_tokens: {slot: reasoning_tokens}
+        total_tokens: {slot: total_tokens}

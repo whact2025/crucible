@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -173,38 +174,113 @@ def _wire_line(sequence: int, **fields: Any) -> bytes:
     ).encode()
 
 
-@pytest.fixture(scope="module")
-def worker_module():
-    source = (
-        Path(deepseek_mod.__file__).with_name("deepseek_worker")
-        / "src"
-        / "crucible_deepseek_worker"
-        / "__main__.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "crucible_deepseek_worker_test_module",
-        source,
-    )
+_WORKER_PROJECT = Path(deepseek_mod.__file__).with_name("deepseek_worker")
+
+
+def _project_entries(project: Path) -> dict[str, tuple[int, int]]:
+    """Size and modification time of every entry of a worker project.
+
+    The installed environment is left out: nothing here imports from it.
+    """
+
+    entries: dict[str, tuple[int, int]] = {}
+    for root, directories, files in os.walk(project):
+        if Path(root) == project:
+            directories[:] = [name for name in directories if name != ".venv"]
+        for name in (*directories, *files):
+            path = Path(root) / name
+            metadata = path.lstat()
+            entries[path.relative_to(project).as_posix()] = (
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+    return entries
+
+
+def _load_worker_source(name: str, source: Path, *, project: Path = _WORKER_PROJECT) -> Any:
+    """Load a source file of the worker project by path and leave no bytecode there.
+
+    The adapter's pin hashes the worker's source directory with every
+    bytecode entry in it and is revalidated before every launch. A
+    ``__pycache__`` written by this process would change the pin of the
+    checkout under every other test that runs in it, while those tests run.
+    """
+
+    spec = importlib.util.spec_from_file_location(name, source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    before = _project_entries(project)
+    write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = write_bytecode
+    assert _project_entries(project) == before, "loading worker source changed its project"
     return module
+
+
+@pytest.fixture(scope="module")
+def worker_module():
+    return _load_worker_source(
+        "crucible_deepseek_worker_test_module",
+        _WORKER_PROJECT / "src" / "crucible_deepseek_worker" / "__main__.py",
+    )
 
 
 @pytest.fixture(scope="module")
 def transport_check_module():
-    source = (
-        Path(deepseek_mod.__file__).with_name("deepseek_worker")
-        / "provider_free_transport_check.py"
-    )
-    spec = importlib.util.spec_from_file_location(
+    return _load_worker_source(
         "crucible_deepseek_transport_check_test_module",
-        source,
+        _WORKER_PROJECT / "provider_free_transport_check.py",
     )
+
+
+def test_worker_source_is_loaded_without_leaving_bytecode_in_the_worker_project(
+    worker_module,
+    transport_check_module,
+    monkeypatch,
+    tmp_path,
+):
+    # Both fixtures above went through the loader, which compares the worker
+    # project before and after the load. What it guards against, on a
+    # stand-in project: a plain load by path leaves bytecode beside the
+    # source, which is an entry the adapter's pin would hash.
+    assert {worker_module.__name__, transport_check_module.__name__} == {
+        "crucible_deepseek_worker_test_module",
+        "crucible_deepseek_transport_check_test_module",
+    }
+    project = tmp_path / "standin_worker"
+    source = project / "src" / "standin.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VALUE = 7\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    monkeypatch.setattr(sys, "pycache_prefix", None)
+
+    spec = importlib.util.spec_from_file_location("standin_plain_load", source)
     assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    cache = source.parent / "__pycache__"
+    assert [path.suffix for path in cache.iterdir()] == [".pyc"]
+    assert "src/__pycache__" in _project_entries(project)
+
+    # The loader of this module leaves the project as it found it, and the
+    # interpreter's switch as it was.
+    shutil.rmtree(cache)
+    before = _project_entries(project)
+    loaded = _load_worker_source("standin_guarded_load", source, project=project)
+    assert loaded.VALUE == 7
+    assert _project_entries(project) == before and not cache.exists()
+    assert sys.dont_write_bytecode is False
+    # A load that does change the project is refused, whatever it wrote.
+    source.write_text(
+        "from pathlib import Path\n"
+        "Path(__file__).with_name('written-during-the-load').write_text('x')\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="changed its project"):
+        _load_worker_source("standin_writing_load", source, project=project)
+    assert sys.dont_write_bytecode is False
 
 
 def _terminal_wire(
