@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A model response that calls a tool of a configured tool server, as the
+# app-server reports the call before it runs. Nothing was observed of the
+# real tool (see app_server.agent_message).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: tool_call_started
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai_codex.generated.v2_all.ItemStartedNotification with a
+    McpToolCallThreadItem whose status is the McpToolCallStatus value
+    inProgress (method item/started in
+    openai_codex.generated.notification_registry)
+  sdk_version: openai-codex 0.144.4
+  reason: >-
+    The notification holds exactly the required fields of the generated type
+    of the vendor (threadId, turnId, startedAtMs, item) and the item the
+    required fields of McpToolCallThreadItem (type, id, server, tool, status,
+    arguments). The server is the name under which the command line
+    configures the tool server, the tool its bare name on that server and the
+    arguments the decoded object, as the type states them. That the real tool
+    reports a call before it runs, and in this order with the usage of the
+    response, is stated by no source in reach.
+
+status: 200
+
+body:
+  method: item/started
+  params:
+    threadId: {slot: thread_id}
+    turnId: {slot: turn_id}
+    startedAtMs: {slot: created}
+    item:
+      type: mcpToolCall
+      id: {slot: call_id}
+      server: {slot: tool_server}
+      tool: {slot: tool_name}
+      status: inProgress
+      arguments: {slot: tool_input}

@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A chat completion that asks for one function tool call, as a local
+# OpenAI-compatible model server sends it when its tool-call parser is on.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: local
+behaviour: tool_call
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletion whose message.tool_calls holds one
+    ChatCompletionMessageFunctionToolCall
+  sdk_version: openai 2.44.0
+  notes: >-
+    No local model server was run or observed. One serving guide says that
+    without the tool-call parser a call "would be left as raw text in
+    content" and the finish reason stays "stop" (the guide of one such
+    server for the model family, primary source, read 2026-11-18): with the
+    parser the call travels in tool_calls, but no body is documented. So
+    this envelope proves that the reply parses through the SDK, not that a
+    given server sends it.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+        tool_calls:
+          - id: {slot: call_id}
+            type: function
+            function:
+              name: {slot: tool_name}
+              arguments: {slot: tool_arguments}
+      finish_reason: tool_calls
+  usage:
+    prompt_tokens: {slot: input_tokens}
+    completion_tokens: {slot: output_tokens}
+    total_tokens: {slot: total_tokens}

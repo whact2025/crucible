@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal frame of a session that ended on a text answer. Nothing was
+# observed of the real tool (see cli.init), and the accounting it carries is
+# the tool's own: every cell that uses this envelope rests on an emulation.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: result
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.ResultMessage, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "result")
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    The top-level keys are among those the pinned SDK reads for a result frame
+    (five of them are required there). The session accounting is the tool's
+    own and is emulated: the usage is the sum of the turns the scripted peer
+    relayed, the turn count is the number of those turns, the cost is that
+    usage at the rate card the adapter is configured with, and the two
+    durations are placeholders. Two parts of the frame have no source but the
+    adapter. The first is the terminal usage mapping. The SDK types it as a
+    free mapping. Its four counter names follow anthropic.types.Usage by
+    analogy with the usage of a model turn; no source in reach says that the
+    tool reports them on its terminal frame, and the adapter requires all
+    four as valid counters before it builds the pricing evidence of the
+    terminal (crucible/backends/claude.py, where the result frame's usage is
+    read): without the two cache counters a cell reports unreconciled
+    pricing. The second is the usage record per model. The SDK types it as a
+    free mapping too, and no vendor source in reach states its fields. The
+    ten names written here are the ones that the reviewed-wire parser of the
+    product requires (crucible/backends/claude.py, the function that reads
+    the terminal model-usage record); the context window and the output
+    ceiling are placeholders and the provider label is a guess. Those two
+    parts of the frame therefore show only that the adapter accepts what it
+    was written to accept. A recording of the real tool would replace them.
+
+status: 200
+
+body:
+  type: result
+  subtype: success
+  is_error: false
+  duration_ms: 1
+  duration_api_ms: 1
+  num_turns: {slot: turns}
+  result: {slot: text}
+  stop_reason: end_turn
+  session_id: {slot: session_id}
+  total_cost_usd: {slot: cost_usd}
+  usage:
+    input_tokens: {slot: input_tokens}
+    output_tokens: {slot: output_tokens}
+    cache_creation_input_tokens: 0
+    cache_read_input_tokens: 0
+  modelUsage:
+    "${slot:served_model}":
+      inputTokens: {slot: input_tokens}
+      outputTokens: {slot: output_tokens}
+      cacheReadInputTokens: 0
+      cacheCreationInputTokens: 0
+      webSearchRequests: 0
+      costUSD: {slot: cost_usd}
+      contextWindow: 200000
+      maxOutputTokens: 64000
+      canonicalModel: {slot: served_model}
+      provider: firstParty
+  uuid: {slot: frame_id}

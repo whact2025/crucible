@@ -341,26 +341,66 @@ class _NativeStreamEndpoint(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
 
+_WORKER_PROJECT = Path(kimi_mod.__file__).with_name("kimi_worker")
+
+
+def _project_entries(project: Path) -> dict[str, tuple[int, int]]:
+    """Size and modification time of every entry of a worker project.
+
+    The installed environment is left out: nothing here imports from it.
+    """
+
+    entries: dict[str, tuple[int, int]] = {}
+    for root, directories, files in os.walk(project):
+        if Path(root) == project:
+            directories[:] = [name for name in directories if name != ".venv"]
+        for name in (*directories, *files):
+            entry = Path(root) / name
+            metadata = entry.lstat()
+            entries[entry.relative_to(project).as_posix()] = (
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+    return entries
+
+
+def _load_worker_source(name: str, source: Path, *, project: Path = _WORKER_PROJECT) -> Any:
+    """Load a source file of the worker project by path and leave no bytecode there.
+
+    The adapter's pin hashes the worker's source directory with every
+    bytecode entry in it and is checked again before every launch. A
+    ``__pycache__`` written by this process would change the pin of the
+    checkout under every other test that runs in it, while those tests run.
+    """
+
+    spec = importlib.util.spec_from_file_location(name, source)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    before = _project_entries(project)
+    write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name]
+        raise
+    finally:
+        sys.dont_write_bytecode = write_bytecode
+    assert _project_entries(project) == before, "loading worker source changed its project"
+    return module
+
+
 def _load_production_worker_module() -> Any:
     """Load the isolated worker source that the deployed subprocess executes."""
 
     module_name = "crucible_kimi_worker_test_target"
     if module_name in sys.modules:
         return sys.modules[module_name]
-    worker_main = (
-        Path(__file__).parents[1]
-        / "backends"
-        / "kimi_worker"
-        / "src"
-        / "crucible_kimi_worker"
-        / "__main__.py"
+    return _load_worker_source(
+        module_name,
+        _WORKER_PROJECT / "src" / "crucible_kimi_worker" / "__main__.py",
     )
-    spec = importlib.util.spec_from_file_location(module_name, worker_main)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 worker_mod = _load_production_worker_module()
@@ -421,8 +461,15 @@ def _native_usage_chunk(
 
 
 def _run_pinned_native_stream(
+    locked_worker_launch: Any,
     chunks: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run ``chunks`` through the pinned native stream in the locked interpreter.
+
+    The interpreter is started through the launcher of the suite fixture, so
+    it runs under the worker harness with the network guard installed.
+    """
+
     endpoint = http.server.ThreadingHTTPServer(
         ("127.0.0.1", 0),
         _NativeStreamEndpoint,
@@ -495,7 +542,7 @@ async def main():
 asyncio.run(main())
 """
     try:
-        completed = subprocess.run(
+        completed = locked_worker_launch.run(
             [
                 str(kimi_mod._DEFAULT_WORKER_PYTHON),
                 "-c",
@@ -2055,12 +2102,13 @@ def test_kimi_provider_requires_exact_auto_compaction_boundary(
         qualifier(session, max_response_tokens=32_768)
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
-def test_pinned_native_stream_keeps_interleaved_parallel_tool_calls_separate() -> None:
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
+def test_pinned_native_stream_keeps_interleaved_parallel_tool_calls_separate(
+    locked_worker_launch: Any,
+) -> None:
     result, requests = _run_pinned_native_stream(
+        locked_worker_launch,
         [
             _native_chunk(
                 delta={
@@ -2137,12 +2185,13 @@ def test_pinned_native_stream_keeps_interleaved_parallel_tool_calls_separate() -
     assert requests[0]["stream_options"] == {"include_usage": True}
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
-def test_pinned_native_stream_retains_length_finish_reason() -> None:
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
+def test_pinned_native_stream_retains_length_finish_reason(
+    locked_worker_launch: Any,
+) -> None:
     result, _ = _run_pinned_native_stream(
+        locked_worker_launch,
         [
             _native_chunk(delta={"content": "truncated visible response"}),
             _native_chunk(finish_reason="length"),
@@ -2171,15 +2220,15 @@ def test_pinned_native_stream_retains_length_finish_reason() -> None:
     }
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
 def test_pinned_native_stream_preserves_terminal_only_evidence(
     finish_reason: str,
+    locked_worker_launch: Any,
 ) -> None:
     result, _ = _run_pinned_native_stream(
+        locked_worker_launch,
         [
             _native_chunk(finish_reason=finish_reason),
             _native_usage_chunk(),
@@ -2207,15 +2256,15 @@ def test_pinned_native_stream_preserves_terminal_only_evidence(
     }
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
 def test_pinned_native_stream_discards_partial_tool_on_nonstop_terminal(
     finish_reason: str,
+    locked_worker_launch: Any,
 ) -> None:
     result, _ = _run_pinned_native_stream(
+        locked_worker_launch,
         [
             _native_chunk(
                 delta={
@@ -2250,10 +2299,8 @@ def test_pinned_native_stream_discards_partial_tool_on_nonstop_terminal(
     }
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize(
     ("chunks", "message"),
     [
@@ -2339,19 +2386,21 @@ def test_pinned_native_stream_discards_partial_tool_on_nonstop_terminal(
 def test_pinned_native_stream_rejects_malformed_tool_call_indices(
     chunks: list[dict[str, Any]],
     message: str,
+    locked_worker_launch: Any,
 ) -> None:
-    result, _ = _run_pinned_native_stream(chunks)
+    result, _ = _run_pinned_native_stream(locked_worker_launch, chunks)
 
     assert result["error_type"] == "WorkerQualificationError"
     assert message in result["error"]
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
-def test_pinned_native_stream_rejects_served_model_mismatch() -> None:
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
+def test_pinned_native_stream_rejects_served_model_mismatch(
+    locked_worker_launch: Any,
+) -> None:
     result, _ = _run_pinned_native_stream(
+        locked_worker_launch,
         [
             _native_chunk(
                 delta={"content": "untrusted response"},
@@ -6292,10 +6341,8 @@ def test_kimi_balanced_read_attempt_still_suppresses_physical_retry(
     backend.close()
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_multistep_replays_reasoning_and_tool_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6375,10 +6422,8 @@ def test_real_worker_multistep_replays_reasoning_and_tool_result(
     assert result.completeness.trace_complete is True
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_project_locked_worker_preserves_settled_max_steps_pricing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6454,10 +6499,8 @@ def test_real_project_locked_worker_preserves_settled_max_steps_pricing(
     ]
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
 @pytest.mark.parametrize("partial_text", ["", "partial billed response"])
 def test_real_worker_normalizes_partial_and_terminal_only_finish_reasons(
@@ -6521,10 +6564,8 @@ def test_real_worker_normalizes_partial_and_terminal_only_finish_reasons(
     assert len(endpoint.requests) == 1
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 @pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
 def test_real_worker_never_dispatches_partial_tool_on_nonstop_terminal(
     monkeypatch: pytest.MonkeyPatch,
@@ -6598,10 +6639,8 @@ def test_real_worker_never_dispatches_partial_tool_on_nonstop_terminal(
     assert len(endpoint.requests) == 1
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_fails_before_hidden_auto_compaction_inference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6655,10 +6694,8 @@ def test_real_worker_fails_before_hidden_auto_compaction_inference(
     assert len(endpoint.requests) == 1
 
 
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
+@pytest.mark.matrix_worker
+@pytest.mark.usefixtures("require_kimi_worker")
 def test_real_worker_disables_hidden_retries_for_retriable_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

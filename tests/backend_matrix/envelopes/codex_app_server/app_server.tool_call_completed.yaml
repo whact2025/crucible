@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A tool call that its tool server answered without an error, as the
+# app-server reports it once the result is there. Nothing was observed of the
+# real tool (see app_server.agent_message).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: tool_call_completed
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai_codex.generated.v2_all.ItemCompletedNotification with a
+    McpToolCallThreadItem whose status is the McpToolCallStatus value
+    completed and whose result is a McpToolCallResult (method item/completed
+    in openai_codex.generated.notification_registry)
+  sdk_version: openai-codex 0.144.4
+  reason: >-
+    The notification holds exactly the required fields of the generated type
+    of the vendor and the item the required fields of McpToolCallThreadItem
+    with its result, whose one required field is the content list. The
+    content is the list the tool server returned for the call, passed on as
+    it came. How the real tool reports a call that its server answered with
+    an error is not known and has no envelope: the dialect refuses to render
+    one.
+
+status: 200
+
+body:
+  method: item/completed
+  params:
+    threadId: {slot: thread_id}
+    turnId: {slot: turn_id}
+    completedAtMs: {slot: created}
+    item:
+      type: mcpToolCall
+      id: {slot: call_id}
+      server: {slot: tool_server}
+      tool: {slot: tool_name}
+      status: completed
+      arguments: {slot: tool_input}
+      result:
+        content: {slot: tool_result}

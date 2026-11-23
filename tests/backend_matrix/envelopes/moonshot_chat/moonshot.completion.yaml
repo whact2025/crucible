@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed chat completion that reasons and ends cleanly with visible text,
+# as Moonshot answers a request of the K3 series for which nothing was read
+# from its cache: the final statistics carry no count of cache reads.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: completion
+
+provenance:
+  grade: documented
+  sources:
+    - source: >-
+        a live observation, not a published document: four raw streamed chat
+        completions against the production endpoint with the request fields
+        the locked worker sends, key names and counters only
+      retrieved: "2026-11-18"
+      states: >-
+        Live on 2026-11-18, for the model of the Kimi columns: HTTP 200, the
+        requested model name on every chunk, the delta keys role, content and
+        reasoning_content, one finish_reason "stop", then a statistics chunk
+        with empty choices, then "[DONE]" last. The statistics of a request
+        that read nothing from the cache hold prompt_tokens,
+        completion_tokens (which include the reasoning tokens), total_tokens
+        (their sum) and prompt_tokens_details with cache_write_tokens only:
+        there is no cached_tokens key, nested or at the top level, with or
+        without a cache write. A request that hit the cache carries the key
+        in both places; that is another reply than this one. No body was
+        stored.
+    - source: >-
+        the crucible test module test_backends_kimi_k3_stream_contract.py:
+        the recorded final statistics of the same four requests (the comment
+        and the table at the top of the module)
+      retrieved: "2026-11-18"
+      states: >-
+        The statistics also hold completion_tokens_details with
+        reasoning_tokens, and the finish choice repeated the same counters
+        (a usage block inside the choice) in each recorded stream.
+    - source: >-
+        the vendor's chat reference and its guide to streaming output
+        (platform.kimi.ai/docs/api/chat.md), primary source
+      retrieved: "2026-11-18"
+      states: >-
+        In a stream of the K3 series delta.reasoning_content arrives before
+        delta.content. Usage, with the cache breakdown, appears only in the
+        final chunk, which has an empty choices list and is sent when the
+        request asks for it with stream_options.include_usage.
+    - source: >-
+        the vendor's guide to context caching and its chat reference, primary
+        source
+      retrieved: "2026-11-18"
+      states: >-
+        usage.prompt_tokens is the total input; cached_tokens and
+        cache_write_tokens under prompt_tokens_details are disjoint parts of
+        it.
+  notes: >-
+    Observed or documented: the chunk kinds and their order, the delta keys,
+    the finish reason, where the usage travels and which of its keys a reply
+    without a cache read has. Constructed: the keys the sources do not name
+    (id, object and created on every chunk, index of the one choice, a null
+    finish_reason before the finish chunk) are the fields without a default
+    of openai.types.chat.ChatCompletionChunk in the SDK the worker pins;
+    that role travels with the first delta, and that the reasoning
+    and the text each arrive in one delta, are choices of this envelope. The
+    reasoning text is a slot: raw reasoning is text of the provider, not
+    shape. The last entry is the closing message of the stream, which is no
+    JSON document.
+
+status: 200
+body:
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          role: assistant
+          reasoning_content: {slot: reasoning_text}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          content: {slot: text}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta: {}
+        finish_reason: stop
+        usage:
+          prompt_tokens: {slot: input_tokens}
+          completion_tokens: {slot: output_tokens}
+          total_tokens: {slot: total_tokens}
+          prompt_tokens_details:
+            cache_write_tokens: 0
+          completion_tokens_details:
+            reasoning_tokens: {slot: reasoning_tokens}
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices: []
+    usage:
+      prompt_tokens: {slot: input_tokens}
+      completion_tokens: {slot: output_tokens}
+      total_tokens: {slot: total_tokens}
+      prompt_tokens_details:
+        cache_write_tokens: 0
+      completion_tokens_details:
+        reasoning_tokens: {slot: reasoning_tokens}
+  - "[DONE]"
