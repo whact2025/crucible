@@ -180,8 +180,17 @@ from ._resilience import (
     is_transport_failure_implementation,
     is_transport_failure_verdict,
 )
-from ._run import FailureTerminal, exec_ctx_now, open_run_with_capture
+from ._run import (
+    FailureTerminal,
+    exec_ctx_now,
+    open_run_with_capture,
+    record_handled_terminal,
+)
 from ._review import AUTONOMOUS_REVIEW_CHUNK_CHARS, review
+from ._write_root_guard import (
+    WRITE_ROOT_REFUSAL_ERROR_KIND,
+    host_route_write_root_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -8071,6 +8080,20 @@ def _main(
     corpus = Corpus(args.spec)
     import os as _os
     cwd = str(args.cwd) if args.cwd else _os.getcwd()
+    # The Defender's write root is refused before the workspace lock and the
+    # run exist; every later setup error is recorded inside that run.
+    refusal = host_route_write_root_refusal(args, cwd, ("breach_defender",))
+    if refusal is not None:
+        record_handled_terminal(
+            corpus,
+            "breach",
+            status="setup_error",
+            message=refusal,
+            error_kind=WRITE_ROOT_REFUSAL_ERROR_KIND,
+            extra={"implementation_refs": []},
+            provenance_root=None,
+        )
+        return 2
     # See workflows/tier.py for the rationale: the Defender's
     # assay.implement call + _build_verify both take cwd= explicitly,
     # so the workflow forwards the resolved cwd rather than chdir'ing

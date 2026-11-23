@@ -133,6 +133,10 @@ from ._benchmark_planning import (
     bind_benchmark_planning_policy,
 )
 from ._run import open_run_with_capture, record_handled_terminal, write_atomic_json
+from ._write_root_guard import (
+    WRITE_ROOT_REFUSAL_ERROR_KIND,
+    host_route_write_root_refusal,
+)
 from .plan import (
     _diagnostic_candidate_dag,
     _format_validation_findings,
@@ -142,6 +146,7 @@ from .plan import (
     run_plan,
 )
 from .tier import (
+    _load_spec_yaml_policies,
     _resolve_cli_breach_policy,
     run_tier,
 )
@@ -3445,6 +3450,38 @@ def run_architect(
             provenance_root=None,
         )
         return 2
+    if not args.worktree:
+        # Every tier writes in ``cwd``. With --worktree it writes in a fresh
+        # worktree instead, and run_tier asks about that root itself. A tier
+        # that is passed no breach policy resolves the Spec's own, so the
+        # same resolution decides here whether the Defender will write.
+        tier_breach_policy = (
+            args.breach_policy
+            if args.breach_policy is not None
+            else _load_spec_yaml_policies(args.spec).breach
+        )
+        refusal = host_route_write_root_refusal(
+            args,
+            cwd,
+            ("implementer", "breach_defender")
+            if tier_breach_policy.enabled
+            else ("implementer",),
+        )
+        if refusal is not None:
+            record_handled_terminal(
+                corpus,
+                "architect",
+                status="setup_error",
+                message=refusal,
+                error_kind=WRITE_ROOT_REFUSAL_ERROR_KIND,
+                extra=_zero_tier_terminal_fields(
+                    corpus=corpus,
+                    cwd=args.cwd,
+                    checkpoints=checkpoints,
+                ),
+                provenance_root=None,
+            )
+            return 2
 
     # ``cwd`` came in via the run_architect kwarg — no os.getcwd()
     # fallback at this layer; main() handles the CLI's implicit-cwd
