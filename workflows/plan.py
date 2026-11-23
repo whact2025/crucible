@@ -595,6 +595,14 @@ def _review_budget_terminal_stage(
     return None
 
 
+def _review_control_failure_status(role: str, verdict: Any, corpus: Corpus) -> str:
+    """Status of a Critic or Judge review that ended in a control-plane failure."""
+
+    if _review_budget_terminal_stage(verdict, corpus) is not None:
+        return "budget_exhausted"
+    return f"{role}_{review_failure_domain(verdict) or 'infrastructure'}_failure"
+
+
 def _plan_review_diagnostics(
     verdicts: Iterable[Verdict],
 ) -> dict[str, int | float | None | str | bool]:
@@ -1170,11 +1178,7 @@ def _review_control_failure_outcome(
     )
     budget_terminal = budget_terminal_stage is not None
     failure_domain = review_failure_domain(failure.verdict)
-    status = (
-        "budget_exhausted"
-        if budget_terminal
-        else f"{failure.role}_{failure_domain or 'infrastructure'}_failure"
-    )
+    status = _review_control_failure_status(failure.role, failure.verdict, corpus)
     if budget_terminal_stage == "response_repair":
         reason = (
             f"{failure.role} review exhausted the cumulative planning budget "
@@ -2017,12 +2021,17 @@ def run_plan(
     synthesize a starter Spec and run plan→tier per instance compose
     ``run_plan(...)`` directly without going through argparse.
 
-    ``cwd`` (optional) is the working directory the caller's
-    ``planner_backend`` was constructed with. ``assay.primitives.plan`` itself doesn't
-    consume cwd directly; the backend's tool-sandbox cwd is what
-    matters and is set at backend-construction time. The kwarg
-    exists so multi-threaded fan-out callers can carry a consistent workspace
-    contract across planning, tier, architect, and breach entry points.
+    ``cwd`` (optional) is the project root the caller's ``planner_backend``
+    and its source tools were constructed with. The backend's tool-sandbox cwd
+    is set at backend-construction time; here the same directory roots source
+    context capture and source revalidation, and for a generated plan it is
+    forwarded, resolved, to ``assay.primitives.plan`` as ``project_root``.
+    Planner scope paths are therefore canonicalized against it and never
+    against the process working directory, so multi-threaded fan-out callers
+    carry one workspace contract across planning, tier, architect, and breach
+    entry points. Without ``cwd`` a leading project-name segment is always
+    stripped. A ``cwd`` that is not an existing directory raises from Assay
+    before any Planner call.
 
     ``allowed_tools`` is forwarded to ``assay.primitives.plan`` for
     the planner's tool-use loop. Repository-backed planning can use a
@@ -2114,6 +2123,12 @@ def run_plan(
             budget_usd=budget_usd,
             allowed_tools=allowed_tools,
             prompt_toolset=prompt_toolset,
+            # A fixed candidate is reviewed, not parsed, so it needs no root.
+            project_root=(
+                Path(cwd).resolve()
+                if cwd is not None and planner_backend is not None
+                else None
+            ),
             candidate_transform=effective_candidate_transform,
             candidate_validator=candidate_validator,
             candidate_context_provider=source_context_provider(

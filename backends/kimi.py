@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-"""Dedicated Kimi Agent SDK backend for explicit Moonshot K2.7 and K3 routes.
+"""Dedicated Kimi Agent SDK backend for explicit Moonshot K3.1 Pro routes.
 
 This adapter deliberately does not reuse :mod:`backends.openai_compat`.
 ``kimi-agent-sdk`` embeds a Kimi CLI runtime whose low-level ``Session`` API
@@ -14,15 +14,15 @@ context.  Every real invocation therefore runs in the separately locked
 The qualified surface keeps provider-native capabilities disabled and supports
 either prompt-only evaluation or an explicitly attached Crucible ``ToolSet``:
 
-* exact model ``kimi-k2.7-code-highspeed`` or ``kimi-k3`` at
-  ``https://api.moonshot.ai/v1``;
+* exact model ``kimi-k3.1-pro`` at ``https://api.moonshot.ai/v1``;
 * endpoint and credential read at invocation time from ``KIMI_BASE_URL`` and
   ``MOONSHOT_API_KEY``;
 * in-memory native ``kimi`` provider configuration;
-* K2.7's always-on reasoning preserved as ``reasoning_content`` while the
-  pinned CLI's incompatible ``reasoning_effort`` shim is disabled;
-* K3's explicit ``max`` reasoning, ``max_completion_tokens``, and implicit
-  five-minute caching, with disjoint cache-read/write accounting;
+* the K3-series request contract: explicit ``max`` reasoning,
+  ``max_completion_tokens``, and implicit five-minute caching with disjoint
+  cache-read/write accounting; the pinned CLI's ``thinking`` and
+  ``reasoning_effort`` shim stays disabled, and reasoning is replayed as
+  ``reasoning_content``;
 * a non-inheriting agent with no native tools or subagents;
 * an optional capability-filtered ToolSet exposed through one authenticated,
   ephemeral loopback MCP server;
@@ -101,21 +101,22 @@ from .pricing import compute_cost
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "kimi-k2.7-code-highspeed"
-_K3_MODEL = "kimi-k3"
-_MODEL_CONTEXT_SIZES = {_MODEL: 262_144, _K3_MODEL: 1_048_576}
+_MODEL = "kimi-k3.1-pro"
+_MODEL_CONTEXT_SIZES = {_MODEL: 1_048_576}
+_REASONING_EFFORT = "max"
+# The bound policy names its one model separately from the admitted set.
+_COST_BOUND_MODEL = _MODEL
 _BASE_URL = "https://api.moonshot.ai/v1"
 _SDK_VERSION = "0.0.5"
 _CLI_VERSION = "1.12.0"
 _KOSONG_VERSION = "0.42.0"
 _OPENAI_VERSION = "2.14.0"
 _PROVIDER_NAME = "crucible-moonshot"
-_MAX_CONTEXT_SIZE = 262_144
 _DEFAULT_TIMEOUT_SECONDS = 10 * 60.0
 _WORKER_DRAIN_SECONDS = 2.0
 _PROCESS_STOP_SECONDS = 2.0
-_WORKER_PROTOCOL = "crucible.kimi-worker.v6"
-_K3_BOUND_POLICY = "kimi-k3-cache-read-upper-bound-v1"
+_WORKER_PROTOCOL = "crucible.kimi-worker.v7"
+_K3_BOUND_POLICY = "kimi-k3.1-pro-cache-read-upper-bound-v1"
 _WORKER_PROJECT = Path(__file__).with_name("kimi_worker")
 _DEFAULT_WORKER_PYTHON = _WORKER_PROJECT / ".venv" / "bin" / "python"
 KIMI_PROJECT_LOCKED_WORKER_SOURCE = "project_locked"
@@ -606,13 +607,13 @@ class KimiToolDispatchTerminal(RuntimeError):
 
 
 def _extract_final_text(text: str) -> str:
-    """Return K2.7 visible text without guessing at raw reasoning envelopes.
+    """Return visible text without guessing at raw reasoning envelopes.
 
-    Moonshot K2.7 streams private reasoning in ``reasoning_content``.  The
+    Moonshot streams private reasoning in ``reasoning_content``.  The
     qualified provider converts that field to SDK ``ThinkPart`` objects, which
     are never copied into the final message.  A reasoning marker arriving in
     visible ``TextPart`` content is therefore an unqualified wire shape and
-    fails closed instead of reusing the NVIDIA K2.6 envelope heuristic.
+    fails closed instead of guessing at an envelope.
     """
 
     if _THINK_MARKER_LIKE_RE.search(text):
@@ -650,7 +651,7 @@ class _WorkerRequest:
     system: str = field(repr=False)
     user: str = field(repr=False)
     model: str = _MODEL
-    reasoning_effort: str | None = None
+    reasoning_effort: str = _REASONING_EFFORT
     diagnostic_cost_upper_bound: bool = False
     diagnostic_budget_usd: float | None = None
     schema_json: str | None = field(default=None, repr=False)
@@ -798,7 +799,7 @@ class _WorkerOutcome:
             raise ValueError("Kimi worker emitted invalid logical-step evidence")
         bound_records = _parse_cost_bound_records(payload["cost_bound_segments"])
         if bound_records and (
-            not diagnostic_cost_upper_bound or model != _K3_MODEL
+            not diagnostic_cost_upper_bound or model != _COST_BOUND_MODEL
             or len(bound_records) > steps_used
         ):
             raise ValueError("Kimi worker emitted unauthorized cost bounds")
@@ -1258,7 +1259,7 @@ def _admit_cost_bound_checkpoint(
     diagnostic_cost_upper_bound: bool, model: str,
 ) -> _WorkerOutcome:
     if (
-        not diagnostic_cost_upper_bound or model != _K3_MODEL
+        not diagnostic_cost_upper_bound or model != _COST_BOUND_MODEL
         or set(payload) != {"type", "ordinal", "segment"}
         or type(payload["ordinal"]) is not int
         or payload["ordinal"] != len(latest.cost_bound_segments)
@@ -2099,10 +2100,10 @@ def _build_sdk_config(bindings: _SdkBindings, request: _WorkerRequest) -> Any:
     return bindings.Config.model_validate(
         {
             "default_model": request.model,
-            # K2.7 is always-thinking.  Keep the SDK session in thinking mode
-            # for its state machine, but intentionally omit the model
-            # capability below: CLI 1.12 otherwise translates this flag to
-            # reasoning_effort="high", which Moonshot rejects.
+            # K3-series models take no ``thinking`` parameter.  Keep the SDK
+            # session in thinking mode for its state machine, but
+            # intentionally omit the model capability below: CLI 1.12 would
+            # otherwise send reasoning_effort="high" plus extra_body.thinking.
             "default_thinking": True,
             "default_yolo": False,
             "providers": {
@@ -2188,17 +2189,19 @@ def _parse_cost_bound_records(value: Any) -> tuple[dict[str, Any], ...]:
 
 
 def _cost_bound_amounts(record: Mapping[str, Any]) -> tuple[float, float]:
-    # K3's request-bound implicit 5m policy charges input and writes $3/M,
-    # reads $0.30/M, and output $15/M. P includes both cache categories.
+    # kimi-k3.1-pro's request-bound implicit 5m policy charges input and
+    # writes $2/M, reads $0.20/M, and output $10/M
+    # (https://platform.kimi.ai/docs/pricing/chat, verified 2026-11-18).
+    # P includes both cache categories.
     p, o, w, r = (
         record["input_tokens"], record["output_tokens"],
         record["cache_creation_tokens"], record["cache_read_tokens"],
     )
-    upper = (3.0 * p + 15.0 * o) / 1_000_000
+    upper = (2.0 * p + 10.0 * o) / 1_000_000
     if r is None:
-        lower = (0.30 * (p - w) + 3.0 * w + 15.0 * o) / 1_000_000
+        lower = (0.20 * (p - w) + 2.0 * w + 10.0 * o) / 1_000_000
         return lower, upper
-    exact = (3.0 * (p - r) + 0.30 * r + 15.0 * o) / 1_000_000
+    exact = (2.0 * (p - r) + 0.20 * r + 10.0 * o) / 1_000_000
     return exact, exact
 
 
@@ -2432,12 +2435,13 @@ def _install_moonshot_stream_compat(
 ) -> None:
     """Install the version-pinned, request-bound Moonshot stream parser.
 
-    Kosong 0.42.0 already handles Moonshot reasoning and cached-token usage,
-    but its streaming tool parser drops ``tool_call.index`` and its public
-    stream discards ``finish_reason`` and response model identity.  This
-    invocation-scoped generator keeps the reviewed native message/tool
-    conversion while aggregating parallel argument deltas by index and
-    retaining both terminal fields for admission.
+    Kosong 0.42.0 already handles Moonshot reasoning, but its streaming tool
+    parser drops ``tool_call.index``, its public stream discards
+    ``finish_reason`` and response model identity, and its usage projection
+    knows no cache writes.  This invocation-scoped generator keeps the
+    reviewed native message/tool conversion while aggregating parallel
+    argument deltas by index, retaining both terminal fields for admission,
+    and taking usage only from the raw-validated final statistics packet.
     """
 
     try:
@@ -2474,8 +2478,6 @@ def _install_moonshot_stream_compat(
 
         @property
         def usage(self) -> Any:
-            if model != _K3_MODEL:
-                return super().usage
             if self._usage is None:
                 return None
             # CLI/Kosong 0.42 does not know K3 cache writes. Override its
@@ -2536,9 +2538,6 @@ def _install_moonshot_stream_compat(
                                 "Kimi stream changed served model identity"
                             )
                         self.served_model = chunk_model
-                    if model != _K3_MODEL:
-                        if usage := kimi_provider.extract_usage_from_chunk(chunk):
-                            self._usage = usage
                     if not chunk.choices:
                         continue
                     if (
@@ -2619,14 +2618,13 @@ def _install_moonshot_stream_compat(
             ) as exc:
                 raise kimi_provider.convert_error(exc) from exc
 
-            if model == _K3_MODEL:
-                if self._k3_state is None:
-                    raise _k3_usage_failure("missing_raw_stream_state")
-                # Only a raw-validated final packet followed by exact [DONE]
-                # reaches SDK StatusUpdate or the tool-call yield below.
-                self._usage = kimi_provider.CompletionUsage.model_validate(
-                    self._k3_state.canonical_usage()
-                )
+            if self._k3_state is None:
+                raise _k3_usage_failure("missing_raw_stream_state")
+            # Only a raw-validated final packet followed by exact [DONE]
+            # reaches SDK StatusUpdate or the tool-call yield below.
+            self._usage = kimi_provider.CompletionUsage.model_validate(
+                self._k3_state.canonical_usage()
+            )
             if self.served_model != model:
                 raise KimiSDKQualificationError(
                     "Kimi stream did not prove the exact served model"
@@ -2639,7 +2637,7 @@ def _install_moonshot_stream_compat(
                 if self._k3_state is None or self._k3_state.counters is None:
                     raise _k3_usage_failure("missing_raw_stream_state")
                 cost_bounds.settle(self._k3_state.counters)
-            if model == _K3_MODEL and self._usage is None:
+            if self._usage is None:
                 raise KimiSDKQualificationError(
                     "Kimi K3 stream ended without final usage evidence"
                 )
@@ -2716,10 +2714,9 @@ def _install_moonshot_stream_compat(
             kimi_provider._convert_message(message)  # noqa: SLF001
             for message in history
         )
-        generation_kwargs: dict[str, Any] = (
-            {"max_tokens": 32_000} if model == _MODEL else {}
-        )
-        generation_kwargs.update(native_provider._generation_kwargs)
+        # Kosong 0.42's own request would add the deprecated max_tokens=32000;
+        # only the qualified K3-series options are sent.
+        generation_kwargs: dict[str, Any] = dict(native_provider._generation_kwargs)
         try:
             response = await native_provider.client.chat.completions.create(
                 model=native_provider.model,
@@ -2737,18 +2734,16 @@ def _install_moonshot_stream_compat(
             kimi_provider.httpx.HTTPError,
         ) as exc:
             raise kimi_provider.convert_error(exc) from exc
-        k3_state = None
-        if model == _K3_MODEL:
-            try:
-                k3_state = _guard_k3_raw_stream(
-                    response, diagnostic_cost_upper_bound=(
-                        cost_bounds is not None and cost_bounds.enabled
-                    ),
-                )
-            except BaseException:
-                with contextlib.suppress(Exception):
-                    await response.close()
-                raise
+        try:
+            k3_state = _guard_k3_raw_stream(
+                response, diagnostic_cost_upper_bound=(
+                    cost_bounds is not None and cost_bounds.enabled
+                ),
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await response.close()
+            raise
         stream = _QualifiedKimiStream(response, k3_state=k3_state)
         native_provider._crucible_last_stream = stream
         return stream
@@ -2819,25 +2814,26 @@ def _qualify_moonshot_provider(
     *,
     max_response_tokens: int,
     model: str = _MODEL,
-    reasoning_effort: str | None = None,
+    reasoning_effort: str = _REASONING_EFFORT,
     cost_bounds: _K3CostBoundLedger | None = None,
 ) -> None:
-    """Apply explicit K2.7/K3 request policy to CLI 1.12.0's native provider.
+    """Apply the K3-series request policy to CLI 1.12.0's native provider.
 
-    Moonshot K2.7 always thinks, rejects ``reasoning_effort``, and requires
-    every historical assistant message to retain ``reasoning_content``.
-    CLI 1.12's native provider already preserves the reasoning field and
-    Moonshot's top-level cached-token usage, but its thinking capability path
-    sends ``reasoning_effort="high"``. The model configuration deliberately
-    avoids that path. This version-pinned qualification verifies the exact
-    private provider shape, disables hidden HTTP retries and inference-backed
-    CLI compaction, and installs the bounded response limit. The native
-    factory owns a stable per-session ``prompt_cache_key``.
+    The K3 series, to which ``kimi-k3.1-pro`` belongs, takes no
+    ``thinking`` parameter and requires every historical assistant message
+    to retain ``reasoning_content``. CLI 1.12's native provider already
+    preserves the reasoning field, but its thinking capability path sends
+    ``reasoning_effort="high"`` plus ``extra_body.thinking``. The model
+    configuration deliberately avoids that path. This version-pinned
+    qualification verifies the exact private provider shape, disables hidden
+    HTTP retries and inference-backed CLI compaction, and installs the
+    bounded response limit. The native factory owns a stable per-session
+    ``prompt_cache_key``.
 
-    K3 also bypasses the CLI effort translation, but explicitly requests
-    ``max`` at the HTTP boundary, uses ``max_completion_tokens``, and binds
-    implicit caching to five minutes. Neither effort nor cache TTL is inferred
-    as served: Moonshot does not echo those settings in the response.
+    The admitted model uses one contract: ``max`` is requested explicitly
+    at the HTTP boundary, the cap is sent as ``max_completion_tokens``, and
+    implicit caching is bound to five minutes. Effort and cache TTL are
+    requested, not echoed by Moonshot, and are never recorded as served.
     """
 
     try:
@@ -2897,23 +2893,19 @@ def _qualify_moonshot_provider(
             "Kimi runtime could not disable hidden Moonshot HTTP retries"
         )
     _disable_cli_auto_compaction(session)
-    if model not in _MODEL_CONTEXT_SIZES or (
-        (model == _MODEL and reasoning_effort is not None)
-        or (model == _K3_MODEL and reasoning_effort != "max")
-    ):
+    if model not in _MODEL_CONTEXT_SIZES or reasoning_effort != _REASONING_EFFORT:
         raise KimiSDKQualificationError("unqualified Kimi model/effort")
-    if model == _K3_MODEL:
-        provider._generation_kwargs.update({
-            "max_completion_tokens": max_response_tokens,
-            "reasoning_effort": reasoning_effort,
-            "extra_body": {
-                "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
-            },
-        })
-    else:
-        provider._generation_kwargs["max_tokens"] = max_response_tokens
-    if cost_bounds is not None and cost_bounds.enabled and model != _K3_MODEL:
-        raise KimiSDKQualificationError("Kimi diagnostic bounds require K3")
+    provider._generation_kwargs.update({
+        "max_completion_tokens": max_response_tokens,
+        "reasoning_effort": reasoning_effort,
+        "extra_body": {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
+        },
+    })
+    if cost_bounds is not None and cost_bounds.enabled and model != _COST_BOUND_MODEL:
+        raise KimiSDKQualificationError(
+            "Kimi diagnostic bounds require kimi-k3.1-pro"
+        )
     _install_moonshot_stream_compat(provider, model=model, cost_bounds=cost_bounds)
 
 
@@ -4506,16 +4498,18 @@ class KimiBackend:
                 "KimiBackend supports only the qualified models "
                 f"{tuple(_MODEL_CONTEXT_SIZES)!r}"
             )
-        if (model == _MODEL and effort is not None) or (
-            model == _K3_MODEL and effort not in {None, "max"}
-        ):
+        if effort not in {None, _REASONING_EFFORT}:
             raise ValueError("KimiBackend received an unqualified model/effort")
         self.model = model
-        self.effort = "max" if model == _K3_MODEL else None
+        # ``max`` is the single qualified effort of the admitted model; an
+        # omitted effort names that value, never a choice between values.
+        self.effort = _REASONING_EFFORT
         if type(diagnostic_cost_upper_bound) is not bool or (
-            diagnostic_cost_upper_bound and model != _K3_MODEL
+            diagnostic_cost_upper_bound and model != _COST_BOUND_MODEL
         ):
-            raise ValueError("diagnostic_cost_upper_bound requires exact K3/max")
+            raise ValueError(
+                "diagnostic_cost_upper_bound requires exact kimi-k3.1-pro/max"
+            )
         self.diagnostic_cost_upper_bound = diagnostic_cost_upper_bound
         self._max_context_size = _MODEL_CONTEXT_SIZES[model]
         if (

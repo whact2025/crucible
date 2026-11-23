@@ -10,14 +10,16 @@ import json
 from dataclasses import replace
 
 import pytest
-from assay import BudgetExhausted
+from assay import BudgetExhausted, Usage, UsageCostBounds, UsageCostBoundSegment
 
+from crucible.backends import cost_bounds
 from crucible.backends import kimi as parent
+from crucible.backends.pricing import DEFAULT_PRICING
 from crucible.tests import test_backends_kimi_k3 as fixtures
 from crucible.tests import test_backends_kimi_k3_stream_contract as stream_fixtures
 
 worker = fixtures.worker
-POLICY = "kimi-k3-cache-read-upper-bound-v1"
+POLICY = "kimi-k3.1-pro-cache-read-upper-bound-v1"
 
 
 def _missing_read(*, tool=False):
@@ -50,9 +52,9 @@ def test_only_explicit_missing_both_read_counters_can_be_bounded(module):
 @pytest.mark.parametrize("module", [parent, worker])
 def test_bound_ledger_stops_at_cap_before_a_later_generation(module):
     emitted = []
-    ledger = module._K3CostBoundLedger(True, 0.0006, emitted.append)
+    ledger = module._K3CostBoundLedger(True, 0.0004, emitted.append)
     ledger.settle((100, 20, 120, None, 30))
-    assert ledger.upper == pytest.approx(0.0006)
+    assert ledger.upper == pytest.approx(0.0004)
     with pytest.raises(module._K3CostBoundBudget):
         ledger.admit_next()
     assert len(emitted) == 1
@@ -77,8 +79,8 @@ def test_real_worker_bounded_response_retains_unknown_as_unknown(monkeypatch, mi
     assert result.usage.input_tokens == 100
     assert result.usage.cache_creation_tokens == 30
     assert result.usage.cache_read_tokens == (0 if missing else 60)
-    assert result.usage.cost_usd == pytest.approx(0.000411 if missing else 0.000438)
-    assert bounds.upper_bound_usd == pytest.approx(0.0006 if missing else 0.000438)
+    assert result.usage.cost_usd == pytest.approx(0.000274 if missing else 0.000292)
+    assert bounds.upper_bound_usd == pytest.approx(0.0004 if missing else 0.000292)
     assert result.completeness.cost_complete is not missing
     assert result.completeness.token_usage_complete is not missing
     assert result.completeness.terminal_complete
@@ -89,15 +91,15 @@ def test_real_worker_bounded_response_retains_unknown_as_unknown(monkeypatch, mi
 def test_real_worker_upper_bound_exhaustion_denies_tool_and_preserves_bound(monkeypatch):
     result, requests, toolset = fixtures._invoke_real_worker(
         monkeypatch, _missing_read(tool=True), tool=True,
-        diagnostic_cost_upper_bound=True, budget_usd=0.0005,
+        diagnostic_cost_upper_bound=True, budget_usd=0.0003,
     )
     assert len(requests) == 1
     assert toolset.calls == []
     assert isinstance(result.error, BudgetExhausted), result.error
     assert result.cost_bounds is not None
     assert result.cost_bounds.covers(result.usage)
-    assert result.cost_bounds.upper_bound_usd == pytest.approx(0.0006)
-    assert result.error.spent_usd == pytest.approx(0.0006)
+    assert result.cost_bounds.upper_bound_usd == pytest.approx(0.0004)
+    assert result.error.spent_usd == pytest.approx(0.0004)
     assert not result.completeness.cost_complete
     assert not result.completeness.terminal_complete
 
@@ -114,8 +116,8 @@ def test_real_worker_multi_step_bounds_cover_each_response(monkeypatch):
     assert result.error is None, result.error
     assert result.cost_bounds is not None and result.cost_bounds.covers(result.usage)
     assert [s.cache_read_tokens for s in result.cost_bounds.segments] == [None, 60]
-    assert result.usage.cost_usd == pytest.approx(0.000411 + 0.000438)
-    assert result.cost_bounds.upper_bound_usd == pytest.approx(0.0006 + 0.000438)
+    assert result.usage.cost_usd == pytest.approx(0.000274 + 0.000292)
+    assert result.cost_bounds.upper_bound_usd == pytest.approx(0.0004 + 0.000292)
     assert not result.completeness.cost_complete
     assert result.completeness.terminal_complete and result.completeness.trace_complete
 
@@ -130,10 +132,10 @@ def test_parent_rejects_unbound_and_repeated_or_forged_checkpoints():
     }
     with pytest.raises(ValueError):
         parent._admit_cost_bound_checkpoint(
-            latest, record, model="kimi-k3", diagnostic_cost_upper_bound=False,
+            latest, record, model=fixtures.PRO, diagnostic_cost_upper_bound=False,
         )
     admitted = parent._admit_cost_bound_checkpoint(
-        latest, record, model="kimi-k3", diagnostic_cost_upper_bound=True,
+        latest, record, model=fixtures.PRO, diagnostic_cost_upper_bound=True,
     )
     for invalid_latest, invalid in (
         (admitted, record), (replace(latest, steps_used=2), record),
@@ -142,11 +144,11 @@ def test_parent_rejects_unbound_and_repeated_or_forged_checkpoints():
     ):
         with pytest.raises(ValueError):
             parent._admit_cost_bound_checkpoint(
-                invalid_latest, invalid, model="kimi-k3", diagnostic_cost_upper_bound=True,
+                invalid_latest, invalid, model=fixtures.PRO, diagnostic_cost_upper_bound=True,
             )
     _, fault = parent._consume_worker_line(
         json.dumps({"protocol": parent._WORKER_PROTOCOL, **record}).encode(),
-        latest_usage=latest, max_steps=2, model="kimi-k3",
+        latest_usage=latest, max_steps=2, model=fixtures.PRO,
     )
     assert fault is not None and fault.error_kind == "qualification"
 
@@ -156,13 +158,14 @@ def test_parent_rejects_unbound_and_repeated_or_forged_checkpoints():
     {"diagnostic_budget_usd": float("inf")}, {"diagnostic_budget_usd": float("nan")},
     {"diagnostic_budget_usd": True}, {"diagnostic_budget_usd": -1},
     {"diagnostic_budget_usd": 0}, {"diagnostic_budget_usd": "1"},
-    {"model": fixtures.K27, "reasoning_effort": None},
-    {"reasoning_effort": "high"}, {"protocol": "crucible.kimi-worker.v5"},
+    # Not an admitted model, so it cannot reach the bound policy either.
+    {"model": fixtures.HIGHSPEED},
+    {"reasoning_effort": "high"}, {"protocol": "crucible.kimi-worker.v6"},
     {"diagnostic_cost_upper_bound": False},
 ])
 def test_worker_cost_policy_is_explicit_model_effort_and_budget_bound(override):
     payload = fixtures.fixtures._worker_request_payload(
-        model=fixtures.K3, reasoning_effort="max",
+        model=fixtures.PRO, reasoning_effort="max",
         diagnostic_cost_upper_bound=True, diagnostic_budget_usd=1.0,
     )
     accepted = worker._Request.from_wire(payload)
@@ -176,7 +179,7 @@ def test_worker_cost_policy_is_explicit_model_effort_and_budget_bound(override):
 def test_parent_missing_finite_budget_denies_before_worker(budget):
     called = []
     backend = parent.KimiBackend(
-        model=fixtures.K3, diagnostic_cost_upper_bound=True,
+        model=fixtures.PRO, diagnostic_cost_upper_bound=True,
         _worker_runner=lambda *args, **kwargs: called.append(True),
     )
     try:
@@ -209,7 +212,7 @@ def test_real_worker_opt_in_does_not_admit_other_incomplete_or_unsafe_evidence(m
         details["cache_write_tokens"] = 101
     elif fault == "wrong-model":
         for chunk in chunks:
-            chunk["model"] = fixtures.K27
+            chunk["model"] = fixtures.HIGHSPEED
     elif fault == "no-done":
         done = None
     elif fault == "missing-final":
@@ -236,14 +239,14 @@ def test_real_worker_budget_is_cumulative_and_denies_second_step_tools(monkeypat
     second[0]["choices"][0]["delta"]["tool_calls"][0]["id"] = "second-tool"
     result, requests, toolset = fixtures._invoke_real_worker(
         monkeypatch, _missing_read(tool=True), tool=True, second_chunks=second,
-        diagnostic_cost_upper_bound=True, budget_usd=0.001,
+        diagnostic_cost_upper_bound=True, budget_usd=0.0006,
     )
     assert len(requests) == 2
     assert len(toolset.calls) == 1
     assert isinstance(result.error, BudgetExhausted), result.error
     assert result.cost_bounds is not None and result.cost_bounds.covers(result.usage)
     assert len(result.cost_bounds.segments) == 2
-    assert result.cost_bounds.upper_bound_usd == pytest.approx(0.0012)
+    assert result.cost_bounds.upper_bound_usd == pytest.approx(0.0008)
 
 
 @pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
@@ -251,7 +254,7 @@ def test_real_worker_exactly_exhausted_budget_stops_before_next_step(monkeypatch
     result, requests, toolset = fixtures._invoke_real_worker(
         monkeypatch, _missing_read(tool=True), tool=True,
         second_chunks=fixtures._k3_chunks(),
-        diagnostic_cost_upper_bound=True, budget_usd=0.0006,
+        diagnostic_cost_upper_bound=True, budget_usd=0.0004,
     )
     assert len(requests) == 1
     assert len(toolset.calls) == 1
@@ -262,7 +265,7 @@ def test_real_worker_exactly_exhausted_budget_stops_before_next_step(monkeypatch
 
 @pytest.mark.skipif(not parent._DEFAULT_WORKER_PYTHON.is_file(), reason="locked SDK absent")
 @pytest.mark.parametrize("budget,target", [
-    (1.0, "output.txt"), (1.0, "outside.txt"), (0.0005, "output.txt"),
+    (1.0, "output.txt"), (1.0, "outside.txt"), (0.0003, "output.txt"),
 ])
 def test_real_worker_bound_policy_preserves_confined_write_authority(monkeypatch, tmp_path, budget, target):
     chunks = _missing_read(tool=True)
@@ -282,3 +285,101 @@ def test_real_worker_bound_policy_preserves_confined_write_authority(monkeypatch
         assert not (tmp_path / "output.txt").exists()
     assert not result.completeness.cost_complete
     assert not result.completeness.terminal_complete
+
+
+@pytest.mark.parametrize("module", [parent, worker], ids=["parent", "worker"])
+def test_bound_policy_identity_and_rates_agree_with_the_price_table(module):
+    # The worker cannot import Crucible, so the policy id, the bound model and
+    # the rate card exist three times. They must describe one policy.
+    assert (
+        cost_bounds.DIAGNOSTIC_COST_POLICY
+        == parent._K3_BOUND_POLICY
+        == worker._K3_BOUND_POLICY
+        == POLICY
+    )
+    assert (
+        cost_bounds.DIAGNOSTIC_COST_MODEL
+        == parent._COST_BOUND_MODEL
+        == worker._COST_BOUND_MODEL
+        == "kimi-k3.1-pro"
+    )
+    pricing = DEFAULT_PRICING[cost_bounds.DIAGNOSTIC_COST_MODEL]
+    for known_read in (60, None):
+        record = {
+            "input_tokens": 100, "output_tokens": 20,
+            "cache_creation_tokens": 30, "cache_read_tokens": known_read,
+            "policy": POLICY,
+        }
+        lower, upper = module._cost_bound_amounts(record)
+        # Unknown reads: the lower bound prices every non-written input token
+        # as a cache hit, the upper bound prices none of them as one.
+        expected_lower = pricing.compute_cost(
+            input_tokens=100, output_tokens=20, cache_creation_tokens=30,
+            cache_read_tokens=70 if known_read is None else known_read,
+        )
+        expected_upper = pricing.compute_cost(
+            input_tokens=100, output_tokens=20, cache_creation_tokens=30,
+            cache_read_tokens=0 if known_read is None else known_read,
+        )
+        assert lower == pytest.approx(expected_lower, rel=1e-12)
+        assert upper == pytest.approx(expected_upper, rel=1e-12)
+        assert (lower, upper) == pytest.approx(
+            (0.000292, 0.000292) if known_read is not None else (0.000274, 0.0004)
+        )
+        bounds = UsageCostBounds((UsageCostBoundSegment(
+            input_tokens=100, output_tokens=20, cache_creation_tokens=30,
+            cache_read_tokens=known_read, lower_bound_usd=lower,
+            upper_bound_usd=upper, policy=POLICY,
+        ),), coverage_complete=True)
+        usage = Usage(
+            100, 20, lower, cache_creation_tokens=30,
+            cache_read_tokens=known_read or 0, cost_bounds=bounds,
+        )
+        assert cost_bounds.valid_diagnostic_cost_bounds(usage)
+
+
+def test_bound_policy_does_not_reach_another_model_id():
+    # One policy id, one exact route, one rate card. kimi-k3.1-pro-highspeed
+    # is billed under another card: it is not admitted at all, and a bound
+    # checkpoint attributed to it is never authorized.
+    with pytest.raises(ValueError, match="supports only the qualified model"):
+        parent.KimiBackend(model=fixtures.HIGHSPEED, diagnostic_cost_upper_bound=True)
+    payload = fixtures.fixtures._worker_request_payload(
+        model=fixtures.HIGHSPEED, reasoning_effort="max",
+        diagnostic_cost_upper_bound=True, diagnostic_budget_usd=1.0,
+    )
+    with pytest.raises(worker.WorkerQualificationError, match="unqualified model/effort"):
+        worker._Request.from_wire(payload)
+    record = {
+        "type": "cost_bound", "ordinal": 0,
+        "segment": {"input_tokens": 100, "output_tokens": 20,
+                    "cache_creation_tokens": 30, "cache_read_tokens": None,
+                    "policy": POLICY},
+    }
+    latest = parent._WorkerOutcome(steps_used=1)
+    with pytest.raises(ValueError, match="not authorized"):
+        parent._admit_cost_bound_checkpoint(
+            latest, record, model=fixtures.HIGHSPEED, diagnostic_cost_upper_bound=True,
+        )
+    assert parent._admit_cost_bound_checkpoint(
+        latest, record, model=fixtures.PRO, diagnostic_cost_upper_bound=True,
+    ).cost_bound_segments
+
+
+def test_bound_policy_stays_with_its_model_if_another_id_were_admitted(monkeypatch):
+    # The admitted set and the policy's model are separate tables. The policy
+    # guards are kept so that admitting a second id cannot extend the bound
+    # to a rate card the policy does not replay.
+    other = "kimi-second-admitted-id"
+    monkeypatch.setitem(parent._MODEL_CONTEXT_SIZES, other, 1_048_576)
+    monkeypatch.setitem(worker._MODEL_CONTEXT_SIZES, other, 1_048_576)
+    parent.KimiBackend(model=other).close()
+    with pytest.raises(ValueError, match="exact kimi-k3.1-pro/max"):
+        parent.KimiBackend(model=other, diagnostic_cost_upper_bound=True)
+    payload = fixtures.fixtures._worker_request_payload(
+        model=other, reasoning_effort="max",
+    )
+    assert worker._Request.from_wire(payload).model == other
+    payload.update(diagnostic_cost_upper_bound=True, diagnostic_budget_usd=1.0)
+    with pytest.raises(worker.WorkerQualificationError, match="diagnostic cost policy"):
+        worker._Request.from_wire(payload)

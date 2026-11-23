@@ -4328,6 +4328,110 @@ def test_trusted_runner_cannot_be_shadowed_from_project_cwd(tmp_path: Path):
     assert polyglot_result.values["tests_passed"] == 1.0
 
 
+_RUNNER_REPORTS_JSON_ORIGIN = '''\
+import json, sys
+sys.stdin.read()
+sys.stdout.write(json.dumps({
+    "values": {"returncode": 0.0},
+    "json_origin": json.__file__,
+}))
+sys.exit(0)
+'''
+
+
+def _plant_shadowing_json(workspace: Path) -> Path:
+    """Plant a workspace ``json.py`` that records its own execution."""
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    marker = workspace / "planted_json_ran"
+    (workspace / "json.py").write_text(
+        f"open({str(marker)!r}, 'w', encoding='utf-8').write('ran')\n"
+        "raise SystemExit(97)\n",
+        encoding="utf-8",
+    )
+    return marker
+
+
+@pytest.mark.parametrize(
+    "cwd_entry",
+    [None, "", "."],
+    ids=["absolute_root", "empty_entry", "relative_entry"],
+)
+def test_configured_runner_cannot_be_shadowed_from_project_cwd(
+    runner_pkg: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cwd_entry: str | None,
+):
+    # An ambient safe-path setting would hide a launch that omits its own.
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    if cwd_entry is not None:
+        # ``export PYTHONPATH="$PYTHONPATH:/x"`` leaves an empty entry when
+        # the variable was unset. Python resolves it, like a relative one,
+        # against the working directory, ahead of the standard library.
+        monkeypatch.setenv(
+            "PYTHONPATH",
+            cwd_entry + os.pathsep + os.environ["PYTHONPATH"],
+        )
+    (tmp_path / runner_pkg / "json_origin.py").write_text(
+        textwrap.dedent(_RUNNER_REPORTS_JSON_ORIGIN),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    marker = _plant_shadowing_json(workspace)
+
+    result = _run_runner(
+        "build",
+        f"{runner_pkg}.json_origin",
+        {"parameters": {}},
+        cwd=str(workspace),
+        timeout=30,
+        log_dir=None,
+    )
+
+    assert not marker.exists()
+    assert result.returncode == 0, result.stderr
+    json_origin = Path(json.loads(result.raw_output)["json_origin"])
+    assert not json_origin.resolve().is_relative_to(workspace.resolve())
+
+
+@pytest.mark.parametrize(
+    "pythonpath",
+    [None, "."],
+    ids=["unset", "relative_only"],
+)
+def test_configured_runner_is_not_importable_from_project_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pythonpath: str | None,
+):
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    if pythonpath is None:
+        monkeypatch.delenv("PYTHONPATH", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONPATH", pythonpath)
+    workspace = tmp_path / "workspace"
+    package = workspace / "ws_runners"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "ok.py").write_text(
+        textwrap.dedent(_RUNNER_OK),
+        encoding="utf-8",
+    )
+
+    result = _run_runner(
+        "build",
+        "ws_runners.ok",
+        {"parameters": {}},
+        cwd=str(workspace),
+        timeout=30,
+        log_dir=None,
+    )
+
+    assert result.returncode != 0
+    assert b"ws_runners" in result.stderr
+
+
 def test_repeated_runner_logs_preserve_every_attempt(runner_pkg: str, tmp_path: Path):
     spec = _spec({"build": f"{runner_pkg}.ok"})
     log_dir = tmp_path / "logs"

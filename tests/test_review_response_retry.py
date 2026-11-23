@@ -1070,7 +1070,7 @@ class _AnchorOnlyGlmPlanJudgeBackend:
     """Repeat a live GLM JSON-shape failure, then obey the safe fallback."""
 
     name = "openai_compat"
-    model = "nvidia/zai-org/glm-5.2"
+    model = "nvidia/zai-org/glm-5.3"
     capability = "text"
 
     def __init__(
@@ -1158,7 +1158,7 @@ class _TargetLedgerGlmPlanJudgeBackend:
     """Exercise duplicate/missing repair across the live 17-alias shape."""
 
     name = "openai_compat"
-    model = "nvidia/zai-org/glm-5.2"
+    model = "nvidia/zai-org/glm-5.3"
     capability = "text"
 
     def __init__(
@@ -1442,7 +1442,7 @@ class _TargetLedgerGlmPlanJudgeBackend:
 def _glm_sequence_backend(*replies: _Reply) -> _SequenceBackend:
     backend = _SequenceBackend(*replies)
     backend.name = "openai_compat"
-    backend.model = "nvidia/zai-org/glm-5.2"
+    backend.model = "nvidia/zai-org/glm-5.3"
     return backend
 
 
@@ -2927,7 +2927,7 @@ def test_non_glm_output_length_remains_terminal(tmp_path):
 def test_glm_output_length_detector_covers_all_review_phases(finding_id):
     backend = SimpleNamespace(
         name="openai_compat",
-        model="nvidia/zai-org/glm-5.2",
+        model="nvidia/zai-org/glm-5.3",
     )
     verdict = SimpleNamespace(
         decision="inconclusive",
@@ -4093,7 +4093,7 @@ def test_glm_plan_judge_materializes_container_json_path_without_retry(
     })
     backend = _SequenceBackend(_Reply(response, 0.0))
     backend.name = "openai_compat"
-    backend.model = "nvidia/zai-org/glm-5.2"
+    backend.model = "nvidia/zai-org/glm-5.3"
     corpus = Corpus(tmp_path / "corpus")
 
     verdict = review(
@@ -4207,7 +4207,7 @@ def test_glm_plan_judge_canonicalizes_unproved_closure_without_retry(
     })
     backend = _SequenceBackend(_Reply(response, 0.0))
     backend.name = "openai_compat"
-    backend.model = "nvidia/zai-org/glm-5.2"
+    backend.model = "nvidia/zai-org/glm-5.3"
 
     verdict = review(
         _PLAN_ARTIFACT,
@@ -4375,7 +4375,7 @@ def test_glm_plan_judge_canonicalizes_grouped_unproved_closure_without_retry(
     })
     backend = _SequenceBackend(_Reply(response, 0.0))
     backend.name = "openai_compat"
-    backend.model = "nvidia/zai-org/glm-5.2"
+    backend.model = "nvidia/zai-org/glm-5.3"
 
     verdict = review(
         _PLAN_ARTIFACT,
@@ -4497,7 +4497,7 @@ def test_glm_impl_breaker_canonicalizes_singleton_categories_without_retry(
     })
     backend = _SequenceBackend(_Reply(response, 0.0))
     backend.name = "openai_compat"
-    backend.model = "nvidia/zai-org/glm-5.2"
+    backend.model = "nvidia/zai-org/glm-5.3"
 
     verdict = review(
         _BREAKER_ARTIFACT,
@@ -4647,7 +4647,7 @@ def test_glm_plan_critic_salvages_grounded_blocker_without_retry(tmp_path):
     })
     backend = _SequenceBackend(_Reply(response, 0.0))
     backend.name = "openai_compat"
-    backend.model = "nvidia/zai-org/glm-5.2"
+    backend.model = "nvidia/zai-org/glm-5.3"
 
     verdict = review(
         _PLAN_ARTIFACT,

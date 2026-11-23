@@ -363,6 +363,108 @@ def test_gate_replan_no_tier_dag_fails(tmp_path, monkeypatch):
     assert len(replan_calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("decision", "replan_status"),
+    [
+        ("inconclusive", "planner_infrastructure_failure"),
+        ("inconclusive", "critic_infrastructure_failure"),
+        ("inconclusive", "judge_protocol_failure"),
+        ("inconclusive", "cancelled"),
+        # An open accounting terminal keeps its own name as well, as on the
+        # planning path; a parent reads that name as accounting debt.
+        ("inconclusive", "incomplete_accounting"),
+        # A status of class retryable (a member of ``_RETRYABLE`` in
+        # ``workflows/_outcome.py``) is passed through like the others.
+        ("inconclusive", "transport_failed"),
+    ],
+)
+def test_gate_replan_without_a_ruling_keeps_its_status(
+    tmp_path, monkeypatch, decision, replan_status,
+):
+    """A repair re-plan nobody ruled on is not a failed validation repair.
+
+    The gate still blocks: the plan is not accepted and no further repair
+    round runs. Only the reported status keeps the re-plan's own typed
+    terminal instead of ``replan_validate_failed``.
+    """
+    lost = _spec("lost", tier_dag=None)
+    replan_calls = _patch_common(
+        monkeypatch,
+        validate_seq=[[_blocker()]],
+        replan_outcomes=[_plan_outcome(
+            lost,
+            decision=decision,
+            status=replan_status,
+            cost_usd=0.25,
+        )],
+    )
+    result, status, repair_cost, _ = _call_gate(
+        tmp_path, planned=_spec("planned"), spec=_spec("base"),
+        allow_repair=True, max_repair_attempts=2,
+    )
+    assert status == replan_status
+    assert result.tier_dag is None
+    assert repair_cost == pytest.approx(0.25)
+    assert len(replan_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("decision", "replan_status"),
+    [
+        ("inconclusive", "rounds_exhausted"),
+        ("inconclusive", "no_candidate"),
+        ("rejected", "judge_rejected"),
+        # In no table: an unknown status is never read as "no ruling".
+        ("inconclusive", "accounting_incomplete"),
+        # The three-planner competition keeps this status when a ruling ended
+        # the run (the comparison selected nothing, or every candidate was
+        # refused) and when the records do not prove a lost call. It is in no
+        # status table on purpose, so such a re-plan stays
+        # ``replan_validate_failed``.
+        ("inconclusive", "plan_competition_inconclusive"),
+    ],
+)
+def test_gate_replan_ruled_against_stays_replan_validate_failed(
+    tmp_path, monkeypatch, decision, replan_status,
+):
+    """The pass-through keys on the typed class, not on the plan decision."""
+    dead = _spec("dead", tier_dag=None)
+    replan_calls = _patch_common(
+        monkeypatch,
+        validate_seq=[[_blocker()]],
+        replan_outcomes=[_plan_outcome(
+            dead,
+            decision=decision,
+            status=replan_status,
+        )],
+    )
+    _result, status, _, _ = _call_gate(
+        tmp_path, planned=_spec("planned"), spec=_spec("base"),
+        allow_repair=True,
+    )
+    assert status == "replan_validate_failed"
+    assert len(replan_calls) == 1
+
+
+def test_gate_replan_budget_stop_keeps_budget_exhausted(tmp_path, monkeypatch):
+    """The budget terminal is tested first and keeps its exit-1 status."""
+    dead = _spec("dead", tier_dag=None)
+    _patch_common(
+        monkeypatch,
+        validate_seq=[[_blocker()]],
+        replan_outcomes=[_plan_outcome(
+            dead,
+            decision="inconclusive",
+            status="budget_exhausted",
+        )],
+    )
+    _result, status, _, _ = _call_gate(
+        tmp_path, planned=_spec("planned"), spec=_spec("base"),
+        allow_repair=True,
+    )
+    assert status == "budget_exhausted"
+
+
 def test_gate_passes_only_remaining_budget_to_each_repair(tmp_path, monkeypatch):
     r1 = _spec("r1")
     r2 = _spec("r2")

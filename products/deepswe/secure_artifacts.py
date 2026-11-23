@@ -18,10 +18,21 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import stat
+from typing import Any
 
 
 REWARD_MAX_BYTES = 2
 REWARD_JSON_MAX_BYTES = 16 * 1024
+
+# The closed document the dataset's v1.1 grader writes. ``apply_failed`` is
+# present, as the integer 1, only when the candidate patch did not apply.
+_REWARD_COUNT_FIELDS = ("f2p_passed", "f2p_total", "p2p_passed", "p2p_total")
+_REWARD_RATIO_FIELDS = ("f2p", "p2p", "partial")
+_REWARD_REQUIRED_FIELDS = frozenset(
+    {"reward", *_REWARD_COUNT_FIELDS, *_REWARD_RATIO_FIELDS}
+)
+_REWARD_ADMITTED_FIELDS = _REWARD_REQUIRED_FIELDS | {"apply_failed"}
+_REWARD_RATIO_TOLERANCE = 1e-9
 
 
 class ArtifactReadStatus(StrEnum):
@@ -40,12 +51,93 @@ class BoundedArtifactRead:
     error: str | None = None
 
 
+def _is_exact_count(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+@dataclasses.dataclass(frozen=True)
+class RewardTestInventory:
+    """Whitelist sizes a task's v1.1 reward must report as its totals."""
+
+    f2p_total: int
+    p2p_total: int
+
+    def __post_init__(self) -> None:
+        if not (
+            _is_exact_count(self.f2p_total)
+            and _is_exact_count(self.p2p_total)
+        ):
+            raise ValueError(
+                "reward test inventory sizes must be non-negative integers"
+            )
+
+    def to_payload(self) -> dict[str, int]:
+        return {"f2p_total": self.f2p_total, "p2p_total": self.p2p_total}
+
+
+@dataclasses.dataclass(frozen=True)
+class RewardCounts:
+    """Per-test evidence behind one v1.1 reward.
+
+    ``apply_failed`` records that the dataset grader could not apply the
+    candidate patch and therefore ran no test.
+    """
+
+    f2p_passed: int
+    f2p_total: int
+    p2p_passed: int
+    p2p_total: int
+    apply_failed: bool = False
+
+    def __post_init__(self) -> None:
+        if not all(
+            _is_exact_count(value)
+            for value in (
+                self.f2p_passed,
+                self.f2p_total,
+                self.p2p_passed,
+                self.p2p_total,
+            )
+        ):
+            raise ValueError("reward counts must be non-negative integers")
+        if (
+            self.f2p_passed > self.f2p_total
+            or self.p2p_passed > self.p2p_total
+        ):
+            raise ValueError("reward counts pass more tests than they total")
+        if type(self.apply_failed) is not bool:
+            raise ValueError("reward apply_failed must be a boolean")
+        if self.apply_failed and (self.f2p_passed or self.p2p_passed):
+            raise ValueError("a failed patch application cannot pass tests")
+
+    @property
+    def earned_reward(self) -> int:
+        """The binary reward the dataset's rule derives from these counts."""
+
+        return int(
+            self.f2p_total > 0
+            and self.f2p_passed == self.f2p_total
+            and self.p2p_passed == self.p2p_total
+        )
+
+    def to_payload(self) -> dict[str, int | bool]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_payload(cls, value: object) -> RewardCounts:
+        names = {field.name for field in dataclasses.fields(cls)}
+        if type(value) is not dict or set(value) != names:
+            raise ValueError("reward counts payload must have exact fields")
+        return cls(**value)
+
+
 @dataclasses.dataclass(frozen=True)
 class RewardArtifactRead:
     reward: float | None
     token: str
     state: str
     error: str | None = None
+    counts: RewardCounts | None = None
 
 
 def _flags(*, directory: bool = False, leaf: bool = False) -> int:
@@ -258,8 +350,99 @@ def read_bounded_regular_artifact(
             os.close(descriptor)
 
 
-def read_reward_artifact(logs_dir: Path) -> RewardArtifactRead:
-    """Read one v1.0 text or v1.1 JSON reward with a strict grammar."""
+def _grade_reward_document(
+    payload: dict[str, Any],
+    *,
+    inventory: RewardTestInventory | None,
+) -> RewardArtifactRead:
+    """Check one parsed ``reward.json`` against the dataset v1.1 contract.
+
+    A document that is not the contract's exact shape is ``invalid``. A
+    well-formed document whose reward, ratios, or totals contradict its own
+    counts or the task's whitelist is a ``mismatch``. Neither is a grade.
+    Rejection reasons name contract fields only, never content of the file.
+    """
+
+    def rejected(state: str, reason: str) -> RewardArtifactRead:
+        return RewardArtifactRead(None, "", state, f"reward.json {reason}")
+
+    fields = set(payload)
+    if not _REWARD_REQUIRED_FIELDS <= fields <= _REWARD_ADMITTED_FIELDS:
+        return rejected("invalid", "fields are not the exact v1.1 contract")
+    reward = payload["reward"]
+    if type(reward) is not int or reward not in (0, 1):
+        return rejected("invalid", "reward must be the integer 0 or 1")
+    if not all(_is_exact_count(payload[name]) for name in _REWARD_COUNT_FIELDS):
+        return rejected("invalid", "counts must be non-negative integers")
+    if not all(
+        type(payload[name]) is float and 0.0 <= payload[name] <= 1.0
+        for name in _REWARD_RATIO_FIELDS
+    ):
+        return rejected("invalid", "ratios must be floats between 0 and 1")
+    apply_failed = "apply_failed" in payload
+    if apply_failed and (
+        type(payload["apply_failed"]) is not int or payload["apply_failed"] != 1
+    ):
+        return rejected("invalid", "apply_failed must be the integer 1")
+
+    f2p_passed, f2p_total, p2p_passed, p2p_total = (
+        payload[name] for name in _REWARD_COUNT_FIELDS
+    )
+    if f2p_passed > f2p_total or p2p_passed > p2p_total:
+        return rejected("mismatch", "passes more tests than it totals")
+    if apply_failed and (reward or f2p_passed or p2p_passed):
+        return rejected(
+            "mismatch",
+            "reports a failed patch application with a reward or passed tests",
+        )
+    counts = RewardCounts(
+        f2p_passed=f2p_passed,
+        f2p_total=f2p_total,
+        p2p_passed=p2p_passed,
+        p2p_total=p2p_total,
+        apply_failed=apply_failed,
+    )
+    total = f2p_total + p2p_total
+    derived_ratios = {
+        "f2p": f2p_passed / f2p_total if f2p_total else 0.0,
+        "p2p": p2p_passed / p2p_total if p2p_total else 1.0,
+        "partial": (f2p_passed + p2p_passed) / total if total else 0.0,
+    }
+    if not all(
+        math.isclose(
+            payload[name],
+            derived_ratios[name],
+            rel_tol=0.0,
+            abs_tol=_REWARD_RATIO_TOLERANCE,
+        )
+        for name in _REWARD_RATIO_FIELDS
+    ):
+        return rejected("mismatch", "ratios disagree with its counts")
+    if reward != counts.earned_reward:
+        return rejected("mismatch", "reward disagrees with its counts")
+    if inventory is not None and (f2p_total, p2p_total) != (
+        inventory.f2p_total,
+        inventory.p2p_total,
+    ):
+        return rejected(
+            "mismatch",
+            "totals are not the sizes of the task's test whitelist",
+        )
+    return RewardArtifactRead(float(reward), str(reward), "valid", counts=counts)
+
+
+def read_reward_artifact(
+    logs_dir: Path,
+    *,
+    inventory: RewardTestInventory | None,
+) -> RewardArtifactRead:
+    """Read one v1.0 text or v1.1 JSON reward with a strict grammar.
+
+    ``inventory`` is the whitelist the task's ``tests/config.json`` declares.
+    When it is given, a ``reward.json`` must report exactly its totals. A
+    caller without that authority passes ``None``; the document is then
+    checked against itself only. ``reward.txt`` carries no counts.
+    """
 
     legacy = read_bounded_regular_artifact(
         logs_dir,
@@ -327,15 +510,7 @@ def read_reward_artifact(logs_dir: Path) -> RewardArtifactRead:
                 "invalid",
                 "reward.json must contain one JSON object",
             )
-        reward = payload.get("reward")
-        if type(reward) is not int or reward not in (0, 1):
-            return RewardArtifactRead(
-                None,
-                "",
-                "invalid",
-                "reward.json reward must be the integer 0 or 1",
-            )
-        return RewardArtifactRead(float(reward), str(reward), "valid")
+        return _grade_reward_document(payload, inventory=inventory)
     if not legacy_present:
         return RewardArtifactRead(None, "", "missing", legacy.error or current.error)
     if legacy.status != ArtifactReadStatus.OK:
@@ -364,6 +539,8 @@ __all__ = [
     "REWARD_JSON_MAX_BYTES",
     "REWARD_MAX_BYTES",
     "RewardArtifactRead",
+    "RewardCounts",
+    "RewardTestInventory",
     "read_bounded_regular_artifact",
     "read_reward_artifact",
 ]

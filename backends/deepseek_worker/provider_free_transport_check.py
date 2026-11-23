@@ -14,7 +14,7 @@ import openai
 
 EXPECTED_VERSION = "2.53.0"
 EXPECTED_URL = "https://api.deepseek.com/responses"
-MODEL = "deepseek-v4-flash"
+MODEL = "deepseek-flash"
 
 
 def _completed_event() -> bytes:

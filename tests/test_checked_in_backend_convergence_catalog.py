@@ -41,10 +41,10 @@ PROFILE_KEYS = (
     "deepseek_responses_diagnostic",
     "kimi_sdk",
     "kimi_sdk_diagnostic",
-    "kimi_k3_sdk_diagnostic",
-    "openai_glm52_diagnostic",
-    "openai_kimi26_diagnostic",
-    "local_glm52_diagnostic",
+    "kimi_k31_pro_sdk_diagnostic",
+    "openai_glm53_diagnostic",
+    "openai_kimi_k31_pro_diagnostic",
+    "local_glm53_diagnostic",
 )
 PRODUCTS: tuple[
     tuple[str, tuple[str, ...], Callable[..., BackendLaneCatalog]], ...
@@ -124,8 +124,8 @@ def test_checked_in_profiles_bind_to_complete_ordered_n_lane_catalogs(
     # product's closed comparison identity.
     assert tuple(route.role for route in catalog.lane("kimi_sdk").role_routes) == roles
 
-    local = catalog.lane("local_glm52_diagnostic")
-    hosted = catalog.lane("openai_glm52_diagnostic")
+    local = catalog.lane("local_glm53_diagnostic")
+    hosted = catalog.lane("openai_glm53_diagnostic")
     assert local.backend == "local"
     assert local.runtime_backend == hosted.runtime_backend == "openai_compat"
     assert local.transport == hosted.transport == "openai_compatible_http"
@@ -233,7 +233,7 @@ def test_checked_in_profile_binding_fails_closed_on_catalog_or_route_drift(
             ),
         )
     else:
-        route_path = catalog_path.parent / "backends_local_glm52_diagnostic.yaml"
+        route_path = catalog_path.parent / "backends_local_glm53_diagnostic.yaml"
 
         def drift_local(document: dict[str, Any]) -> None:
             document["default"]["extra"]["expected_served_model"] = "wrong"  # type: ignore[index]

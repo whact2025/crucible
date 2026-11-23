@@ -14,8 +14,16 @@ Runner protocol (mirrors ``assay.bench``):
 - Spec carries ``project_context.runners`` mapping role → dotted module
   path. Recognized roles: ``build``, ``verify`` (or ``test`` —
   ``verify`` wins when both present).
-- The helper subprocess-invokes ``python -m <runner>`` per role,
-  passing the BenchConfig-shaped JSON payload on stdin.
+- The helper starts one subprocess per role in the gated workspace and
+  passes the BenchConfig-shaped JSON payload on stdin. ``crucible.*``
+  runners start isolated through the trusted bootstrap. Any other runner
+  starts as ``python -P -m <runner>``, and the empty and relative
+  ``PYTHONPATH`` entries of its environment are removed, because Python
+  resolves them against the working directory. Neither the launch nor such
+  an entry adds the working directory to ``sys.path``, so the runner must be
+  importable from the environment (installed, or under an absolute
+  ``PYTHONPATH`` entry). Apart from the Git hook override, the rest of the
+  environment reaches the runner unchanged.
 - The workflow injects both ``parameters.role`` and
   ``parameters.runner_mode``.  The former selects the build/verify gate;
   the latter distinguishes ordinary tests from a requested benchmark
@@ -2978,6 +2986,11 @@ def _run_runner(
         return settlement_digests[0]
 
     try:
+        # Bundled runners start isolated through the trusted bootstrap. Any
+        # other runner starts as ``python -P -m <runner>``: the launch does
+        # not add the working directory (the gated, agent-writable workspace)
+        # to ``sys.path``, so the runner must be importable from the
+        # environment. An absolute import root supplied there still applies.
         runner_command = (
             [
                 sys.executable,
@@ -2989,9 +3002,21 @@ def _run_runner(
                 runner,
             ]
             if runner.startswith("crucible.")
-            else [sys.executable, "-m", runner]
+            else [sys.executable, "-P", "-m", runner]
         )
         runner_env = os.environ.copy()
+        if not runner.startswith("crucible."):
+            # ``-P`` does not cover ``PYTHONPATH``: Python resolves an empty
+            # or relative entry there against the working directory and
+            # places it ahead of the standard library. Only the absolute
+            # import roots reach the runner and the processes it starts.
+            import_roots = [
+                entry
+                for entry in runner_env.pop("PYTHONPATH", "").split(os.pathsep)
+                if os.path.isabs(entry)
+            ]
+            if import_roots:
+                runner_env["PYTHONPATH"] = os.pathsep.join(import_roots)
         runner_env.update({
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "core.hooksPath",

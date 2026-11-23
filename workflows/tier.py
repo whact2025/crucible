@@ -29,7 +29,10 @@ Sequence:
    for Python, skip-with-pass for C++/CUDA (no cheap parse step worth
    wiring). On failure, the slice classifies as
    ``hard_fail_smoke`` and the log_excerpt lands on
-   ``Implementation.artifacts["smoke_log"]``.
+   ``Implementation.artifacts["smoke_log"]``. A check that could not run
+   to a verdict (``SmokeResult.infrastructure_failure``) classifies as
+   ``smoke_unavailable`` instead: same log, same restore and halt, no
+   retry, never a Breach seed, and the tier ends ``slice_inconclusive``.
 
 4. **Phase 1.5b — mutation scope (per slice).** When the directive
    declares ``mutation_regions``, run ``_mutation_scope.check_mutation_scope``
@@ -92,18 +95,25 @@ Usage::
 Exit codes:
 - 0: tier complete — all slices, breach, and review passed.
 - 1: a slice's implementer / smoke / mutation_scope / build / verify
-     failed; or Phase 2.5 smoke bench surfaced a regression beyond
-     threshold; or Phase 3 breach exited non-zero for a non-reject
-     reason.
+     failed, or the slice ended without a verdict; or Phase 2.5 smoke
+     bench surfaced a regression beyond threshold; or Phase 3 breach
+     exited non-zero for a non-reject reason.
 - 2: Judge issued ``reject`` (breach persistence veto).
-- 3: review pass surfaced Critical/High findings.
+- 3: review pass surfaced Critical/High findings, or a gating reviewer
+     returned no verdict.
 - 4: ``--tier <id>`` not present in ``spec.tier_dag``.
 
 Halt-on-fail status strings are module-level constants
 (``STATUS_SLICE_FAILED``, ``STATUS_ALL_SLICES_TRANSPORT_FAILED``,
 ``STATUS_EMPTY_UNION_DIFF``, ``STATUS_SMOKE_REGRESSION``,
-``STATUS_REVIEW_FAILED``, ``STATUS_TIER_COMPLETE``). See
-``_finalize_tier_failure``'s docstring for the full cascade map of
+``STATUS_BREACH_FAILED``, ``STATUS_BREACH_REJECT``,
+``STATUS_REVIEW_FAILED``, ``STATUS_TIER_COMPLETE``). Three of them have a
+counterpart for work that nothing judged: ``STATUS_SLICE_INCONCLUSIVE``
+(and ``STATUS_CANCELLED`` for a cancelled implementer),
+``STATUS_BREACH_INCONCLUSIVE`` and ``STATUS_REVIEW_INCONCLUSIVE``. The
+counterpart changes only the typed outcome class; the restore, the halt,
+the exit code and every refusal to land are those of the failed status.
+See ``_finalize_tier_failure``'s docstring for the full cascade map of
 which gate produces each status and when rollback fires.
 """
 
@@ -222,7 +232,10 @@ from ._provider_settlement import (
     ProviderSettlementCleanupError,
     ProviderSettlementExitStack,
 )
-from ._resilience import is_transport_failure_implementation
+from ._resilience import (
+    is_budget_failure_verdict,
+    is_transport_failure_implementation,
+)
 from ._run import (
     FailureTerminal,
     exec_ctx_now,
@@ -233,8 +246,13 @@ from ._review import (
     AUTONOMOUS_REVIEW_CHUNK_CHARS,
     is_review_infrastructure_failure,
     review,
+    review_failure_domain,
 )
 from ._run_policy import WriterLanePolicy
+from ._write_root_guard import (
+    WRITE_ROOT_REFUSAL_ERROR_KIND,
+    host_route_write_root_refusal,
+)
 from ._writer_scheduler import (
     BackendFactory as WriterBackendFactory,
     IntegrationGate as WriterIntegrationGate,
@@ -1581,11 +1599,20 @@ def _validate_review_rubrics(rubrics: tuple[str, ...]) -> None:
 # update together. See _finalize_tier_failure's docstring for the
 # cheap-to-expensive cascade and which gate produces each status.
 STATUS_SLICE_FAILED = "slice_failed"
+# A slice, the breach loop, or a gating review that ended without a verdict.
+# The tier halts and restores exactly as for the ``*_failed`` status beside
+# it; only the typed outcome differs (``inconclusive`` / ``cancelled``).
+STATUS_SLICE_INCONCLUSIVE = "slice_inconclusive"
+STATUS_CANCELLED = "cancelled"
 STATUS_ALL_SLICES_TRANSPORT_FAILED = "all_slices_transport_failed"
 STATUS_INCOMPLETE_TRANSPORT_FAILED = "incomplete_transport_failed"
 STATUS_EMPTY_UNION_DIFF = "empty_union_diff"
 STATUS_SMOKE_REGRESSION = "smoke_regression"
+STATUS_BREACH_FAILED = "breach_failed"
+STATUS_BREACH_REJECT = "breach_reject"
+STATUS_BREACH_INCONCLUSIVE = "breach_inconclusive"
 STATUS_REVIEW_FAILED = "review_failed"
+STATUS_REVIEW_INCONCLUSIVE = "review_inconclusive"
 STATUS_BUDGET_EXHAUSTED = "budget_exhausted"
 STATUS_INCOMPLETE_ACCOUNTING = "incomplete_accounting"
 STATUS_BREACH_EXCEPTION = "breach_exception"
@@ -2388,9 +2415,9 @@ def _finalize_tier_failure(
     """Persist a tier-level failure: stamp the status on summary +
     spec, write summary.json, finalize the run handle, return 1.
 
-    Every tier-level escalation (slice_failed,
-    all_slices_transport_failed, and any future
-    inconclusive_<reason>) shares this exact shape. Factored out so
+    Every tier-level escalation (slice_failed, slice_inconclusive,
+    all_slices_transport_failed, breach_failed, breach_inconclusive,
+    ...) shares this exact shape. Factored out so
     new escalation branches stay one-liners + drift can't slip in
     between the persist / write / finalize / return steps.
 
@@ -2421,7 +2448,12 @@ def _finalize_tier_failure(
        ``workflows/_resilience.is_transport_failure_implementation``
        + the ``TRANSPORT_FAILURE_CLASSIFICATION`` constant; classify
        once there if you're adding a new infrastructure-failure
-       case.
+       case. ``_slice_halt_status`` picks the status after the same
+       rollback: a slice nothing judged (``smoke_unavailable``,
+       ``dev_verify_unavailable``, ``hard_fail_capture``) halts with
+       ``STATUS_SLICE_INCONCLUSIVE`` and a cancelled implementer with
+       ``STATUS_CANCELLED``, both only when the rollback succeeded.
+       Neither continues the tier or retries the slice.
     5. **All-transport-failed escalation** — if every pending slice
        hit transport failure and there's no prior landed work
        (``landed_impls`` from ``workflows._partition`` is empty),
@@ -2438,11 +2470,20 @@ def _finalize_tier_failure(
        lands as ``breach_exception``. Child ``budget_exhausted`` propagates as
        the tier's own ``budget_exhausted`` status; a semantically complete
        child with unknown aggregate spend propagates as
-       ``incomplete_accounting`` and cannot authorize another tier.
+       ``incomplete_accounting`` and cannot authorize another tier. A child
+       whose typed outcome is inconclusive, retryable or cancelled reached
+       no ruling and lands as ``breach_inconclusive``; its own status stays
+       in ``summary["phase_3_breach"]``. The two inconclusive child statuses
+       in ``_BREACH_DETERMINISTIC_REFUSAL_STATUSES`` record a deterministic
+       refusal instead and stay ``breach_failed``.
     9. **Phase 4 — review** — Critical / High rubric findings land
        at the end-of-pipeline finalize with
        ``final_status=STATUS_REVIEW_FAILED``; a passing review
        finishes the tier with ``final_status=STATUS_TIER_COMPLETE``.
+       When the pass that ended the loop lost a gating reviewer and no
+       gating reviewer ruled against the candidate it was looking at,
+       the same finalize uses ``STATUS_REVIEW_INCONCLUSIVE`` and records
+       the rubric and cause in ``summary["phase_4_review_inconclusive"]``.
 
     Resumability: this helper persists ``cur_spec`` BEFORE finalizing
     so the next run's ``workflows._partition.partition_for_resume``
@@ -3257,6 +3298,75 @@ _TEST_FILENAME_STEM_RE = re.compile(
     re.IGNORECASE,
 )
 _JAVA_TEST_CLASS_RE = re.compile(r".+Tests?\.java$")
+# The smoke counterpart of ``dev_verify_unavailable``: the cheap gate ended
+# without a verdict about the slice (``SmokeResult.infrastructure_failure``).
+_SMOKE_UNAVAILABLE_CLASSIFICATION = "smoke_unavailable"
+# A gate that could not run. It executes only after the candidate passed its
+# own scope validation, so scope escapes recorded with one of these
+# classifications are what the gate left behind, not evidence about the slice.
+_GATE_UNAVAILABLE_SLICE_CLASSIFICATIONS = frozenset({
+    _SMOKE_UNAVAILABLE_CLASSIFICATION,
+    "dev_verify_unavailable",
+})
+# Slice classifications that record "nothing judged this slice". They are
+# never a Breach seed, and the per-slice halt reports them apart from a
+# judged failure. None of them starts a retry.
+_UNJUDGED_SLICE_CLASSIFICATIONS = frozenset({
+    *_GATE_UNAVAILABLE_SLICE_CLASSIFICATIONS,
+    "hard_fail_capture",
+})
+# Breach child statuses that Breach files as ``inconclusive`` although the
+# loop did not end for want of a ruling: Breach accepted the candidate
+# (``proceed`` or ``no_attacks``) and the final shipping gate ran and did not
+# pass it, or a deterministic gate changed source or Git state or wrote
+# outside the transaction scope (or the candidate was absent from the
+# workspace). Like a Phase 1 gate that changed the candidate
+# (``hard_fail_gate_mutation``), that is deterministic evidence, and the tier
+# keeps ``breach_failed``. A round gate or the final shipping gate that could
+# not run is ``inconclusive_gate_unavailable`` and is not in this set.
+_BREACH_DETERMINISTIC_REFUSAL_STATUSES = frozenset({
+    "inconclusive_post_strip_verify",
+    "inconclusive_workspace_mismatch",
+})
+
+
+def _slice_halt_status(impl: Implementation, *, restored: bool) -> str:
+    """Tier status for the slice that halts the tier after its restore.
+
+    A status outside the permanent class claims the workspace is back at its
+    baseline, so it needs the restore to have succeeded. Where the model was
+    the only writer (an uncapturable delta, a cancelled call), a scope escape
+    is deterministic evidence against the slice and keeps it ``slice_failed``.
+    """
+
+    if not restored:
+        return STATUS_SLICE_FAILED
+    if impl.classification in _GATE_UNAVAILABLE_SLICE_CLASSIFICATIONS:
+        return STATUS_SLICE_INCONCLUSIVE
+    if impl.scope_escapes:
+        return STATUS_SLICE_FAILED
+    if impl.classification in _UNJUDGED_SLICE_CLASSIFICATIONS:
+        return STATUS_SLICE_INCONCLUSIVE
+    if impl.classification == "hard_fail_cancellation":
+        return STATUS_CANCELLED
+    return STATUS_SLICE_FAILED
+
+
+def _review_no_verdict_domain(
+    verdict,
+) -> Literal["budget", "infrastructure", "protocol"] | None:
+    """Why a gating review returned no verdict; ``None`` when it ruled.
+
+    The shared classifier files a reviewer stopped by its budget under
+    ``infrastructure`` and leaves budget precedence to the workflow that owns
+    the budget. The tier names that cause so the summary does not report a
+    spent budget as an outage.
+    """
+
+    domain = review_failure_domain(verdict)
+    if domain is None:
+        return None
+    return "budget" if is_budget_failure_verdict(verdict) else domain
 
 
 def _has_complete_priced_execution(impl: Implementation) -> bool:
@@ -5965,6 +6075,25 @@ def run_tier(
                     provenance_root=None,
                 )
                 return 2
+        # ``cwd`` is the root every write context below uses: the caller's
+        # checkout, or the worktree this call or Architect rebound it to.
+        refusal = host_route_write_root_refusal(
+            args,
+            cwd,
+            ("implementer", "breach_defender")
+            if args.breach_policy.enabled
+            else ("implementer",),
+        )
+        if refusal is not None:
+            record_handled_terminal(
+                corpus,
+                "tier",
+                status="setup_error",
+                message=refusal,
+                error_kind=WRITE_ROOT_REFUSAL_ERROR_KIND,
+                provenance_root=None,
+            )
+            return 2
         runner_parameters = extra_parameters
         ctx = ToolContext(
             workspace_root=Path(cwd), repo_root=Path(cwd),
@@ -10868,18 +10997,30 @@ def _run_tier_locked_body(
                         kind="logs",
                         name_hint=f"{s.id}_smoke.log",
                     )
+                    # A flagged result is no verdict about the slice: the
+                    # check could not run. It is neither a smoke failure nor
+                    # a reason to retry; the slice halts unjudged below.
                     impl = _replace(
                         impl,
-                        classification="hard_fail_smoke",
+                        classification=(
+                            _SMOKE_UNAVAILABLE_CLASSIFICATION
+                            if smoke_outcome.infrastructure_failure
+                            else "hard_fail_smoke"
+                        ),
                         artifacts={
                             **impl.artifacts,
                             "smoke_log": smoke_ref,
                         },
                     )
                     logger.warning(
-                        "tier %s: slice %s smoke failed (lang=%s, "
+                        "tier %s: slice %s smoke %s (lang=%s, "
                         "%dms) — skipping build/verify",
                         args.tier_id, s.id,
+                        (
+                            "could not run"
+                            if smoke_outcome.infrastructure_failure
+                            else "failed"
+                        ),
                         smoke_outcome.language, smoke_outcome.duration_ms,
                     )
 
@@ -11440,8 +11581,10 @@ def _run_tier_locked_body(
                 # An unavailable verifier is workflow/environment evidence,
                 # not a broken implementation seed. Sending it to Breach
                 # would merely replace one suppressed paid retry with a more
-                # expensive Defender loop.
-                and impl.classification != "dev_verify_unavailable"
+                # expensive Defender loop. The same holds for a smoke check
+                # that could not run and for a delta that was not captured.
+                and impl.classification
+                not in _UNJUDGED_SLICE_CLASSIFICATIONS
                 # Host-finalizer failures are terminal workflow evidence.
                 # They can retain a non-empty combined diagnostic diff, but
                 # that must never become a benchmark Breach/Defender seed.
@@ -11481,6 +11624,12 @@ def _run_tier_locked_body(
                     "classification": impl.classification,
                     "smoke_check": (smoke_outcome.language if smoke_outcome else None),
                     "smoke_passed": (smoke_outcome.passed if smoke_outcome else None),
+                    # Kept beside ``smoke_passed`` because a gate that also
+                    # changed source is reclassified ``hard_fail_gate_mutation``.
+                    "smoke_infrastructure_failure": (
+                        smoke_outcome.infrastructure_failure
+                        if smoke_outcome else None
+                    ),
                     "mutation_scope_violations": len(mutation_findings),
                     "build_verify": (
                         bv_outcome.classification
@@ -11523,6 +11672,10 @@ def _run_tier_locked_body(
                     "slice_id": s.id,
                     "classification": impl.classification,
                     "smoke_passed": (smoke_outcome.passed if smoke_outcome else None),
+                    "smoke_infrastructure_failure": (
+                        smoke_outcome.infrastructure_failure
+                        if smoke_outcome else None
+                    ),
                     "mutation_scope_violations": len(mutation_findings),
                     "build_verify": bv_outcome.classification if bv_outcome else None,
                     "missing_create_paths": list(missing_create_paths),
@@ -11709,14 +11862,24 @@ def _run_tier_locked_body(
                     )
                 )
                 summary["rollback_applied"] = rolled_back
+                # The halt and the restore above are the same for every
+                # slice. Only the label differs: a slice no gate judged, or
+                # whose implementer was cancelled, is not a failed slice.
+                halt_status = _slice_halt_status(impl, restored=rolled_back)
                 logger.error(
-                    "tier %s: slice %s failed (classification=%s) — halting%s",
-                    args.tier_id, s.id, impl.classification,
+                    "tier %s: slice %s %s (classification=%s) — halting%s",
+                    args.tier_id, s.id,
+                    (
+                        "failed"
+                        if halt_status == STATUS_SLICE_FAILED
+                        else "ended without a verdict"
+                    ),
+                    impl.classification,
                     " (rolled back)" if rolled_back else "",
                 )
                 return _finalize_tier_failure(
                     handle, run_dir, summary, corpus, cur_spec,
-                    status=STATUS_SLICE_FAILED,
+                    status=halt_status,
                     costs=costs,
                 )
 
@@ -12821,7 +12984,7 @@ def _run_tier_locked_body(
                     summary,
                     corpus,
                     cur_spec,
-                    "breach_failed",
+                    STATUS_BREACH_FAILED,
                     costs=costs,
                 )
 
@@ -12843,6 +13006,37 @@ def _run_tier_locked_body(
                     costs=costs,
                 )
 
+            if (
+                breach_rc != 0
+                and typed_breach is not None
+                and typed_breach.terminal_class
+                in _outcome.UNJUDGED_TERMINAL_CLASSES
+                and child_status not in _BREACH_DETERMINISTIC_REFUSAL_STATUSES
+            ):
+                # The loop reached no ruling on the candidate (a lost
+                # Breaker, attack-authority reviewer or Judge, a gate that
+                # could not run, a concurrent Spec change). That is not a
+                # failed breach. The halt is the same; the exact child status
+                # stays in summary["phase_3_breach"]. A deferred seed takes
+                # this branch too: its repair loop was lost, and its own gate
+                # result stays in its Phase 1 row. The branch is also taken
+                # when Breach left a deferred seed unrepaired and its final
+                # shipping gate could not run. A child that ended on a
+                # deterministic refusal (an accepted candidate the final
+                # shipping gate ran and did not pass, a gate that changed
+                # source) is not such a loop and falls through to
+                # ``breach_failed``.
+                logger.error(
+                    "tier %s: breach ended without a ruling (status=%s) "
+                    "— halting",
+                    args.tier_id,
+                    child_status,
+                )
+                return _finalize_tier_failure(
+                    handle, run_dir, summary, corpus, cur_spec,
+                    STATUS_BREACH_INCONCLUSIVE,
+                    costs=costs,
+                )
             if breach_rc == 2:
                 # Persistence veto / reject — halt.
                 logger.error(
@@ -12851,7 +13045,7 @@ def _run_tier_locked_body(
                 )
                 return _finalize_tier_failure(
                     handle, run_dir, summary, corpus, cur_spec,
-                    "breach_reject", return_code=2, costs=costs,
+                    STATUS_BREACH_REJECT, return_code=2, costs=costs,
                 )
             if breach_rc != 0:
                 logger.error(
@@ -12860,7 +13054,7 @@ def _run_tier_locked_body(
                 )
                 return _finalize_tier_failure(
                     handle, run_dir, summary, corpus, cur_spec,
-                    "breach_failed",
+                    STATUS_BREACH_FAILED,
                     costs=costs,
                 )
 
@@ -12894,6 +13088,15 @@ def _run_tier_locked_body(
         # ------------------------------------------------------------------
         review_failed = False
         review_infrastructure_failed = False
+        # True when the pass that ended the review loop lost a gating
+        # reviewer and no gating reviewer ruled against the candidate it was
+        # looking at. It only selects the terminal label; every refusal that
+        # follows a failed review is keyed on ``review_failed``.
+        review_unjudged = False
+        # The candidates (exact union diffs) a gating reviewer ruled against.
+        # A feedback retry that changes nothing is re-reviewed as the same
+        # bytes, and that ruling still stands when the re-review is lost.
+        review_rejected_candidates: set[bytes] = set()
         review_attempt = 0
         review_conflict_pending: dict[str, object] | None = None
         review_conflict_attempted = False
@@ -12977,6 +13180,7 @@ def _run_tier_locked_body(
 
                 review_failed = False
                 review_infrastructure_failed = False
+                review_unjudged = False
                 review_feedback_retryable = True
                 gating_failures: list[tuple[str, tuple]] = []
                 for rubric_name in policy_rubrics:
@@ -13103,12 +13307,27 @@ def _run_tier_locked_body(
                                     args.tier_id,
                                     rubric_name,
                                 )
+                                # A ruling against these bytes still stands,
+                                # from an earlier gating rubric of this pass
+                                # or from an earlier pass.
+                                review_unjudged = (
+                                    union_diff
+                                    not in review_rejected_candidates
+                                )
+                                if review_unjudged:
+                                    summary["phase_4_review_inconclusive"] = {
+                                        "rubric": rubric_name,
+                                        "domain": _review_no_verdict_domain(
+                                            verdict
+                                        ),
+                                    }
                                 break
                             if verdict.decision != "revise":
                                 review_feedback_retryable = False
                             gating_failures.append(
                                 (rubric_name, verdict.findings)
                             )
+                            review_rejected_candidates.add(union_diff)
 
 
                 if (
@@ -14215,6 +14434,8 @@ def _run_tier_locked_body(
                         )
                         fresh_review_failed = False
                         fresh_infrastructure_failed = False
+                        fresh_semantic_rejection = False
+                        fresh_unjudged: dict[str, object] | None = None
                         fresh_attempt = review_attempt + 1
                         if "tier_completeness" in mandatory_rubrics:
                             evidence_ok, evidence_error = (
@@ -14346,10 +14567,31 @@ def _run_tier_locked_body(
                                     fresh_infrastructure_failed
                                     or infrastructure_failure
                                 )
+                                if not infrastructure_failure:
+                                    fresh_semantic_rejection = True
+                                elif fresh_unjudged is None:
+                                    fresh_unjudged = {
+                                        "rubric": rubric_name,
+                                        "domain": _review_no_verdict_domain(
+                                            verdict
+                                        ),
+                                    }
                         review_failed = fresh_review_failed
                         review_infrastructure_failed = (
                             fresh_infrastructure_failed
                         )
+                        # This pass reviews the reconciled candidate anew
+                        # under the admitted amendment and runs every
+                        # mandatory rubric, so a lost reviewer leaves it
+                        # unjudged only when none of them ruled against it.
+                        review_unjudged = bool(
+                            fresh_infrastructure_failed
+                            and not fresh_semantic_rejection
+                        )
+                        if review_unjudged:
+                            summary["phase_4_review_inconclusive"] = (
+                                fresh_unjudged
+                            )
                         conflict_summary["status"] = (
                             "fresh_reviews_failed"
                             if fresh_review_failed
@@ -16098,7 +16340,11 @@ def _run_tier_locked_body(
 
         exec_ctx = exec_ctx_now("tier", run_id=run_dir.name)
         if review_failed:
-            final_status = STATUS_REVIEW_FAILED
+            final_status = (
+                STATUS_REVIEW_INCONCLUSIVE
+                if review_unjudged
+                else STATUS_REVIEW_FAILED
+            )
             lifecycle_kind = "abandoned"
             rc = 3
         elif args.diagnostic_cost_policy is not None:

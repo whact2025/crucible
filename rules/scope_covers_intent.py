@@ -33,6 +33,15 @@ Free-form claims such as "context only" or "not to be edited" do not
 suppress a finding. The mutation boundary cannot safely depend on
 interpreting nearby prose. A real path token must be declared in mutation
 scope or removed from the intent entirely.
+
+During post-implementation validation only, a path that a successful
+current-plan slice created is not treated as pre-existing: the explicit
+``CitedPathExistsContext`` proves that the exact declaring slice created it
+from an absent project-base path and that the live checkout matches the
+recorded postimage. Such a path did not exist when the plan was accepted, so
+a reference to it keeps its plan-time verdict. A plain ``RuleContext`` carries
+no such proof, and an existing path that is unrecorded, altered, or left by a
+failed slice remains a finding.
 """
 
 from __future__ import annotations
@@ -41,6 +50,8 @@ import re
 from pathlib import Path
 
 from assay import Evidence, Finding, RuleContext, Spec
+
+from .cited_path_exists import CitedPathExistsContext
 
 
 # Multi-component source path: at least one '/' before a recognized
@@ -109,6 +120,29 @@ def _scope_omits_referenced_path_finding(
     )
 
 
+def _verified_plan_created_paths(
+    spec: Spec,
+    ctx: RuleContext,
+) -> frozenset[str]:
+    """Return the paths this plan provably created.
+
+    The authority is the one ``cited_path_exists`` uses for an existing
+    ``creates_paths`` entry: the exact declaring slice is successful and
+    plan-bound, and its ``(tier_id, slice_id, path)`` create is verified.
+    """
+
+    if spec.tier_dag is None or not isinstance(ctx, CitedPathExistsContext):
+        return frozenset()
+    return frozenset(
+        path
+        for tier in spec.tier_dag.tiers
+        for slice_ in tier.slices
+        if (tier.tier_id, slice_.id) in ctx.successful_plan_bound_slices
+        for path in (slice_.directive.creates_paths or ())
+        if (tier.tier_id, slice_.id, path) in ctx.verified_create_paths
+    )
+
+
 def scope_covers_intent(spec: Spec, ctx: RuleContext) -> tuple[Finding, ...]:
     if spec.tier_dag is None:
         return ()
@@ -118,6 +152,8 @@ def scope_covers_intent(spec: Spec, ctx: RuleContext) -> tuple[Finding, ...]:
     base = Path(ctx.workspace_root)
     if ctx.submodule_path:
         base = base / ctx.submodule_path
+
+    verified_created_paths = _verified_plan_created_paths(spec, ctx)
 
     findings: list[Finding] = []
     for tier in spec.tier_dag.tiers:
@@ -130,6 +166,10 @@ def scope_covers_intent(spec: Spec, ctx: RuleContext) -> tuple[Finding, ...]:
 
             for ref in sorted(_extract_referenced_paths(d.intent or "")):
                 if ref in in_scope:
+                    continue
+                # A proven create of this plan was absent when the plan was
+                # accepted; the reference keeps the verdict it had then.
+                if ref in verified_created_paths:
                     continue
                 # Only flag paths that genuinely exist on disk — if the
                 # path is a typo or hallucination, phantom_reference /

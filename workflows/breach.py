@@ -36,7 +36,12 @@ Exit codes:
 - 0: all attacks dismissed; diff survives the loop.
 - 1: Judge issued ``revise`` and the round budget was exhausted.
 - 2: Judge issued ``reject`` (fundamental flaw).
-- 3: Runner / build error not classifiable by the loop.
+- 3: Runner / build error not classifiable by the loop. A round gate or the
+  final shipping gate that could not run ends
+  ``inconclusive_gate_unavailable``: no Test Author repair, Defender recovery
+  or Judge call follows it. After a round gate nothing judged the candidate;
+  after the final shipping gate, which runs on a result Breach had accepted,
+  no ruling stands.
 """
 
 from __future__ import annotations
@@ -175,8 +180,17 @@ from ._resilience import (
     is_transport_failure_implementation,
     is_transport_failure_verdict,
 )
-from ._run import FailureTerminal, exec_ctx_now, open_run_with_capture
+from ._run import (
+    FailureTerminal,
+    exec_ctx_now,
+    open_run_with_capture,
+    record_handled_terminal,
+)
 from ._review import AUTONOMOUS_REVIEW_CHUNK_CHARS, review
+from ._write_root_guard import (
+    WRITE_ROOT_REFUSAL_ERROR_KIND,
+    host_route_write_root_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1347,6 +1361,11 @@ _BREACH_DEFENDER_EMPTY_CLASSES = frozenset({
 _BREACH_INCOMPLETE_TERMINAL_CLASSES = frozenset({
     "hard_fail_budget_exhausted",
     "hard_fail_cancellation",
+    # Assay gives a record this classification when the Git capture after the
+    # call, or the workspace check that precedes that capture, failed. A role
+    # whose delta could not be captured cannot authorize its writes: they are
+    # restored and the Breach loop ends.
+    "hard_fail_capture",
     "hard_fail_content_rejected",
     "hard_fail_incomplete_evidence",
     "hard_fail_max_turns",
@@ -6753,6 +6772,7 @@ class _RoundState:
         "invalid_attack_identity",
         "pre_fix_gate_error",
         "observation_failure",
+        "gate_unavailable",
         "test_author_completion_exhausted",
         "test_author_repair_exhausted",
         "test_author_budget_exhausted",
@@ -7119,6 +7139,47 @@ def _gate_observation_failure(
             "kind": "channel",
             "detail": str(exc)[:1_000],
         }
+
+
+def _gate_command_timed_out(
+    outcome: _build_verify.BuildVerifyOutcome,
+) -> bool:
+    """Whether the gate's own contained command ran into its time limit.
+
+    The DeepSWE runner reports what that command ended with; 124 is its
+    timeout. Other runners do not report the key.
+    """
+
+    result = _gate_result(outcome)
+    return (
+        result is not None
+        and result.values.get("dev_verify_candidate_process_returncode") == 124.0
+    )
+
+
+def _round_gate_unavailable(
+    outcome: _build_verify.BuildVerifyOutcome,
+    observation_failure: dict[str, str] | None,
+) -> bool:
+    """Whether a gate ended without evidence about the candidate.
+
+    True for the runner's own unavailable flag, and for an exact-observation
+    envelope of kind ``infrastructure`` unless the gate's own command timed
+    out. The runner has one window for that command and the observers, so a
+    candidate suite that runs to its cap leaves the same envelope; that
+    timeout stays a judged failure, as Tier files the same gate. The kind is
+    otherwise the runner's own statement. A ``channel`` or ``configuration``
+    envelope alone does not count: the candidate or the generated test can
+    cause it.
+    """
+
+    if outcome.classification == "dev_verify_unavailable":
+        return True
+    return (
+        observation_failure is not None
+        and observation_failure["kind"] == "infrastructure"
+        and not _gate_command_timed_out(outcome)
+    )
 
 
 def _structured_attack_observations(
@@ -8019,6 +8080,20 @@ def _main(
     corpus = Corpus(args.spec)
     import os as _os
     cwd = str(args.cwd) if args.cwd else _os.getcwd()
+    # The Defender's write root is refused before the workspace lock and the
+    # run exist; every later setup error is recorded inside that run.
+    refusal = host_route_write_root_refusal(args, cwd, ("breach_defender",))
+    if refusal is not None:
+        record_handled_terminal(
+            corpus,
+            "breach",
+            status="setup_error",
+            message=refusal,
+            error_kind=WRITE_ROOT_REFUSAL_ERROR_KIND,
+            extra={"implementation_refs": []},
+            provenance_root=None,
+        )
+        return 2
     # See workflows/tier.py for the rationale: the Defender's
     # assay.implement call + _build_verify both take cwd= explicitly,
     # so the workflow forwards the resolved cwd rather than chdir'ing
@@ -10749,6 +10824,11 @@ def _main(
                     break
 
                 observation_failure = _gate_observation_failure(pre_outcome)
+                # A gate that could not run produced no evidence about the
+                # candidate: the loop ends without a verdict, not incomplete.
+                gate_unavailable = _round_gate_unavailable(
+                    pre_outcome, observation_failure,
+                )
                 if observation_failure is not None:
                     logger.error(
                         "breach round %d: exact observation %s failure is "
@@ -10768,7 +10848,34 @@ def _main(
                         "skipped": True,
                         "failure": observation_failure,
                     })
-                    final_status = "incomplete"
+                    final_status = (
+                        "inconclusive_gate_unavailable"
+                        if gate_unavailable else "incomplete"
+                    )
+                    rounds.append(state)
+                    abort_round = True
+                    break
+                if gate_unavailable:
+                    # The runner flagged the gate itself, whatever rows it
+                    # still returned. Neither the generated test nor the
+                    # production source can repair that, so no Test Author
+                    # repair, Defender or Judge call follows.
+                    logger.error(
+                        "breach round %d: pre-fix gate could not run "
+                        "(classification=%s); ending without a verdict",
+                        r, pre_outcome.classification,
+                    )
+                    state.defender_classification = (
+                        "round_skipped_pre_fix_gate_unavailable"
+                    )
+                    state.skip_reason = "gate_unavailable"
+                    handle.write_event({
+                        "round": r,
+                        "status": "pre_fix_gate_unavailable",
+                        "skipped": True,
+                        "classification": pre_outcome.classification,
+                    })
+                    final_status = "inconclusive_gate_unavailable"
                     rounds.append(state)
                     abort_round = True
                     break
@@ -11481,15 +11588,40 @@ def _main(
                 state.post_fix_classification = outcome.classification
                 state.build_classification = outcome.classification
                 observation_failure = _gate_observation_failure(outcome)
+                gate_unavailable = _round_gate_unavailable(
+                    outcome, observation_failure,
+                )
                 if observation_failure is not None:
                     state.observation_failure = observation_failure
                     state.skip_reason = "observation_failure"
-                    final_status = "incomplete"
+                    final_status = (
+                        "inconclusive_gate_unavailable"
+                        if gate_unavailable else "incomplete"
+                    )
                     handle.write_event({
                         "round": r,
                         "status": "post_fix_observation_failure",
                         "skipped": True,
                         "failure": observation_failure,
+                    })
+                    _persist_terminal_defender(defender_impl)
+                    rounds.append(state)
+                    break
+                if gate_unavailable:
+                    # No evidence about the Defender's fix exists, so no
+                    # Defender recovery turn and no Judge ruling follows.
+                    logger.error(
+                        "breach round %d: post-fix gate could not run "
+                        "(classification=%s); ending without a verdict",
+                        r, outcome.classification,
+                    )
+                    state.skip_reason = "gate_unavailable"
+                    final_status = "inconclusive_gate_unavailable"
+                    handle.write_event({
+                        "round": r,
+                        "status": "post_fix_gate_unavailable",
+                        "skipped": True,
+                        "classification": outcome.classification,
                     })
                     _persist_terminal_defender(defender_impl)
                     rounds.append(state)
@@ -11756,16 +11888,40 @@ def _main(
                     state.post_fix_classification = outcome.classification
                     state.build_classification = outcome.classification
                     observation_failure = _gate_observation_failure(outcome)
+                    gate_unavailable = _round_gate_unavailable(
+                        outcome, observation_failure,
+                    )
                     if observation_failure is not None:
                         state.observation_failure = observation_failure
                         state.skip_reason = "observation_failure"
-                        final_status = "incomplete"
+                        final_status = (
+                            "inconclusive_gate_unavailable"
+                            if gate_unavailable else "incomplete"
+                        )
                         defender_recovery_terminal = True
                         handle.write_event({
                             "round": r,
                             "status": "post_fix_observation_failure",
                             "skipped": True,
                             "failure": observation_failure,
+                        })
+                        break
+                    if gate_unavailable:
+                        logger.error(
+                            "breach round %d: no-progress post-fix gate "
+                            "could not run (classification=%s); ending "
+                            "without a verdict",
+                            r, outcome.classification,
+                        )
+                        state.skip_reason = "gate_unavailable"
+                        final_status = "inconclusive_gate_unavailable"
+                        defender_recovery_terminal = True
+                        handle.write_event({
+                            "round": r,
+                            "status": "post_fix_gate_unavailable",
+                            "skipped": True,
+                            "classification": outcome.classification,
+                            "recovery": "no_progress",
                         })
                         break
                 if defender_recovery_terminal:
@@ -12248,7 +12404,18 @@ def _main(
                     settlement_outcome.classification,
                     settlement_gate_error,
                 )
-                final_status = "inconclusive_post_strip_verify"
+                # A gate that could not run produced no evidence about the
+                # accepted bytes. One that ran and failed, or that changed
+                # source or Git authority whatever it classified, is
+                # deterministic evidence against the result.
+                final_status = (
+                    "inconclusive_gate_unavailable"
+                    if settlement_gate_error is None
+                    # This gate requests no exact observation, so only the
+                    # runner's own flag applies.
+                    and _round_gate_unavailable(settlement_outcome, None)
+                    else "inconclusive_post_strip_verify"
+                )
                 accepted = False
                 if transaction.active and not _after_provider_quiescence(
                     transaction.restore
@@ -12324,6 +12491,7 @@ def _main(
             "inconclusive_transport_failed":    "abandoned",
             "inconclusive_workspace_mismatch":  "abandoned",
             "inconclusive_post_strip_verify":   "abandoned",
+            "inconclusive_gate_unavailable":    "abandoned",
             "inconclusive_breaker":             "abandoned",
             "inconclusive_judge":               "abandoned",
             "inconclusive_authority":           "abandoned",
@@ -12454,6 +12622,7 @@ def _main(
             "inconclusive_transport_failed",
             "inconclusive_workspace_mismatch",
             "inconclusive_post_strip_verify",
+            "inconclusive_gate_unavailable",
             "inconclusive_breaker",
             "inconclusive_judge",
             "inconclusive_authority",

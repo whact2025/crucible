@@ -60,8 +60,8 @@ def _route_document(
     model = {
         "claude": "claude-fable-5-1",
         "codex": "gpt-6-astra",
-        "deepseek": "deepseek-v4-flash",
-        "kimi": "kimi-k2.7-code-highspeed",
+        "deepseek": "deepseek-flash",
+        "kimi": "kimi-k3.1-pro",
         "local": "local-test-model",
         "openai_compat": "openai-compatible-test-model",
     }[backend]

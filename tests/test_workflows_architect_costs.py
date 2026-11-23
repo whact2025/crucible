@@ -773,7 +773,7 @@ def test_authoritative_summary_includes_unpersisted_planner_spend():
 def test_planning_usage_tracks_tokens_and_logical_calls_separately_from_usd():
     class _Backend:
         name = "openai_compat"
-        model = "nvidia/zai-org/glm-5.2"
+        model = "nvidia/zai-org/glm-5.3"
 
         def invoke(self, invocation):
             return SimpleNamespace(
@@ -1259,7 +1259,7 @@ def test_run_architect_preserves_usage_before_untyped_transport_exception(
 
     class _Backend:
         name = "openai_compat"
-        model = "nvidia/zai-org/glm-5.2"
+        model = "nvidia/zai-org/glm-5.3"
 
         def __init__(self, role: str) -> None:
             self.role = role

@@ -12,8 +12,9 @@ Coverage:
 - happy path (reward=1)
 - unresolved path (reward=0)
 - docker exec failure (returncode != 0)
-- reward.txt missing (verifier exited before Step 5)
-- reward.txt contents not parseable
+- reward.txt missing (verifier exited before Step 5): no reward emitted
+- reward.txt contents not parseable: no reward emitted
+- reward.json grammar, self-consistency and whitelist totals (v1.1)
 - role refusal (build / unknown)
 - malformed BenchConfig stdin
 - missing deepswe_metadata keys
@@ -31,6 +32,11 @@ from pathlib import Path
 import pytest
 
 from crucible.products.deepswe.runners import deepswe_verifier
+from crucible.products.deepswe.secure_artifacts import (
+    RewardCounts,
+    RewardTestInventory,
+    read_reward_artifact,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +78,49 @@ def _write_json_reward(logs_dir: Path, payload: str) -> None:
 
     (logs_dir / "verifier").mkdir(parents=True, exist_ok=True)
     (logs_dir / "verifier" / "reward.json").write_text(payload)
+
+
+def _v11_document(
+    *,
+    f2p_passed: int = 3,
+    f2p_total: int = 3,
+    p2p_passed: int = 120,
+    p2p_total: int = 120,
+    apply_failed: bool = False,
+) -> dict:
+    """Build a reward document exactly as the dataset's ``grader.py`` does."""
+
+    total = f2p_total + p2p_total
+    document = {
+        "reward": int(
+            not apply_failed
+            and f2p_total > 0
+            and f2p_passed == f2p_total
+            and p2p_passed == p2p_total
+        ),
+        "f2p_total": f2p_total,
+        "f2p_passed": f2p_passed,
+        "p2p_total": p2p_total,
+        "p2p_passed": p2p_passed,
+        "f2p": f2p_passed / f2p_total if f2p_total else 0.0,
+        "p2p": p2p_passed / p2p_total if p2p_total else 1.0,
+        "partial": (f2p_passed + p2p_passed) / total if total else 0.0,
+    }
+    if apply_failed:
+        document["apply_failed"] = 1
+    return document
+
+
+def _v11_reward(**counts) -> str:
+    return json.dumps(_v11_document(**counts))
+
+
+def _assert_no_reward(values: dict) -> None:
+    """A missing or rejected artifact is never published as a score."""
+
+    assert "reward" not in values
+    assert "resolved" not in values
+    assert values["reward_pending"] == 0.0
 
 
 def _make_stdin(parameters: dict) -> io.StringIO:
@@ -337,27 +386,17 @@ def test_verify_unresolved_reward_zero(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("reward", "expected_rc"),
-    ((1, 0), (0, 1)),
+    ("f2p_passed", "reward", "expected_rc"),
+    ((3, 1, 0), (2, 0, 1)),
 )
 def test_verify_v11_json_reward(
     tmp_path: Path,
     monkeypatch,
+    f2p_passed: int,
     reward: int,
     expected_rc: int,
 ):
-    _write_json_reward(
-        tmp_path,
-        json.dumps(
-            {
-                "reward": reward,
-                "f2p_passed": 3,
-                "f2p_total": 3,
-                "p2p_passed": 120,
-                "p2p_total": 120,
-            }
-        ),
-    )
+    _write_json_reward(tmp_path, _v11_reward(f2p_passed=f2p_passed))
 
     rc, payload = _run_with_logs(tmp_path, monkeypatch)
 
@@ -370,7 +409,7 @@ def test_verify_v11_marker_propagates_to_kpi_and_diagnostics(
     tmp_path: Path,
     monkeypatch,
 ):
-    _write_json_reward(tmp_path, '{"reward":1}')
+    _write_json_reward(tmp_path, _v11_reward())
     command_stdout = (
         "[verifier] base pytest rc=0; new pytest rc=70 "
         "(nonzero on failing tests is normal; graded from XML)\n"
@@ -406,31 +445,45 @@ def test_verify_v11_marker_propagates_to_kpi_and_diagnostics(
     assert evidence["new_test_returncode"] == 70
 
 
+def _exact_document_with(fragment: str) -> str:
+    """Splice raw JSON text over the ``partial`` member of an exact document."""
+
+    exact = _v11_reward()
+    marker = '"partial": 1.0}'
+    assert exact.endswith(marker)
+    return exact[: -len(marker)] + fragment + "}"
+
+
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "reason"),
     (
-        "[]",
-        "{}",
-        '{"reward":"1"}',
-        '{"reward":true}',
-        '{"reward":1.0}',
-        '{"reward":2}',
-        '{"reward":1,"reward":0}',
-        '{"reward":NaN}',
-        '{"reward":1,"partial":1e999}',
+        ("[]", "one JSON object"),
+        (
+            _exact_document_with('"partial": 1.0, "reward": 1'),
+            "duplicate field",
+        ),
+        (_exact_document_with('"partial": NaN'), "non-finite"),
+        (_exact_document_with('"partial": 1e999'), "non-finite"),
     ),
+    ids=("array", "duplicate_field", "nan", "overflowing_float"),
 )
 def test_verify_v11_json_reward_rejects_noncanonical_authority(
     tmp_path: Path,
     monkeypatch,
     payload: str,
+    reason: str,
 ):
     _write_json_reward(tmp_path, payload)
 
     rc, result = _run_with_logs(tmp_path, monkeypatch)
 
     assert rc == 1
-    assert result["values"]["reward"] == 0.0
+    _assert_no_reward(result["values"])
+    reward = read_reward_artifact(tmp_path, inventory=None)
+    assert reward.state == "invalid"
+    assert reason in reward.error
+    assert reward.reward is None
+    assert reward.counts is None
 
 
 def test_verify_v11_json_reward_rejects_excessive_nesting(
@@ -442,7 +495,10 @@ def test_verify_v11_json_reward_rejects_excessive_nesting(
     rc, result = _run_with_logs(tmp_path, monkeypatch)
 
     assert rc == 1
-    assert result["values"]["reward"] == 0.0
+    _assert_no_reward(result["values"])
+    # Whether the interpreter refuses the depth or parses a list, the document
+    # is not one contract object.
+    assert read_reward_artifact(tmp_path, inventory=None).state == "invalid"
 
 
 @pytest.mark.parametrize("failure", ("symlink", "oversize", "invalid_utf8"))
@@ -455,31 +511,49 @@ def test_verify_v11_json_reward_rejects_unsafe_or_unreadable_leaf(
     verifier.mkdir()
     reward = verifier / "reward.json"
     if failure == "symlink":
+        # The forged target is a complete, all-passing grade: only the
+        # no-follow open keeps it from being read.
         forged = tmp_path / "forged-reward.json"
-        forged.write_text('{"reward":1}', encoding="utf-8")
+        forged.write_text(_v11_reward(), encoding="utf-8")
         reward.symlink_to(forged)
+        expected_state = "unreadable"
     elif failure == "oversize":
-        reward.write_bytes(b"x" * (16 * 1024 + 1))
+        # A complete grade padded with JSON whitespace past the byte bound.
+        reward.write_bytes(_v11_reward().encode() + b" " * (16 * 1024))
+        expected_state = "unreadable"
     else:
-        reward.write_bytes(b'{"reward":1,"detail":"\xff"}')
+        reward.write_bytes(
+            _v11_reward().encode()[:-1] + b',"detail":"\xff"}'
+        )
+        expected_state = "invalid"
 
     rc, result = _run_with_logs(tmp_path, monkeypatch)
 
     assert rc == 1
-    assert result["values"]["reward"] == 0.0
+    _assert_no_reward(result["values"])
+    observed = read_reward_artifact(tmp_path, inventory=None)
+    assert observed.state == expected_state
+    assert observed.reward is None
+    if failure == "invalid_utf8":
+        assert "not strict JSON" in observed.error
 
 
 def test_verify_rejects_ambiguous_text_and_json_rewards(
     tmp_path: Path,
     monkeypatch,
 ):
+    # Each artifact alone is a valid resolved grade; only their coexistence
+    # is rejected.
     _write_reward(tmp_path, "1\n")
-    _write_json_reward(tmp_path, '{"reward":1}')
+    _write_json_reward(tmp_path, _v11_reward())
 
     rc, payload = _run_with_logs(tmp_path, monkeypatch)
 
     assert rc == 1
-    assert payload["values"]["reward"] == 0.0
+    _assert_no_reward(payload["values"])
+    reward = read_reward_artifact(tmp_path, inventory=None)
+    assert reward.state == "invalid"
+    assert reward.error == "multiple reward artifacts are ambiguous"
 
 
 # ---------- failure modes ----------
@@ -487,7 +561,7 @@ def test_verify_rejects_ambiguous_text_and_json_rewards(
 
 def test_verify_docker_exec_failed(tmp_path: Path, monkeypatch):
     """docker exec returned non-zero (e.g., container died,
-    bash error). Emit reward=0, surface the docker rc, return
+    bash error). Emit no reward, surface the docker rc, return
     non-zero."""
     # NOTE: deliberately do NOT write reward.txt — docker exec
     # failure typically means the verifier shell never reached
@@ -508,13 +582,13 @@ def test_verify_docker_exec_failed(tmp_path: Path, monkeypatch):
     rc = deepswe_verifier.main(stdin=stdin, stdout=stdout)
     assert rc == 137
     payload = json.loads(stdout.getvalue())
-    assert payload["values"]["reward"] == 0.0
+    _assert_no_reward(payload["values"])
     assert payload["values"]["verify_returncode"] == 137.0
 
 
 def test_verify_reward_txt_missing(tmp_path: Path, monkeypatch):
     """docker exec rc=0 but reward.txt absent → verifier exited
-    before Step 5 (early-error in test.sh). Emit reward=0, return 1."""
+    before Step 5 (early-error in test.sh). Emit no reward, return 1."""
     fake = _fake_docker_exec(rc=0)
     monkeypatch.setattr(subprocess, "Popen", fake)
 
@@ -531,12 +605,12 @@ def test_verify_reward_txt_missing(tmp_path: Path, monkeypatch):
     rc = deepswe_verifier.main(stdin=stdin, stdout=stdout)
     assert rc == 1
     payload = json.loads(stdout.getvalue())
-    assert payload["values"]["reward"] == 0.0
+    _assert_no_reward(payload["values"])
 
 
 def test_verify_reward_txt_unparseable(tmp_path: Path, monkeypatch):
     """reward.txt contains something other than '0' or '1' (e.g.
-    truncated, race, corrupt). Emit reward=0, return 1."""
+    truncated, race, corrupt). Emit no reward, return 1."""
     _write_reward(tmp_path, "garbage")
     fake = _fake_docker_exec(rc=0)
     monkeypatch.setattr(subprocess, "Popen", fake)
@@ -554,7 +628,7 @@ def test_verify_reward_txt_unparseable(tmp_path: Path, monkeypatch):
     rc = deepswe_verifier.main(stdin=stdin, stdout=stdout)
     assert rc == 1
     payload = json.loads(stdout.getvalue())
-    assert payload["values"]["reward"] == 0.0
+    _assert_no_reward(payload["values"])
 
 
 def test_verify_reward_txt_whitespace(tmp_path: Path, monkeypatch):
@@ -587,8 +661,9 @@ def test_verify_reward_leaf_symlink_is_never_followed(tmp_path: Path, monkeypatc
     rc, payload = _run_with_logs(tmp_path, monkeypatch)
 
     assert rc == 1
-    assert payload["values"]["reward"] == 0.0
-    reward = deepswe_verifier.read_reward_artifact(tmp_path)
+    _assert_no_reward(payload["values"])
+    reward = read_reward_artifact(tmp_path, inventory=None)
+    assert reward.state == "unreadable"
     assert reward.reward is None
     assert reward.token == ""
 
@@ -604,7 +679,7 @@ def test_verify_reward_parent_symlink_is_never_followed(tmp_path: Path, monkeypa
     rc, payload = _run_with_logs(logs, monkeypatch)
 
     assert rc == 1
-    assert payload["values"]["reward"] == 0.0
+    _assert_no_reward(payload["values"])
 
 
 def test_verify_reward_nonregular_leaf_is_rejected(tmp_path: Path, monkeypatch):
@@ -614,7 +689,7 @@ def test_verify_reward_nonregular_leaf_is_rejected(tmp_path: Path, monkeypatch):
     rc, payload = _run_with_logs(tmp_path, monkeypatch)
 
     assert rc == 1
-    assert payload["values"]["reward"] == 0.0
+    _assert_no_reward(payload["values"])
 
 
 def test_verify_reward_oversize_is_bounded_and_not_logged(
@@ -628,9 +703,297 @@ def test_verify_reward_oversize_is_bounded_and_not_logged(
     rc, payload = _run_with_logs(tmp_path, monkeypatch)
 
     assert rc == 1
-    assert payload["values"]["reward"] == 0.0
+    _assert_no_reward(payload["values"])
     assert secret not in caplog.text
     assert "ATTACKER_CONTROLLED_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    (
+        "absent",
+        "text_garbage",
+        "text_crash_marker",
+        "json_empty_object",
+        "json_self_inconsistent",
+    ),
+)
+def test_direct_mode_never_scores_a_missing_or_rejected_artifact(
+    tmp_path: Path,
+    monkeypatch,
+    artifact: str,
+):
+    if artifact == "text_garbage":
+        _write_reward(tmp_path, "garbage")
+    elif artifact == "text_crash_marker":
+        # The dataset's test.sh writes this when it exits before grading.
+        _write_reward(tmp_path, "-1\n")
+    elif artifact == "json_empty_object":
+        _write_json_reward(tmp_path, "{}")
+    elif artifact == "json_self_inconsistent":
+        _write_json_reward(
+            tmp_path,
+            json.dumps({**_v11_document(f2p_passed=2), "reward": 1}),
+        )
+
+    rc, payload = _run_with_logs(tmp_path, monkeypatch)
+
+    assert rc != 0
+    _assert_no_reward(payload["values"])
+
+
+_EXACT = _v11_document()
+
+
+@pytest.mark.parametrize(
+    "document",
+    (
+        *(
+            {key: value for key, value in _EXACT.items() if key != missing}
+            for missing in (
+                "f2p_total",
+                "f2p_passed",
+                "p2p_total",
+                "p2p_passed",
+                "f2p",
+                "p2p",
+                "partial",
+            )
+        ),
+        {**_EXACT, "notes": "all good"},
+        {**_EXACT, "f2p_passed": 3.0},
+        {**_EXACT, "p2p_total": True},
+        {**_EXACT, "f2p_total": "3"},
+        {**_EXACT, "p2p_passed": -1},
+        {**_EXACT, "f2p": 1},
+        {**_EXACT, "p2p": "1.0"},
+        {**_EXACT, "partial": 1.5},
+        {**_EXACT, "partial": -0.5},
+        {**_EXACT, "apply_failed": 0},
+        {**_EXACT, "apply_failed": True},
+        {**_EXACT, "apply_failed": 2},
+        # ``reward`` itself, in an otherwise exact all-passing document.
+        {key: value for key, value in _EXACT.items() if key != "reward"},
+        {**_EXACT, "reward": True},
+        {**_EXACT, "reward": 1.0},
+        {**_EXACT, "reward": "1"},
+        {**_EXACT, "reward": 2},
+    ),
+)
+def test_reward_json_requires_exact_v11_fields(tmp_path: Path, document: dict):
+    _write_json_reward(tmp_path, json.dumps(document))
+
+    reward = read_reward_artifact(tmp_path, inventory=None)
+
+    assert reward.state == "invalid"
+    assert reward.reward is None
+    assert reward.token == ""
+    assert reward.counts is None
+
+
+def test_reward_json_rejection_never_repeats_file_content(tmp_path: Path):
+    _write_json_reward(
+        tmp_path,
+        json.dumps({**_EXACT, "ATTACKER_KEY": "ATTACKER_VALUE"}),
+    )
+
+    reward = read_reward_artifact(tmp_path, inventory=None)
+
+    assert reward.state == "invalid"
+    assert "ATTACKER" not in reward.error
+
+
+@pytest.mark.parametrize(
+    "document",
+    (
+        # reward 1 although one fail-to-pass test failed
+        {**_v11_document(f2p_passed=2), "reward": 1},
+        # reward 0 although every whitelisted test passed
+        {**_EXACT, "reward": 0},
+        # reward 1 without any fail-to-pass evidence
+        {**_v11_document(f2p_passed=0, f2p_total=0), "reward": 1},
+        # more passed tests than exist
+        {**_EXACT, "f2p_passed": 4},
+        {**_EXACT, "p2p_passed": 121},
+        # ratios that are not the ones the counts give
+        {**_v11_document(f2p_passed=2), "f2p": 1.0},
+        {**_v11_document(p2p_passed=60), "p2p": 1.0},
+        {**_v11_document(f2p_passed=2), "partial": 1.0},
+        # the patch did not apply, yet a test passed
+        {**_v11_document(f2p_passed=2), "apply_failed": 1},
+        {**_EXACT, "apply_failed": 1},
+    ),
+)
+def test_reward_json_rejects_self_inconsistent_grade(
+    tmp_path: Path,
+    document: dict,
+):
+    _write_json_reward(tmp_path, json.dumps(document))
+
+    reward = read_reward_artifact(tmp_path, inventory=None)
+
+    assert reward.state == "mismatch"
+    assert reward.reward is None
+    assert reward.token == ""
+    assert reward.counts is None
+    assert reward.error
+
+
+@pytest.mark.parametrize(
+    "other_inventory",
+    (
+        # Each half of the whitelist bound alone: the other total is equal.
+        RewardTestInventory(f2p_total=4, p2p_total=120),
+        RewardTestInventory(f2p_total=3, p2p_total=121),
+        RewardTestInventory(f2p_total=3, p2p_total=119),
+    ),
+    ids=("fail_to_pass_larger", "pass_to_pass_larger", "pass_to_pass_smaller"),
+)
+def test_reward_json_totals_must_equal_task_inventory(
+    tmp_path: Path,
+    other_inventory: RewardTestInventory,
+):
+    _write_json_reward(tmp_path, _v11_reward())
+
+    other_task = read_reward_artifact(tmp_path, inventory=other_inventory)
+    this_task = read_reward_artifact(
+        tmp_path,
+        inventory=RewardTestInventory(f2p_total=3, p2p_total=120),
+    )
+
+    assert other_task.state == "mismatch"
+    assert other_task.reward is None
+    assert other_task.counts is None
+    assert "whitelist" in other_task.error
+    assert this_task.state == "valid"
+    assert this_task.reward == 1.0
+    assert this_task.token == "1"
+    assert this_task.error is None
+    assert this_task.counts == RewardCounts(
+        f2p_passed=3,
+        f2p_total=3,
+        p2p_passed=120,
+        p2p_total=120,
+    )
+    assert this_task.counts.earned_reward == 1
+    assert this_task.counts.apply_failed is False
+
+
+def test_reward_json_apply_failed_is_a_valid_zero_grade(tmp_path: Path):
+    _write_json_reward(
+        tmp_path,
+        _v11_reward(apply_failed=True, f2p_passed=0, p2p_passed=0),
+    )
+
+    reward = read_reward_artifact(
+        tmp_path,
+        inventory=RewardTestInventory(f2p_total=3, p2p_total=120),
+    )
+
+    assert reward.state == "valid"
+    assert reward.reward == 0.0
+    assert reward.token == "0"
+    assert reward.counts == RewardCounts(
+        f2p_passed=0,
+        f2p_total=3,
+        p2p_passed=0,
+        p2p_total=120,
+        apply_failed=True,
+    )
+    assert reward.counts.to_payload() == {
+        "apply_failed": True,
+        "f2p_passed": 0,
+        "f2p_total": 3,
+        "p2p_passed": 0,
+        "p2p_total": 120,
+    }
+
+
+def test_reward_json_without_fail_to_pass_tests_is_a_valid_zero_grade(
+    tmp_path: Path,
+):
+    _write_json_reward(tmp_path, _v11_reward(f2p_passed=0, f2p_total=0))
+
+    reward = read_reward_artifact(tmp_path, inventory=None)
+
+    assert reward.state == "valid"
+    assert reward.reward == 0.0
+    assert reward.counts.earned_reward == 0
+
+
+def test_reward_txt_remains_a_countless_grade(tmp_path: Path):
+    _write_reward(tmp_path, "1\n")
+
+    reward = read_reward_artifact(
+        tmp_path,
+        inventory=RewardTestInventory(f2p_total=3, p2p_total=120),
+    )
+
+    assert reward.state == "valid"
+    assert reward.reward == 1.0
+    assert reward.token == "1"
+    assert reward.counts is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"f2p_passed": 1, "f2p_total": 2, "p2p_passed": 3},
+        {
+            "apply_failed": False,
+            "f2p_passed": 1,
+            "f2p_total": 2,
+            "p2p_passed": 3,
+            "p2p_total": 3,
+            "partial": 0.8,
+        },
+        {
+            "apply_failed": False,
+            "f2p_passed": 3,
+            "f2p_total": 2,
+            "p2p_passed": 3,
+            "p2p_total": 3,
+        },
+        {
+            "apply_failed": False,
+            "f2p_passed": True,
+            "f2p_total": 2,
+            "p2p_passed": 3,
+            "p2p_total": 3,
+        },
+        {
+            "apply_failed": 1,
+            "f2p_passed": 0,
+            "f2p_total": 2,
+            "p2p_passed": 0,
+            "p2p_total": 3,
+        },
+        {
+            "apply_failed": True,
+            "f2p_passed": 0,
+            "f2p_total": 2,
+            "p2p_passed": 1,
+            "p2p_total": 3,
+        },
+        [1, 2, 3, 3],
+    ),
+)
+def test_reward_counts_payload_is_closed_and_exact(payload):
+    with pytest.raises(ValueError):
+        RewardCounts.from_payload(payload)
+
+
+def test_reward_counts_payload_round_trips():
+    counts = RewardCounts(f2p_passed=1, f2p_total=2, p2p_passed=3, p2p_total=3)
+
+    assert RewardCounts.from_payload(counts.to_payload()) == counts
+    assert counts.earned_reward == 0
+
+
+@pytest.mark.parametrize("sizes", ((-1, 0), (True, 1), (1.0, 1), ("1", 1)))
+def test_reward_test_inventory_requires_exact_sizes(sizes):
+    with pytest.raises(ValueError):
+        RewardTestInventory(f2p_total=sizes[0], p2p_total=sizes[1])
 
 
 def test_workflow_deferred_mode_never_reads_reward_before_stop(
@@ -640,7 +1003,7 @@ def test_workflow_deferred_mode_never_reads_reward_before_stop(
     _write_reward(tmp_path, "1\n")
     monkeypatch.setattr(subprocess, "Popen", _fake_docker_exec(rc=0))
 
-    def forbidden_read(_logs_dir):
+    def forbidden_read(_logs_dir, **_kwargs):
         raise AssertionError("workflow reward must not be read before strict stop")
 
     monkeypatch.setattr(deepswe_verifier, "read_reward_artifact", forbidden_read)
@@ -857,7 +1220,7 @@ def test_secure_reader_rejects_leaf_replacement_during_read(
 
 def test_verify_docker_timeout(tmp_path: Path, monkeypatch):
     """docker exec raises TimeoutExpired → runner surfaces as
-    rc=124, emits reward=0, returns non-zero."""
+    rc=124, emits no reward, returns non-zero."""
     monkeypatch.setattr(
         subprocess,
         "Popen",
@@ -877,6 +1240,7 @@ def test_verify_docker_timeout(tmp_path: Path, monkeypatch):
     rc = deepswe_verifier.main(stdin=stdin, stdout=stdout)
     assert rc == 124
     payload = json.loads(stdout.getvalue())
+    _assert_no_reward(payload["values"])
     assert payload["values"]["verify_returncode"] == 124.0
 
 

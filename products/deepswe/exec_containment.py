@@ -8,6 +8,7 @@ module exposes the DeepSWE profile and its established product import path.
 """
 
 from crucible.common.runners.container_exec import (
+    CONTAINMENT_NOT_STARTED_RC,
     CONTAINMENT_UNUSABLE_RC,
     ContainerExecProfile,
     DEEPSWE_EXEC_PROFILE,
@@ -17,6 +18,7 @@ from crucible.common.runners.container_exec import (
 
 
 __all__ = [
+    "CONTAINMENT_NOT_STARTED_RC",
     "CONTAINMENT_UNUSABLE_RC",
     "ContainerExecProfile",
     "DEEPSWE_EXEC_PROFILE",

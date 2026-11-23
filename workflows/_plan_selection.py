@@ -14,7 +14,11 @@ from typing import Any, Literal, cast
 from assay import ReviewCoverage, Spec, TierDAG, Verdict
 from assay.canonical import hash_record, serialize
 from assay.corpus.store import Corpus
-from assay.primitives.plan import _serialize_tier_dag
+from assay.primitives.plan import (
+    _canonicalize_scope_path,
+    _serialize_tier_dag,
+    _validated_project_root,
+)
 
 from crucible.rubrics import load
 
@@ -63,6 +67,53 @@ def _decode_dag(raw: bytes) -> TierDAG:
     from .plan import _decode_review_candidate
 
     return _decode_review_candidate(raw)
+
+
+def _decode_authored_dag(
+    raw: bytes, spec: Spec, project_root: str | None,
+) -> TierDAG:
+    """Strictly decode a plan a model authored in this run; canonicalize its scope.
+
+    Single-track planning canonicalizes scope paths while Assay parses the
+    Planner reply. A competition draft and a proposed synthesis are decoded
+    here instead, so Assay's rule runs here, on ``files_in_scope`` and
+    ``creates_paths``, against the absolute ``project_root`` and never the
+    process working directory. ``None`` proves no same-named directory, so a
+    leading project/submodule-name segment is always removed.
+
+    Use this only where model output becomes a plan. The rule is not
+    idempotent: an operator candidate and stored plan bytes keep their content
+    and digest through ``_decode_dag``. A synthesis is new model text, so a
+    path it copies from a judged candidate is canonicalized again.
+    """
+    dag = _decode_dag(raw)
+    context = spec.project_context
+    prefix = context.submodule_path or context.project or ""
+
+    def canonical(slice_id: str, paths: tuple[str, ...]) -> tuple[str, ...]:
+        result = []
+        for written in paths:
+            path = _canonicalize_scope_path(written, prefix, project_root)
+            if not path:
+                # The closed candidate schema has no empty scope path.
+                raise ValueError(
+                    f"slice {slice_id!r} scope path {written!r} is empty after "
+                    "canonicalization"
+                )
+            result.append(path)
+        return tuple(result)
+
+    return replace(dag, tiers=tuple(
+        replace(tier, slices=tuple(
+            replace(slice_, directive=replace(
+                slice_.directive,
+                files_in_scope=canonical(slice_.id, slice_.directive.files_in_scope),
+                creates_paths=canonical(slice_.id, slice_.directive.creates_paths),
+            ))
+            for slice_ in tier.slices
+        ))
+        for tier in dag.tiers
+    ))
 
 
 def _candidate_payload(candidate: PlanSelectionCandidate) -> dict[str, Any]:
@@ -169,6 +220,8 @@ def _json_range(payload: Any, path: tuple[str | int, ...]) -> tuple[int, int]:
 def _parse_selection(
     verdict: Verdict,
     *,
+    spec: Spec,
+    project_root: str | None,
     source_spec_hash: str,
     bundle_ref: str,
     candidates: dict[str, PlanSelectionCandidate],
@@ -226,7 +279,9 @@ def _parse_selection(
     elif mode == "synthesize":
         if payload["selected_id"] is not None or payload["selected_digest"] is not None:
             raise ValueError("synthesis must not select a candidate identity")
-        dag = _decode_dag(serialize(payload["synthesized_dag"]))
+        dag = _decode_authored_dag(
+            serialize(payload["synthesized_dag"]), spec, project_root,
+        )
     elif mode == "none":
         if any(payload[key] is not None for key in (
             "selected_id", "selected_digest", "synthesized_dag",
@@ -253,12 +308,18 @@ def select_plan_candidate(
     corpus: Corpus,
     budget_usd: float | None = None,
     max_turns: int = 5,
+    project_root: str | None = None,
 ) -> PlanSelectionResult:
     """Return an exact reviewed candidate or an unaccepted synthesis proposal.
 
     The caller owns a separate selector backend/session and must give every
     synthesized DAG fresh fixed-candidate Critic/Judge and deterministic/source
     gates. This helper writes evidence only; it never updates the Corpus Spec.
+
+    ``project_root`` is the existing absolute directory a proposed synthesis's
+    scope paths are canonicalized against, as for a draft; ``None`` always
+    removes a leading project/submodule-name segment. An invalid root raises
+    before any selector call.
     """
 
     if not isinstance(spec, Spec):
@@ -270,6 +331,7 @@ def select_plan_candidate(
         or not math.isfinite(budget_usd) or budget_usd < 0
     ):
         raise ValueError("budget_usd must be finite and nonnegative")
+    project_root = _validated_project_root(project_root)
     payloads = [_candidate_payload(candidate) for candidate in candidates]
     by_id = {candidate.id: candidate for candidate in candidates}
     if len(by_id) != len(candidates):
@@ -320,7 +382,8 @@ def select_plan_candidate(
     def response_errors(verdict: Verdict) -> tuple[str, ...]:
         try:
             _parse_selection(
-                verdict, source_spec_hash=source_spec_hash,
+                verdict, spec=spec, project_root=project_root,
+                source_spec_hash=source_spec_hash,
                 bundle_ref=bundle_ref, candidates=by_id,
                 required_evidence=required_evidence,
             )
@@ -369,7 +432,8 @@ def select_plan_candidate(
             ):
                 raise ValueError("selector execution evidence is incomplete")
             response, dag = _parse_selection(
-                verdict, source_spec_hash=source_spec_hash,
+                verdict, spec=spec, project_root=project_root,
+                source_spec_hash=source_spec_hash,
                 bundle_ref=bundle_ref, candidates=by_id,
                 required_evidence=required_evidence,
             )

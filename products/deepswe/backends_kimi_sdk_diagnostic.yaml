@@ -7,17 +7,43 @@
 # bounded frontier qualification. It is not E12 Arm C, cannot produce
 # promotion evidence, and does not relax the default KIM-03 writer gate.
 # Source ~/.config/crucible/env before loading it.
+#
+# Observed on 2026-11-18 for kimi-k3.1-pro: Moonshot's streamed final usage
+# omits prompt_tokens_details.cached_tokens when nothing was read from cache,
+# with or without a cache write, and sends it on a cache hit. No acceptance
+# follows from that observation: strict accounting rejects a reply without
+# the counter after it was billed (counter_missing, field R), and a missing
+# counter is never read as zero.
+#
+# Every role therefore carries extra.diagnostic_cost_upper_bound: true, the
+# adapter half of the cost upper-bound policy
+# kimi-k3.1-pro-cache-read-upper-bound-v1. Routing admits it only with this
+# exact model, effort max, feature_admission: diagnostic, the public Moonshot
+# endpoint and worker_source: project_locked. A run returns a result only
+# when it also passes
+#   --backend-limit-mode diagnostic --backend-limit-deadline-seconds <seconds>
+#   --diagnostic-cost-policy kimi-k3.1-pro-cache-read-upper-bound-v1
+#   --budget-usd <finite positive amount>
+# and, for crucible deepswe, --planner-count 1 with exactly one fresh task
+# (no --rerun, no --rerun-status). Diagnostic limits without the policy are
+# refused when the backend is bound, before any provider request; without a
+# limit mode the adapter refuses an invocation that has no finite positive
+# budget, and a budgeted reply whose read count is missing is recorded as
+# incomplete accounting, which authorizes no further paid work. A result is
+# a cost interval: diagnostic, never rankable or promotable.
 
 schema_version: crucible.backend-routing.v1
 
 default:
   backend: kimi
-  model: kimi-k2.7-code-highspeed
+  model: kimi-k3.1-pro
+  effort: max
   base_url: ${KIMI_BASE_URL}
   api_key: ${MOONSHOT_API_KEY}
   feature_admission: diagnostic
   extra:
     diagnostic_workspace_write: true
+    diagnostic_cost_upper_bound: true
     worker_source: project_locked
 
 roles:
@@ -29,102 +55,124 @@ roles:
       max_response_tokens: 16384
   architect_planner:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
       max_response_tokens: 16384
   implementer:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
       timeout_seconds: 1200
   architect_critic:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   architect_judge:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   breach_defender:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   impl_breaker:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   breach_judge:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   diff_scope:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   tier_completeness:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   api_contract_fidelity:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked
   review_conflict_authority:
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
+    effort: max
     base_url: ${KIMI_BASE_URL}
     api_key: ${MOONSHOT_API_KEY}
     feature_admission: diagnostic
     extra:
       diagnostic_workspace_write: true
+      diagnostic_cost_upper_bound: true
       worker_source: project_locked

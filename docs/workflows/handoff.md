@@ -30,6 +30,15 @@ so account for their total before execution.
 The summary reports each Implementation and its `diff_ref`; subsequent Breach
 or Review can consume that exact artifact. Failed targets remain pending.
 Scope capture, journal recovery, and cleanup must complete before publication.
+A working-tree delta Git cannot capture ends the run as `setup_error` before
+anything is recorded for that target. The out-of-scope report captures the
+whole tree, so an uncapturable entry outside the slice scope also stops the
+run. Targets recorded earlier in the same run keep their records; follow-on
+gates and landing do not run. The `--land` re-check differs: a recorded
+candidate Git can no longer capture blocks landing (exit 1), and its target
+row names the capture error. A scoped capture that lists a directory (an
+untracked nested repository) fails the target, because the diff cannot carry
+its content.
 
 ## Options
 
@@ -73,5 +82,5 @@ files; events, traces, and domain artifacts are conditional. Source:
 | rc | Meaning |
 |----|---------|
 | 0  | all targets recorded (or previewed under `--dry-run`) |
-| 1  | a target failed — empty diff without `--allow-empty`, verification failure, or optional-gate/accounting failure |
-| 2  | missing Spec, unknown/missing target, Spec without a `tier_dag`, or mutation-recovery setup failure |
+| 1  | a target failed — empty diff without `--allow-empty`, a directory entry in the scoped capture, verification failure, or optional-gate/accounting failure |
+| 2  | missing Spec, unknown/missing target, Spec without a `tier_dag`, mutation-recovery setup failure, or a working-tree delta Git could not capture before recording |

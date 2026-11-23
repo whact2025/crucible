@@ -1,93 +1,108 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-# Diagnostic local-alias route for an operator-served exact GLM-5.2 model.
+# Diagnostic local-alias route for an operator-served exact GLM-5.3 model.
 #
 # This file invents neither an endpoint nor a price. The operator must set
 # CRUCIBLE_LOCAL_URL to the OpenAI-compatible loopback/private endpoint that
-# truthfully serves the exact model below. GLM-5.2 already has an explicit
-# reviewed zero-rate pricing entry. The served-model pin fails closed if that
-# endpoint returns another identity. The generic local feature profile remains
+# truthfully serves GLM-5.3 (open weights zai-org/GLM-5.3) under the exact
+# served-model name below. A server reports that name only when it is
+# configured to (vLLM: --served-model-name; without it vLLM reports
+# zai-org/GLM-5.3), and the served-model pin fails closed if the endpoint
+# returns another identity. The pin proves only what the server reports:
+# SGLang does not validate the requested model name. The id has an explicit
+# zero-rate pricing entry. The generic local feature profile remains
 # diagnostic and cannot produce promotion evidence.
+#
+# Server requirements this route depends on; the profile installs and starts
+# nothing. Tool calls must arrive as structured `tool_calls` and reasoning in
+# a separate field (vLLM: --tool-call-parser glm47 --enable-auto-tool-choice
+# --reasoning-parser glm47). The vLLM recipe for zai-org/GLM-5.3 requires
+# vLLM >= 0.29.0 and Transformers >= 5.15.0. GLM-5.3 always reasons, so
+# max_tokens below is shared by reasoning and the answer. The weights are
+# under the GLM-5.3 License, not MIT. Checked 2026-11-18 against
+# https://recipes.vllm.ai/zai-org/GLM-5.3.md ,
+# https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.3.md and
+# https://huggingface.co/zai-org/GLM-5.3 .
 
 schema_version: crucible.backend-routing.v1
 
 default:
   backend: local
-  model: nvidia/zai-org/glm-5.2
+  model: nvidia/zai-org/glm-5.3
   base_url: ${CRUCIBLE_LOCAL_URL}
   feature_admission: diagnostic
   extra:
-    expected_served_model: nvidia/zai-org/glm-5.2
+    expected_served_model: nvidia/zai-org/glm-5.3
     max_tokens: 16384
 
 roles:
   architect_planner:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   architect_critic:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   architect_judge:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   implementer:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   breach_defender:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   swebench_impl_breaker:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   breach_judge:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   diff_scope:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   tier_completeness:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:
       max_tokens: 16384
   review_conflict_authority:
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     base_url: ${CRUCIBLE_LOCAL_URL}
     feature_admission: diagnostic
     extra:

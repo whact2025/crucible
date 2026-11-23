@@ -2815,6 +2815,13 @@ def test_journal_rejects_and_rewinds_model_authored_commit(tmp_path: Path):
             False,
         ),
         (
+            "smoke_unavailable",
+            False,
+            "# baseline a.py\n",
+            "mutation_journals_recovered",
+            False,
+        ),
+        (
             "hard_fail_missing_declared_test_mutation",
             False,
             "# baseline a.py\n",

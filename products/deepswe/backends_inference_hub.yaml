@@ -5,10 +5,18 @@
 # transport.  This is an explicit opt-in profile; omitting --backend-config
 # retains Crucible's built-in Codex default.
 #
-# Every DeepSWE comparison role explicitly pins the same GLM-5.2 route, and
-# `expected_served_model` rejects response-identity drift. The model's pricing
-# entry is intentionally zero-rate, while token/call telemetry is still
-# recorded. Keep the secret outside the repository:
+# Every DeepSWE comparison role explicitly pins the same GLM-5.3 route, and
+# `expected_served_model` rejects response-identity drift. On 2026-11-18 the
+# hub listed this id and answered one-line requests for it through
+# `OpenAIBackend` under this model name (text, a strict `json_schema`
+# response, a tool loop with the constrained finalization, a required write
+# turn). That is a transport observation, not a qualification: the route
+# carries the generic OpenAI-compatible feature profile. The model's pricing
+# entry is zero-rate, carried over from the GLM-5.2 row (no per-token charge
+# has been verified for this id; on 2026-11-18 the hub's model information
+# reported a non-zero cost per token for it, so the zero may understate),
+# while token/call telemetry is still recorded. Keep the secret outside the
+# repository:
 #
 #   export INFER_AUTH_TOKEN=...
 #   crucible deepswe --backend-config \
@@ -20,75 +28,75 @@ default:
   backend: openai_compat
   base_url: ${INFER_BASE_URL}
   api_key: ${INFER_AUTH_TOKEN}
-  model: nvidia/zai-org/glm-5.2
+  model: nvidia/zai-org/glm-5.3
   feature_admission: diagnostic
   extra:
-    expected_served_model: nvidia/zai-org/glm-5.2
+    expected_served_model: nvidia/zai-org/glm-5.3
 
 roles:
   architect_planner:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   architect_critic:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   architect_judge:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   implementer:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   breach_defender:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   impl_breaker:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   breach_judge:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   diff_scope:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   tier_completeness:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   api_contract_fidelity:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic
   review_conflict_authority:
     backend: openai_compat
     base_url: ${INFER_BASE_URL}
     api_key: ${INFER_AUTH_TOKEN}
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     feature_admission: diagnostic

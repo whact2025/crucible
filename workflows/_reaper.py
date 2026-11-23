@@ -304,6 +304,7 @@ def _is_failure_class(classification: str) -> bool:
         "dev_verify_unavailable",
         "partial",
         "runner_missing",
+        "smoke_unavailable",
         "verify_failed",
     }
 

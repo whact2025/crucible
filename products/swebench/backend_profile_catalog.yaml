@@ -67,7 +67,7 @@ profiles:
   deepseek_responses_diagnostic:
     routing: backends_deepseek_diagnostic.yaml
     backend: deepseek
-    model: deepseek-v4-flash
+    model: deepseek-flash
     transport: native_responses
     feature_admission: diagnostic
     availability: diagnostic
@@ -77,7 +77,7 @@ profiles:
   kimi_sdk:
     routing: backends_kimi_sdk.yaml
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
     transport: kimi_agent_sdk
     feature_admission: enforce
     availability: blocked
@@ -87,47 +87,47 @@ profiles:
   kimi_sdk_diagnostic:
     routing: backends_kimi_sdk_diagnostic.yaml
     backend: kimi
-    model: kimi-k2.7-code-highspeed
+    model: kimi-k3.1-pro
     transport: kimi_agent_sdk
     feature_admission: diagnostic
     availability: diagnostic
     runtime_binding: project_locked
     promotion_evidence: false
 
-  kimi_k3_sdk_diagnostic:
-    routing: backends_kimi_k3_sdk_diagnostic.yaml
+  kimi_k31_pro_sdk_diagnostic:
+    routing: backends_kimi_k31_pro_sdk_diagnostic.yaml
     backend: kimi
-    model: kimi-k3
+    model: kimi-k3.1-pro
     transport: kimi_agent_sdk
     feature_admission: diagnostic
     availability: diagnostic
     runtime_binding: project_locked
     promotion_evidence: false
 
-  openai_glm52_diagnostic:
+  openai_glm53_diagnostic:
     routing: backends_inference_hub.yaml
     backend: openai_compat
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     transport: openai_chat_completions
     feature_admission: diagnostic
     availability: diagnostic
     runtime_binding: configured_endpoint
     promotion_evidence: false
 
-  openai_kimi26_diagnostic:
+  openai_kimi_k31_pro_diagnostic:
     routing: backends_kimi_inference.yaml
     backend: openai_compat
-    model: nvidia/moonshotai/kimi-k2.6
+    model: nvidia/moonshotai/kimi-k3.1-pro
     transport: openai_chat_completions
     feature_admission: diagnostic
     availability: diagnostic
     runtime_binding: configured_endpoint
     promotion_evidence: false
 
-  local_glm52_diagnostic:
-    routing: backends_local_glm52_diagnostic.yaml
+  local_glm53_diagnostic:
+    routing: backends_local_glm53_diagnostic.yaml
     backend: local
-    model: nvidia/zai-org/glm-5.2
+    model: nvidia/zai-org/glm-5.3
     transport: openai_chat_completions
     feature_admission: diagnostic
     availability: diagnostic

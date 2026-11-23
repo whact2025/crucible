@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Whact Inc.
 # SPDX-License-Identifier: MIT
 
-"""Explicit K3 diagnostic budget policy; never exact billing authority."""
+"""Explicit Kimi K3.1 Pro diagnostic budget policy; never exact billing authority."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from assay import UsageCostBounds
 from .pricing import DEFAULT_PRICING
 
 
-DIAGNOSTIC_COST_POLICY = "kimi-k3-cache-read-upper-bound-v1"
+DIAGNOSTIC_COST_POLICY = "kimi-k3.1-pro-cache-read-upper-bound-v1"
+# The one exact model whose rate card the policy replays.
+DIAGNOSTIC_COST_MODEL = "kimi-k3.1-pro"
 EXACT_COST_BOUND_POLICY = "observed-exact-cost-v1"
 
 
@@ -38,7 +40,7 @@ def valid_diagnostic_cost_bounds(usage: Any, bounds: UsageCostBounds | None = No
             segment.input_tokens - segment.cache_creation_tokens
             if known_read is None else known_read
         )
-        pricing = DEFAULT_PRICING["kimi-k3"]
+        pricing = DEFAULT_PRICING[DIAGNOSTIC_COST_MODEL]
         lower = pricing.compute_cost(
             input_tokens=segment.input_tokens, output_tokens=segment.output_tokens,
             cache_creation_tokens=segment.cache_creation_tokens,

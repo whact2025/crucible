@@ -58,7 +58,7 @@ def test_legacy_mode_is_unmodified():
 
 def _costs():
     costs = CostAccumulator(max_cost_usd=1, diagnostic_cost_policy=DIAGNOSTIC_COST_POLICY)
-    costs.record(role="planner", usage=_bound_result().usage, backend_name="kimi", model="kimi-k3")
+    costs.record(role="planner", usage=_bound_result().usage, backend_name="kimi", model="kimi-k3.1-pro")
     return costs
 
 
@@ -160,7 +160,7 @@ def test_development_budget_debits_upper_without_erasing_unknown_actuals():
 
 class _DiagnosticWriter:
     name = "kimi"
-    model = "kimi-k3"
+    model = "kimi-k3.1-pro"
 
     def __init__(self, *, known_read=False, incomplete_terminal=False):
         self.repo = None
@@ -333,7 +333,7 @@ def test_diagnostic_breach_child_bound_receipt_reaches_tier_without_landing(tmp_
 
     class Breaker:
         name = "kimi"
-        model = "kimi-k3"
+        model = "kimi-k3.1-pro"
         calls = 0
 
         def invoke(self, invocation):

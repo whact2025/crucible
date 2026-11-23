@@ -9,7 +9,7 @@ Pins:
   output portions sum correctly from absolute per-MTok rates).
 - YAML override discovery + merge semantics.
 - ``lookup_pricing_for_role`` routing → model → pricing lookup.
-- Explicit zero-cost routes and fail-closed unknown models.
+- Declared zero-rate rows and fail-closed unknown models.
 """
 
 from __future__ import annotations
@@ -54,8 +54,10 @@ def test_default_pricing_covers_known_models():
         "claude-opus-4-8", "claude-sonnet-4-6",
         "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol",
         "gpt-6-astra",
-        "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k3",
-        "nvidia/zai-org/glm-5.2",
+        "kimi-k3.1-pro",
+        "deepseek-flash",
+        "nvidia/zai-org/glm-5.3",
+        "nvidia/moonshotai/kimi-k3.1-pro",
     }
     missing = expected_models - set(DEFAULT_PRICING.keys())
     assert not missing, f"DEFAULT_PRICING missing: {missing}"
@@ -216,40 +218,14 @@ def test_gpt_5_5_has_no_separate_cache_write_premium():
     ) == pytest.approx(5.00)
 
 
-def test_moonshot_kimi_k27_standard_pricing_rates():
-    pricing = DEFAULT_PRICING["kimi-k2.7-code"]
-
-    assert pricing.input_per_mtok == pytest.approx(0.95)
-    assert pricing.output_per_mtok == pytest.approx(4.00)
-    assert pricing.cache_read_per_mtok == pytest.approx(0.19)
-    assert pricing.cache_write_per_mtok is None
-    assert pricing.compute_cost(
-        input_tokens=2_000_000,
-        output_tokens=1_000_000,
-        cache_read_tokens=1_000_000,
-    ) == pytest.approx(5.14)
-
-
-def test_moonshot_kimi_k27_highspeed_pricing_rates():
-    pricing = DEFAULT_PRICING["kimi-k2.7-code-highspeed"]
-
-    assert pricing.input_per_mtok == pytest.approx(1.90)
-    assert pricing.output_per_mtok == pytest.approx(8.00)
-    assert pricing.cache_read_per_mtok == pytest.approx(0.38)
-    assert pricing.cache_write_per_mtok is None
-    assert pricing.compute_cost(
-        input_tokens=2_000_000,
-        output_tokens=1_000_000,
-        cache_read_tokens=1_000_000,
-    ) == pytest.approx(10.28)
-
-
-def test_moonshot_kimi_k3_five_minute_cache_pricing():
-    pricing = DEFAULT_PRICING["kimi-k3"]
-    assert pricing.input_per_mtok == 3.00
-    assert pricing.output_per_mtok == 15.00
-    assert pricing.cache_write_per_mtok == 3.00
-    assert pricing.cache_read_per_mtok == 0.30
+def test_moonshot_kimi_k31_pro_five_minute_cache_pricing():
+    pricing = DEFAULT_PRICING["kimi-k3.1-pro"]
+    assert pricing.input_per_mtok == 2.00
+    assert pricing.output_per_mtok == 10.00
+    assert pricing.cache_write_per_mtok == 2.00
+    assert pricing.cache_read_per_mtok == 0.20
+    # Flat pay-as-you-go pricing: no tiering by context length.
+    assert pricing.long_context_threshold_tokens is None
     # Total input includes both cached subsets. Only one million of these
     # three million prompt tokens are uncached; no double subtraction.
     assert pricing.compute_cost(
@@ -257,7 +233,39 @@ def test_moonshot_kimi_k3_five_minute_cache_pricing():
         output_tokens=1_000_000,
         cache_creation_tokens=1_000_000,
         cache_read_tokens=1_000_000,
-    ) == pytest.approx(21.30)
+    ) == pytest.approx(14.20)
+    # Ids the dedicated route does not admit keep no price row, so an
+    # unpriced id fails closed: the retired ones and the current
+    # kimi-k3.1-pro-highspeed.
+    for unadmitted in (
+        "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k3",
+        "kimi-k3.1-pro-highspeed",
+    ):
+        assert unadmitted not in DEFAULT_PRICING
+
+
+def test_deepseek_flash_row_is_the_published_peak_ceiling():
+    pricing = DEFAULT_PRICING["deepseek-flash"]
+    # DeepSeek bills by time of day and this table has no time dimension, so
+    # the row holds the published peak rates.
+    assert pricing.input_per_mtok == 0.30
+    assert pricing.output_per_mtok == 1.20
+    assert pricing.cache_read_per_mtok == 0.006
+    # No cache-write rate is published; such tokens bill as ordinary input.
+    assert pricing.cache_write_per_mtok is None
+    assert pricing.long_context_threshold_tokens is None
+    peak_cost = pricing.compute_cost(
+        input_tokens=2_000_000,
+        output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+    )
+    assert peak_cost == pytest.approx(1.506)
+    # Off-peak every published rate is half the peak rate ($0.15 input,
+    # $0.003 cache hit, $0.60 output per MTok): the row never understates.
+    off_peak_charge = 0.15 + 0.003 + 0.60
+    assert peak_cost == pytest.approx(2 * off_peak_charge)
+    # The retired request name keeps no price row: an unpriced id fails closed.
+    assert "deepseek-v4-flash" not in DEFAULT_PRICING
 
 
 def test_latest_verified_at_is_a_date():
@@ -411,14 +419,34 @@ def test_compute_cost_placeholder_model_fails_closed(model):
         compute_cost(model, input_tokens=1000, output_tokens=1000)
 
 
-def test_compute_cost_glm_5_2_profile_is_free():
+@pytest.mark.parametrize(
+    "model",
+    ["nvidia/zai-org/glm-5.3", "nvidia/moonshotai/kimi-k3.1-pro"],
+)
+def test_compute_cost_inference_hub_rows_are_declared_zero_rate(model):
+    """Pins the rate the table declares, not what the hub charges.
+
+    Both rows are explicit zeros that are unverified for these ids (see the
+    row comment in ``backends/pricing.py``).
+    """
     assert compute_cost(
-        "nvidia/zai-org/glm-5.2",
+        model,
         input_tokens=3_000_000,
         output_tokens=1_000_000,
         cache_creation_tokens=1_000_000,
         cache_read_tokens=1_000_000,
     ) == 0.0
+
+
+@pytest.mark.parametrize(
+    "retired",
+    ["nvidia/zai-org/glm-5.2", "nvidia/moonshotai/kimi-k2.6"],
+)
+def test_retired_inference_hub_ids_have_no_price_row(retired, monkeypatch):
+    monkeypatch.delenv("CRUCIBLE_PRICING_CONFIG", raising=False)
+    assert retired not in DEFAULT_PRICING
+    with pytest.raises(PricingConfigurationError, match="no pricing entry"):
+        compute_cost(retired, input_tokens=1, output_tokens=1)
 
 
 # ----------------------------------------------------------------------

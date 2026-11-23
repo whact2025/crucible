@@ -22,10 +22,15 @@ installed worker and binds its exact fingerprint into a new routing file.
 Construction does not silently bless whichever environment is currently present.
 
 The route uses its exact configured Flash model and Responses endpoint with
-streaming and client-side tools. Credentials enter only the authorized
-invocation's private input channel. They never enter process arguments, worker
-probe/SBOM output, or retained diagnostics. Stateless continuation is bounded
-and transient; raw reasoning is not copied into public artifacts or tool output.
+streaming and client-side tools. The request alias is `deepseek-flash`; the
+vendor moves it between snapshots without an id change, so the adapter attests
+the returned alias, not a snapshot. Cost is recorded at the vendor's
+published peak rate: it equals the charge at peak and is twice the charge
+off-peak, an upper bound of the amount billed. Credentials enter only the
+authorized invocation's private input channel. They never enter process
+arguments, worker probe/SBOM output, or retained diagnostics. Stateless
+continuation is bounded and transient; raw reasoning is not copied into public
+artifacts or tool output.
 
 The Linux supervisor proves descendant-empty settlement. Installed dependencies
 must match the reviewed lock inventory. Diagnostic workspace-write opt-ins stay

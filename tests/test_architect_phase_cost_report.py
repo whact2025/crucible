@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from assay import ExecutionCompleteness, ReviewCoverage, Usage, UsageCostBounds, UsageCostBoundSegment, Verdict
-from crucible.backends.cost_bounds import DIAGNOSTIC_COST_POLICY
+from crucible.backends.cost_bounds import DIAGNOSTIC_COST_MODEL, DIAGNOSTIC_COST_POLICY
 from crucible.backends.pricing import DEFAULT_PRICING
 from crucible.common.cost import CostAccumulator
 from crucible.workflows._diagnostic_cost import diagnostic_summary_bounds
@@ -22,7 +22,7 @@ from crucible.workflows.architect import _authoritative_cost_summary
 def _usage(counters):
     segments = []
     for prompt, output, write, read in counters:
-        pricing = DEFAULT_PRICING["kimi-k3"]
+        pricing = DEFAULT_PRICING[DIAGNOSTIC_COST_MODEL]
         segments.append(UsageCostBoundSegment(
             input_tokens=prompt, output_tokens=output,
             cache_creation_tokens=write, cache_read_tokens=read,
@@ -51,6 +51,9 @@ def _ledgers():
     planning = CostAccumulator(max_cost_usd=4.8, diagnostic_cost_policy=DIAGNOSTIC_COST_POLICY)
     # Numeric-only replay of the two rejected pilot planner calls (5 + 1
     # generation segments), with no retained response or task material.
+    # The token counters were recorded with kimi-k3; the dollar values below
+    # replay them at the current kimi-k3.1-pro rate card. They exercise the
+    # bound arithmetic and were never incurred as cost.
     for counters in (
         ((4488, 216, 4352, None), (5187, 177, 768, 4352),
          (7936, 259, 2816, 5120), (10052, 369, 2048, 7936),
@@ -58,7 +61,7 @@ def _ledgers():
         ((6186, 2843, 2816, 3328),),
     ):
         planning.record(role="architect_planner", usage=_usage(counters),
-                        backend_name="kimi", model="kimi-k3")
+                        backend_name="kimi", model=DIAGNOSTIC_COST_MODEL)
     records = CostAccumulator(diagnostic_cost_policy=DIAGNOSTIC_COST_POLICY)
     for _ in range(2):
         records.record(
@@ -97,10 +100,10 @@ def test_early_rejected_plan_retains_validated_phase_bounds_only():
     assert bounds == diagnostic_summary_bounds(evidence, policy=DIAGNOSTIC_COST_POLICY)
     assert [len(call["cost_bounds"]["segments"]) for call in evidence["cost_bounds_by_call"]] == [5, 1]
     assert bounds.segments[0].cache_read_tokens is None
-    assert evidence["cost_lower_bound_usd"] == pytest.approx(.1455708)
-    assert evidence["cost_upper_bound_usd"] == pytest.approx(.145938)
-    assert evidence["budget_cost_usd"] == pytest.approx(.145938)
-    assert evidence["cost_bounds_by_call"][0]["budget_debit_usd"] == pytest.approx(.0937206)
+    assert evidence["cost_lower_bound_usd"] == pytest.approx(.0970472)
+    assert evidence["cost_upper_bound_usd"] == pytest.approx(.097292)
+    assert evidence["budget_cost_usd"] == pytest.approx(.097292)
+    assert evidence["cost_bounds_by_call"][0]["budget_debit_usd"] == pytest.approx(.0624804)
     assert evidence["actual_cost_usd"] is None
     assert evidence["accounting_debt"] is True
     assert evidence["by_role"]["architect_planner"]["calls"] == 2
@@ -116,7 +119,7 @@ def test_early_rejected_plan_retains_validated_phase_bounds_only():
     assert summary["promotion_evidence"] is False
     assert diagnostic_summary_bounds(summary, policy=DIAGNOSTIC_COST_POLICY) is None
     # Reporting does not mutate even the active phase accumulator.
-    assert planning.remaining() == pytest.approx(4.8 - .145938)
+    assert planning.remaining() == pytest.approx(4.8 - .097292)
     assert records.to_dict() == original_records
     assert planning.to_dict() == original_planning
 

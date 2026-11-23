@@ -217,12 +217,19 @@ class PricingConfigurationError(ValueError):
 # Active comparison rates are verified against their first-party pricing
 # pages. Mythos 5.1 was added and Anthropic rates were rechecked on
 # 2026-09-13; retained model rates were last rechecked during the preceding
-# release reviews:
+# release reviews. On 2026-11-18 the Moonshot and DeepSeek rows were
+# re-verified against the pages below, and the NVIDIA Inference Hub ids
+# nvidia/zai-org/glm-5.3, nvidia/moonshotai/kimi-k3.1-pro,
+# nvidia/deepseek-ai/deepseek-v4-pro and nvidia/minimaxai/minimax-m2.7 were
+# re-read from the hub's model list (ids only; see the hub rows). That pass
+# did not cover the Anthropic or OpenAI rows, so LATEST_VERIFIED_AT is
+# unchanged:
 # - Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
 #   (canonical; the marketing page at claude.com/pricing redirects)
 # - OpenAI:    https://developers.openai.com/api/docs/pricing
 #              https://developers.openai.com/api/docs/guides/prompt-caching
-# - Moonshot:  https://www.kimi.com/resources/kimi-k2-7-code-pricing
+# - Moonshot:  https://platform.kimi.ai/docs/pricing/chat
+# - DeepSeek:  https://api-docs.deepseek.com/quick_start/pricing
 #
 # Bump LATEST_VERIFIED_AT above when re-auditing. Providers change
 # prices without API notification; treat anything older than ~3
@@ -447,41 +454,45 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
         input_per_mtok=5.00, output_per_mtok=30.00,
         cache_write_per_mtok=None, cache_read_per_mtok=0.50,
     ),
-    # Moonshot public API standard route. Cached input is a published read
-    # discount; no separate cache-write rate is published, so writes fall
-    # back to the ordinary uncached-input rate.
-    "kimi-k2.7-code": ModelPricing(
-        input_per_mtok=0.95, output_per_mtok=4.00,
-        cache_write_per_mtok=None, cache_read_per_mtok=0.19,
+    # Moonshot public API, K3.1 Pro. Verified 2026-11-18 against
+    # https://platform.kimi.ai/docs/pricing/chat and
+    # https://platform.kimi.ai/docs/guide/context-caching . The dedicated
+    # adapter explicitly binds implicit caching to a five-minute TTL, whose
+    # write rate equals ordinary input. One-hour writes cost $4 per MTok and
+    # are deliberately not admitted by that route. Pricing is flat (no
+    # long-context tier). Input is the inclusive prompt total; read/write
+    # counters are disjoint subsets.
+    "kimi-k3.1-pro": ModelPricing(
+        input_per_mtok=2.00, output_per_mtok=10.00,
+        cache_write_per_mtok=2.00, cache_read_per_mtok=0.20,
     ),
-    # Moonshot's distinct high-speed K2.7 Code route uses the same context
-    # and cache semantics at exactly twice the standard token rates.
-    "kimi-k2.7-code-highspeed": ModelPricing(
-        input_per_mtok=1.90, output_per_mtok=8.00,
-        cache_write_per_mtok=None, cache_read_per_mtok=0.38,
+    # DeepSeek public native Responses Flash route (``deepseek-flash``; the
+    # vendor's pricing page listed model version DeepSeek-V4.1-Flash-1017 for
+    # it). Verified 2026-11-18 against
+    # https://api-docs.deepseek.com/quick_start/pricing . DeepSeek bills by
+    # time of day. These are the PEAK rates (01:00-04:00 and 06:00-10:00 UTC,
+    # Monday-Friday, excluding Chinese public holidays); off-peak rates are
+    # exactly half ($0.15 input, $0.003 cache hit, $0.60 output). This table
+    # has no time dimension, so the row is a ceiling: computed cost equals the
+    # charge at peak and is twice the charge off-peak. At these published
+    # rates it never understates. Automatic-cache hits use the published hit
+    # rate; all non-hit input uses the cache-miss rate. No cache-write rate is
+    # published.
+    "deepseek-flash": ModelPricing(
+        input_per_mtok=0.30, output_per_mtok=1.20,
+        cache_write_per_mtok=None, cache_read_per_mtok=0.006,
     ),
-    # K3 public Moonshot route, verified 2026-09-24 against
-    # https://platform.kimi.ai/docs/guide/context-caching and
-    # https://www.kimi.com/en/blog/kimi-k3 . The dedicated adapter explicitly
-    # binds implicit caching to a five-minute TTL. One-hour writes cost $6
-    # per MTok and are deliberately not admitted by that route. Input is the
-    # inclusive prompt total; read/write counters are disjoint subsets.
-    "kimi-k3": ModelPricing(
-        input_per_mtok=3.00, output_per_mtok=15.00,
-        cache_write_per_mtok=3.00, cache_read_per_mtok=0.30,
-    ),
-    # DeepSeek public native Responses Flash route. Automatic-cache hits use
-    # the published discount; all non-hit input uses the cache-miss rate.
-    # No peak-hours multiplier was published in the DSK-00a freeze.
-    "deepseek-v4-flash": ModelPricing(
-        input_per_mtok=0.14, output_per_mtok=0.28,
-        cache_write_per_mtok=None, cache_read_per_mtok=0.0028,
-    ),
-    # Explicit zero-cost routes. These hosted models currently publish no
-    # per-token charge to Crucible operators. Keeping them in the same table
-    # makes zero a reviewed configuration value rather than an unknown-model
-    # fallback. Operator-hosted local models must likewise declare a zero-rate
-    # entry in pricing.yaml.
+    # Declared zero-rate rows for NVIDIA Inference Hub ids. Keeping them in
+    # the same table makes zero an explicit configuration value rather than
+    # an unknown-model fallback; it is not evidence that the hub charges
+    # operators nothing. The release entered the rows directly below as
+    # hosted models that published no per-token charge to Crucible
+    # operators. The maintainer of these rows stated on 2026-11-19 that
+    # calls through the hub are not charged to the account the rows were
+    # entered for; no row cites a confirmation of that from the hub itself.
+    # The two successor rows after them have their own comment.
+    # Operator-hosted local models must likewise declare a zero-rate entry in
+    # pricing.yaml.
     "nvidia/nvidia/nemotron-3-super-v3": ModelPricing(
         input_per_mtok=0.0, output_per_mtok=0.0,
     ),
@@ -494,10 +505,23 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "nvidia/deepseek-ai/deepseek-v4-pro": ModelPricing(
         input_per_mtok=0.0, output_per_mtok=0.0,
     ),
-    "nvidia/moonshotai/kimi-k2.6": ModelPricing(
+    # Successors of the retired ``nvidia/moonshotai/kimi-k2.6`` and
+    # ``nvidia/zai-org/glm-5.2`` rows. The NVIDIA Inference Hub model list
+    # (https://inference-api.nvidia.com/v1/models) named both ids on
+    # 2026-11-18. On that date the hub's per-model information
+    # (https://inference-api.nvidia.com/model/info) listed 1.60 / 8.00 USD
+    # per million input / output tokens for nvidia/moonshotai/kimi-k3.1-pro
+    # and 1.40 / 4.40 for nvidia/zai-org/glm-5.3. The zero rate is kept on
+    # the maintainer's statement of 2026-11-19 that calls through the hub are
+    # not charged to the account these rows were entered for. It rests on
+    # that statement: it is not a vendor price and not a confirmation by the
+    # hub. An operator who is charged the listed prices declares them for
+    # both ids in pricing.yaml (an override replaces the row); otherwise
+    # budgets and cost reports understate.
+    "nvidia/moonshotai/kimi-k3.1-pro": ModelPricing(
         input_per_mtok=0.0, output_per_mtok=0.0,
     ),
-    "nvidia/zai-org/glm-5.2": ModelPricing(
+    "nvidia/zai-org/glm-5.3": ModelPricing(
         input_per_mtok=0.0, output_per_mtok=0.0,
     ),
 }

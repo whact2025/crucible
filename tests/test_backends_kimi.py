@@ -35,7 +35,7 @@ from crucible.backends.kimi import (
 )
 from crucible.backends.openai_compat import OpenAIBackend
 
-_MODEL = "kimi-k2.7-code-highspeed"
+_MODEL = "kimi-k3.1-pro"
 _BASE_URL = "https://api.moonshot.ai/v1"
 _TOKEN = "test-runtime-token-not-real"
 _HOSTILE_KIMI_PROVIDER_ENV = {
@@ -104,7 +104,14 @@ def _call_attached_mcp(
 
 
 class _ScriptedKimiEndpoint(http.server.BaseHTTPRequestHandler):
-    """Two-step OpenAI stream: tool call, then final answer."""
+    """Two-step OpenAI stream: tool call, then final answer.
+
+    The usage is synthetic. Both final packets carry an explicit
+    ``cached_tokens: 0`` so that strict accounting can accept them; Moonshot
+    was observed on 2026-11-18 to omit the counter when nothing was read from
+    cache. The recorded kimi-k3.1-pro shapes are pinned in
+    ``test_backends_kimi_k3_stream_contract.py``.
+    """
 
     server: Any
     protocol_version = "HTTP/1.1"
@@ -179,6 +186,10 @@ class _ScriptedKimiEndpoint(http.server.BaseHTTPRequestHandler):
                         "prompt_tokens": first_prompt_tokens,
                         "completion_tokens": 5,
                         "total_tokens": first_prompt_tokens + 5,
+                        "prompt_tokens_details": {
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                        },
                     },
                 },
             ]
@@ -241,6 +252,10 @@ class _ScriptedKimiEndpoint(http.server.BaseHTTPRequestHandler):
                         "prompt_tokens": 30,
                         "completion_tokens": 4,
                         "total_tokens": 34,
+                        "prompt_tokens_details": {
+                            "cached_tokens": 0,
+                            "cache_write_tokens": 0,
+                        },
                     },
                 },
             ]
@@ -377,18 +392,30 @@ def _native_usage_chunk(
     prompt_tokens: int = 13,
     completion_tokens: int = 4,
     cached_tokens: int = 2,
+    cache_write_tokens: int = 0,
+    model: str = _MODEL,
 ) -> dict[str, Any]:
+    """Return the K3-series final statistics packet (``choices: []``).
+
+    The counters are synthetic and ``cached_tokens`` is always present. An
+    explicit zero is a shape the provider was observed not to send
+    (2026-11-18: the counter is omitted when nothing was read from cache).
+    """
+
     return {
         "id": "chatcmpl-native-qualification",
         "object": "chat.completion.chunk",
         "created": 1,
-        "model": _MODEL,
+        "model": model,
         "choices": [],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
-            "cached_tokens": cached_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": cache_write_tokens,
+            },
         },
     }
 
@@ -419,13 +446,13 @@ from crucible_kimi_worker import __main__ as worker
 
 async def main():
     provider = Kimi(
-        model="kimi-k2.7-code-highspeed",
+        model=sys.argv[2],
         api_key="test-native-stream-token",
         base_url=sys.argv[1],
         stream=True,
     )
     provider.client = provider.client.with_options(max_retries=0)
-    worker._install_moonshot_stream_compat(provider)
+    worker._install_moonshot_stream_compat(provider, model=sys.argv[2])
     try:
         stream = await provider.generate("", [], [])
         parts = []
@@ -474,6 +501,7 @@ asyncio.run(main())
                 "-c",
                 script,
                 base_url,
+                _MODEL,
             ],
             capture_output=True,
             check=False,
@@ -599,8 +627,14 @@ def test_kimi_rejects_conversation_before_credentials_or_worker(
 @pytest.mark.parametrize(
     "model",
     [
+        # Retired route ids are refused outright: no alias, no fallback.
+        "kimi-k3",
+        "kimi-k2.7-code-highspeed",
         "kimi-k2.7-code",
-        "nvidia/moonshotai/kimi-k2.6",
+        # A current Moonshot id that this route does not admit.
+        "kimi-k3.1-pro-highspeed",
+        # The NVIDIA gateway id of the same model is another route.
+        "nvidia/moonshotai/kimi-k3.1-pro",
     ],
 )
 def test_kimi_backend_rejects_any_model_substitution(
@@ -759,11 +793,12 @@ def test_kimi_credentials_are_read_at_invocation_time_and_not_retained(
     assert result.usage.input_tokens == 15
     assert result.usage.output_tokens == 7
     assert result.usage.cost_usd == pytest.approx(
-        10 * 1.90 / 1_000_000
-        + 2 * 1.90 / 1_000_000
-        + 3 * 0.38 / 1_000_000
-        + 7 * 8.00 / 1_000_000
+        10 * 2.00 / 1_000_000
+        + 2 * 2.00 / 1_000_000
+        + 3 * 0.20 / 1_000_000
+        + 7 * 10.00 / 1_000_000
     )
+    assert result.usage.cost_usd == pytest.approx(0.0000946)
     assert result.completeness.complete is True
     assert [event.kind for event in result.execution_trace.events] == [
         "request",
@@ -773,7 +808,7 @@ def test_kimi_credentials_are_read_at_invocation_time_and_not_retained(
     assert result.execution_trace.backend == "kimi"
     assert result.execution_trace.requested_model == _MODEL
     assert result.execution_trace.served_model == _MODEL
-    assert result.execution_trace.requested_effort is None
+    assert result.execution_trace.requested_effort == "max"
     assert result.execution_trace.endpoint == _BASE_URL
 
     assert len(captured) == 1
@@ -811,7 +846,7 @@ def test_kimi_route_owned_max_response_tokens_reaches_plain_invoke(
 
 @pytest.mark.parametrize(
     "value",
-    [True, 0, -1, kimi_mod._MAX_CONTEXT_SIZE + 1],
+    [True, 0, -1, kimi_mod._MODEL_CONTEXT_SIZES[kimi_mod._MODEL] + 1],
 )
 def test_kimi_route_owned_max_response_tokens_is_closed(value: Any) -> None:
     with pytest.raises(ValueError, match="max_response_tokens"):
@@ -905,12 +940,13 @@ def test_kimi_legacy_infer_and_model_env_cannot_redirect_moonshot_route(
     ("configured_model", "served_model"),
     [
         (None, _MODEL),
-        ("kimi-k2.7-code", _MODEL),
-        ("kimi-k2.6", _MODEL),
+        # A sibling id is not proof of this invocation's model.
+        ("kimi-k3.1-pro-highspeed", _MODEL),
+        ("kimi-k3", _MODEL),
         (7, _MODEL),
         (_MODEL, None),
-        (_MODEL, "kimi-k2.7-code"),
-        (_MODEL, "kimi-k2.6"),
+        (_MODEL, "kimi-k3.1-pro-highspeed"),
+        (_MODEL, "kimi-k3"),
         (_MODEL, 7),
     ],
 )
@@ -1836,7 +1872,7 @@ def _worker_paths(root: Path) -> Any:
         ),
     ],
 )
-def test_kimi_k27_provider_requires_exact_native_generation_shape(
+def test_kimi_provider_requires_exact_native_generation_shape(
     qualifier: Any,
     error_type: type[Exception],
     field: str,
@@ -1872,7 +1908,7 @@ def test_kimi_k27_provider_requires_exact_native_generation_shape(
         ("Kimi", "kosong.contrib.chat_provider.openai_legacy"),
     ],
 )
-def test_kimi_k27_provider_requires_exact_native_type(
+def test_kimi_provider_requires_exact_native_type(
     qualifier: Any,
     error_type: type[Exception],
     provider_name: str,
@@ -1916,7 +1952,7 @@ def test_kimi_k27_provider_requires_exact_native_type(
         ("AsyncOpenAI", "openai", 2, None),
     ],
 )
-def test_kimi_k27_provider_requires_exact_native_http_client(
+def test_kimi_provider_requires_exact_native_http_client(
     qualifier: Any,
     error_type: type[Exception],
     client_name: str,
@@ -1951,7 +1987,7 @@ def test_kimi_k27_provider_requires_exact_native_http_client(
         ),
     ],
 )
-def test_kimi_k27_provider_fails_if_hidden_retries_remain_enabled(
+def test_kimi_provider_fails_if_hidden_retries_remain_enabled(
     qualifier: Any,
     error_type: type[Exception],
 ) -> None:
@@ -1978,7 +2014,7 @@ def test_kimi_k27_provider_fails_if_hidden_retries_remain_enabled(
         ),
     ],
 )
-def test_kimi_k27_provider_disables_unaccounted_auto_compaction(
+def test_kimi_provider_disables_unaccounted_auto_compaction(
     qualifier: Any,
     error_type: type[Exception],
 ) -> None:
@@ -2008,7 +2044,7 @@ def test_kimi_k27_provider_disables_unaccounted_auto_compaction(
         ),
     ],
 )
-def test_kimi_k27_provider_requires_exact_auto_compaction_boundary(
+def test_kimi_provider_requires_exact_auto_compaction_boundary(
     qualifier: Any,
     error_type: type[Exception],
 ) -> None:
@@ -2017,56 +2053,6 @@ def test_kimi_k27_provider_requires_exact_auto_compaction_boundary(
 
     with pytest.raises(error_type, match="unqualified compaction boundary"):
         qualifier(session, max_response_tokens=32_768)
-
-
-@pytest.mark.skipif(
-    not kimi_mod._DEFAULT_WORKER_PYTHON.is_file(),
-    reason="isolated Kimi worker environment is not installed",
-)
-def test_native_kimi_usage_maps_top_level_cached_tokens() -> None:
-    script = """
-import json
-from openai.types.completion_usage import CompletionUsage
-from kosong.chat_provider.kimi import KimiStreamedMessage
-
-native = CompletionUsage.model_validate({
-    "prompt_tokens": 20,
-    "completion_tokens": 5,
-    "total_tokens": 25,
-    "cached_tokens": 7,
-})
-message = object.__new__(KimiStreamedMessage)
-message._usage = native
-mapped = message.usage
-print(json.dumps({
-    "native_type": f"{type(native).__module__}.{type(native).__name__}",
-    "cached_tokens": native.cached_tokens,
-    "input": mapped.input,
-    "input_other": mapped.input_other,
-    "output": mapped.output,
-    "input_cache_read": mapped.input_cache_read,
-    "input_cache_creation": mapped.input_cache_creation,
-}, sort_keys=True))
-"""
-    completed = subprocess.run(
-        [str(kimi_mod._DEFAULT_WORKER_PYTHON), "-c", script],
-        capture_output=True,
-        check=False,
-        env=kimi_mod._worker_environment(),
-        text=True,
-        timeout=10.0,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {
-        "cached_tokens": 7,
-        "input": 20,
-        "input_cache_creation": 0,
-        "input_cache_read": 7,
-        "input_other": 13,
-        "native_type": "openai.types.completion_usage.CompletionUsage",
-        "output": 5,
-    }
 
 
 @pytest.mark.skipif(
@@ -2115,6 +2101,7 @@ def test_pinned_native_stream_keeps_interleaved_parallel_tool_calls_separate() -
                 }
             ),
             _native_chunk(finish_reason="tool_calls"),
+            _native_usage_chunk(),
         ]
     )
 
@@ -2137,6 +2124,13 @@ def test_pinned_native_stream_keeps_interleaved_parallel_tool_calls_separate() -
             },
         ],
         "served_model": _MODEL,
+        "usage": {
+            "input": 13,
+            "input_cache_creation": 0,
+            "input_cache_read": 2,
+            "input_other": 11,
+            "output": 4,
+        },
     }
     assert len(requests) == 1
     assert requests[0]["model"] == _MODEL
@@ -2152,6 +2146,7 @@ def test_pinned_native_stream_retains_length_finish_reason() -> None:
         [
             _native_chunk(delta={"content": "truncated visible response"}),
             _native_chunk(finish_reason="length"),
+            _native_usage_chunk(),
         ]
     )
 
@@ -2166,6 +2161,13 @@ def test_pinned_native_stream_retains_length_finish_reason() -> None:
             }
         ],
         "served_model": _MODEL,
+        "usage": {
+            "input": 13,
+            "input_cache_creation": 0,
+            "input_cache_read": 2,
+            "input_other": 11,
+            "output": 4,
+        },
     }
 
 
@@ -2294,6 +2296,9 @@ def test_pinned_native_stream_discards_partial_tool_on_nonstop_terminal(
                     }
                 ),
                 _native_chunk(finish_reason="tool_calls"),
+                # This rejection follows the stream, so the K3-series final
+                # statistics packet must have been accepted first.
+                _native_usage_chunk(),
             ],
             "sparse tool-call index set",
         ),
@@ -2350,12 +2355,13 @@ def test_pinned_native_stream_rejects_served_model_mismatch() -> None:
         [
             _native_chunk(
                 delta={"content": "untrusted response"},
-                model="kimi-k2.7-code-highspeed-substitute",
+                model=f"{_MODEL}-substitute",
             ),
             _native_chunk(
                 finish_reason="stop",
-                model="kimi-k2.7-code-highspeed-substitute",
+                model=f"{_MODEL}-substitute",
             ),
+            _native_usage_chunk(model=f"{_MODEL}-substitute"),
         ]
     )
 
@@ -2379,7 +2385,7 @@ def test_pinned_native_stream_rejects_served_model_mismatch() -> None:
     ],
 )
 @pytest.mark.parametrize("session_id", [None, "", "bad\nid", "s" * 257])
-def test_kimi_k27_provider_requires_bounded_session_cache_identity(
+def test_kimi_provider_requires_bounded_session_cache_identity(
     qualifier: Any,
     error_type: type[Exception],
     session_id: Any,
@@ -2442,7 +2448,7 @@ def test_kimi_preserves_ordinary_final_text_byte_for_byte(
         ),
     ],
 )
-def test_kimi_k27_fails_closed_on_any_visible_reasoning_marker(
+def test_kimi_fails_closed_on_any_visible_reasoning_marker(
     extractor: Any,
     error_type: type[Exception],
     text: str,
@@ -2673,7 +2679,11 @@ def test_kimi_session_uses_confined_prompt_only_sdk_surface(
     assert session.provider.thinking_effort is None
     assert session.provider._generation_kwargs == {
         "prompt_cache_key": session.id,
-        "max_tokens": 32_768,
+        "max_completion_tokens": 32_768,
+        "reasoning_effort": "max",
+        "extra_body": {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
+        },
     }
     assert [
         event["steps_used"] for event in emitted if event["type"] == "step_progress"
@@ -3128,7 +3138,11 @@ def test_kimi_session_runs_allowlisted_tool_and_returns_only_final_step(
     assert session.provider.thinking_effort is None
     assert session.provider._generation_kwargs == {
         "prompt_cache_key": session.id,
-        "max_tokens": 1_234,
+        "max_completion_tokens": 1_234,
+        "reasoning_effort": "max",
+        "extra_body": {
+            "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
+        },
     }
     assert [
         event["steps_used"] for event in emitted if event["type"] == "step_progress"
@@ -3666,7 +3680,7 @@ def test_max_steps_rejects_non_exact_accounting_boundary(
             "stop" if fault == "wrong_finish_reason" else "tool_calls"
         ),
         served_model=(
-            "kimi-k2.7-code-highspeed-substitute"
+            f"{_MODEL}-substitute"
             if fault == "wrong_served_model"
             else _MODEL
         ),
@@ -4506,14 +4520,14 @@ def test_deployed_subprocess_kills_term_ignoring_descendant_after_leader_exit(
         "    \"print(os.getpid(), flush=True);time.sleep(60)\",\n"
         "], stdout=subprocess.PIPE, text=True)\n"
         "child_pid = int(child.stdout.readline())\n"
-        "print(json.dumps({\"protocol\":\"crucible.kimi-worker.v6\","
+        "print(json.dumps({\"protocol\":\"crucible.kimi-worker.v7\","
         "\"type\":\"step_progress\",\"steps_used\":1}), flush=True)\n"
-        "print(json.dumps({\"protocol\":\"crucible.kimi-worker.v6\","
+        "print(json.dumps({\"protocol\":\"crucible.kimi-worker.v7\","
         "\"type\":\"usage\",\"input_tokens\":1,\"output_tokens\":1,"
         "\"cache_creation_tokens\":0,\"cache_read_tokens\":0,"
         "\"usage_valid\":True}), flush=True)\n"
         "print(json.dumps({\n"
-        "    \"protocol\":\"crucible.kimi-worker.v6\", \"type\":\"terminal\",\n"
+        "    \"protocol\":\"crucible.kimi-worker.v7\", \"type\":\"terminal\",\n"
         "    \"final_message\":str(child_pid), \"input_tokens\":1,\n"
         "    \"output_tokens\":1, \"cache_creation_tokens\":0,\n"
         "    \"cache_read_tokens\":0, \"usage_seen\":True, \"usage_valid\":True,\n"
@@ -4677,7 +4691,7 @@ def test_kimi_subprocess_protocol_keeps_secrets_out_of_argv_and_env(
         'artifact = pathlib.Path(request["root"]) / "secret-artifact"\n'
         "artifact.write_text(token)\n"
         "payload = {\n"
-        '  "protocol": "crucible.kimi-worker.v6",\n'
+        '  "protocol": "crucible.kimi-worker.v7",\n'
         '  "type": "terminal",\n'
         '  "final_message": json.dumps({"argv_clean": argv_clean, '
         '"env_clean": env_clean}),\n'
@@ -4699,9 +4713,9 @@ def test_kimi_subprocess_protocol_keeps_secrets_out_of_argv_and_env(
         '  "tool_events": [],\n'
         '  "cost_bound_segments": [],\n'
         "}\n"
-        'print(json.dumps({"protocol": "crucible.kimi-worker.v6", '
+        'print(json.dumps({"protocol": "crucible.kimi-worker.v7", '
         '"type": "step_progress", "steps_used": 1}), flush=True)\n'
-        'print(json.dumps({"protocol": "crucible.kimi-worker.v6", '
+        'print(json.dumps({"protocol": "crucible.kimi-worker.v7", '
         '"type": "usage", "input_tokens": 1, "output_tokens": 1, '
         '"cache_creation_tokens": 0, "cache_read_tokens": 0, '
         '"usage_valid": True}), flush=True)\n'
@@ -4836,7 +4850,7 @@ def _worker_request_payload(**overrides: Any) -> dict[str, Any]:
         "system": "system",
         "user": "user",
         "model": _MODEL,
-        "reasoning_effort": None,
+        "reasoning_effort": "max",
         "diagnostic_cost_upper_bound": False,
         "diagnostic_budget_usd": None,
         "schema_json": None,
@@ -4939,7 +4953,7 @@ def test_worker_request_rejects_oversized_inference_token() -> None:
 
 @pytest.mark.parametrize(
     "max_response_tokens",
-    [None, True, 0, -1, worker_mod._MAX_CONTEXT_SIZE + 1],
+    [None, True, 0, -1, worker_mod._MODEL_CONTEXT_SIZES[worker_mod._MODEL] + 1],
 )
 def test_worker_request_rejects_invalid_max_response_tokens(
     max_response_tokens: Any,
@@ -6328,10 +6342,16 @@ def test_real_worker_multistep_replays_reasoning_and_tool_result(
     assert toolset.calls == [("echo", {"value": "scripted-nonce"})]
     assert len(endpoint.requests) == 2
     first, second = endpoint.requests
-    assert first["max_tokens"] == 32_768
-    assert second["max_tokens"] == 32_768
-    assert "reasoning_effort" not in first
-    assert "reasoning_effort" not in second
+    for request in (first, second):
+        assert request["model"] == _MODEL
+        assert request["max_completion_tokens"] == 32_768
+        assert request["reasoning_effort"] == "max"
+        assert request["prompt_cache_options"] == {
+            "mode": "implicit",
+            "ttl": "5m",
+        }
+        assert "max_tokens" not in request
+        assert "thinking" not in request
     assert isinstance(first["prompt_cache_key"], str)
     assert first["prompt_cache_key"]
     assert second["prompt_cache_key"] == first["prompt_cache_key"]
@@ -6590,7 +6610,9 @@ def test_real_worker_fails_before_hidden_auto_compaction_inference(
         _ScriptedKimiEndpoint,
     )
     endpoint.requests = []
-    endpoint.first_prompt_tokens = 220_000
+    # CLI 1.12 compacts once context + 50,000 reserved tokens reaches the
+    # configured 1,048,576-token window.
+    endpoint.first_prompt_tokens = 1_000_000
     endpoint_thread = threading.Thread(
         target=endpoint.serve_forever,
         daemon=True,
@@ -6717,7 +6739,7 @@ def test_kimi_chat_with_tools_bounds_sdk_steps(
         backend.chat_with_tools(
             _invocation(),
             _ToolSet(),
-            max_response_tokens=kimi_mod._MAX_CONTEXT_SIZE + 1,
+            max_response_tokens=kimi_mod._MODEL_CONTEXT_SIZES[kimi_mod._MODEL] + 1,
         )
     backend.close()
 

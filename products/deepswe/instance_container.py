@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import selectors
 import shutil
 import subprocess
@@ -117,6 +118,11 @@ _STEP_TIMEOUT_SEC = 900
 _MIN_FREE_DISK_GB = 10.0
 _PIDS_LIMIT = 512
 _MAX_TMPFS_MB = 4096
+
+# A complete SHA-1 or SHA-256 object id, and the shortest prefix of one that
+# the dataset may pin instead (Git's own default abbreviation length).
+_FULL_COMMIT_ID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_ABBREVIATED_COMMIT_ID_RE = re.compile(r"[0-9a-f]{7,63}")
 
 
 class InstanceContainerSetupError(RuntimeError):
@@ -436,8 +442,12 @@ def populate_workspace_from_image(
     image_app_path: str = "/app",
     labels: Mapping[str, str] | None = None,
     register_container: ContainerRegistrationCallback | None = None,
-) -> None:
+) -> str:
     """Extract the image's baked workspace into a host directory.
+
+    Returns the full object id of the checkout's base commit. ``base_commit``
+    is the dataset pin, which a few tasks abbreviate; the returned id is the
+    one every later Git comparison binds.
 
     DeepSWE images ship with the repo cloned + checked out at
     ``base_commit_hash`` under ``/app``. The cascade's
@@ -520,7 +530,43 @@ def populate_workspace_from_image(
                 "may have been removed already",
                 throwaway_id[:12], e,
             )
-    _sanitize_workspace_history(host_workspace, base_commit=base_commit)
+    return _sanitize_workspace_history(host_workspace, base_commit=base_commit)
+
+
+def is_full_commit_id(value: object) -> bool:
+    """Whether ``value`` is one complete lowercase Git object id."""
+
+    return (
+        isinstance(value, str)
+        and _FULL_COMMIT_ID_RE.fullmatch(value) is not None
+    )
+
+
+def _resolve_base_commit(*, base_commit: str, head: str) -> str:
+    """Bind the dataset's base-commit pin to the checkout's full object id.
+
+    The pin is either the complete id or a lowercase hexadecimal prefix of
+    it. Only the observed ``HEAD`` is compared. Git is never asked to resolve
+    the pin: it resolves a ref name before an abbreviated object id, so a ref
+    that merely carries the pin's spelling could stand in for the commit.
+    """
+
+    if not is_full_commit_id(head):
+        raise InstanceContainerSetupError(
+            f"deepswe_container: image HEAD {head!r} is not a full Git "
+            "object id"
+        )
+    if base_commit != head and not (
+        isinstance(base_commit, str)
+        and _ABBREVIATED_COMMIT_ID_RE.fullmatch(base_commit) is not None
+        and len(base_commit) < len(head)
+        and head.startswith(base_commit)
+    ):
+        raise InstanceContainerSetupError(
+            f"deepswe_container: image HEAD {head!r} does not match "
+            f"dataset base_commit {base_commit!r}"
+        )
+    return head
 
 
 def _run_git(workspace: Path, *args: str) -> subprocess.CompletedProcess:
@@ -541,13 +587,15 @@ def _run_git(workspace: Path, *args: str) -> subprocess.CompletedProcess:
 
 def _sanitize_workspace_history(
     workspace: Path, *, base_commit: str,
-) -> None:
+) -> str:
     """Make the copied image checkout a one-commit, remote-free repo.
 
     DeepSWE images may carry refs and objects created after the dataset's
     base commit. Authoring roles have an in-container shell, so hiding refs
     in a prompt is insufficient: descendant commit objects must be removed
     before the workspace is mounted.
+
+    Returns the full object id of that one commit.
     """
     try:
         git_dir = sanitize_copied_git_metadata(workspace)
@@ -556,12 +604,8 @@ def _sanitize_workspace_history(
             f"deepswe_container: unsafe copied Git metadata: {exc}"
         ) from exc
     head = _run_git(workspace, "rev-parse", "HEAD").stdout.strip()
-    if head != base_commit:
-        raise InstanceContainerSetupError(
-            f"deepswe_container: image HEAD {head!r} does not match "
-            f"dataset base_commit {base_commit!r}"
-        )
-    _run_git(workspace, "checkout", "--detach", base_commit)
+    full_base_commit = _resolve_base_commit(base_commit=base_commit, head=head)
+    _run_git(workspace, "checkout", "--detach", full_base_commit)
     refs = _run_git(
         workspace, "for-each-ref", "--format=%(refname)",
     ).stdout.splitlines()
@@ -573,7 +617,10 @@ def _sanitize_workspace_history(
         if remote.strip():
             _run_git(workspace, "remote", "remove", remote.strip())
     shutil.rmtree(git_dir / "logs", ignore_errors=True)
-    (git_dir / "shallow").write_text(base_commit + "\n", encoding="ascii")
+    # ``.git/shallow`` holds complete object ids only.
+    (git_dir / "shallow").write_text(
+        full_base_commit + "\n", encoding="ascii",
+    )
     _run_git(workspace, "reflog", "expire", "--expire=now", "--all")
     _run_git(workspace, "repack", "-Ad")
     _run_git(workspace, "prune", "--expire=now")
@@ -583,6 +630,7 @@ def _sanitize_workspace_history(
             "deepswe_container: history isolation invariant failed; "
             f"commit_count={count!r}"
         )
+    return full_base_commit
 
 
 def _resolve_container_mount_roots(
@@ -1270,6 +1318,7 @@ __all__ = [
     "check_disk_headroom",
     "container_immutable_image",
     "docker_available",
+    "is_full_commit_id",
     "populate_workspace_from_image",
     "pull_image",
     "reconcile_orphans",

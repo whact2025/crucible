@@ -93,17 +93,18 @@ files; events, traces, and domain artifacts are conditional. Source:
 | Code | Meaning |
 |---|---|
 | `0` | Tier complete — all slices, breach, and review passed. |
-| `1` | A slice's implementer / smoke / mutation_scope / build / verify failed; or Phase 2.5 surfaced a regression beyond threshold; or Phase 3 breach exited non-zero for a non-reject reason. |
+| `1` | A slice's implementer / smoke / mutation_scope / build / verify failed, or the slice ended without a verdict; or Phase 2.5 surfaced a regression beyond threshold; or Phase 3 breach exited non-zero for a non-reject reason, including a breach loop that reached no ruling. |
 | `2` | Setup/preflight failed, the tier id was absent, or Breach Judge issued `reject`. |
-| `3` | A non-advisory review remained failing after its configured retry budget. |
+| `3` | A non-advisory review remained failing after its configured retry budget, or a gating reviewer returned no verdict. |
 
 The `summary.json` `status` field disambiguates exit-1 sub-cases:
 `slice_failed` (covers implementer / smoke / mutation_scope / build /
-verify failures), `all_slices_transport_failed`,
+verify failures), `slice_inconclusive`, `cancelled`,
+`all_slices_transport_failed`,
 `incomplete_transport_failed`, `hard_fail_tool_mutation_indeterminate`,
 `budget_exhausted`, `empty_union_diff`,
 `smoke_regression`, `smoke_bench_error`, `smoke_direction_config_error`,
-`breach_exception`, and other typed Breach failures.
+`breach_exception`, `breach_failed`, and `breach_inconclusive`.
 `all_slices_transport_failed` and `incomplete_transport_failed` remain
 non-successful and cannot authorize a partial tier, but `outcome.json`
 classifies them as `retryable_failure`. This preserves the Slice transport
@@ -112,3 +113,50 @@ it does not continue Phase 2, breach, review, or promotion in the failed run.
 An accepted breach whose final recapture, adversarial-state gate,
 shipping-state gate, or plan binding cannot be proven against the original
 plan terminates as `final_binding_failed`.
+
+Three statuses record work that nothing judged. `outcome.json` classifies
+them as `inconclusive`, never as a permanent failure, and none of them
+continues the run, retries, or lands anything:
+
+- `slice_inconclusive`: the slice's smoke check could not run to a verdict
+  (`smoke_unavailable`), its build/verify gate could not run
+  (`dev_verify_unavailable`), or its working-tree delta could not be captured
+  (`hard_fail_capture`). The row in `phase_1_slices` keeps that classification,
+  and `smoke_infrastructure_failure` reports the smoke flag. Such a slice is
+  never handed to Breach. The status requires the slice transaction to have
+  been restored (`rollback_applied`); otherwise the tier reports
+  `slice_failed`. An uncaptured delta with writes outside the slice scope also
+  stays `slice_failed`.
+- `breach_inconclusive`: the breach child ended with an inconclusive,
+  retryable, or cancelled outcome and its loop reached no ruling. The child's
+  own status stays in `phase_3_breach.status`. This includes a deferred
+  benchmark seed whose repair loop was lost; the seed is restored and its
+  gate result stays in `phase_1_slices`. It also includes a breach round
+  gate or the final shipping gate that could not run
+  (`inconclusive_gate_unavailable`), also when Breach left a deferred seed
+  unrepaired and its final shipping gate could not run. Two
+  inconclusive child statuses record a deterministic refusal, not a lost
+  ruling, and keep `breach_failed`: `inconclusive_post_strip_verify` (Breach
+  accepted the candidate and the final shipping gate ran and did not pass
+  it) and `inconclusive_workspace_mismatch` (the candidate was absent from
+  the workspace). A gate that changed source or Git state or wrote outside
+  the transaction scope ends with one of these two statuses whether or not
+  it could run. Any other failed breach child keeps `breach_failed` as well
+  (`breach_reject` for `reject`); `outcome.json` classifies both as
+  `permanent_failure`.
+- `review_inconclusive` (exit `3`): a gating reviewer returned no verdict and
+  no gating reviewer ruled against the candidate under review.
+  `phase_4_review_inconclusive` names the rubric and the cause (`protocol`,
+  `infrastructure`, or `budget`). The key can remain in a summary whose
+  status is `incomplete_accounting` or `budget_exhausted`. A ruling against
+  the candidate keeps `review_failed`, whether it came from another gating
+  rubric of the same pass or from an earlier pass whose feedback retry left
+  the candidate unchanged.
+
+A cancelled implementer ends the tier `cancelled` (`outcome.json` class
+`cancelled`) when the slice transaction was restored and the cancelled call
+wrote nothing outside the slice scope; otherwise the tier reports
+`slice_failed`. Later slices are not attempted. All four statuses apply when
+accounting is complete: unknown usage on the failed call ends the tier
+`incomplete_accounting` first, and spend over the budget ends it
+`budget_exhausted`.

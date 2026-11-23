@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -889,7 +890,7 @@ def test_claude_session_model_rejection_survives_disconnect_failure(monkeypatch)
             pass
 
         async def set_model(self, _model):
-            # Pinned SDK 0.2.110 represents a correlated control-response
+            # Pinned SDK 0.2.121 represents a correlated control-response
             # rejection as exactly the built-in Exception type.
             raise Exception("model excluded")
 
@@ -2613,7 +2614,7 @@ def test_agent_sdk_synthetic_api_error_requires_exact_http_status(
 
 @pytest.mark.parametrize(
     "result_subtype",
-    [None, True, "error_max_budget_usd", "future_error"],
+    [None, True, "error_max_budget_usd", "error_max_turns", "future_error"],
 )
 def test_agent_sdk_synthetic_api_error_requires_exact_success_subtype(
     monkeypatch,
@@ -4986,6 +4987,469 @@ def test_agent_public_invoke_preserves_explicit_max_turn_terminal(monkeypatch):
     )
 
 
+# ----------------------------------------------------------------------
+# Provider turn-limit terminal (``subtype="error_max_turns"``)
+# ----------------------------------------------------------------------
+
+_TURN_LIMIT_PROSE = "Reached maximum number of turns (5)"
+_TURN_LIMIT_PARTIAL_TEXT = "patched convert.py; running the suite next"
+
+
+def _max_turns_terminal(
+    *,
+    is_error=True,
+    errors=None,
+    num_turns=6,
+    output_tokens=3,
+    result=None,
+    **overrides,
+):
+    """The terminal Claude Code emits when a session uses up ``max_turns``."""
+
+    return _result_message(
+        subtype="error_max_turns",
+        # The last API stop reason, not the reason the session ended.
+        stop_reason="tool_use",
+        is_error=is_error,
+        errors=errors,
+        num_turns=num_turns,
+        output_tokens=output_tokens,
+        result=result,
+        **overrides,
+    )
+
+
+def _turn_limit_text_turn(text=_TURN_LIMIT_PARTIAL_TEXT):
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="claude-opus-5",
+    )
+
+
+def _limit_event_names(result):
+    assert result.execution_trace is not None
+    return [
+        event.name
+        for event in result.execution_trace.events
+        if event.kind == "limit"
+    ]
+
+
+def _invoke_turn_limit_streams(
+    monkeypatch,
+    streams,
+    *,
+    on_max_turns="raise",
+    max_turns=5,
+    trailing_error=None,
+):
+    """Invoke the public retry boundary over one faked SDK stream per query.
+
+    ``streams[i]`` is the message list of physical query ``i``.  Returns the
+    result and the observation ``query_max_turns`` (the ``max_turns`` option
+    of every physical query, in order) / ``closed`` (streams torn down).
+    """
+
+    import claude_agent_sdk
+
+    observed = SimpleNamespace(query_max_turns=[], closed=0)
+
+    async def fake_query(*, prompt, options):  # noqa: ARG001
+        index = len(observed.query_max_turns)
+        observed.query_max_turns.append(options.max_turns)
+        try:
+            for message in streams[index]:
+                yield message
+            if trailing_error is not None:
+                raise trailing_error
+        finally:
+            observed.closed += 1
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    result = ClaudeBackend(model=_EXPLICIT_OPUS_MODEL).invoke(Invocation(
+        system="s",
+        user="u",
+        tools=None,
+        max_turns=max_turns,
+        budget_usd=None,
+        policy=BackendPolicy(
+            retry_budget=3,
+            timeout_seconds=10.0,
+            on_cancellation="raise",
+            on_max_turns=on_max_turns,
+        ),
+    ))
+    return result, observed
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+@pytest.mark.parametrize(
+    "errors",
+    [None, [], [_TURN_LIMIT_PROSE]],
+    ids=["errors-none", "errors-empty", "errors-prose"],
+)
+def test_agent_max_turns_terminal_is_typed_for_every_reported_shape(
+    monkeypatch,
+    is_error,
+    errors,
+):
+    """The provider subtype, not ``is_error`` or error prose, is the limit."""
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(is_error=is_error, errors=errors),
+        ]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.kind == "max_turns"
+    assert result.error.retriable is False
+    assert result.error.turns_used == 6
+    assert result.error.turns_limit == 5
+    assert _TURN_LIMIT_PROSE not in result.error.message
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert result.usage.output_tokens == 3
+    assert result.completeness.token_usage_complete is True
+    assert result.completeness.cost_complete is True
+    assert result.completeness.terminal_complete is True
+    assert _limit_event_names(result) == ["max_turns"]
+    assert result.execution_trace.terminal_event_count == 1
+    assert not any(
+        event.kind == "retry" for event in result.execution_trace.events
+    )
+
+
+def test_agent_max_turns_result_precedes_trailing_cli_exit(monkeypatch):
+    """Claude Code's exit after the turn-limit terminal is not the outcome."""
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[_turn_limit_text_turn(), _max_turns_terminal(num_turns=21)]],
+        max_turns=20,
+        # The pinned SDK's text for an error result that reported no errors.
+        trailing_error=Exception(
+            "Claude Code returned an error result: error_max_turns"
+        ),
+    )
+
+    assert observed.closed == 1
+    assert observed.query_max_turns == [20]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.turns_used == 21
+    assert result.error.turns_limit == 20
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert result.completeness.terminal_complete is True
+    assert result.execution_trace is not None
+    assert not any(
+        event.kind == "retry" for event in result.execution_trace.events
+    )
+
+
+def test_agent_max_turns_terminal_after_retry_reports_logical_turns(
+    monkeypatch,
+):
+    """A retried call that then hits the limit counts both physical queries."""
+    from assay import MaxTurnsExceeded
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(
+        "crucible.backends.claude.asyncio.sleep",
+        no_sleep,
+    )
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [
+            [
+                _result_message(
+                    output_tokens=2,
+                    is_error=True,
+                    api_error_status=529,
+                    num_turns=2,
+                ),
+            ],
+            [_turn_limit_text_turn(), _max_turns_terminal(num_turns=4)],
+        ],
+    )
+
+    # The second physical query receives the turns the first one left.
+    assert observed.query_max_turns == [5, 3]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.turns_used == 6
+    assert result.error.turns_limit == 5
+    assert result.stop_reason == "max_turns"
+    assert _limit_event_names(result) == ["max_turns"]
+    assert [event.kind for event in result.execution_trace.events].count(
+        "retry"
+    ) == 1
+
+
+def test_agent_max_turns_subtype_is_authoritative_below_the_turn_count(
+    monkeypatch,
+):
+    """The subtype is terminal authority; ``num_turns`` is accounting only."""
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[_turn_limit_text_turn(), _max_turns_terminal(num_turns=2)]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert result.error.turns_used == 2
+    assert result.error.turns_limit == 5
+    assert result.stop_reason == "max_turns"
+    assert _limit_event_names(result) == ["max_turns"]
+
+
+@pytest.mark.parametrize(
+    "terminal_result",
+    [None, "", _TURN_LIMIT_PROSE],
+    ids=["result-none", "result-empty", "result-prose"],
+)
+def test_agent_max_turns_terminal_with_continue_policy_returns_partial_result(
+    monkeypatch,
+    terminal_result,
+):
+    """``continue_with_warning`` returns the model's work, never CLI prose."""
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(result=terminal_result),
+        ]],
+        on_max_turns="continue_with_warning",
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.error is None
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert [
+        (message.role, message.content) for message in result.transcript
+    ] == [("assistant", _TURN_LIMIT_PARTIAL_TEXT)]
+    assert _limit_event_names(result) == ["max_turns"]
+
+
+def test_agent_max_turns_terminal_result_prose_is_not_the_typed_reply(
+    monkeypatch,
+):
+    """Under ``raise`` the CLI's limit prose is neither reply nor message."""
+    from assay import MaxTurnsExceeded
+
+    result, _observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(
+                result=_TURN_LIMIT_PROSE,
+                errors=[_TURN_LIMIT_PROSE],
+            ),
+        ]],
+    )
+
+    assert isinstance(result.error, MaxTurnsExceeded)
+    assert _TURN_LIMIT_PROSE not in result.error.message
+    assert result.final_message == _TURN_LIMIT_PARTIAL_TEXT
+    assert [
+        (message.role, message.content) for message in result.transcript
+    ] == [("assistant", _TURN_LIMIT_PARTIAL_TEXT)]
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        pytest.param(
+            lambda: _max_turns_terminal(output_tokens=0),
+            id="provider-subtype",
+        ),
+        pytest.param(
+            lambda: _result_message(
+                stop_reason="max_turns",
+                output_tokens=0,
+                num_turns=5,
+            ),
+            id="canonical-stop-reason",
+        ),
+    ],
+)
+def test_agent_text_free_max_turns_terminal_is_not_an_empty_completion(
+    monkeypatch,
+    terminal,
+):
+    """A tool-only session at its limit is not the retriable stall shape.
+
+    That holds for the provider's turn-limit subtype and for a terminal that
+    reports the canonical ``max_turns`` stop reason itself.
+    """
+    from claude_agent_sdk.types import AssistantMessage, ToolUseBlock
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            AssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="t1",
+                        name="Bash",
+                        input={"command": "ls"},
+                    ),
+                ],
+                model="claude-opus-5",
+            ),
+            terminal(),
+        ]],
+        on_max_turns="continue_with_warning",
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.error is None
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == ""
+    assert result.usage.output_tokens == 0
+    assert _limit_event_names(result) == ["max_turns"]
+
+
+@pytest.mark.parametrize(
+    ("on_max_turns", "error_kind"),
+    [
+        ("raise", "max_turns"),
+        ("continue_with_warning", "transport"),
+    ],
+)
+def test_agent_max_turns_malformed_terminal_is_typed_and_incomplete(
+    monkeypatch,
+    on_max_turns,
+    error_kind,
+):
+    """A malformed turn-limit terminal is incomplete under either policy.
+
+    ``raise`` types it as the turn limit. ``continue_with_warning`` keeps the
+    malformed field's own transport error, which is not retriable.
+    """
+    from assay import MaxTurnsExceeded
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _max_turns_terminal(errors="malformed-terminal-field"),
+        ]],
+        on_max_turns=on_max_turns,
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.error is not None
+    assert result.error.kind == error_kind
+    assert isinstance(result.error, MaxTurnsExceeded) is (
+        on_max_turns == "raise"
+    )
+    assert result.error.retriable is False
+    assert result.stop_reason == "max_turns"
+    assert result.completeness.terminal_complete is False
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+@pytest.mark.parametrize("on_max_turns", ["raise", "continue_with_warning"])
+def test_agent_max_turns_terminal_requires_served_model_identity(
+    monkeypatch,
+    is_error,
+    on_max_turns,
+):
+    """A turn-limit terminal needs the served-model proof a success needs."""
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _max_turns_terminal(
+                is_error=is_error,
+                model_usage=None,
+                result="unproven content must not be admitted",
+                # ``result`` is never admitted on a turn-limit terminal;
+                # ``structured_output`` is the content the gate withholds.
+                structured_output={"unproven": True},
+            ),
+        ]],
+        on_max_turns=on_max_turns,
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.stop_reason == "missing_model_identity"
+    assert result.error is not None
+    assert result.error.kind == "incomplete_evidence"
+    assert result.final_message == ""
+    assert result.transcript == ()
+    assert result.completeness.terminal_complete is False
+
+
+def test_agent_max_turns_terminal_does_not_outrank_permission_denial(
+    monkeypatch,
+):
+    import dataclasses
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            dataclasses.replace(
+                _max_turns_terminal(),
+                permission_denials=[{"tool": "Write"}],
+            ),
+        ]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.stop_reason == "permission_denied"
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert result.error.retriable is False
+    assert _limit_event_names(result) == ["permission_denial"]
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    ["error_during_execution", "error_max_structured_output_retries"],
+)
+def test_agent_other_error_terminal_subtypes_stay_transport_failures(
+    monkeypatch,
+    subtype,
+):
+    """Only the exact turn-limit subtype is a limit; the count is not one."""
+
+    result, observed = _invoke_turn_limit_streams(
+        monkeypatch,
+        [[
+            _turn_limit_text_turn(),
+            _result_message(
+                subtype=subtype,
+                stop_reason="tool_use",
+                is_error=True,
+                num_turns=6,
+                output_tokens=3,
+            ),
+        ]],
+    )
+
+    assert observed.query_max_turns == [5]
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert result.error.retriable is False
+    assert result.stop_reason != "max_turns"
+    assert "max_turns" not in _limit_event_names(result)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("num_turns", True), ("is_error", "false")],
@@ -7307,6 +7771,369 @@ def test_workflow_external_stale_session_is_typed_and_not_retried(
     assert result.conversation is not None
     assert result.conversation.state == "stale"
     assert result.conversation.opaque_id is None
+
+
+# The adapter keeps at most this many of the CLI's stderr lines per attempt.
+_CLI_STDERR_BOUND = 200
+
+
+def _failing_cli_query(stderr_lines, raised, *, after_handshake=False):
+    """Fake ``query``: feed the stderr callback, then fail as the CLI does.
+
+    The SDK transport hands the CLI's stderr to ``options.stderr`` one line
+    at a time. It reports a non-zero exit as a ``ProcessError`` that carries
+    a placeholder, never the stderr text: a caller waiting for the handshake
+    receives that error itself, and once the handshake is done the SDK's
+    message reader re-raises its text as a bare ``Exception``.
+    """
+    from claude_agent_sdk import ProcessError
+
+    def fake_query(*, prompt, options):  # noqa: ARG001
+        async def _gen():
+            for line in stderr_lines:
+                options.stderr(line)
+            error: Exception = ProcessError(
+                "Command failed with exit code 1",
+                exit_code=1,
+                stderr="Check stderr output for details",
+            )
+            if after_handshake:
+                error = Exception(str(error))
+            raised.append(error)
+            raise error
+            yield  # pragma: no cover
+
+        return _gen()
+
+    return fake_query
+
+
+def _attempt_with_failing_cli(
+    monkeypatch,
+    stderr_lines,
+    *,
+    after_handshake=False,
+):
+    """Run one attempt without a conversation request against a failing CLI."""
+    import claude_agent_sdk
+
+    raised: list[Exception] = []
+    monkeypatch.setattr(
+        claude_agent_sdk,
+        "query",
+        _failing_cli_query(
+            stderr_lines,
+            raised,
+            after_handshake=after_handshake,
+        ),
+    )
+    invocation = Invocation(
+        system="s",
+        user="u",
+        tools=None,
+        max_turns=1,
+        budget_usd=None,
+    )
+    policy = BackendPolicy(
+        retry_budget=1,
+        timeout_seconds=10.0,
+        on_cancellation="raise",
+        on_max_turns="raise",
+    )
+    result = asyncio.run(ClaudeBackend()._invoke_once(invocation, policy))
+    (error,) = raised
+    return result, error
+
+
+def _fail_once_with_cli_stderr(monkeypatch, caplog, stderr_lines):
+    """Run one failing attempt; return every reader's view of the stderr.
+
+    The views are the redacted lines attached to the raised exception, the
+    header of the ERROR record, and the lines of the tail that record logs.
+    """
+    with caplog.at_level(logging.ERROR, logger="crucible.backends.claude"):
+        result, error = _attempt_with_failing_cli(monkeypatch, stderr_lines)
+
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    (logged,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "stderr tail" in record.getMessage()
+    ]
+    header, _, tail = logged.partition("\n")
+    return error.cli_stderr.split("\n"), header, tail.split("\n")
+
+
+@pytest.mark.parametrize("after_handshake", [False, True])
+@pytest.mark.parametrize("lines_before_reason", [3, 199, 200, 250, 1000])
+def test_workflow_external_stale_reason_survives_any_amount_of_stderr(
+    monkeypatch,
+    lines_before_reason,
+    after_handshake,
+):
+    """A rejected handle is typed as stale however much stderr precedes it.
+
+    The SDK's error for a failed CLI carries no stderr, so the reason for
+    the rejection has to be among the lines the adapter keeps, also when
+    more lines than the bound were written before it.
+    """
+    import claude_agent_sdk
+    from crucible.backends import claude as claude_mod
+
+    stderr_lines = [
+        f"cli stderr line {index}" for index in range(lines_before_reason)
+    ]
+    stderr_lines.append("No conversation found with session ID: session-stale")
+    resumes: list[str | None] = []
+    failing_query = _failing_cli_query(
+        stderr_lines,
+        [],
+        after_handshake=after_handshake,
+    )
+
+    def fake_query(*, prompt, options):
+        resumes.append(options.resume)
+        return failing_query(prompt=prompt, options=options)
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    result = claude_mod.ClaudeBackend().invoke(
+        Invocation(
+            system="sys",
+            user="correction",
+            tools=(),
+            max_turns=2,
+            budget_usd=1.0,
+            policy=BackendPolicy(
+                retry_budget=3,
+                timeout_seconds=10.0,
+                on_cancellation="convert_to_backend_error",
+                on_max_turns="raise",
+            ),
+            conversation=_conversation_request(
+                action="reuse",
+                opaque_id="session-stale",
+            ),
+        )
+    )
+
+    assert resumes == ["session-stale"]
+    assert result.error is not None
+    assert result.error.kind == "stale_conversation"
+    assert result.error.retriable is False
+    assert result.stop_reason == "stale_conversation"
+    assert result.conversation is not None
+    assert result.conversation.state == "stale"
+    assert result.conversation.opaque_id is None
+
+
+@pytest.mark.parametrize(
+    ("after_handshake", "message", "retriable"),
+    [
+        (
+            False,
+            "ProcessError: Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details",
+            True,
+        ),
+        (
+            True,
+            "sdk_transport: Command failed with exit code 1 (exit code: 1)",
+            False,
+        ),
+    ],
+)
+def test_cli_stderr_reason_without_a_resumed_handle_stays_an_ordinary_error(
+    monkeypatch,
+    after_handshake,
+    message,
+    retriable,
+):
+    """Kept stderr decides nothing but the staleness of a resumed handle."""
+    stderr_lines = [f"cli stderr line {index}" for index in range(250)]
+    stderr_lines.append("No conversation found with session ID: session-stale")
+
+    result, _error = _attempt_with_failing_cli(
+        monkeypatch,
+        stderr_lines,
+        after_handshake=after_handshake,
+    )
+
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert result.error.message == message
+    assert result.error.retriable is retriable
+    assert result.stop_reason == "error"
+    assert result.conversation is None
+
+
+@pytest.mark.parametrize("line_count", [201, 250, 1000])
+def test_cli_stderr_beyond_the_bound_keeps_the_last_lines(
+    monkeypatch,
+    caplog,
+    line_count,
+):
+    lines = [f"cli stderr line {index}" for index in range(line_count)]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert len(kept) == _CLI_STDERR_BOUND
+    assert kept == lines[-_CLI_STDERR_BOUND:]
+    assert header.endswith("stderr tail (last 50 of 200 lines):")
+    assert tail == lines[-50:]
+
+
+@pytest.mark.parametrize("line_count", [1, 50, 51, 199, 200])
+def test_cli_stderr_within_the_bound_is_kept_whole(
+    monkeypatch,
+    caplog,
+    line_count,
+):
+    lines = [f"cli stderr line {index}" for index in range(line_count)]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == lines
+    assert header.endswith(
+        f"stderr tail (last {min(line_count, 50)} of {line_count} lines):"
+    )
+    assert tail == lines[-50:]
+
+
+def test_cli_stderr_bound_counts_entries_however_long_the_lines(
+    monkeypatch,
+    caplog,
+):
+    """Kept stderr is at most the bound times the longest line handed over.
+
+    Each line here is as long as one pipe read. The SDK transport caps the
+    length of a line it hands over; the session transport tests pin that cap.
+    """
+    line_chars = 64 * 1024
+    lines = [
+        f"{index:04d}:".ljust(line_chars, "x")
+        for index in range(_CLI_STDERR_BOUND + 30)
+    ]
+
+    kept, _header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert len(kept) == _CLI_STDERR_BOUND
+    assert kept == lines[-_CLI_STDERR_BOUND:]
+    assert sum(len(line) for line in kept) == _CLI_STDERR_BOUND * line_chars
+    assert tail == lines[-50:]
+
+
+def test_cli_stderr_written_after_the_bound_is_redacted(monkeypatch, caplog):
+    token = "offline-stderr-token-0123456789"
+    lines = [f"cli stderr line {index}" for index in range(260)]
+    lines.append(f"upstream rejected Bearer {token}")
+
+    kept, _header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept[-1] == "upstream rejected Bearer [REDACTED]"
+    assert tail[-1] == "upstream rejected Bearer [REDACTED]"
+    assert token not in "\n".join(kept)
+    assert token not in caplog.text
+
+
+def _stderr_then_exit_cli_double(tmp_path, stderr_text):
+    """Create a CLI double that writes ``stderr_text`` and exits 1.
+
+    It answers the SDK's version probe, records the arguments of every
+    other start, and never reads its input.
+    """
+    from crucible.backends._claude_session_transport import (
+        REVIEWED_CLAUDE_FABLE_CODE_VERSION,
+    )
+
+    starts = tmp_path / "claude-starts.jsonl"
+    cli = tmp_path / "stderr-claude"
+    cli.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:] == ["-v"]:
+    print({f"{REVIEWED_CLAUDE_FABLE_CODE_VERSION} (Claude Code)"!r}, flush=True)
+    raise SystemExit(0)
+with open({str(starts)!r}, "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\\n")
+sys.stderr.write({stderr_text!r})
+sys.stderr.flush()
+raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    return str(cli.resolve()), starts
+
+
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_workflow_external_stale_reason_is_kept_on_the_sdk_delivery_path(
+    tmp_path,
+    caplog,
+    final_newline,
+):
+    """The reason reaches the adapter when the SDK itself delivers stderr.
+
+    Nothing of the SDK is replaced here. It starts the CLI double, reads its
+    stderr in a task of its own, reports the non-zero exit from another, and
+    cancels the stderr reader when it closes. The double writes more lines
+    than the bound and then the reason as its last output, with or without
+    a final newline, and exits 1.
+    """
+    reason = "No conversation found with session ID: session-stale"
+    written = [
+        f"cli stderr line {index}" for index in range(_CLI_STDERR_BOUND + 50)
+    ]
+    written.append(reason)
+    cli_path, starts = _stderr_then_exit_cli_double(
+        tmp_path,
+        "\n".join(written) + ("\n" if final_newline else ""),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="crucible.backends.claude"):
+        result = ClaudeBackend(cli_path=cli_path, cwd=str(tmp_path)).invoke(
+            Invocation(
+                system="sys",
+                user="correction",
+                tools=(),
+                max_turns=2,
+                budget_usd=1.0,
+                policy=BackendPolicy(
+                    retry_budget=3,
+                    timeout_seconds=30.0,
+                    on_cancellation="convert_to_backend_error",
+                    on_max_turns="raise",
+                ),
+                conversation=_conversation_request(
+                    action="reuse",
+                    opaque_id="session-stale",
+                ),
+            )
+        )
+
+    assert result.error is not None
+    assert result.error.kind == "stale_conversation"
+    assert result.error.retriable is False
+    assert result.stop_reason == "stale_conversation"
+    assert result.conversation is not None
+    assert result.conversation.state == "stale"
+    assert result.conversation.opaque_id is None
+    # The model process was started once, with the workflow's handle.
+    (model_argv,) = [
+        json.loads(line)
+        for line in starts.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum("session-stale" in token for token in model_argv) == 1
+    (logged,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "stderr tail" in record.getMessage()
+    ]
+    header, _, tail = logged.partition("\n")
+    assert header.endswith("stderr tail (last 50 of 200 lines):")
+    assert tail.split("\n") == written[-50:]
 
 
 def test_workflow_external_transport_failure_is_not_retried(

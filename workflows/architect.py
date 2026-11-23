@@ -133,6 +133,10 @@ from ._benchmark_planning import (
     bind_benchmark_planning_policy,
 )
 from ._run import open_run_with_capture, record_handled_terminal, write_atomic_json
+from ._write_root_guard import (
+    WRITE_ROOT_REFUSAL_ERROR_KIND,
+    host_route_write_root_refusal,
+)
 from .plan import (
     _diagnostic_candidate_dag,
     _format_validation_findings,
@@ -142,6 +146,7 @@ from .plan import (
     run_plan,
 )
 from .tier import (
+    _load_spec_yaml_policies,
     _resolve_cli_breach_policy,
     run_tier,
 )
@@ -2040,12 +2045,21 @@ def _terminal_status(
         # its topological walk.  The walk still stops and no downstream tier
         # gains execution authority; this status only preserves retryability
         # for the parent workflow and a later fresh attempt.
-        if all(
-            result.get("terminal_class")
-            == _outcome.TerminalClass.RETRYABLE_FAILURE.value
-            for result in failed_tiers
-        ):
+        #
+        # The same holds for a Tier that ended without a ruling on its work
+        # (a gate could not run, a reviewer or the breach loop returned no
+        # verdict) or was cancelled: the walk stops, but the failure is not
+        # filed as judged. One judged, contract-error or untyped Tier keeps
+        # ``partial_failed``.
+        classes = {result.get("terminal_class") for result in failed_tiers}
+        if classes == {_outcome.TerminalClass.RETRYABLE_FAILURE.value}:
             return "retryable_tier_failure"
+        if classes == {_outcome.TerminalClass.CANCELLED.value}:
+            return "cancelled"
+        if classes <= {
+            item.value for item in _outcome.UNJUDGED_TERMINAL_CLASSES
+        }:
+            return "inconclusive_tier_failure"
         return "partial_failed"
     if checkpoint_failed:
         return "checkpoint_failed"
@@ -2411,9 +2425,12 @@ def _validation_gate(
     """Validate the planned tier_dag with `assay.validate` before
     descending into per-slice implement. Returns
     ``(spec, status, repair_cost_usd)`` where status is ``passed``,
-    ``validate_failed``, ``replan_validate_failed``, or
-    ``budget_exhausted``.  ``budget_usd`` is the budget REMAINING on entry,
-    not the architect command's original cap; every repair consumes from it.
+    ``validate_failed``, ``replan_validate_failed``, ``budget_exhausted``,
+    or the repair re-plan's own typed status when nobody ruled on that
+    re-plan (an inconclusive, retryable or cancelled terminal such as
+    ``planner_infrastructure_failure``).  ``budget_usd`` is the budget
+    REMAINING on entry, not the architect command's original cap; every
+    repair consumes from it.
 
     On blocking (Critical/High) findings:
     - If ``allow_repair`` is True (the common case — we planned fresh
@@ -2800,11 +2817,18 @@ def _validation_gate(
                 repair_outcome.status,
                 attempt + 1,
             )
-            status = (
-                "budget_exhausted"
-                if repair_outcome.status == "budget_exhausted"
-                else "replan_validate_failed"
-            )
+            if repair_outcome.status == "budget_exhausted":
+                status = "budget_exhausted"
+            elif (
+                _outcome.classify_terminal_status(repair_outcome.status)
+                in _outcome.UNJUDGED_TERMINAL_CLASSES
+            ):
+                # Nobody ruled on the repair plan (a planning backend was
+                # lost, or the re-plan was stopped): keep its own typed
+                # status. The gate still blocks.
+                status = repair_outcome.status
+            else:
+                status = "replan_validate_failed"
             return _blocked(current), status, repair_spent_usd
 
     # Unreachable — the loop returns on pass, abort, or exhaustion.
@@ -3426,6 +3450,38 @@ def run_architect(
             provenance_root=None,
         )
         return 2
+    if not args.worktree:
+        # Every tier writes in ``cwd``. With --worktree it writes in a fresh
+        # worktree instead, and run_tier asks about that root itself. A tier
+        # that is passed no breach policy resolves the Spec's own, so the
+        # same resolution decides here whether the Defender will write.
+        tier_breach_policy = (
+            args.breach_policy
+            if args.breach_policy is not None
+            else _load_spec_yaml_policies(args.spec).breach
+        )
+        refusal = host_route_write_root_refusal(
+            args,
+            cwd,
+            ("implementer", "breach_defender")
+            if tier_breach_policy.enabled
+            else ("implementer",),
+        )
+        if refusal is not None:
+            record_handled_terminal(
+                corpus,
+                "architect",
+                status="setup_error",
+                message=refusal,
+                error_kind=WRITE_ROOT_REFUSAL_ERROR_KIND,
+                extra=_zero_tier_terminal_fields(
+                    corpus=corpus,
+                    cwd=args.cwd,
+                    checkpoints=checkpoints,
+                ),
+                provenance_root=None,
+            )
+            return 2
 
     # ``cwd`` came in via the run_architect kwarg — no os.getcwd()
     # fallback at this layer; main() handles the CLI's implicit-cwd

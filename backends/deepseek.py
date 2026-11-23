@@ -11,12 +11,20 @@ never imports the OpenAI SDK. Every physical response runs in a fresh
 interpreter, and client policy are fingerprinted before dispatch.
 
 The only transport identity is ``POST https://api.deepseek.com/responses``
-with request alias ``deepseek-v4-flash``, high reasoning, streaming, and
-client-executed function tools.  ``DEEPSEEK_API_KEY`` is read only immediately
-before subprocess dispatch and crosses the boundary on standard input.  It is
-never retained in routing, argv, the worker environment, traces, or debug
-records. Response schemas use the canonical Assay prompt ABI, and diagnostic
-writers execute only through an invocation-scoped isolated mutation host.
+with request alias ``deepseek-flash``, high reasoning, streaming, and
+client-executed function tools.  The vendor moves that alias between Flash
+snapshots without an id change and exposes no dated id, so the returned
+alias is attested and the served snapshot is not.  ``DEEPSEEK_API_KEY`` is
+read only immediately before subprocess dispatch and crosses the boundary on
+standard input.  It is never retained in routing, argv, the worker
+environment, traces, or debug records. Response schemas use the canonical
+Assay prompt ABI, and diagnostic writers execute only through an
+invocation-scoped isolated mutation host.
+
+DeepSeek bills by time of day and the price table has no time dimension, so
+recorded cost uses the vendor's published peak rate: it equals the charge at
+peak and is twice the charge off-peak.  ``cost_complete`` therefore attests
+complete token counters priced at that ceiling, not the amount billed.
 """
 
 from __future__ import annotations
@@ -63,7 +71,7 @@ from .pricing import compute_cost, pricing_for_model
 
 
 _PROTOCOL = "crucible.deepseek-worker.v1"
-_MODEL = "deepseek-v4-flash"
+_MODEL = "deepseek-flash"
 _BASE_URL = "https://api.deepseek.com"
 _ENDPOINT = "https://api.deepseek.com/responses"
 _OPENAI_VERSION = "2.53.0"
@@ -74,12 +82,12 @@ _OPENAI_SOURCE_SHA256 = (
     "baf5802ad08980e1d9d561e1b996e800c8bcd14af5847c6d0e7a5cc59e4d4116"
 )
 _WORKER_LOCK_SHA256 = (
-    "c2622cb4b213068c3db4e1e39abc419a975df5a4e3113b5b2ab4a9625d3137e3"
+    "eea1c2ebb8d53d57881c8f0f7d3ea7c1f001e11c696969195ec29a96a6340e3e"
 )
 _LOCKED_LINUX_COMPONENT_VERSIONS = (
     ("annotated-types", "0.8.0"),
     ("anyio", "4.14.2"),
-    ("certifi", "2026.7.22"),
+    ("certifi", "2026.10.18"),
     ("crucible-deepseek-worker", "0.1.0"),
     ("distro", "1.9.0"),
     ("h11", "0.16.0"),
@@ -2681,6 +2689,9 @@ class DeepSeekBackend:
                     and total_cost > invocation.budget_usd
                 ):
                     add_event("limit", name="budget_usd")
+                    # A limit exit ends with its own logical terminal;
+                    # ``_result`` keeps only the last terminal event.
+                    add_event("terminal", name="budget_exhausted")
                     return self._result(
                         final_message=final_message,
                         transcript=transcripts,
@@ -2747,6 +2758,7 @@ class DeepSeekBackend:
                     )
                 if turn == invocation.max_turns - 1:
                     add_event("limit", name="max_turns")
+                    add_event("terminal", name="max_turns")
                     return self._result(
                         final_message=final_message,
                         transcript=transcripts,
@@ -2864,6 +2876,7 @@ class DeepSeekBackend:
                         and cumulative_tool_bytes + encoded_size > context_budget
                     ):
                         add_event("limit", name="context_bytes")
+                        add_event("terminal", name="context_limit")
                         return self._result(
                             final_message=final_message,
                             transcript=transcripts,

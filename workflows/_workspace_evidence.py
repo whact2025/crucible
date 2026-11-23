@@ -14,11 +14,18 @@ existing ``creates_paths`` exemption only when the creator is selected by the
 current plan's resume identity, the path was absent at the project base, the
 creator actually touched it, and the final retained writer's exact Git
 type/mode/blob matches the live checkout.
+
+Selection covers the retained prefix.  Tier keeps the writes of a slice that
+succeeded before a sibling failed and skips that slice on the next run, so for
+Architect's resume the retained slices of the first incomplete tier join the
+selection when, and only when, the whole extended state is proven.  A failed,
+pending, or unbound sibling is never selected, and Tier admission always
+receives the retained prefix alone.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from assay.canonical import hash_record
@@ -42,7 +49,7 @@ from .reconcile import (
 
 @dataclass(frozen=True, slots=True)
 class PlanWorkspaceEvidence:
-    """Exact retained-prefix proof derived from one Spec snapshot."""
+    """Exact retained-state proof derived from one Spec snapshot."""
 
     context: CitedPathExistsContext
     retained_tier_ids: tuple[str, ...]
@@ -53,6 +60,11 @@ class PlanWorkspaceEvidence:
     selected_implementation_hashes: tuple[tuple[str, str, str], ...]
     rows: tuple[dict[str, object], ...]
     errors: tuple[str, ...]
+
+
+_ADMISSION_BOUNDARY_REASON = (
+    "not attempted: Tier admission receives the retained prefix only"
+)
 
 
 def reconstruct_plan_workspace_evidence(
@@ -80,6 +92,147 @@ def reconstruct_plan_workspace_evidence(
     authoritative on overlaps; every other path must match project-base
     content or absence. This prevents persistent workspaces from admitting
     unrecorded current-tier dirt before a provider runs.
+
+    The boundary tier is the first tier that is not fully retained.  Every
+    dependency of it is in the retained prefix, so the prefix plus its
+    retained slices is the dependency-composed state a failed tier leaves
+    behind.  Without an ``admission_tier`` those slices obtain the same
+    authority as the prefix, but only together: a second proof selects the
+    prefix and all of them, and it replaces the prefix proof only when it has
+    no error, every expected surface path matches the checkout, and every
+    required create is verified.  Otherwise the prefix proof is returned
+    unchanged, so an unproven sibling grants nothing and adds no finding.
+    A failed, pending, or unbound sibling is never retained and is therefore
+    never selected, and no tier after the boundary is eligible.
+
+    ``retained_tier_ids``, ``accepted_tier_ids``, ``all_slices_complete``,
+    and ``selected_implementation_hashes`` always describe the prefix alone.
+    The boundary tier's row names its retained slices, whether they were
+    proven, the ``[slice_id, implementation_hash]`` pairs of the proven
+    records, and otherwise why the extended proof was not adopted.  Tier
+    admission never receives boundary authority: with an ``admission_tier``
+    the result is the prefix proof, because Tier compares only the prefix
+    bindings and could not see a record outside its dependency closure.
+    """
+
+    prefix = _reconstruct_selection(
+        corpus=corpus,
+        spec=spec,
+        source_root=source_root,
+        admission_tier=admission_tier,
+        include_boundary=False,
+    )
+    boundary_index = next(
+        (
+            index
+            for index, row in enumerate(prefix.rows)
+            if row["boundary_retained_slices"]
+        ),
+        None,
+    )
+    if boundary_index is None:
+        return prefix
+    if admission_tier is not None:
+        return replace(
+            prefix,
+            rows=_with_boundary_row(
+                prefix.rows,
+                boundary_index,
+                boundary_retained_unproven=[_ADMISSION_BOUNDARY_REASON],
+            ),
+        )
+
+    extended = _reconstruct_selection(
+        corpus=corpus,
+        spec=spec,
+        source_root=source_root,
+        admission_tier=None,
+        include_boundary=True,
+    )
+    if not extended.workspace_evidence_passed:
+        # The retained siblings obtain authority only as part of one complete
+        # proof.  An incomplete extended proof grants nothing and adds no
+        # finding; the row keeps why, because the operator otherwise sees
+        # only the collision the unproven sibling leaves behind.
+        return replace(
+            prefix,
+            rows=_with_boundary_row(
+                prefix.rows,
+                boundary_index,
+                boundary_retained_unproven=_unproven_boundary_reasons(
+                    extended,
+                ),
+            ),
+        )
+    return PlanWorkspaceEvidence(
+        context=extended.context,
+        retained_tier_ids=prefix.retained_tier_ids,
+        accepted_tier_ids=prefix.accepted_tier_ids,
+        all_slices_complete=prefix.all_slices_complete,
+        workspace_evidence_passed=True,
+        required_create_paths=extended.required_create_paths,
+        selected_implementation_hashes=prefix.selected_implementation_hashes,
+        rows=_with_boundary_row(
+            prefix.rows,
+            boundary_index,
+            boundary_retained_proven=True,
+            boundary_retained_implementation_hashes=extended.rows[
+                boundary_index
+            ]["boundary_retained_implementation_hashes"],
+        ),
+        errors=extended.errors,
+    )
+
+
+def _with_boundary_row(
+    rows: tuple[dict[str, object], ...],
+    boundary_index: int,
+    **changes: object,
+) -> tuple[dict[str, object], ...]:
+    """Return ``rows`` with the boundary tier's row updated."""
+
+    return tuple(
+        {**row, **changes} if index == boundary_index else row
+        for index, row in enumerate(rows)
+    )
+
+
+def _unproven_boundary_reasons(extended: PlanWorkspaceEvidence) -> list[str]:
+    """Return why the extended proof is incomplete, in a stable order."""
+
+    context = extended.context
+    return [
+        *extended.errors,
+        *(
+            f"{path}: workspace does not match the composed postimage"
+            for path in sorted(
+                context.expected_plan_surface_paths
+                - context.verified_plan_surface_paths
+            )
+        ),
+        *(
+            f"{tier_id}/{slice_id}: declared create '{path}' is not verified"
+            for tier_id, slice_id, path in sorted(
+                extended.required_create_paths
+                - context.verified_create_paths
+            )
+        ),
+    ]
+
+
+def _reconstruct_selection(
+    *,
+    corpus,
+    spec,
+    source_root: Path,
+    admission_tier,
+    include_boundary: bool,
+) -> PlanWorkspaceEvidence:
+    """Prove the retained prefix, optionally with the boundary tier's slices.
+
+    ``include_boundary`` only adds the retained slices of the boundary tier
+    to the proven selection.  The prefix fields and every row value except
+    the boundary bindings are the same in both modes.
     """
 
     repo = Path(source_root).resolve()
@@ -148,6 +301,11 @@ def reconstruct_plan_workspace_evidence(
             )
 
         retained_here = retained_open and complete
+        # Tier commits the journal of a slice that succeeded before a sibling
+        # failed, and the next run skips it.  Only the first incomplete tier
+        # can hold such records as part of the state that produced this tree:
+        # every dependency of it is retained.
+        boundary_here = retained_open and not complete and bool(landed)
         accepted_here = (
             accepted_open
             and retained_here
@@ -171,6 +329,20 @@ def reconstruct_plan_workspace_evidence(
             accepted_tier_ids.append(tier.tier_id)
         else:
             accepted_open = False
+
+        # The boundary records follow every prefix record in ``selected`` and
+        # stay out of the prefix bindings that Tier admission compares.
+        boundary_hashes: list[list[str]] = []
+        if boundary_here and include_boundary:
+            for slice_ in tier.slices:
+                if slice_.id not in landed:
+                    continue
+                implementation = landed[slice_.id]
+                selected.append((tier, slice_, implementation))
+                boundary_hashes.append([
+                    slice_.id,
+                    hash_record(implementation),
+                ])
 
         # A completed record set after a gap is not a prefix and therefore
         # cannot be interpreted safely as the state that produced this tree.
@@ -201,6 +373,12 @@ def reconstruct_plan_workspace_evidence(
             "verification_complete": verification_complete,
             "lifecycle_accepted": lifecycle_accepted,
             "lifecycle_reason": lifecycle_reason,
+            "boundary_retained_slices": (
+                sorted(landed) if boundary_here else []
+            ),
+            "boundary_retained_proven": False,
+            "boundary_retained_implementation_hashes": boundary_hashes,
+            "boundary_retained_unproven": [],
         })
 
     successful_plan_bound_slices: set[tuple[str, str]] = set()

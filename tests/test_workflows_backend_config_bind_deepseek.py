@@ -316,7 +316,7 @@ roles: {}
             """schema_version: crucible.backend-routing.v1
 default:
   backend: deepseek
-  model: deepseek-v4-flash
+  model: deepseek-flash
   feature_admission: diagnostic
 roles:
   architect_critic: {backend: codex, model: gpt-6-astra, effort: max}
@@ -326,7 +326,7 @@ roles:
         (
             """schema_version: crucible.backend-routing.v1
 schema_version: crucible.backend-routing.v1
-default: {backend: deepseek, model: deepseek-v4-flash, feature_admission: diagnostic}
+default: {backend: deepseek, model: deepseek-flash, feature_admission: diagnostic}
 roles: {}
 """,
             "unambiguous UTF-8 YAML",
@@ -335,7 +335,7 @@ roles: {}
             f"""schema_version: crucible.backend-routing.v1
 default:
   backend: deepseek
-  model: deepseek-v4-flash
+  model: deepseek-flash
   feature_admission: diagnostic
   extra: {{expected_worker_runtime_fingerprint: {_DIGEST}}}
 roles: {{}}
@@ -344,7 +344,7 @@ roles: {{}}
         ),
         (
             """schema_version: crucible.backend-routing.v1
-default: {backend: deepseek, model: deepseek-v4-flash}
+default: {backend: deepseek, model: deepseek-flash}
 roles: {}
 """,
             "feature_admission='diagnostic'",

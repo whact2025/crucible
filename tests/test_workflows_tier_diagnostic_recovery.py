@@ -34,7 +34,7 @@ from tests.test_workflows_tier_empty_diff_retry import _COMPLETE_EXECUTION, _run
 
 class _SettledMaxTurnsBackend:
     name = "kimi"
-    model = "kimi-k2.7-code-highspeed"
+    model = "kimi-k3.1-pro"
 
     def __init__(self, *, mutate, completeness):
         self.repo = None
