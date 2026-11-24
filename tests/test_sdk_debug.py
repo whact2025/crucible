@@ -18,6 +18,7 @@ Coverage:
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -1032,6 +1033,530 @@ def test_mkdir_failure_warning_redacts_secret_path(
     warning = "\n".join(record.message for record in caplog.records)
     assert secret not in warning
     assert "/dev/null/[REDACTED]/logs" in warning
+
+
+# ----------------------------------------------------------------------
+# Redaction of the lines of one bounded text
+# ----------------------------------------------------------------------
+
+_LINE_WITHHELD = "[REDACTED: line withheld]"
+
+
+def _made_up_value(tag: str, length: int = 20) -> str:
+    """Return a value made at run time, so that no file holds it."""
+    digest = hashlib.sha256(f"redaction test value {tag}".encode())
+    return digest.hexdigest()[:length]
+
+
+def _readable(value: str, text: str) -> bool:
+    """Whether any six characters in a row of ``value`` stand in ``text``."""
+    return any(
+        value[start : start + 6] in text for start in range(len(value) - 5)
+    )
+
+
+def _as_the_sdk_frames(text: str) -> list[str]:
+    """Split ``text`` as the reviewed SDK frames a CLI's stderr."""
+    return [line.rstrip() for line in text.split("\n") if line.rstrip()]
+
+
+def test_redact_sdk_text_knows_environment_values_of_eight_characters_up(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The exact values are those of variables with a sensitive name."""
+    long_enough = _made_up_value("eight characters", 8)
+    too_short = _made_up_value("seven characters", 7)
+    other_name = _made_up_value("another name", 20)
+    monkeypatch.setenv("CRUCIBLE_TEST_LINES_API_KEY", long_enough)
+    monkeypatch.setenv("CRUCIBLE_TEST_LINES_SHORT_TOKEN", too_short)
+    monkeypatch.setenv("CRUCIBLE_TEST_LINES_SETTING", other_name)
+
+    redacted = sdk_debug.redact_sdk_text(
+        f"saw {long_enough} and {too_short} and {other_name}"
+    )
+
+    assert redacted == f"saw [REDACTED] and {too_short} and {other_name}"
+
+
+def test_redact_sdk_lines_withholds_the_lines_its_passes_disagree_on():
+    """A line is returned only where every pass holds that same line.
+
+    Each line is redacted on its own, each pair of neighbouring lines as
+    one text, and all lines joined as one text.
+    """
+    value = _made_up_value("lines the passes disagree on")
+
+    # By position: the joined text keeps its line breaks, and the value
+    # line differs from what its own redaction returns.
+    assert sdk_debug.redact_sdk_lines(["token:", f"  {value}", "  done"]) == [
+        "token:",
+        _LINE_WITHHELD,
+        "  done",
+    ]
+    # By the pairs: in the joined text the outer name takes the inner name
+    # as its value, so only the pair of the last two lines covers the value.
+    assert sdk_debug.redact_sdk_lines(
+        ["auth:", "  token:", f"    {value}"]
+    ) == ["auth:", _LINE_WITHHELD, _LINE_WITHHELD]
+    # By alignment: the redaction of the joined text removed a line break,
+    # and the lines around the two withheld ones stay in their places.
+    assert sdk_debug.redact_sdk_lines(
+        ["one", "two", "Authorization: Bearer", f" {value}", "five"]
+    ) == ["one", "two", _LINE_WITHHELD, _LINE_WITHHELD, "five"]
+    # A joined pass over the lines as redacted on their own would print
+    # the token here: its first line no longer holds the scheme word.
+    assert sdk_debug.redact_sdk_lines(
+        ["Authorization: Bearer", f" {value}"]
+    ) == [_LINE_WITHHELD, _LINE_WITHHELD]
+    assert sdk_debug.redact_sdk_lines([]) == []
+
+
+def test_redact_sdk_lines_withholds_a_framed_line_of_an_environment_value(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A line of a sensitive value is withheld wherever it stands.
+
+    Output that was split at line breaks and stripped does not hold a value
+    with a line break as the parent holds it. A value without a line break
+    and without white space at its ends is found as it stands, and is
+    redacted in its place. A line of a value is looked for from 8
+    characters on, counted after stripping: a shorter one withholds
+    nothing.
+    """
+    first = _made_up_value("framed value, first line")
+    second = _made_up_value("framed value, second line")
+    single = _made_up_value("value on one line")
+    monkeypatch.setenv("CRUCIBLE_TEST_LINES_TWO_LINE_TOKEN", f"{first}\n{second}")
+    monkeypatch.setenv("CRUCIBLE_TEST_LINES_ONE_LINE_TOKEN", single)
+
+    # Also when the other line of the value is not among the lines.
+    assert sdk_debug.redact_sdk_lines([f"got {second} here", "next"]) == [
+        _LINE_WITHHELD,
+        "next",
+    ]
+    assert sdk_debug.redact_sdk_lines(
+        [f"value is {first}", f"{second} end"]
+    ) == [_LINE_WITHHELD, _LINE_WITHHELD]
+    assert sdk_debug.redact_sdk_lines([f"value is {single}", "next"]) == [
+        "value is [REDACTED]",
+        "next",
+    ]
+
+    # The shortest line that is looked for has exactly 8 characters. The
+    # other line of this value has 8 as the parent holds it and 7 after
+    # stripping: the line that holds it is returned as redacted on its own.
+    eight = _made_up_value("framed value, a line of eight characters", 8)
+    seven = _made_up_value("framed value, a line of seven characters", 7)
+    monkeypatch.setenv(
+        "CRUCIBLE_TEST_LINES_SHORT_LINES_TOKEN",
+        f"{eight}\n {seven}",
+    )
+    assert sdk_debug.redact_sdk_lines([f"got {eight} here", "next"]) == [
+        _LINE_WITHHELD,
+        "next",
+    ]
+    assert sdk_debug.redact_sdk_lines([f"request {seven} done", "next"]) == [
+        f"request {seven} done",
+        "next",
+    ]
+
+
+def test_redact_sdk_lines_two_checks_also_withhold_plain_lines(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """What the pair check and the framed lines cost, as known behavior.
+
+    A plain line after a name whose own line follows another name is
+    withheld. So is every line that holds the stripped form of a one-line
+    value held with white space at an end, secret or not.
+    """
+    edged = _made_up_value("value held with a blank at its end")
+    monkeypatch.setenv("CRUCIBLE_TEST_LINES_EDGED_TOKEN", f"{edged} ")
+
+    assert sdk_debug.redact_sdk_lines(
+        ["auth:", "  token:", "plain line here"]
+    ) == ["auth:", _LINE_WITHHELD, _LINE_WITHHELD]
+    assert sdk_debug.redact_sdk_lines([f"rejected {edged} (401)"]) == [
+        _LINE_WITHHELD
+    ]
+
+
+def _texts_of_lines_with_their_values() -> list[tuple[list[str], list[str]]]:
+    """Texts of one to several lines, each with the made-up values it holds."""
+    value = _made_up_value("texts of lines")
+    first = _made_up_value("texts of lines, first half")
+    second = _made_up_value("texts of lines, second half")
+    texts: list[tuple[list[str], list[str]]] = [
+        (["upstream said token:", f"  {value}"], [value]),
+        (["Authorization: Bearer", f" {value}"], [value]),
+        ([f'password = "{first}', f'{second}"'], [first, second]),
+        ([f"upstream said token: {value}"], [value]),
+        ([f"Authorization: Bearer {value}"], [value]),
+        (["auth:", f"  token: {value}"], [value]),
+        (["secret:", f"  password: {value}", "  user: bob"], [value]),
+        (["expected scheme Bearer", f"token: {value}"], [value]),
+        (['password = "abc', "more text", f'password = "{value}"'], [value]),
+        (["auth:", "  token:", f"    {value}"], [value]),
+        (["retry with secret:", "No conversation found", "exit"], []),
+        (["a: b", "c = d", "[e]"], []),
+        (["only line"], []),
+    ]
+    # A line break at every position of four one-line shapes.
+    for shape, values in (
+        (f"upstream said token: {value} ok", [value]),
+        (f"api_key={value};next", [value]),
+        (f"Authorization: Bearer {value} ok", [value]),
+        (f'password = "{first} {second}" ok', [first, second]),
+    ):
+        for position in range(1, len(shape)):
+            lines = _as_the_sdk_frames(
+                shape[:position] + "\n" + shape[position:]
+            )
+            texts.append((lines, values))
+    return texts
+
+
+def test_redact_sdk_lines_returns_each_line_alone_or_the_marker():
+    """No line is returned in another form than its own redaction.
+
+    So the function shows nothing that redacting each line on its own
+    hides. It shows nothing that redacting the joined lines hides either,
+    because a line is returned only where the joined result holds it.
+    """
+    texts = _texts_of_lines_with_their_values()
+    assert len(texts) > 100
+
+    for lines, values in texts:
+        alone = [sdk_debug.redact_sdk_text(line) for line in lines]
+        together = sdk_debug.redact_sdk_text("\n".join(lines))
+
+        returned = sdk_debug.redact_sdk_lines(lines)
+
+        assert len(returned) == len(lines)
+        for item, line_alone in zip(returned, alone, strict=True):
+            assert item in (line_alone, _LINE_WITHHELD)
+        for value in values:
+            if _readable(value, "\n".join(returned)):
+                assert _readable(value, "\n".join(alone))
+                assert _readable(value, together)
+
+    # Where every pass agrees, the lines are returned as redacted alone.
+    for plain in (["a: b", "c = d", "[e]"], ["only line"]):
+        assert sdk_debug.redact_sdk_lines(plain) == plain
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "name_then_value",
+        "name_separator_value_on_three_lines",
+        "assignment_of_bearer_then_token",
+        "bearer_alone_then_token",
+        "name_and_bearer_then_token",
+        "name_then_bearer_then_token",
+        "other_name_then_bearer_then_token",
+        "double_quoted_value_over_two_line_breaks",
+        "single_quoted_value_over_a_line_break",
+        "value_then_name_then_second_value",
+        "value_and_bearer_then_token",
+        "environment_value_of_three_lines",
+        "bearer_then_bearer_then_token",
+        "quoted_value_over_a_line_break_after_the_pairing_text",
+    ],
+)
+def test_redact_sdk_lines_hides_a_value_whose_shape_spans_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+):
+    """No part of a value is readable in what is returned.
+
+    In the last two cases the joined text does not redact the value. Only
+    the pair of the last two lines does, and its redaction is a single
+    line: a pair whose redaction lost its line break withholds both of its
+    lines.
+    """
+    value = _made_up_value(case)
+    first = _made_up_value(case + " first part")
+    second = _made_up_value(case + " second part")
+    third = _made_up_value(case + " third part")
+    hidden = [value]
+    if case == "name_then_value":
+        lines = ["upstream said token:", f"  {value}"]
+    elif case == "name_separator_value_on_three_lines":
+        lines = ["api_key", "=", value]
+    elif case == "assignment_of_bearer_then_token":
+        lines = ["authorization=Bearer", value]
+    elif case == "bearer_alone_then_token":
+        lines = ["Bearer", value]
+    elif case == "name_and_bearer_then_token":
+        lines = ["auth: Bearer", value]
+    elif case == "name_then_bearer_then_token":
+        lines = ["Authorization:", "Bearer", value]
+    elif case == "other_name_then_bearer_then_token":
+        lines = ["password:", "Bearer", value]
+    elif case == "double_quoted_value_over_two_line_breaks":
+        lines = [f'password = "{first}', second, f'{third}"']
+        hidden = [first, second, third]
+    elif case == "single_quoted_value_over_a_line_break":
+        lines = [f"password = '{first}", f"{second}'"]
+        hidden = [first, second]
+    elif case == "value_then_name_then_second_value":
+        lines = [f"token: {first}", "password:", second]
+        hidden = [first, second]
+    elif case == "value_and_bearer_then_token":
+        lines = [f"token={first} Bearer", second]
+        hidden = [first, second]
+    elif case == "environment_value_of_three_lines":
+        monkeypatch.setenv(
+            "CRUCIBLE_TEST_LINES_THREE_LINE_TOKEN",
+            f"{first}\n{second}\n{third}",
+        )
+        lines = [f"value is {first}", second, f"{third} end"]
+        hidden = [first, second, third]
+    elif case == "bearer_then_bearer_then_token":
+        # In the joined text the first scheme word takes the second as its
+        # token, and the token line stays a line of its own.
+        lines = ["Bearer", "Bearer", value]
+    else:
+        assert case == "quoted_value_over_a_line_break_after_the_pairing_text"
+        # In the joined text the first quote is closed by the second, and
+        # the last line stays a line of its own.
+        lines = [
+            'password = "abc',
+            "more text",
+            f'password = "{first}',
+            f'{second}"',
+        ]
+        hidden = [first, second]
+
+    returned = sdk_debug.redact_sdk_lines(lines)
+
+    assert len(returned) == len(lines)
+    for part in hidden:
+        assert not _readable(part, "\n".join(returned))
+
+
+_LINES_FUNCTION = "redact_sdk_lines"
+# Every place of the package where the name stands: the function, the
+# adapter's import of it, and the one call, with the entries of the stderr
+# window of one attempt.
+_USES_OF_THE_LINES_FUNCTION = [
+    ("backends/_sdk_debug.py", "definition", "redact_sdk_lines"),
+    (
+        "backends/claude.py",
+        "call",
+        "redact_sdk_lines(cli_stderr_window.entries)",
+    ),
+    ("backends/claude.py", "import", "redact_sdk_lines"),
+]
+
+
+def _uses_of_the_lines_function(root: Path) -> list[tuple[str, str, str]]:
+    """Every use of the name ``redact_sdk_lines`` in the Python under ``root``.
+
+    Read is every ``*.py`` file outside the directories named ``tests`` or
+    ``__pycache__`` and those whose name begins with a dot. A use is a
+    definition by the name, an import of it (as written, so with the name
+    it is bound to), a call of it (as written, so with its arguments), and
+    every other place where it stands as a name, as an attribute or as a
+    whole string: the function handed over as a value, bound to another
+    name, or looked up by its name. Comments and longer strings are not
+    uses, and a name put together at run time is not seen.
+    """
+    uses: list[tuple[str, str, str]] = []
+    for current, directories, files in os.walk(root):
+        directories[:] = [
+            name
+            for name in directories
+            if not name.startswith(".") and name not in {"__pycache__", "tests"}
+        ]
+        for file_name in files:
+            if not file_name.endswith(".py"):
+                continue
+            path = Path(current) / file_name
+            source = path.read_bytes()
+            if _LINES_FUNCTION.encode() not in source:
+                continue
+            where = path.relative_to(root).as_posix()
+            tree = ast.parse(source)
+            calls = {
+                id(node.func): node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+            }
+            for node in ast.walk(tree):
+                if isinstance(
+                    node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                ):
+                    if node.name == _LINES_FUNCTION:
+                        uses.append((where, "definition", node.name))
+                elif isinstance(node, ast.alias):
+                    imported = node.name.rpartition(".")[2]
+                    if _LINES_FUNCTION in (imported, node.asname):
+                        uses.append((where, "import", ast.unparse(node)))
+                elif (
+                    (isinstance(node, ast.Name) and node.id == _LINES_FUNCTION)
+                    or (
+                        isinstance(node, ast.Attribute)
+                        and node.attr == _LINES_FUNCTION
+                    )
+                    or (
+                        isinstance(node, ast.Constant)
+                        and node.value == _LINES_FUNCTION
+                    )
+                ):
+                    call = calls.get(id(node))
+                    if call is None:
+                        uses.append((where, "value", ast.unparse(node)))
+                    else:
+                        uses.append((where, "call", ast.unparse(call)))
+    return sorted(uses)
+
+
+def test_redact_sdk_lines_has_one_caller_which_hands_it_a_bounded_text():
+    """``redact_sdk_lines`` has no bound of its own, and one caller.
+
+    It reads every line four times, so its caller has to bound the text.
+    The one caller is the Claude adapter's handler of a failed attempt,
+    which hands it the entries of that attempt's stderr window and nothing
+    else. A second caller, another argument, the function under another
+    name or handed over as a value needs a bound of its own and fails
+    here, in whichever module of the package it stands.
+    """
+    import crucible
+
+    root = Path(crucible.__file__).resolve().parent
+
+    assert _uses_of_the_lines_function(root) == _USES_OF_THE_LINES_FUNCTION
+
+
+_UNREAD_USE = (
+    "from crucible.backends._sdk_debug import redact_sdk_lines\n"
+    "\n"
+    "redact_sdk_lines([])\n"
+)
+# One more use of the function in a made-up package tree: the file it is
+# appended to, its text, and what it adds to the uses found.
+_FURTHER_USES_OF_THE_LINES_FUNCTION = {
+    "a_call_in_rules": (
+        "rules/late.py",
+        "from ..backends import _sdk_debug\n"
+        "\n"
+        "\n"
+        "def publish(lines):\n"
+        "    return _sdk_debug.redact_sdk_lines(lines)\n",
+        [("rules/late.py", "call", "_sdk_debug.redact_sdk_lines(lines)")],
+    ),
+    "a_call_in_scripts": (
+        "scripts/report.py",
+        "from crucible.backends._sdk_debug import redact_sdk_lines\n"
+        "\n"
+        "print(redact_sdk_lines(['a']))\n",
+        [
+            ("scripts/report.py", "call", "redact_sdk_lines(['a'])"),
+            ("scripts/report.py", "import", "redact_sdk_lines"),
+        ],
+    ),
+    "a_call_in_a_module_at_the_root": (
+        "orchestration.py",
+        "from .backends._sdk_debug import redact_sdk_lines\n"
+        "\n"
+        "LINES = redact_sdk_lines(())\n",
+        [
+            ("orchestration.py", "call", "redact_sdk_lines(())"),
+            ("orchestration.py", "import", "redact_sdk_lines"),
+        ],
+    ),
+    "a_second_call_in_the_adapter": (
+        "backends/claude.py",
+        "\n"
+        "\n"
+        "def publish_again(lines):\n"
+        "    return redact_sdk_lines(lines)\n",
+        [("backends/claude.py", "call", "redact_sdk_lines(lines)")],
+    ),
+    "a_call_under_another_name": (
+        "backends/other.py",
+        "from ._sdk_debug import redact_sdk_lines as lines_of\n"
+        "\n"
+        "\n"
+        "def publish(lines):\n"
+        "    return lines_of(lines)\n",
+        [("backends/other.py", "import", "redact_sdk_lines as lines_of")],
+    ),
+    "the_function_handed_over_as_a_value": (
+        "backends/claude.py",
+        "\n"
+        "\n"
+        "def publish_each(texts):\n"
+        "    return list(map(redact_sdk_lines, texts))\n",
+        [("backends/claude.py", "value", "redact_sdk_lines")],
+    ),
+    "the_function_looked_up_by_its_name": (
+        "workflows/report.py",
+        "from ..backends import _sdk_debug\n"
+        "\n"
+        "publish = getattr(_sdk_debug, 'redact_sdk_lines')\n",
+        [("workflows/report.py", "value", "'redact_sdk_lines'")],
+    ),
+}
+
+
+def _package_with_the_one_caller(root: Path) -> None:
+    """Write a made-up package tree that uses the function as the real one.
+
+    Beside the three uses it holds the name in a comment and in a longer
+    string, and uses of it where nothing is read: under ``tests`` at two
+    depths and in a virtual environment.
+    """
+    files = {
+        "backends/_sdk_debug.py": (
+            "def redact_sdk_lines(lines):\n"
+            '    """Stand in for ``redact_sdk_lines``."""\n'
+            "    return list(lines)\n"
+        ),
+        "backends/claude.py": (
+            "from ._sdk_debug import redact_sdk_lines\n"
+            "\n"
+            "\n"
+            "def publish(cli_stderr_window):\n"
+            "    # The kept entries go through ``redact_sdk_lines``.\n"
+            "    return redact_sdk_lines(cli_stderr_window.entries)\n"
+        ),
+        "tests/test_lines.py": _UNREAD_USE,
+        "products/demo/tests/test_demo.py": _UNREAD_USE,
+        ".venv/lib/site.py": _UNREAD_USE,
+    }
+    for relative, text in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode())
+
+
+@pytest.mark.parametrize("case", sorted(_FURTHER_USES_OF_THE_LINES_FUNCTION))
+def test_a_further_use_of_redact_sdk_lines_is_found_wherever_it_stands(
+    tmp_path: Path,
+    case: str,
+):
+    """What the test of the one caller reads, shown on a made-up package.
+
+    The tree holds the three uses of the real package. One more use, in a
+    module of any directory or at the root, and in any spelling, is found
+    with its place and its text.
+    """
+    relative, text, further = _FURTHER_USES_OF_THE_LINES_FUNCTION[case]
+    _package_with_the_one_caller(tmp_path)
+    assert _uses_of_the_lines_function(tmp_path) == _USES_OF_THE_LINES_FUNCTION
+
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as stream:
+        stream.write(text.encode())
+
+    assert _uses_of_the_lines_function(tmp_path) == sorted(
+        [*_USES_OF_THE_LINES_FUNCTION, *further]
+    )
 
 
 # ----------------------------------------------------------------------

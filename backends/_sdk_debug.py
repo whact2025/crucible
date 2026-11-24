@@ -77,6 +77,7 @@ Failure isolation: dump writes are wrapped in a try/except so a
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -86,6 +87,7 @@ import secrets
 import stat
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -192,14 +194,20 @@ def _truncate_redacted_text(
     }
 
 
-def _redact_text(value: str) -> str:
-    """Remove common credentials and exact sensitive environment values."""
+def _sensitive_env_values() -> set[str]:
+    """Values of the parent's variables with a sensitive name, 8 characters up."""
 
-    sensitive_values = {
+    return {
         secret
         for name, secret in os.environ.items()
         if _SENSITIVE_ENV_RE.search(name) and len(secret) >= 8
     }
+
+
+def _redact_text(value: str) -> str:
+    """Remove common credentials and exact sensitive environment values."""
+
+    sensitive_values = _sensitive_env_values()
     # Discover every exact match against the original string and replace the
     # union in one pass. Sequential replacement is unsafe: an assignment
     # heuristic can split a delimiter-containing secret, while replacing one
@@ -218,6 +226,66 @@ def redact_sdk_text(value: str) -> str:
     """Redact credential-shaped text before it reaches ordinary logs."""
 
     return _redact_text(value)
+
+
+_LINE_WITHHELD = "[REDACTED: line withheld]"
+
+
+def _framed_secret_lines() -> set[str]:
+    """Lines of sensitive values that line-framed output does not hold whole.
+
+    A value that holds a line break, or begins or ends in white space, is
+    not found as it stands in output that was split at line breaks and
+    right-stripped, or that a child printed after stripping the value. Its
+    lines of at least 8 characters, stripped, are returned.
+    """
+
+    framed: set[str] = set()
+    for secret in _sensitive_env_values():
+        parts = [part.strip() for part in secret.split("\n")]
+        if parts != [secret]:
+            framed.update(part for part in parts if len(part) >= 8)
+    return framed
+
+
+def redact_sdk_lines(lines: Sequence[str]) -> list[str]:
+    """Redact the lines of one bounded text; return one item per line.
+
+    Each line is redacted on its own, each pair of neighbouring lines as
+    one text, and all lines joined by line breaks as one text. A line is
+    returned, as redacted on its own, only where the pair results and the
+    joined result hold that same line and it holds none of the lines
+    ``_framed_secret_lines`` names; any other line is replaced by a fixed
+    marker. The caller bounds the text: every line is read four times.
+    """
+
+    per_line = [_redact_text(line) for line in lines]
+    joined = _redact_text("\n".join(lines)).split("\n")
+    if len(joined) == len(per_line):
+        shown = [
+            alone == together
+            for alone, together in zip(per_line, joined, strict=True)
+        ]
+    else:
+        shown = [False] * len(per_line)
+        matcher = difflib.SequenceMatcher(a=per_line, b=joined, autojunk=False)
+        for block in matcher.get_matching_blocks():
+            end = block.a + block.size
+            shown[block.a:end] = [True] * block.size
+    for index in range(len(lines) - 1):
+        pair = _redact_text(f"{lines[index]}\n{lines[index + 1]}").split("\n")
+        if len(pair) != 2:
+            shown[index] = shown[index + 1] = False
+            continue
+        shown[index] = shown[index] and pair[0] == per_line[index]
+        shown[index + 1] = shown[index + 1] and pair[1] == per_line[index + 1]
+    framed = _framed_secret_lines()
+    return [
+        alone
+        if keep and not any(part in line for part in framed)
+        else _LINE_WITHHELD
+        for line, alone, keep in zip(lines, per_line, shown, strict=True)
+    ]
 
 
 def _redact(value: Any) -> Any:

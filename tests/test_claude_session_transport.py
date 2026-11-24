@@ -901,10 +901,11 @@ def test_session_stderr_reaches_the_callback_in_lines_of_bounded_length(
 ):
     """Every stderr entry the callback receives has a bounded length.
 
-    The adapter bounds the stderr it keeps by counting entries, so its
-    memory bound rests on the length of one entry. The reviewed SDK hands
-    over a run without a newline in pieces of at most ``max_buffer_size``
-    plus one pipe read, and the line that follows the run stays intact.
+    The adapter bounds the stderr it keeps in entries and in bytes, so what
+    it keeps no longer rests on the length of one entry. The entry in
+    flight is still the SDK's: the reviewed SDK hands over a run without a
+    newline in pieces of at most ``max_buffer_size`` plus one pipe read,
+    and the line that follows the run stays intact.
     """
     reason = "No conversation found with session ID: offline-session"
     max_buffer_size = _sdk_cli._DEFAULT_MAX_BUFFER_SIZE
