@@ -60,7 +60,7 @@ from ._classify import (
     TERMINAL_EXCEPTION_NAMES,
     ClassifiedError,
 )
-from ._sdk_debug import SdkDebugSink, redact_sdk_text
+from ._sdk_debug import SdkDebugSink, redact_sdk_lines, redact_sdk_text
 
 logger = logging.getLogger(__name__)
 
@@ -289,29 +289,114 @@ def _conversation_outcome(
     )
 
 
+_CLI_STDERR_MAX_ENTRIES = 200
+_CLI_STDERR_MAX_BYTES = 64 * 1024
+_RESUME_REJECTED_EXACT = 1
+_RESUME_REJECTED_SESSION_ID = 2
+_RESUME_REJECTED_LOOSE = 4
+
+
+def _resume_rejection_marks(text: str) -> int:
+    """Name the rejected-resume markers that one piece of evidence holds."""
+
+    lowered = text.lower()
+    marks = 0
+    if any(
+        marker in lowered
+        for marker in (
+            "no conversation found",
+            "conversation not found",
+            "no session found",
+            "session not found",
+        )
+    ):
+        marks |= _RESUME_REJECTED_EXACT
+    if "session id" in lowered:
+        marks |= _RESUME_REJECTED_SESSION_ID
+    if any(
+        marker in lowered
+        for marker in ("does not exist", "not found", "unknown", "invalid")
+    ):
+        marks |= _RESUME_REJECTED_LOOSE
+    return marks
+
+
 def _claude_resume_was_rejected(
     exc: BaseException,
     stderr_lines: list[str],
+    stderr_marks: int,
 ) -> bool:
     """Recognize a missing/rejected session without treating outage as stale."""
 
     leaf = _unwrap_exception_group(exc)
-    evidence = "\n".join([str(leaf), *stderr_lines]).lower()
-    exact_markers = (
-        "no conversation found",
-        "conversation not found",
-        "no session found",
-        "session not found",
+    marks = stderr_marks | _resume_rejection_marks(
+        "\n".join([str(leaf), *stderr_lines])
     )
-    if any(marker in evidence for marker in exact_markers):
+    if marks & _RESUME_REJECTED_EXACT:
         return True
-    return (
-        "session id" in evidence
-        and any(
-            marker in evidence
-            for marker in ("does not exist", "not found", "unknown", "invalid")
+    loose = _RESUME_REJECTED_SESSION_ID | _RESUME_REJECTED_LOOSE
+    return marks & loose == loose
+
+
+class _CliStderrWindow:
+    """The end of one attempt's CLI stderr, bounded in entries and in bytes.
+
+    ``entries`` holds the last entries that fit both bounds, ``notes`` flags
+    those that are the window's own size note for an entry over the byte
+    bound, and ``received`` counts every entry handed over.
+    """
+
+    def __init__(self, *, note_resume_markers: bool) -> None:
+        self.entries: list[str] = []
+        self.received = 0
+        self._entry_bytes = 0
+        self._sizes: list[int] = []
+        self._marks: list[int] = []
+        self.notes: list[bool] = []
+        self._note_resume_markers = note_resume_markers
+
+    def add(self, line: str) -> None:
+        """Keep one entry. Called by the SDK; never raises for a ``str``."""
+
+        self.received += 1
+        if self._note_resume_markers:
+            if len(self._marks) >= _CLI_STDERR_MAX_ENTRIES:
+                del self._marks[0]
+            self._marks.append(_resume_rejection_marks(line))
+        size = (
+            len(line)
+            if line.isascii()
+            else len(line.encode("utf-8", "surrogatepass"))
         )
-    )
+        noted = size > _CLI_STDERR_MAX_BYTES
+        if noted:
+            line = f"[crucible: one stderr line of {size} bytes not kept]"
+            size = len(line)
+        self.entries.append(line)
+        self._sizes.append(size)
+        self.notes.append(noted)
+        self._entry_bytes += size
+        while len(self.entries) > 1 and (
+            len(self.entries) > _CLI_STDERR_MAX_ENTRIES
+            or self.kept_bytes > _CLI_STDERR_MAX_BYTES
+        ):
+            self._entry_bytes -= self._sizes.pop(0)
+            del self.entries[0]
+            del self.notes[0]
+
+    @property
+    def kept_bytes(self) -> int:
+        """UTF-8 size of the kept entries joined by line breaks."""
+
+        return self._entry_bytes + max(len(self.entries) - 1, 0)
+
+    def resume_marks(self) -> int:
+        """Markers of the last 200 entries received, kept or not."""
+
+        marks = 0
+        for entry_marks in self._marks:
+            marks |= entry_marks
+        return marks
 
 
 def _usage_sum(left: Usage, right: Usage) -> Usage:
@@ -3801,17 +3886,14 @@ class ClaudeBackend:
         # instead of the unhelpful "Check stderr output for details"
         # placeholder. Without this callback the SDK silently drops the
         # subprocess's stderr; we'd see ``re_raised: True`` in the
-        # debug dump with no diagnostic context. Bounded to avoid an
-        # accidentally-chatty CLI bloating the in-memory buffer: only the
-        # last lines are kept, so that what the CLI writes before it exits
-        # (the reason for a rejected ``--resume``, for one) is among them.
-        cli_stderr_lines: list[str] = []
-        _CLI_STDERR_MAX_LINES = 200
-
-        def _on_cli_stderr(line: str) -> None:
-            if len(cli_stderr_lines) >= _CLI_STDERR_MAX_LINES:
-                del cli_stderr_lines[0]
-            cli_stderr_lines.append(line)
+        # debug dump with no diagnostic context. Bounded so that a chatty
+        # CLI cannot grow what one attempt keeps: the window holds the last
+        # 200 entries and at most 65 536 bytes of UTF-8 over them, in whole
+        # entries. For a resumed handle it reads every entry for the reason
+        # of a rejected ``--resume`` as the entry arrives, so that reason is
+        # found among the last 200 entries received whether or not its text
+        # is kept. ``_claude_session_transport.py`` records the limits.
+        cli_stderr_window = _CliStderrWindow(note_resume_markers=external_resume)
 
         effective_max_turns = (
             invocation.max_turns
@@ -3831,7 +3913,7 @@ class ClaudeBackend:
             "max_turns": effective_max_turns,
             "thinking": _adaptive_thinking(),
             "effort": self._effort,
-            "stderr": _on_cli_stderr,
+            "stderr": cli_stderr_window.add,
             # The workflow supplies the complete MCP surface explicitly.
             # Never inherit project/user/plugin MCP servers, settings, hooks,
             # skills, or plugins from the checkout or operator account.
@@ -5137,17 +5219,33 @@ class ClaudeBackend:
             # Without this, the SDK transport's "Command failed with
             # exit code 1 (Check stderr output for details)" reaches
             # us with no actual stderr — making transport-level
-            # crashes opaque.
-            if cli_stderr_lines:
-                redacted_stderr = [
-                    redact_sdk_text(line) for line in cli_stderr_lines
-                ]
+            # crashes opaque. The kept entries are published through
+            # ``redact_sdk_lines``. An entry the window flags as its own
+            # size note is no line of the CLI: it is published as redacted
+            # on its own, so a kept note is never the withheld marker. The
+            # search for a rejected resume reads the kept entries as the
+            # CLI wrote them, never the redacted lines.
+            if cli_stderr_window.entries:
+                redacted_stderr = redact_sdk_lines(cli_stderr_window.entries)
+                for index, noted in enumerate(
+                    cli_stderr_window.notes[: len(redacted_stderr)]
+                ):
+                    if noted:
+                        redacted_stderr[index] = redact_sdk_text(
+                            cli_stderr_window.entries[index]
+                        )
                 tail = "\n".join(redacted_stderr[-50:])
+                dropped = cli_stderr_window.received - len(redacted_stderr)
                 logger.error(
-                    "claude bundled CLI exited abnormally; stderr tail "
+                    "claude bundled CLI exited abnormally; %sstderr tail "
                     "(last %d of %d lines):\n%s",
-                    min(len(cli_stderr_lines), 50),
-                    len(cli_stderr_lines),
+                    (
+                        f"earlier stderr lines dropped: {dropped}; "
+                        if dropped
+                        else ""
+                    ),
+                    min(len(redacted_stderr), 50),
+                    len(redacted_stderr),
                     tail,
                 )
                 try:
@@ -5157,7 +5255,11 @@ class ClaudeBackend:
             if (
                 external_resume
                 and not session_id_holder
-                and _claude_resume_was_rejected(exc, cli_stderr_lines)
+                and _claude_resume_was_rejected(
+                    exc,
+                    cli_stderr_window.entries,
+                    cli_stderr_window.resume_marks(),
+                )
             ):
                 return self._result_with_evidence(
                     final_message=final_message,

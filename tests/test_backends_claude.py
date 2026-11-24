@@ -16,8 +16,10 @@ when those land later.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7775,6 +7777,19 @@ def test_workflow_external_stale_session_is_typed_and_not_retried(
 
 # The adapter keeps at most this many of the CLI's stderr lines per attempt.
 _CLI_STDERR_BOUND = 200
+# It also keeps at most this many bytes of UTF-8, counted over the kept
+# lines joined by line breaks.
+_CLI_STDERR_BYTE_BOUND = 64 * 1024
+_CLI_STDERR_HEADER = "claude bundled CLI exited abnormally; "
+_CLI_STDERR_LINE_WITHHELD = "[REDACTED: line withheld]"
+_STALE_REASON = "No conversation found with session ID: session-stale"
+# What a failed resume is when the reason for it is not recognized.
+_UNRECOGNIZED_RESUME_FAILURE = (
+    "ProcessError: Command failed with exit code 1 (exit code: 1)\n"
+    "Error output: Check stderr output for details; automatic retry "
+    "suppressed because the prior physical attempt's token/cost accounting "
+    "is incomplete"
+)
 
 
 def _failing_cli_query(stderr_lines, raised, *, after_handshake=False):
@@ -7874,9 +7889,9 @@ def test_workflow_external_stale_reason_survives_any_amount_of_stderr(
 ):
     """A rejected handle is typed as stale however much stderr precedes it.
 
-    The SDK's error for a failed CLI carries no stderr, so the reason for
-    the rejection has to be among the lines the adapter keeps, also when
-    more lines than the bound were written before it.
+    The SDK's error for a failed CLI carries no stderr, so the adapter has
+    to find the reason for the rejection in the stderr it receives, also
+    when more lines than the bound were written before it.
     """
     import claude_agent_sdk
     from crucible.backends import claude as claude_mod
@@ -8000,27 +8015,29 @@ def test_cli_stderr_within_the_bound_is_kept_whole(
     assert tail == lines[-50:]
 
 
-def test_cli_stderr_bound_counts_entries_however_long_the_lines(
+def test_cli_stderr_bound_counts_bytes_however_long_the_lines(
     monkeypatch,
     caplog,
 ):
-    """Kept stderr is at most the bound times the longest line handed over.
+    """Kept stderr is at most the byte bound, however long the lines are.
 
-    Each line here is as long as one pipe read. The SDK transport caps the
-    length of a line it hands over; the session transport tests pin that cap.
+    Each line here is exactly as long as the byte bound, so it fits alone:
+    the last one is kept whole, and every line before it is dropped and
+    counted in the header.
     """
-    line_chars = 64 * 1024
     lines = [
-        f"{index:04d}:".ljust(line_chars, "x")
+        f"{index:04d}:".ljust(_CLI_STDERR_BYTE_BOUND, "x")
         for index in range(_CLI_STDERR_BOUND + 30)
     ]
 
-    kept, _header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
 
-    assert len(kept) == _CLI_STDERR_BOUND
-    assert kept == lines[-_CLI_STDERR_BOUND:]
-    assert sum(len(line) for line in kept) == _CLI_STDERR_BOUND * line_chars
-    assert tail == lines[-50:]
+    assert kept == lines[-1:]
+    assert len(kept[0].encode("utf-8")) == _CLI_STDERR_BYTE_BOUND
+    assert header.endswith(
+        "earlier stderr lines dropped: 229; stderr tail (last 1 of 1 lines):"
+    )
+    assert tail == lines[-1:]
 
 
 def test_cli_stderr_written_after_the_bound_is_redacted(monkeypatch, caplog):
@@ -8134,6 +8151,1075 @@ def test_workflow_external_stale_reason_is_kept_on_the_sdk_delivery_path(
     header, _, tail = logged.partition("\n")
     assert header.endswith("stderr tail (last 50 of 200 lines):")
     assert tail.split("\n") == written[-50:]
+
+
+def _made_up_value(tag: str, length: int = 20) -> str:
+    """Return a value made at run time, so that no file holds it."""
+    digest = hashlib.sha256(f"cli stderr test value {tag}".encode())
+    return digest.hexdigest()[:length]
+
+
+def _readable(value: str, text: str) -> bool:
+    """Whether any six characters in a row of ``value`` stand in ``text``."""
+    return any(
+        value[start : start + 6] in text for start in range(len(value) - 5)
+    )
+
+
+def _size_note(size: int) -> str:
+    """What the adapter keeps in the place of a line over the byte bound."""
+    return f"[crucible: one stderr line of {size} bytes not kept]"
+
+
+def _as_the_sdk_frames(text: str) -> list[str]:
+    """Return the stderr entries the reviewed SDK hands over for ``text``.
+
+    It splits at line feeds, strips every line on the right and hands over
+    no blank line.
+    """
+    return [line.rstrip() for line in text.split("\n") if line.rstrip()]
+
+
+def _resume_against_failing_cli(monkeypatch, stderr_lines):
+    """Resume a workflow handle against a CLI that fails after its stderr.
+
+    The CLI is started once, with the workflow's handle. Returns the result
+    and the errors the fake transport raised; the adapter attaches the kept
+    stderr to them.
+    """
+    import claude_agent_sdk
+    from crucible.backends import claude as claude_mod
+
+    resumes: list[str | None] = []
+    raised: list[Exception] = []
+    failing_query = _failing_cli_query(stderr_lines, raised)
+
+    def fake_query(*, prompt, options):
+        resumes.append(options.resume)
+        return failing_query(prompt=prompt, options=options)
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    result = claude_mod.ClaudeBackend().invoke(
+        Invocation(
+            system="sys",
+            user="correction",
+            tools=(),
+            max_turns=2,
+            budget_usd=1.0,
+            policy=BackendPolicy(
+                retry_budget=3,
+                timeout_seconds=10.0,
+                on_cancellation="convert_to_backend_error",
+                on_max_turns="raise",
+            ),
+            conversation=_conversation_request(
+                action="reuse",
+                opaque_id="session-stale",
+            ),
+        )
+    )
+    assert resumes == ["session-stale"]
+    return result, raised
+
+
+def _assert_rejected_handle(result):
+    assert result.error is not None
+    assert result.error.kind == "stale_conversation"
+    assert result.error.retriable is False
+    assert result.stop_reason == "stale_conversation"
+    assert result.conversation is not None
+    assert result.conversation.state == "stale"
+    assert result.conversation.opaque_id is None
+
+
+def _assert_unrecognized_resume_failure(result):
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert result.error.retriable is False
+    assert result.error.message == _UNRECOGNIZED_RESUME_FAILURE
+    assert result.stop_reason == "error"
+    assert result.conversation is not None
+    assert result.conversation.state == "active"
+    assert result.conversation.opaque_id == "session-stale"
+
+
+def _fail_once_on_the_sdk_delivery_path(
+    tmp_path,
+    caplog,
+    stderr_text,
+    *,
+    resume,
+):
+    """Run one failing attempt in which the SDK itself delivers the stderr.
+
+    Nothing of the SDK is replaced: it starts a CLI double that writes
+    ``stderr_text`` and exits 1. Returns the result, the arguments of every
+    model start, the header of the ERROR record and the lines of its tail.
+    """
+    cli_path, starts = _stderr_then_exit_cli_double(tmp_path, stderr_text)
+    with caplog.at_level(logging.ERROR, logger="crucible.backends.claude"):
+        result = ClaudeBackend(cli_path=cli_path, cwd=str(tmp_path)).invoke(
+            Invocation(
+                system="sys",
+                user="correction",
+                tools=(),
+                max_turns=2,
+                budget_usd=1.0,
+                policy=BackendPolicy(
+                    retry_budget=1,
+                    timeout_seconds=60.0,
+                    on_cancellation="convert_to_backend_error",
+                    on_max_turns="raise",
+                ),
+                conversation=(
+                    _conversation_request(
+                        action="reuse",
+                        opaque_id="session-stale",
+                    )
+                    if resume
+                    else None
+                ),
+            )
+        )
+    model_starts = [
+        json.loads(line)
+        for line in starts.read_text(encoding="utf-8").splitlines()
+    ]
+    (logged,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "stderr tail" in record.getMessage()
+    ]
+    header, _, tail = logged.partition("\n")
+    return result, model_starts, header, tail.split("\n")
+
+
+# ----------------------------------------------------------------------
+# The byte bound on kept stderr
+# ----------------------------------------------------------------------
+
+
+def test_cli_stderr_byte_bound_counts_the_line_breaks(monkeypatch, caplog):
+    """The bound is on the kept lines joined by line breaks.
+
+    Sixty-three lines of 1 024 bytes and their 62 line breaks fit; a
+    64th line would fit only if the line breaks were not counted.
+    """
+    lines = [f"{index:04d}:".ljust(1024, "x") for index in range(300)]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == lines[-63:]
+    assert len("\n".join(kept).encode("utf-8")) == 63 * 1024 + 62
+    assert 63 * 1024 + 62 <= _CLI_STDERR_BYTE_BOUND < 64 * 1024 + 63
+    assert header.endswith(
+        "earlier stderr lines dropped: 237; stderr tail (last 50 of 63 lines):"
+    )
+    assert tail == lines[-50:]
+
+
+@pytest.mark.parametrize(
+    ("first_code_point", "bytes_per_character", "kept_count"),
+    [(0x0100, 2, 32), (0x10000, 4, 16)],
+)
+def test_cli_stderr_byte_bound_is_in_utf8_bytes(
+    monkeypatch,
+    caplog,
+    first_code_point,
+    bytes_per_character,
+    kept_count,
+):
+    """Lines of 1 000 characters are counted by what they encode to."""
+    lines = [chr(first_code_point + index) * 1000 for index in range(300)]
+    assert {len(line.encode("utf-8")) for line in lines} == {
+        1000 * bytes_per_character
+    }
+
+    kept, header, _tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == lines[-kept_count:]
+    kept_bytes = len("\n".join(kept).encode("utf-8"))
+    assert kept_bytes <= _CLI_STDERR_BYTE_BOUND
+    # One more line of this length would not have fitted.
+    assert kept_bytes + 1 + 1000 * bytes_per_character > _CLI_STDERR_BYTE_BOUND
+    assert header.endswith(
+        f"earlier stderr lines dropped: {300 - kept_count}; stderr tail "
+        f"(last {kept_count} of {kept_count} lines):"
+    )
+
+
+@pytest.mark.parametrize(
+    ("character", "character_count", "size"),
+    [
+        ("x", _CLI_STDERR_BYTE_BOUND + 1, 65_537),
+        ("İ", _CLI_STDERR_BYTE_BOUND // 2 + 1, 65_538),
+        ("x", 5 * 1024 * 1024, 5_242_880),
+    ],
+)
+def test_cli_stderr_line_over_the_byte_bound_is_replaced_by_its_size(
+    monkeypatch,
+    caplog,
+    character,
+    character_count,
+    size,
+):
+    """A line that alone is over the bound leaves a note of its size.
+
+    The note stands in the place of the line, counts as one line, and the
+    lines around it are kept: nothing is dropped, so the header has no
+    clause.
+    """
+    lines = ["first line", character * character_count, "last line"]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == ["first line", _size_note(size), "last line"]
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 3 of 3 lines):"
+    assert tail == kept
+
+
+def test_cli_stderr_only_line_over_the_byte_bound_leaves_its_size_note(
+    monkeypatch,
+    caplog,
+):
+    """The text of a line over the bound is not in the record, only its size.
+
+    That also holds when the line is the only thing the CLI wrote. One byte
+    shorter, the same line is kept and redacted as any line is.
+    """
+    value = _made_up_value("only line over the bound")
+    line = f"upstream said token: {value} ".ljust(_CLI_STDERR_BYTE_BOUND + 1, "z")
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, [line])
+
+    assert kept == [_size_note(_CLI_STDERR_BYTE_BOUND + 1)]
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 1 of 1 lines):"
+    assert tail == kept
+
+
+def test_cli_stderr_line_of_exactly_the_byte_bound_is_kept_alone(
+    monkeypatch,
+    caplog,
+):
+    """A last line of exactly the bound is kept, and the lines before it go."""
+    short = [f"cli stderr line {index}" for index in range(199)]
+    longest = "last:".ljust(_CLI_STDERR_BYTE_BOUND, "x")
+
+    kept, header, tail = _fail_once_with_cli_stderr(
+        monkeypatch,
+        caplog,
+        [*short, longest],
+    )
+
+    assert kept == [longest]
+    assert header == (
+        _CLI_STDERR_HEADER
+        + "earlier stderr lines dropped: 199; stderr tail (last 1 of 1 lines):"
+    )
+    assert tail == [longest]
+
+
+def test_cli_stderr_line_one_byte_over_the_bound_leaves_the_others_kept(
+    monkeypatch,
+    caplog,
+):
+    """One byte more, and the lines before it stay and the line is a note."""
+    short = [f"cli stderr line {index}" for index in range(199)]
+    longest = "last:".ljust(_CLI_STDERR_BYTE_BOUND + 1, "x")
+
+    kept, header, tail = _fail_once_with_cli_stderr(
+        monkeypatch,
+        caplog,
+        [*short, longest],
+    )
+
+    assert kept == [*short, _size_note(_CLI_STDERR_BYTE_BOUND + 1)]
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 50 of 200 lines):"
+    assert tail == kept[-50:]
+
+
+def test_cli_stderr_size_note_is_logged_after_a_line_that_ends_in_a_name(
+    monkeypatch,
+    caplog,
+):
+    """A size note the adapter wrote is never shown as a withheld line.
+
+    The line before it ends in a name and a separator, which makes every
+    line of the CLI that follows it a withheld one. The note is no line of
+    the CLI: it is logged as redacted on its own.
+    """
+    from crucible.backends._sdk_debug import redact_sdk_text
+
+    first = "upstream said token:"
+    lines = [first, "x" * 70_000]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == [redact_sdk_text(first), _size_note(70_000)]
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 2 of 2 lines):"
+    assert tail == kept
+
+
+def test_cli_stderr_size_note_is_its_own_redaction_and_never_the_marker(
+    monkeypatch,
+    caplog,
+):
+    """A kept note is published as redacted on its own, whatever that is.
+
+    With a sensitive variable whose value is a word of the note, that is
+    not the note as written, and it is not the withheld marker either.
+    """
+    from crucible.backends._sdk_debug import redact_sdk_text
+
+    monkeypatch.setenv("CRUCIBLE_TEST_STDERR_API_KEY", "crucible")
+    note = _size_note(70_000)
+    lines = ["upstream said token:", "x" * 70_000]
+
+    kept, _header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept[1] == redact_sdk_text(note)
+    assert kept[1] == "[[REDACTED]: one stderr line of 70000 bytes not kept]"
+    assert tail == kept
+
+
+def test_cli_stderr_line_with_the_text_of_a_size_note_is_a_line_of_the_cli(
+    monkeypatch,
+    caplog,
+):
+    """The adapter knows its own notes by their place, not by their text."""
+    lines = ["upstream said token:", _size_note(70_000), "exiting"]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == ["upstream said token:", _CLI_STDERR_LINE_WITHHELD, "exiting"]
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 3 of 3 lines):"
+    assert tail == kept
+
+
+def test_cli_stderr_callback_keeps_any_string(monkeypatch, caplog):
+    """The stderr callback keeps every ``str``, and the entry after it.
+
+    The reviewed SDK swallows an exception of the callback and with it the
+    line, so a callback that raised for one string would lose that line
+    without a trace. The SDK decodes stderr strictly and hands over no lone
+    surrogate itself; a caller that hands the callback a ``str`` can.
+    """
+    from crucible.backends._sdk_debug import redact_sdk_text
+
+    lines = [
+        "first line",
+        "lone surrogate \ud800 here",
+        "next line",
+        "pair in the wrong order \udc00\ud800 here",
+        "next line again",
+        "null \x00 here",
+        "",
+        "last line",
+    ]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == [redact_sdk_text(line) for line in lines]
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 8 of 8 lines):"
+    assert tail == kept
+    assert not [line for line in kept if line.startswith("[crucible:")]
+
+
+def test_cli_stderr_window_counts_entries_bytes_and_its_own_notes(monkeypatch):
+    """The window's counts and flags are true after every entry."""
+    import os
+
+    from crucible.backends import _sdk_debug
+    from crucible.backends import claude as claude_mod
+
+    budget = claude_mod._CLI_STDERR_MAX_BYTES
+    assert budget == _CLI_STDERR_BYTE_BOUND
+    assert claude_mod._CLI_STDERR_MAX_ENTRIES == _CLI_STDERR_BOUND
+    edges = [
+        "",
+        "\x00",
+        "\ud800",
+        "\udc00\ud800",
+        "\n\n\n",
+        "x" * (budget - 1),
+        "x" * budget,
+        "x" * (budget + 1),
+        "İ" * (budget // 2),
+        "İ" * (budget // 2 + 1),
+        "€" * (budget // 3),
+        "€" * (budget // 3 + 1),
+        "\ud800" * (budget // 3 + 1),
+        "\U00010000" * (budget // 4),
+        "\U00010000" * (budget // 4 + 1),
+    ]
+    rng = random.Random(20261123)
+    window = claude_mod._CliStderrWindow(note_resume_markers=True)
+    replaced: list[bool] = []
+    seen = {"at_the_byte_bound": 0, "at_the_entry_bound": 0, "notes": 0}
+    for _ in range(5_000):
+        if rng.random() < 0.02:
+            entry = rng.choice(edges)
+        else:
+            entry = "s" * rng.randint(0, 300)
+        window.add(entry)
+        over = len(entry.encode("utf-8", "surrogatepass")) > budget
+        replaced.append(over)
+        del replaced[: len(replaced) - len(window.entries)]
+        joined = "\n".join(window.entries).encode("utf-8", "surrogatepass")
+        assert window.kept_bytes == len(joined) <= budget
+        assert 1 <= len(window.entries) <= _CLI_STDERR_BOUND
+        # One flag for each kept entry, set exactly where the window wrote
+        # the entry itself; a flag never outlives its entry.
+        assert window.notes == replaced
+        seen["at_the_byte_bound"] += window.kept_bytes == budget
+        seen["at_the_entry_bound"] += len(window.entries) == _CLI_STDERR_BOUND
+        seen["notes"] += over
+    assert window.received == 5_000
+    assert all(seen.values()), seen
+
+    # Neither text the adapter writes into the record can make a resumed
+    # handle look rejected, and neither is changed by its own redaction
+    # while no sensitive variable holds one of its words.
+    for name in list(os.environ):
+        if _sdk_debug._SENSITIVE_ENV_RE.search(name):
+            monkeypatch.delenv(name)
+    for text in (_size_note(70_000), _CLI_STDERR_LINE_WITHHELD):
+        assert claude_mod._resume_rejection_marks(text) == 0
+        assert _sdk_debug.redact_sdk_text(text) == text
+
+
+@pytest.mark.parametrize(
+    ("line_count", "dropped"),
+    [(201, 1), (250, 50), (1000, 800)],
+)
+def test_cli_stderr_header_counts_the_lines_dropped_by_the_entry_bound(
+    monkeypatch,
+    caplog,
+    line_count,
+    dropped,
+):
+    lines = [f"cli stderr line {index}" for index in range(line_count)]
+
+    _kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert header == (
+        _CLI_STDERR_HEADER
+        + f"earlier stderr lines dropped: {dropped}; "
+        + "stderr tail (last 50 of 200 lines):"
+    )
+    assert tail == lines[-50:]
+
+
+def test_cli_stderr_header_counts_no_line_replaced_by_its_size_note(
+    monkeypatch,
+    caplog,
+):
+    """A line replaced by its note is not dropped: the note is a line.
+
+    Of 230 lines over the byte bound, 200 notes are kept and 30 are
+    dropped by the entry bound.
+    """
+    lines = ["y" * 70_000] * 230
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == [_size_note(70_000)] * 200
+    assert header == (
+        _CLI_STDERR_HEADER
+        + "earlier stderr lines dropped: 30; "
+        + "stderr tail (last 50 of 200 lines):"
+    )
+    assert tail == [_size_note(70_000)] * 50
+
+
+def test_cli_stderr_header_counts_a_long_line_dropped_by_the_entry_bound(
+    monkeypatch,
+    caplog,
+):
+    lines = ["z" * 60_000, *[f"cli stderr line {index}" for index in range(250)]]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == lines[-200:]
+    assert header == (
+        _CLI_STDERR_HEADER
+        + "earlier stderr lines dropped: 51; "
+        + "stderr tail (last 50 of 200 lines):"
+    )
+    assert tail == lines[-50:]
+
+
+@pytest.mark.parametrize("line_count", [1, 50, 51, 199, 200])
+def test_cli_stderr_header_has_no_clause_when_nothing_was_dropped(
+    monkeypatch,
+    caplog,
+    line_count,
+):
+    lines = [f"cli stderr line {index}" for index in range(line_count)]
+
+    _kept, header, _tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert header == (
+        _CLI_STDERR_HEADER
+        + f"stderr tail (last {min(line_count, 50)} of {line_count} lines):"
+    )
+
+
+def test_cli_stderr_kept_on_the_sdk_delivery_path_is_bounded_in_bytes(
+    tmp_path,
+    caplog,
+):
+    """What one failed attempt keeps is measured where the SDK delivers it.
+
+    The CLI double writes 300 lines of 2 048 bytes, which no redaction
+    changes. Thirty-one of them and their line breaks fit into the byte
+    bound, so the record shows every kept line and its tail is the kept
+    text, byte for byte.
+    """
+    written = [f"{index:04d}-".ljust(2048, "x") for index in range(300)]
+
+    result, model_starts, header, tail = _fail_once_on_the_sdk_delivery_path(
+        tmp_path,
+        caplog,
+        "\n".join(written) + "\n",
+        resume=False,
+    )
+
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert len(model_starts) == 1
+    kept_bytes = len("\n".join(tail).encode("utf-8"))
+    assert kept_bytes <= _CLI_STDERR_BYTE_BOUND
+    assert kept_bytes == 31 * 2048 + 30
+    assert tail == written[-31:]
+    assert header == (
+        _CLI_STDERR_HEADER
+        + "earlier stderr lines dropped: 269; "
+        + "stderr tail (last 31 of 31 lines):"
+    )
+
+
+# ----------------------------------------------------------------------
+# The rejected-resume reason, read as each stderr entry arrives
+# ----------------------------------------------------------------------
+
+
+def test_workflow_external_stale_reason_inside_one_long_line_is_recognized(
+    monkeypatch,
+):
+    """The reason is found in a line that is longer than the adapter keeps."""
+    filler = (1_000_000 - len(_STALE_REASON)) // 2
+    line = ("a" * filler + _STALE_REASON).ljust(1_000_000, "b")
+
+    result, _raised = _resume_against_failing_cli(monkeypatch, [line])
+
+    _assert_rejected_handle(result)
+
+
+def _stale_window_entries(case: str) -> list[str]:
+    """Stderr entries around the edge of the rejected-resume window.
+
+    A line of exactly the byte bound is kept and later dropped by bytes; a
+    line of 70 000 bytes is replaced by its size note.
+    """
+    at_the_bound = "x" * _CLI_STDERR_BYTE_BOUND
+    over_the_bound = "y" * 70_000
+    short = "cli stderr line"
+    first_part = "bad session id given"
+    second_part = "request invalid"
+    return {
+        "reason_then_199_lines_at_the_bound": [
+            _STALE_REASON,
+            *[at_the_bound] * 199,
+        ],
+        "reason_then_200_lines_at_the_bound": [
+            _STALE_REASON,
+            *[at_the_bound] * 200,
+        ],
+        "both_parts_with_lines_at_the_bound_between": [
+            first_part,
+            *[at_the_bound] * 100,
+            second_part,
+            *[at_the_bound] * 50,
+        ],
+        "first_part_alone_with_lines_at_the_bound": [
+            first_part,
+            *[at_the_bound] * 150,
+        ],
+        "reason_then_199_lines_over_the_bound": [
+            _STALE_REASON,
+            *[over_the_bound] * 199,
+        ],
+        "reason_then_200_lines_over_the_bound": [
+            _STALE_REASON,
+            *[over_the_bound] * 200,
+        ],
+        "first_part_inside_a_line_over_the_bound": [
+            first_part.ljust(70_000, "y"),
+            *[short] * 100,
+            second_part,
+            *[short] * 50,
+        ],
+        "first_part_alone_inside_a_line_over_the_bound": [
+            first_part.ljust(70_000, "y"),
+            *[short] * 150,
+        ],
+        "second_part_inside_the_199th_line_after_the_first": [
+            first_part,
+            *[over_the_bound] * 198,
+            second_part.ljust(70_000, "y"),
+        ],
+        "second_part_inside_the_200th_line_after_the_first": [
+            first_part,
+            *[over_the_bound] * 199,
+            second_part.ljust(70_000, "y"),
+        ],
+    }[case]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "reason_then_199_lines_at_the_bound",
+        "both_parts_with_lines_at_the_bound_between",
+        "reason_then_199_lines_over_the_bound",
+        "first_part_inside_a_line_over_the_bound",
+        "second_part_inside_the_199th_line_after_the_first",
+    ],
+)
+def test_workflow_external_stale_reason_is_read_from_lines_no_longer_kept(
+    monkeypatch,
+    case,
+):
+    """A rejected handle is typed as stale by what the CLI wrote, kept or not.
+
+    Every entry is read for the reason as it arrives, so the reason is
+    found among the last 200 entries the adapter received, also when the
+    byte bound dropped its line or replaced it by a size note.
+    """
+    result, _raised = _resume_against_failing_cli(
+        monkeypatch,
+        _stale_window_entries(case),
+    )
+
+    _assert_rejected_handle(result)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "first_part_alone_with_lines_at_the_bound",
+        "first_part_alone_inside_a_line_over_the_bound",
+    ],
+)
+def test_workflow_external_stale_two_part_reason_needs_both_parts(
+    monkeypatch,
+    case,
+):
+    result, _raised = _resume_against_failing_cli(
+        monkeypatch,
+        _stale_window_entries(case),
+    )
+
+    _assert_unrecognized_resume_failure(result)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "reason_then_200_lines_at_the_bound",
+        "reason_then_200_lines_over_the_bound",
+        "second_part_inside_the_200th_line_after_the_first",
+    ],
+)
+def test_workflow_external_stale_reason_window_is_the_last_200_entries(
+    monkeypatch,
+    case,
+):
+    """A reason followed by 200 or more entries is not recognized.
+
+    This pins the window of the last 200 entries received, whatever
+    becomes of an entry: kept, dropped by bytes, or replaced by its size
+    note. The record comment in ``_claude_session_transport.py`` states
+    that window as a limit of the adapter, not as a requirement: a change
+    that remembers a reason for longer edits these cases.
+    """
+    result, _raised = _resume_against_failing_cli(
+        monkeypatch,
+        _stale_window_entries(case),
+    )
+
+    _assert_unrecognized_resume_failure(result)
+
+
+def test_workflow_external_stale_reason_survives_long_lines_on_the_sdk_path(
+    tmp_path,
+    caplog,
+):
+    """The reason is recognized after more long lines than the adapter keeps.
+
+    The SDK itself delivers 230 lines of 65 536 characters and then the
+    reason. Each long line fits the byte bound alone and is dropped when
+    the next one arrives, so the record is the reason and the count.
+    """
+    written = [
+        f"{index:04d}:".ljust(_CLI_STDERR_BYTE_BOUND, "x")
+        for index in range(_CLI_STDERR_BOUND + 30)
+    ]
+    written.append(_STALE_REASON)
+
+    result, model_starts, header, tail = _fail_once_on_the_sdk_delivery_path(
+        tmp_path,
+        caplog,
+        "\n".join(written) + "\n",
+        resume=True,
+    )
+
+    _assert_rejected_handle(result)
+    assert len(model_starts) == 1
+    assert tail == [_STALE_REASON]
+    assert header.endswith(
+        "earlier stderr lines dropped: 230; stderr tail (last 1 of 1 lines):"
+    )
+
+
+def test_workflow_external_stale_reason_inside_a_long_line_on_the_sdk_path(
+    tmp_path,
+    caplog,
+):
+    """The SDK delivers one line of 1 MB that holds the reason in its middle."""
+    filler = (1_000_000 - len(_STALE_REASON)) // 2
+    line = ("a" * filler + _STALE_REASON).ljust(1_000_000, "b")
+
+    result, model_starts, _header, _tail = _fail_once_on_the_sdk_delivery_path(
+        tmp_path,
+        caplog,
+        line + "\n",
+        resume=True,
+    )
+
+    _assert_rejected_handle(result)
+    assert len(model_starts) == 1
+
+
+# ----------------------------------------------------------------------
+# Redaction of kept stderr across a line break
+# ----------------------------------------------------------------------
+
+_SENSITIVE_TEST_VARIABLE = "CRUCIBLE_TEST_STDERR_TOKEN"
+
+
+def _credential_text(case: str):
+    """Build one stderr text that holds a made-up value, at run time.
+
+    Returns the entries as the reviewed SDK hands them over, the values
+    that must not be readable in what the adapter publishes, and the value
+    the parent holds in a variable with a sensitive name, if the case has
+    one.
+    """
+    value = _made_up_value(case)
+    first = _made_up_value(case + " first half")
+    second = _made_up_value(case + " second half")
+    if case == "name_then_value":
+        return ["upstream said token:", f"  {value}"], [value], None
+    if case == "bearer_then_token":
+        return ["Authorization: Bearer", f" {value}"], [value], None
+    if case == "quoted_value_over_a_line_break":
+        return (
+            [f'password = "{first}', f'{second}"'],
+            [first, second],
+            None,
+        )
+    if case == "environment_value_with_a_line_break":
+        held = f"{first}\n{second}"
+        return (
+            _as_the_sdk_frames(f"value is {held} end\n"),
+            [first, second],
+            held,
+        )
+    if case == "name_under_a_name_indented":
+        return ["auth:", "  token:", f"    {value}"], [value], None
+    if case == "name_under_a_name":
+        return ["secret:", "token:", value], [value], None
+    if case == "environment_value_with_crlf":
+        held = f"{first}\r\n{second}"
+        return (
+            _as_the_sdk_frames(f"value is {held} end\n"),
+            [first, second],
+            held,
+        )
+    if case == "environment_value_ending_in_a_line_break":
+        held = f"{first}\n{second}\n"
+        return (
+            _as_the_sdk_frames(f"key follows\n{held}"),
+            [first, second],
+            held,
+        )
+    if case == "environment_value_with_a_blank_line":
+        held = f"{first}\n\n{second}"
+        return _as_the_sdk_frames(f"{held}\n"), [first, second], held
+    if case == "environment_value_with_a_final_line_break_inside_a_line":
+        return [f"rejected {value} (401)"], [value], f"{value}\n"
+    if case == "environment_value_held_with_trailing_blanks_inside_a_line":
+        return [f"rejected {value} (401)"], [value], f"{value}  "
+    if case == "name_and_value_together_exactly_the_byte_bound":
+        name_line = "upstream said token:"
+        value_line = f"  {value} ".ljust(
+            _CLI_STDERR_BYTE_BOUND - len(name_line) - 1,
+            "z",
+        )
+        return [name_line, value_line], [value], None
+    if case == "name_and_value_on_one_line":
+        return [f"upstream said token: {value}"], [value], None
+    if case == "bearer_and_token_on_one_line":
+        return [f"Authorization: Bearer {value}"], [value], None
+    if case == "name_then_name_and_value":
+        return ["auth:", f"  token: {value}"], [value], None
+    if case == "name_then_name_and_value_then_plain_line":
+        return (
+            ["secret:", f"  password: {value}", "  user: bob"],
+            [value],
+            None,
+        )
+    if case == "scheme_word_then_name_and_value":
+        return ["expected scheme Bearer", f"token: {value}"], [value], None
+    if case == "pairing_text":
+        return (
+            ['password = "abc', "more text", f'password = "{value}"'],
+            [value],
+            None,
+        )
+    if case == "name_and_value_on_one_line_of_exactly_the_byte_bound":
+        line = f"upstream said token: {value} ".ljust(
+            _CLI_STDERR_BYTE_BOUND,
+            "z",
+        )
+        return [line], [value], None
+    raise AssertionError(f"unknown case {case}")
+
+
+def _assert_published_without(values, kept, tail, caplog):
+    published = "\n".join(kept)
+    for value in values:
+        assert not _readable(value, published)
+        assert not _readable(value, "\n".join(tail))
+        assert not _readable(value, caplog.text)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "name_then_value",
+        "bearer_then_token",
+        "quoted_value_over_a_line_break",
+        "environment_value_with_a_line_break",
+        "name_under_a_name_indented",
+        "name_under_a_name",
+        "environment_value_with_crlf",
+        "environment_value_ending_in_a_line_break",
+        "environment_value_with_a_blank_line",
+        "environment_value_with_a_final_line_break_inside_a_line",
+        "environment_value_held_with_trailing_blanks_inside_a_line",
+        "name_and_value_together_exactly_the_byte_bound",
+    ],
+)
+def test_cli_stderr_credential_across_a_line_break_is_not_published(
+    monkeypatch,
+    caplog,
+    case,
+):
+    """A credential shape that spans a line break is in no published text.
+
+    The value is in neither ``cli_stderr`` nor the ERROR record, and the
+    record still counts one line for every kept entry.
+    """
+    entries, values, held = _credential_text(case)
+    if held is not None:
+        monkeypatch.setenv(_SENSITIVE_TEST_VARIABLE, held)
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, entries)
+
+    _assert_published_without(values, kept, tail, caplog)
+    assert len(kept) == len(tail) == len(entries)
+    assert header == (
+        _CLI_STDERR_HEADER
+        + f"stderr tail (last {len(entries)} of {len(entries)} lines):"
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "name_and_value_on_one_line",
+        "bearer_and_token_on_one_line",
+        "name_then_name_and_value",
+        "name_then_name_and_value_then_plain_line",
+        "scheme_word_then_name_and_value",
+        "pairing_text",
+        "name_and_value_on_one_line_of_exactly_the_byte_bound",
+    ],
+)
+def test_cli_stderr_credential_on_one_line_stays_redacted(
+    monkeypatch,
+    caplog,
+    case,
+):
+    """What each line's own redaction removes is never published.
+
+    In four of these texts a redaction of the joined lines alone would
+    print the value: the name on the line before takes the inner name as
+    its value. Every line is therefore redacted on its own as well.
+    """
+    entries, values, _held = _credential_text(case)
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, entries)
+
+    _assert_published_without(values, kept, tail, caplog)
+    assert len(kept) == len(tail) == len(entries)
+    assert header == (
+        _CLI_STDERR_HEADER
+        + f"stderr tail (last {len(entries)} of {len(entries)} lines):"
+    )
+    if case == "name_then_name_and_value_then_plain_line":
+        assert kept[-1] == tail[-1] == "  user: bob"
+    if case == "name_and_value_on_one_line":
+        # The published line is its entry redacted once. Redacting what the
+        # function returned once more leaves a bracket after the marker.
+        assert kept == tail == ["upstream said token: [REDACTED]"]
+
+
+def test_cli_stderr_plain_lines_are_published_unchanged(monkeypatch, caplog):
+    lines = [
+        f"[{index:02d}] step={index} status: ok "
+        f"(elapsed={index * 3}ms) [cache: hit]"
+        for index in range(60)
+    ]
+
+    kept, header, tail = _fail_once_with_cli_stderr(monkeypatch, caplog, lines)
+
+    assert kept == lines
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 50 of 60 lines):"
+    assert tail == lines[-50:]
+
+
+def test_workflow_external_stale_reason_after_a_name_keeps_the_count_true(
+    monkeypatch,
+    caplog,
+):
+    """A rejection reason on the line after a name is still recognized.
+
+    The staleness is decided on the kept entries as the CLI wrote them,
+    never on redacted text. The record has one line for every kept entry;
+    what it shows of the reason line is not asserted.
+    """
+    lines = ["retry with secret:", _STALE_REASON, "exit"]
+
+    with caplog.at_level(logging.ERROR, logger="crucible.backends.claude"):
+        result, raised = _resume_against_failing_cli(monkeypatch, lines)
+
+    _assert_rejected_handle(result)
+    (error,) = raised
+    assert len(error.cli_stderr.split("\n")) == 3
+    (logged,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "stderr tail" in record.getMessage()
+    ]
+    header, _, tail = logged.partition("\n")
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 3 of 3 lines):"
+    assert len(tail.split("\n")) == 3
+
+
+def test_workflow_external_stale_reason_and_a_split_credential_together(
+    monkeypatch,
+    caplog,
+):
+    """The byte bound, the reason and the redaction hold in one attempt.
+
+    A line of 1 MB holds the reason in its middle; a credential shape over
+    a line break follows. The handle is typed as stale, the long line is
+    its size note, and the token is in no published text.
+    """
+    token = _made_up_value("reason and split credential")
+    filler = (1_000_000 - len(_STALE_REASON)) // 2
+    long_line = ("a" * filler + _STALE_REASON).ljust(1_000_000, "b")
+    lines = [long_line, "Authorization: Bearer", f" {token}"]
+
+    with caplog.at_level(logging.ERROR, logger="crucible.backends.claude"):
+        result, raised = _resume_against_failing_cli(monkeypatch, lines)
+
+    _assert_rejected_handle(result)
+    (error,) = raised
+    kept = error.cli_stderr.split("\n")
+    assert kept == [
+        _size_note(1_000_000),
+        _CLI_STDERR_LINE_WITHHELD,
+        _CLI_STDERR_LINE_WITHHELD,
+    ]
+    assert not _readable(token, caplog.text)
+    (logged,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "stderr tail" in record.getMessage()
+    ]
+    assert logged.partition("\n")[0] == (
+        _CLI_STDERR_HEADER + "stderr tail (last 3 of 3 lines):"
+    )
+
+
+def test_cli_stderr_bearer_token_on_the_next_line_on_the_sdk_delivery_path(
+    tmp_path,
+    caplog,
+):
+    """The SDK delivers ``Bearer`` and its token as two entries."""
+    token = _made_up_value("bearer on the sdk path")
+
+    result, model_starts, header, tail = _fail_once_on_the_sdk_delivery_path(
+        tmp_path,
+        caplog,
+        f"Authorization: Bearer\n {token}\n",
+        resume=False,
+    )
+
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert len(model_starts) == 1
+    assert not _readable(token, caplog.text)
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 2 of 2 lines):"
+    assert len(tail) == 2
+
+
+def test_cli_stderr_environment_value_with_crlf_on_the_sdk_delivery_path(
+    tmp_path,
+    caplog,
+    monkeypatch,
+):
+    """The SDK's own framing makes the kept text differ from the CLI's text.
+
+    The CLI double writes a sensitive environment value as the parent
+    holds it, with a carriage return and a line feed inside. The SDK
+    strips the carriage return, so the value is not in the kept text as it
+    stands; neither of its lines is published.
+    """
+    first = _made_up_value("crlf on the sdk path, first line")
+    second = _made_up_value("crlf on the sdk path, second line")
+    held = f"{first}\r\n{second}"
+    monkeypatch.setenv(_SENSITIVE_TEST_VARIABLE, held)
+
+    result, model_starts, header, tail = _fail_once_on_the_sdk_delivery_path(
+        tmp_path,
+        caplog,
+        f"value is {held} end\n",
+        resume=False,
+    )
+
+    assert result.error is not None
+    assert result.error.kind == "transport"
+    assert len(model_starts) == 1
+    assert not _readable(first, caplog.text)
+    assert not _readable(second, caplog.text)
+    assert header == _CLI_STDERR_HEADER + "stderr tail (last 2 of 2 lines):"
+    assert len(tail) == 2
 
 
 def test_workflow_external_transport_failure_is_not_retried(

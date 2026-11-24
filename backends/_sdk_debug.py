@@ -59,8 +59,10 @@ When a result exists, its complete redacted diagnostic projection is stored in
 union of original-text spans before shape heuristics run, so delimiters and
 overlapping credentials cannot expose a suffix. Invalid Unicode surrogate code
 points become the replacement character before hashing or JSON encoding.
-Typed workflow records remain the semantic parse authority; redaction can
-intentionally make embedded JSON text invalid.
+``redact_sdk_lines`` applies the same steps to line-framed text for the Claude
+adapter's kept CLI stderr; the dump does not use it. Typed workflow records
+remain the semantic parse authority; redaction can intentionally make embedded
+JSON text invalid.
 
 Version 2 adds the structured pricing ledger. Results from older adapters (or
 historical v1 records where the field is absent) have incomplete pricing
@@ -77,6 +79,7 @@ Failure isolation: dump writes are wrapped in a try/except so a
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -86,6 +89,7 @@ import secrets
 import stat
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -192,14 +196,23 @@ def _truncate_redacted_text(
     }
 
 
-def _redact_text(value: str) -> str:
-    """Remove common credentials and exact sensitive environment values."""
+def _sensitive_env_values() -> set[str]:
+    """Values of this process's environment variables with a sensitive name.
 
-    sensitive_values = {
+    Only values of 8 characters or more are returned.
+    """
+
+    return {
         secret
         for name, secret in os.environ.items()
         if _SENSITIVE_ENV_RE.search(name) and len(secret) >= 8
     }
+
+
+def _redact_text(value: str) -> str:
+    """Remove common credentials and exact sensitive environment values."""
+
+    sensitive_values = _sensitive_env_values()
     # Discover every exact match against the original string and replace the
     # union in one pass. Sequential replacement is unsafe: an assignment
     # heuristic can split a delimiter-containing secret, while replacing one
@@ -218,6 +231,82 @@ def redact_sdk_text(value: str) -> str:
     """Redact credential-shaped text before it reaches ordinary logs."""
 
     return _redact_text(value)
+
+
+_LINE_WITHHELD = "[REDACTED: line withheld]"
+
+
+def _framed_secret_lines() -> set[str]:
+    """Lines of sensitive values that line-framed output does not hold whole.
+
+    A value that holds a line break, or begins or ends in white space, is
+    not found as it stands in output that was split at line breaks and
+    right-stripped, or that a child printed after stripping the value. Its
+    lines of at least 8 characters, stripped, are returned.
+    """
+
+    framed: set[str] = set()
+    for secret in _sensitive_env_values():
+        parts = [part.strip() for part in secret.split("\n")]
+        if parts != [secret]:
+            framed.update(part for part in parts if len(part) >= 8)
+    return framed
+
+
+def redact_sdk_lines(lines: Sequence[str]) -> list[str]:
+    """Redact the lines of one bounded text; return one item per line.
+
+    Each line is redacted on its own, each pair of neighbouring lines as
+    one text, and all lines joined by line breaks as one text. A line is
+    returned, as redacted on its own, only where the pair results and the
+    joined result hold that same line and it holds none of the lines
+    ``_framed_secret_lines`` names; any other line is replaced by a fixed
+    marker. The caller bounds the text: every line is read four times.
+    What stays readable under this rule, and what it withholds of plain
+    output, is recorded in ``_claude_session_transport.py``.
+    """
+
+    per_line = [_redact_text(line) for line in lines]
+    joined = _redact_text("\n".join(lines)).split("\n")
+    if len(joined) == len(per_line):
+        shown = [
+            alone == together
+            for alone, together in zip(per_line, joined, strict=True)
+        ]
+    else:
+        shown = [False] * len(per_line)
+        matcher = difflib.SequenceMatcher(a=per_line, b=joined, autojunk=False)
+        for block in matcher.get_matching_blocks():
+            end = block.a + block.size
+            shown[block.a:end] = [True] * block.size
+    for index in range(len(lines) - 1):
+        pair = _redact_text(f"{lines[index]}\n{lines[index + 1]}").split("\n")
+        if len(pair) != 2:
+            # The pair did not come back as two lines: a redaction took the
+            # line break, or a line holds a line feed itself. Neither line
+            # is shown. The first of the two needs this where another line
+            # is the same text when redacted alone: the alignment above can
+            # match it to the joined line that came from that other line.
+            # For lines that hold no line feed themselves no other case was
+            # found.
+            shown[index] = shown[index + 1] = False
+            continue
+        # For lines that hold no line feed themselves, a pair that kept its
+        # line break differs from its two lines as redacted alone in the
+        # second line only: a shared pattern that reaches across the break
+        # puts the first line back as written. The comparison of the first
+        # line withholds nothing there. It is kept for a later pattern, and
+        # for a line that holds a line feed: such a pair can lose its break
+        # to a redaction and still split in two.
+        shown[index] = shown[index] and pair[0] == per_line[index]
+        shown[index + 1] = shown[index + 1] and pair[1] == per_line[index + 1]
+    framed = _framed_secret_lines()
+    return [
+        alone
+        if keep and not any(part in line for part in framed)
+        else _LINE_WITHHELD
+        for line, alone, keep in zip(lines, per_line, shown, strict=True)
+    ]
 
 
 def _redact(value: Any) -> Any:
