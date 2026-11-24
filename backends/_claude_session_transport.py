@@ -46,24 +46,185 @@ logger = logging.getLogger(__name__)
 #   token, so a value that begins with a dash is no longer read as a flag
 #   of its own (the fix for CVE-2026-96620);
 # - the stderr callback receives complete lines instead of raw read chunks,
-#   so the adapter's 200-entry stderr bound counts lines. The adapter keeps
-#   the last 200 lines and drops earlier ones: a rejected-resume reason is
-#   seen, and reported as ``stale_conversation``, unless the CLI writes 200
-#   or more lines after it. One kept line is at most ``max_buffer_size``
-#   plus one pipe read long, because a longer run without a newline is
-#   handed over in pieces;
+#   so the adapter's 200-entry stderr bound counts lines: a rejected-resume
+#   reason is seen, and reported as ``stale_conversation``, unless the CLI
+#   writes 200 or more lines after it. One line handed over is at most
+#   ``max_buffer_size`` plus one pipe read long, because a longer run
+#   without a newline is handed over in pieces. What the adapter keeps of
+#   these lines is recorded below;
 # - ``close()`` is shielded against cancellation, bounds every wait, and
 #   keeps a child it could not reap tracked for the exit-time reaper;
 # - stdout is framed by line: a large frame no longer loses whitespace at a
 #   read boundary, and a malformed JSON line fails the turn at once.
-# A further consequence of the second point, recorded on 2026-11-21 after
-# that acceptance: the adapter redacts each kept stderr entry on its own,
-# and an entry is now one line. A credential shape that spans a line break
-# (a name and its value, ``Bearer`` and its token, a quoted value, or a
-# secret that itself holds a newline) is not matched and stays readable in
-# the adapter's ERROR record and in ``cli_stderr``. On 0.2.110 an entry was
-# one pipe read, so such a shape was matched when both lines arrived in one
-# read.
+#
+# What the adapter does with the stderr lines of the second point. An entry
+# is one line, so a bound in entries alone lets one attempt keep 200 lines
+# of up to ``max_buffer_size`` plus one pipe read each, and redacting each
+# kept entry on its own leaves a credential shape that spans a line break
+# readable. The adapter therefore also bounds what it keeps in bytes
+# (point 1) and redacts the kept entries as the lines of one text (point
+# 6). Three words have one meaning each below. An entry is "dropped" when
+# it is gone, and the header counts it. "Not kept" are the words of a size
+# note: an entry whose text was replaced by its size, in no number. A line
+# is "withheld" when a fixed marker stands in its place.
+#
+# 1. What is kept (``_CliStderrWindow`` in ``claude.py``). Of one physical
+#    attempt the adapter keeps the last 200 entries and at most 65 536 bytes
+#    of UTF-8 over them joined by line breaks, in whole entries, the oldest
+#    dropped first. An entry that alone is over 65 536 bytes is not kept:
+#    its text is not in the record, only a note of its size in bytes as
+#    received, before redaction, also when it is the last or the only thing
+#    the CLI wrote. "Line", in the note and in the header, is an entry as
+#    the SDK hands it over, so a run without a line break gives one note for
+#    each piece over the bound. The note counts as one line of "last N of
+#    M". The bound is on what is kept, and what is published can be longer:
+#    a redacted line can be longer than the kept one, and a withheld line is
+#    a marker of 25 characters whatever its length, so neither the ERROR
+#    record nor ``cli_stderr`` is held to 65 536 bytes.
+# 2. What the header counts. "earlier stderr lines dropped: N" is printed
+#    whenever the adapter received more entries than it holds, for either
+#    bound: N is the entries received minus the entries kept. An entry is
+#    what the SDK hands over, so a run without a line break counts once for
+#    each piece. An entry replaced by its note is not in N: the note stands
+#    for it and is one of the M lines. Blank lines, and output the SDK did
+#    not hand over (whatever follows a byte sequence that is not UTF-8), are
+#    in no number. ``cli_stderr`` carries no trace of dropped entries. For
+#    every output, entries received = N dropped + M kept. No number says how
+#    many of the M lines are size notes or withheld lines, and a header
+#    without the clause does not say that the whole error output is shown.
+# 3. What the record loses to the byte bound. It shows fewer than 50 lines
+#    once the last 50 lines, each at most 65 536 bytes, hold more than
+#    65 487 bytes together (an average of 1 310 bytes or more for lines of
+#    one length). The line that states the cause is gone when more than
+#    about 64 KB, in lines of at most 65 536 bytes each, follow it within
+#    the last 49 lines. Neither sentence holds for a line over the bound:
+#    its note has about 50 bytes and does not push the lines before it out.
+# 4. The rejected resume. For a resumed handle the markers of a rejected
+#    resume are read as each entry arrives, for the last 200 entries
+#    received, kept or not. A consequence of that window: a rejection
+#    reason followed by 200 or more entries is not recognized. The attempt
+#    then ends as a transport error and is not retried; the handle stays
+#    active; in a planner session the operation is left indeterminate, the
+#    next call needs an operator recovery, and after it the same handle is
+#    sent again; the reason is then in no log record and not in
+#    ``cli_stderr``.
+# 5. What the published tail is for: a session process that ends without a
+#    terminal of its protocol. Under the rule of point 6 the adapter
+#    publishes the last 50 kept entries in one ERROR record and all kept
+#    entries in ``cli_stderr``.
+# 6. The rule of redaction (``redact_sdk_lines`` in ``_sdk_debug.py``): never
+#    joined instead of per entry, and never the function applied to its own
+#    output. Every logged line is the per-entry result of its entry or one
+#    fixed marker. The form is a line agreement (per entry and joined, on
+#    the bounded raw kept entries; a line of the CLI is printed only where
+#    both hold it); the union of spans is not taken. Beside it two checks, and
+#    only these: (1) the same agreement over each pair of neighbouring
+#    entries; (2) an entry is withheld when it holds a stripped line, 8
+#    characters or more, of a sensitive environment value that holds a line
+#    break or begins or ends in white space. Each reads bounded raw kept
+#    entries, never output of the function, replaces neither pass and can
+#    only withhold. A size note is no line of the CLI: it is printed as
+#    redacted on its own, never as the marker. The two checks are the whole
+#    list. A further check, text held beside the kept entries, or other
+#    printed text is a change of this rule: it has to state its bound and
+#    count, in a run, the plain lines it withholds.
+# 7. What the rule costs. Whole lines are withheld where a pass disagrees
+#    or a line of check 2 is held, harmless ones among them; the line that
+#    states a cause is a likely one. The pair agreement withholds the plain
+#    line after a name whose own line follows another name, also in output
+#    without any credential. The lines of check 2 are taken from every
+#    variable whose name the shared pattern calls sensitive (``KEY``,
+#    ``TOKEN``, ``SECRET``, ``PASSWORD``, ``PASSWD``, ``CREDENTIAL`` or
+#    ``AUTH`` in its name), so a value under such a name that is no secret
+#    withholds lines as well: one of several lines, every line that holds
+#    one of its lines; one of one line that begins or ends in white space,
+#    every kept line that holds its stripped form, where the redaction of
+#    that entry alone prints the line. As far as measured, the handler
+#    takes two to three times the time of redacting each entry alone, and
+#    about five times where the joined result has another number of lines
+#    and the entries are aligned (200 short entries: 26 ms against 5 ms).
+#    That time grows with the number of environment variables.
+# 8. What is not covered, and is not claimed.
+#    A. What the shared patterns miss on one line they miss across a line
+#    break as well. The rule adds no pattern: it lets the three steps of
+#    ``_redact_text`` see across a line break and nothing more. In the forms
+#    a credential has on the wire these are a quoted key as in a token
+#    response, a name inside a longer name such as a refresh token or a
+#    variable name, and a scheme other than ``Bearer``. On the
+#    organization-session route the adapter knows no exact value (it hands
+#    the CLI no credential), so only the shape rules apply there. The
+#    classes: (1) a scheme other than ``Bearer``, where the name takes the
+#    scheme word as its value; (2) a name inside a longer name, an
+#    underscore being no word boundary, and a quoted JSON key, whose closing
+#    quote stands between the name and the separator; (3) a quote that is
+#    never closed, and a quote inside the quoted value; (4) a delimiter
+#    inside the value, where the part after it stays; (5) two names on one
+#    line before one value, where the first takes the second as its value;
+#    (6) a name without a separator, color codes between the name and the
+#    separator, and the marker text as the CLI's own output before a value
+#    on the same line.
+#    B. What a line break still hides. (1) A shape whose first or last line
+#    the bound took: dropped by either bound, replaced by its size note, or
+#    cut at the SDK's piece boundary of a run without a line break. The
+#    value line is then logged as its own redaction leaves it; nothing is
+#    built for this class. A first line dropped by the entry bound, or by
+#    the byte bound with more than 50 lines kept, leaves the value in
+#    ``cli_stderr`` only. A first line dropped by the byte bound with at
+#    most 50 lines kept, replaced by a note among the last 50 lines, or cut
+#    at a piece boundary leaves it in the ERROR record and in ``stderr.log``
+#    as well, whenever the value line is among the last 50 kept. The header
+#    carries the clause for a drop and a kept note is never the marker, so
+#    such a seam can be seen in the tail; a note that stands 51 or more
+#    lines from the end is not among the lines shown. A value of 8
+#    characters or more that the parent holds in a sensitive variable is
+#    hidden at a seam, as anywhere else, where it stands whole in one kept
+#    entry: the value as held on one line, or, of a value that holds a line
+#    break or begins or ends in white space, each of its lines that has 8
+#    characters or more after stripping (check 2). Not hidden at a seam: a
+#    value, or a line of such a value, under 8 characters; a value cut by
+#    the SDK's piece boundary or printed with a line break inside it; a
+#    value printed in another form. On the organization-session route the
+#    adapter knows no such value. (2) A value broken in its middle, by a
+#    line break, by a lone carriage return inside one entry, or by the SDK's
+#    piece boundary: the part before the break is redacted when its name
+#    stands before it, the rest is readable. A name, or the word ``Bearer``,
+#    broken in its middle is the same class. (3) A line between the name and
+#    the value. (4) The same value a second time where no pass matches it:
+#    the withheld line is hidden, the repeated line has no name before it in
+#    any pass and is logged (an exact environment value is found wherever it
+#    stands; this is about values the adapter does not know). (5) An
+#    environment value that holds no line break and no white space at its
+#    ends and is printed with a break inside it, or any environment value
+#    printed in another form (encoded, or wrapped at other places than its
+#    own line breaks). (6) A line of an environment value that is shorter
+#    than 8 characters after stripping, where the passes do not match the
+#    value whole. (7) A shape of three or more lines directly below a line
+#    that takes its first line: one that ends in a name and a separator or
+#    in the word ``Bearer``, or, for a quoted value, one that holds an open
+#    quote. Seen for a name, a separator and a value on three lines and for
+#    a quoted value over two line breaks: the joined pass gives the earlier
+#    line the first line of the shape and sees no shape, and a pair of
+#    neighbours holds two of its lines only, so the value line, or the
+#    second and third line of the quoted value, is logged.
+#    The two checks do not cover B (7), B (6), B (5), A (5) and B (3).
+#    Check 2 mends this one path: the same miss of the exact-value step,
+#    which looks for a value as the parent holds it, stays for every other
+#    caller of ``redact_sdk_text``. Both the exact-value step and check 2
+#    know values the parent's environment holds, nothing else: on the
+#    organization-session route neither reaches the session's own
+#    credential; on the other routes check 2 reaches the token that the
+#    adapter hands to the CLI stripped.
+#    Besides. Against the joined pass the agreement's promise is by string
+#    where the alignment decides: a line is shown only if the very same line
+#    is a line of the joined result. The entry in flight is the SDK's: at
+#    most ``max_buffer_size`` plus one pipe read in characters, held by the
+#    SDK's framer before the callback is called; the adapter's bound starts
+#    at the callback. A byte sequence that is not UTF-8 ends the SDK's
+#    stderr reader, and nothing of that read or after it is delivered. Other
+#    text leaves the adapter without this rule: the message of a typed error
+#    is built from the exception text. ``stderr.log`` has no second
+#    redaction: what the handler logs is what is written. Nothing was
+#    observed of what the real CLI writes to stderr.
 REVIEWED_CLAUDE_AGENT_SDK_VERSION = "0.2.121"
 REVIEWED_CLAUDE_LEGACY_CODE_VERSION = "2.1.220"
 REVIEWED_CLAUDE_CODE_VERSION = "2.1.261"
