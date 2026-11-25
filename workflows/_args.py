@@ -17,10 +17,15 @@ Constants:
   implementer calls. It is intentionally empty: greenfield workflows expose
   source/write/build operations only through path-confined MCP profiles, so an
   unrestricted native shell cannot bypass scope enforcement.
+- ``SPEC_READ_AGAINST_OPTION`` — the one spelling of ``--spec-read-against``,
+  with its two values and its help text. Every message that names the option
+  is built from this constant.
 
 Helpers:
 
 - ``add_spec_arg(p)`` — required ``--spec PATH``.
+- ``add_spec_read_against_arg(p)`` — optional ``--spec-read-against`` with
+  the values ``write-root`` and ``parent``.
 - ``add_backend_config_arg(p, *roles)`` — optional path to a YAML
   override; help text names the role(s) consulted so operators see
   which role keys to edit in their backends.yaml.
@@ -42,6 +47,28 @@ from pathlib import Path
 
 
 IMPLEMENTER_BUILTIN_TOOLS: tuple[str, ...] = ()
+
+# What the paths of a Spec are read against. The value is a statement about
+# the Spec, given per run; it names no directory and is stored nowhere.
+SPEC_READ_AGAINST_OPTION = "--spec-read-against"
+SPEC_READ_AGAINST_WRITE_ROOT = "write-root"
+SPEC_READ_AGAINST_PARENT = "parent"
+SPEC_READ_AGAINST_VALUES: tuple[str, ...] = (
+    SPEC_READ_AGAINST_WRITE_ROOT,
+    SPEC_READ_AGAINST_PARENT,
+)
+SPEC_READ_AGAINST_HELP = (
+    "What the paths of the Spec are relative to: the directory this run "
+    "writes in (write-root) or the directory above it (parent). The value is "
+    "one of these two words, not a directory. Needed in a checkout whose "
+    "root holds a directory of its own name, when a path of the Spec begins "
+    "with that name or a scope entry of the Spec is that name itself; and, "
+    "where a refusal asks for it, in a checkout that holds no entry of its "
+    "own name, for a Spec with a scope entry that is that name itself."
+    " In a checkout that holds a directory of its own name the value is "
+    "given on every run of such a Spec, the same each time, by where the "
+    "Spec was planned; it is not stored."
+)
 
 
 def positive_int_arg(value: str) -> int:
@@ -108,6 +135,22 @@ def add_spec_arg(p: argparse.ArgumentParser) -> None:
         "--spec", required=True, type=Path,
         help="Path to a Corpus-shaped spec directory (the spec's "
              "manifests live under <spec>/versions/).",
+    )
+
+
+def add_spec_read_against_arg(p: argparse.ArgumentParser) -> None:
+    """Add the optional ``--spec-read-against`` flag to ``p``.
+
+    The value is one of two words and nothing else, so a directory or a
+    near-miss spelling is an argparse error. Absent, the parsed value is
+    None: no statement was made. No workflow's parser calls this helper
+    yet, so no command takes the option.
+    """
+    p.add_argument(
+        SPEC_READ_AGAINST_OPTION,
+        choices=SPEC_READ_AGAINST_VALUES,
+        default=None,
+        help=SPEC_READ_AGAINST_HELP,
     )
 
 
@@ -262,8 +305,14 @@ def validate_backend_limit_args(
 
 __all__ = [
     "IMPLEMENTER_BUILTIN_TOOLS",
+    "SPEC_READ_AGAINST_HELP",
+    "SPEC_READ_AGAINST_OPTION",
+    "SPEC_READ_AGAINST_PARENT",
+    "SPEC_READ_AGAINST_VALUES",
+    "SPEC_READ_AGAINST_WRITE_ROOT",
     "add_backend_limit_args",
     "add_spec_arg",
+    "add_spec_read_against_arg",
     "add_backend_config_arg",
     "add_max_turns_arg",
     "add_budget_arg",
