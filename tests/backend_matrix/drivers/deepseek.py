@@ -388,7 +388,8 @@ class _Bound:
     provider: LoopbackProvider
     log_dirs: tuple[Path, ...]
     journal: launch.Journal
-    # The runtime identity captured in the cell, which the route was built with.
+    # The runtime identity captured in the cell, which the route was built
+    # with; ``None`` where the routing file was read as shipped.
     identity: Any
     # The adapter holds no token beside the credential it reads at dispatch.
     secrets: tuple[str, ...] = ()
@@ -485,6 +486,10 @@ class DeepSeekDriver:
             self._capture(launch.Journal(Path(directory)))
 
     def overlay(self, column: Column, env: Mapping[str, str]) -> Mapping[str, str]:
+        if column.shipped:
+            # The file as shipped: nothing is bound to its routes, so routing
+            # is asked what it does with a route no run has bound yet.
+            return {}
         return {_OVERLAY_FIELD: "<captured in the cell from the installed worker>"}
 
     def _dialect(self, journal: launch.Journal, interpreter: str) -> DeepSeekResponsesDialect:
@@ -516,19 +521,28 @@ class DeepSeekDriver:
         journal = launch.Journal(tmp_path / "worker-harness")
         journal.directory.mkdir()
         with contextlib.ExitStack() as stack:
-            # The fingerprint the route is bound to is captured here, in the cell.
-            identity = self._capture(journal)
+            # The fingerprint the route is bound to is captured here, in the
+            # cell. On the file as shipped nothing is bound and nothing is
+            # captured: a worker that routing starts there all the same runs
+            # under the harness below, as every other one does.
+            fields = self.overlay(column, {})
+            identity = self._capture(journal) if fields else None
+            interpreter = self.interpreter if identity is None else identity.logical_worker_python
             provider = stack.enter_context(
                 LoopbackProvider(
                     script,
                     credential=CANARY_CREDENTIAL,
-                    dialect=self._dialect(journal, str(identity.logical_worker_python)),
+                    dialect=self._dialect(journal, str(interpreter)),
                 )
             )
             interposer = launch.Interposer(lambda: journal, redirect=self._redirect(provider))
             stack.enter_context(launch.at_supervisor(adapter, interposer, _SEAM))
             stack.enter_context(matrix_columns.adapter_credential(self.kind))
-            overlay = {name: identity.runtime_fingerprint for name in self.overlay(column, {})}
+            overlay = (
+                {}
+                if identity is None
+                else {name: identity.runtime_fingerprint for name in fields}
+            )
             # The boundary of the matrix: exactly what a workflow calls.
             backend = resolve_for_role(
                 matrix_columns.ROLE_BY_CAPABILITY[capability],

@@ -81,22 +81,23 @@ run time and typed nowhere in the package.
 
 The scenarios come in three sets (`backend_matrix/scenarios.py`): the starter
 set (`S00`, `S01`, `S03`, `S04`), pack A (limits on turns, tool dispatch, cost
-and tool-result bytes, refusals, a write as progress) and pack B (the
-admission scenario `S51` so far). The toy columns run all three. Every real
-kind runs the starter set and pack A (`ENABLEMENT` in
-`backend_matrix/cells.py`); the static cell `H02` of a kind that did not
-would report it. On a column pack A is ten cells: the turn limit (`S10a`) in
-both lenses and, in the raw lens, the suite's default turn count (`S11`), the
-dispatch-budget denial (`S12`), the USD overrun of one response (`S13`), the
-tool-result byte budget (`S18`), three forms of refusal (`S23a` a
-content-filter stop, `S23b` a refusal part of the message, `S23c` an HTTP
-policy rejection) and a write as progress (`S40`). The primary and the
-secondary column of a kind run both sets; a blocked column runs its three
-scenarios. A form of refusal that the wire of a kind cannot carry is pinned
-not expressible in [the inventory](backend_matrix/inventory.yaml) and has no
-cell: the refusal part on the Claude columns, the content-filter stop and
-the refusal part on both Codex kinds. No such pin exists on an open-weight
-kind.
+and tool-result bytes, refusals, a write as progress) and pack B, which is
+every scenario in neither and is still landing. The toy columns and every
+real kind run all three (`ENABLEMENT` in `backend_matrix/cells.py`); the
+static cell `H02` of a kind that did not run pack A would report it. On a
+column pack A is ten cells: the turn limit (`S10a`) in both lenses and, in
+the raw lens, the suite's default turn count (`S11`), the dispatch-budget
+denial (`S12`), the USD overrun of one response (`S13`), the tool-result
+byte budget (`S18`), three forms of refusal (`S23a` a content-filter stop,
+`S23b` a refusal part of the message, `S23c` an HTTP policy rejection) and a
+write as progress (`S40`). The primary and the secondary column of a kind
+run the starter set and pack A. Pack B runs on the primary column of a kind
+only, each scenario from the change that defines it. A blocked column runs
+its three scenarios. A form of refusal that the wire of a kind cannot carry
+is pinned not expressible in [the inventory](backend_matrix/inventory.yaml)
+and has no cell: the refusal part on the Claude columns, the content-filter
+stop and the refusal part on both Codex kinds. No such pin exists on an
+open-weight kind.
 
 The two turn cells hold a count. The turn limit asks every turn of the count
 of the provider, so a limit that is typed after fewer tool-bearing requests
@@ -138,13 +139,15 @@ A cell computes deviation codes from a closed vocabulary
 
 A fix deletes its entry in the same change. The ledger counts its entries
 under two ceilings, one for the starter set with pack A and one for pack B,
-and states a ceiling frozen (`ceilings.frozen`) once every cell it counts
-passes or has its entry. A frozen ceiling is the count of its entries, and
-static cell `H03` fails on any other number: the change that deletes an
-entry lowers it by one, so no later entry fits into room that a fix left.
-Only a behaviour cell of a real backend and the static cells `H01` and `H02`
-can have an entry: the toy cells and the other static cells check the matrix
-itself and are never expected failures. The gap registry in the same file is
+and states a ceiling frozen (`ceilings.frozen`) once every scenario it
+counts is defined and every cell it counts passes or has its entry. That of
+pack A is frozen; that of pack B rises while the scenarios of the pack
+land. A frozen ceiling is the count of its entries, and static cell `H03`
+fails on any other number: the change that deletes an entry lowers it by
+one, so no later entry fits into room that a fix left. Only a behaviour
+cell of a real backend and the static cells `H01` and `H02` can have an
+entry: the toy cells and the other static cells check the matrix itself and
+are never expected failures. The gap registry in the same file is
 permanent, and
 [the declaration snapshot](backend_matrix/declared_profiles.yaml) pins every
 column's declared profile, so a declaration cannot be weakened to turn a cell
@@ -327,13 +330,32 @@ require the proof that plays the entry's cell.
 
 A column whose profile the catalogs call blocked runs three scenarios as soon
 as its kind is driven: the canary, the plain call and the admission scenario
-`S51`. An admission cell builds a backend for every capability a workflow can
-ask routing for, on the routing files of both products, and calls none. What
-routing does with each capability today, and the word the catalogs have for
-the column, are pinned for the cell in
+`S51`. The primary column of every real kind runs that scenario too: it is
+a scenario of pack B. An admission cell builds a backend for every
+capability a workflow can ask routing for, on the routing files of both
+products, and calls none. What routing does with each capability today, and
+the word the catalogs have for the column, are pinned for the cell in
 [the inventory](backend_matrix/inventory.yaml): the cell passes while routing
 does exactly that and no provider request is made, so a gate that opens or
-closes changes the pin in the same change.
+closes changes the pin in the same change. A capability is pinned with one
+of three outcomes. `admitted`: routing built the adapter and logged no
+requirement of the role that the profile of the route lacks. `retained`:
+routing built the adapter and logged such a requirement, which it does on a
+route that asks for diagnostic admission; the cell reads the warning of the
+routing module for it. Or the type of the exception routing refused with.
+Today both gateway kinds are retained for the text and the read-only
+capability, whose roles ask for structured output, and the writer of the
+blocked Kimi column is refused. The DeepSeek driver binds the fingerprint of
+the installed worker to the shipped routes, as a run does. There the cell
+asks for every capability a second time on the file as shipped, and the pin
+states that routing refuses all three: no route of that kind is built
+before a run has bound the worker. An admission cell asks as the driver of
+its column asks for every cell (no native shell, no trusted project
+instructions, an explicit working directory), on the shipped routes. What
+routing refuses to a caller that asks otherwise, or to a writer route
+without its opt-in where the shipped route carries it, no cell plays:
+`tests/test_backends_config.py` holds those refusals for the Kimi routes
+and `tests/test_backends_deepseek.py` for the DeepSeek routes.
 
 The scripted provider picks a reply by position and tool-call ids, never by
 what a request contains. Where a wire keeps no conversation, the dialect of

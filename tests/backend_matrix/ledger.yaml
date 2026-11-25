@@ -71,22 +71,28 @@
 # scenario sets: the scenarios (scenarios.py) come in three sets. The starter
 #   set is S00 (the seam canary), S01, S03 and S04. Pack A is S10a, S11, S12,
 #   S13, S18, S23a to S23c and S40: the limits (turns, tool dispatch, USD,
-#   tool-result bytes), the refusals and a write as progress. Pack B is the
-#   admission scenario S51 so far. The toy kind runs all three. A real kind
-#   runs the starter set and pack A (`ENABLEMENT` in cells.py); the static
-#   cell H02 of a driven kind reports static:pack_a_not_enabled for a kind
-#   that does not. A blocked column runs S00, S01 and S51 whatever sets its
-#   kind runs.
+#   tool-result bytes), the refusals and a write as progress. Pack B is
+#   every scenario that is in neither, and is still landing. The toy kind
+#   and every real kind run all three sets (`ENABLEMENT` in cells.py). On a
+#   real kind the starter set and pack A run on the primary and on the
+#   secondary column, and pack B on the primary column only, each scenario
+#   from the change that defines it. A blocked column runs S00, S01 and the
+#   admission scenario S51 whatever sets its kind runs. The static cell H02
+#   of a driven kind reports static:pack_a_not_enabled for a kind that does
+#   not run pack A. Pack B has no such code: a registry record lists a cell
+#   of pack B only once the kind of the cell runs the set, which every real
+#   kind does.
 # ceilings: counts may not exceed them. `pack_a` counts the entries on
 #   static cells and on scenarios of the starter set and of pack A, and
 #   every column-wide entry; `pack_b` counts those on scenarios of pack B.
 #   A ceiling rises while the entries of its pack land and is frozen once
-#   the pack runs on every real kind and every cell of it passes or has its
-#   entry; after that it only falls. Pack A runs on every real kind and
-#   every cell of it passes or has its entry: its ceiling is frozen at the
-#   count below, stated by the change that entered the last ruling on a
-#   reference cell of the pack, and from here on it only falls. The ceiling
-#   of pack B still rises.
+#   every scenario of the pack is defined, the pack runs on every real kind
+#   and every cell of it passes or has its entry; after that it only falls.
+#   Pack A runs on every real kind and every cell of it passes or has its
+#   entry: its ceiling is frozen at the count below, stated by the change
+#   that entered the last ruling on a reference cell of the pack, and from
+#   here on it only falls. Pack B runs on every real kind and its scenarios
+#   are still landing: its ceiling still rises.
 #   `frozen` names the packs whose ceiling is frozen. A frozen ceiling is
 #   the count of its pack, and static cell H03 fails on any other number
 #   (static:ceiling_not_the_count). So the change that takes an entry of a

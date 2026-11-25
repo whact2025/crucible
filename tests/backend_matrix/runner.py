@@ -44,6 +44,7 @@ from .cells import Cell
 from .columns import Column
 from .contract import (
     ADMITTED,
+    RETAINED,
     Admitted,
     Deviation,
     Observation,
@@ -83,12 +84,29 @@ class _LogCapture(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
         self.lines: list[str] = []
+        # The logger of each line, for a cell that asks who logged what.
+        self.loggers: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self.lines.append(self.format(record))
+            line = self.format(record)
         except Exception:  # noqa: BLE001 - a broken log record is not the cell's fault
-            self.lines.append(str(record.msg))
+            line = str(record.msg)
+        self.lines.append(line)
+        self.loggers.append(record.name)
+
+    def retained_route_since(self, start: int) -> bool:
+        """Whether routing logged a retained rejected route from line ``start`` on.
+
+        Its own warning, under its own logger: it built a route under
+        diagnostic admission whose profile does not meet what the role asks.
+        """
+
+        return any(
+            logger == matrix_columns.ROUTING_LOGGER
+            and matrix_columns.RETAINED_ROUTE in line
+            for logger, line in zip(self.loggers[start:], self.lines[start:], strict=True)
+        )
 
 
 def shared_tool_authority_digest(
@@ -113,6 +131,19 @@ def shared_tool_authority_digest(
 
 def _required_steps(script: ProviderScript) -> int:
     return sum(1 for step in script.steps if not isinstance(step, Loop) or step.at_least)
+
+
+def _hears_routing() -> bool:
+    """Whether a warning of the routing module reaches the root logger now."""
+
+    logger = logging.getLogger(matrix_columns.ROUTING_LOGGER)
+    if not logger.isEnabledFor(logging.WARNING):
+        return False
+    while logger.parent is not None:
+        if not logger.propagate:
+            return False
+        logger = logger.parent
+    return True
 
 
 def _debug_text(log_dirs: Sequence[Path], capture: _LogCapture) -> str:
@@ -410,14 +441,19 @@ def _execute_admission(
 
     On the routing file of every product the column has, through the driver
     of its kind, so what is built is what a workflow would get. A refusal by
-    routing is what the cell is about and is recorded with its type; nothing
-    is invoked, so the provider must see no request at all.
+    routing is what the cell is about and is recorded with its type; a build
+    during which routing logged that the profile of the route does not meet
+    what the role asks is recorded as retained. Where the driver of the kind
+    adds an admission input to the routing file, every capability is asked
+    for a second time on the file as shipped. Nothing is invoked, so the
+    provider must see no request at all.
     """
 
     scenario = SCENARIOS[cell.scenario]
     column = cell.column
     plan = plan_for(scenario, {})
     wanted = dict(matrix_cells.expected_admission(cell) if expected is None else expected)
+    inputs = matrix_columns.admission_inputs(column.kind)
     capture = _LogCapture()
     baseline = contract.settlement_baseline()
     started = time.monotonic()
@@ -429,6 +465,47 @@ def _execute_admission(
     close_raised: Raised | None = None
     provider_ledger = ProviderLedger()
     late = 0
+
+    def build(view: Column, capability: str, directory: Path) -> str:
+        """Build one backend and close it: what routing did with the capability."""
+
+        nonlocal close_raised, late
+        directory.mkdir(parents=True)
+        logged = len(capture.lines)
+        try:
+            with played_by.open(
+                view,
+                capability=capability,
+                lens=cell.lens,  # type: ignore[arg-type]
+                script=plan.script,
+                tmp_path=directory,
+            ) as bound:
+                frozen = bound.provider.freeze()
+                # From here on every provider request is a late request.
+                bound.provider.end_of_cell()
+                for _ in range(2):  # a second close() must be a no-op
+                    try:
+                        bound.backend.close()
+                    except Exception as exc:  # noqa: BLE001 - observed as C8
+                        close_raised = Raised.from_exception(exc, phase="close")
+                        break
+                provider_ledger.requests.extend(frozen.requests)
+                provider_ledger.extra += frozen.extra
+                provider_ledger.seam_problems.extend(frozen.seam_problems)
+                late += bound.provider.final_counts()[1]
+                children.extend(bound.children())
+                ports.append(bound.provider.port)
+                secrets.extend(bound.secrets)
+                texts.append(_debug_text(bound.log_dirs, _LogCapture()))
+        except (netguard.NetworkGuardViolation, drivers.MatrixSetupError):
+            raise  # the matrix's own failures are not observations
+        except Exception as exc:  # noqa: BLE001 - a refusal is the observation
+            raised = Raised.from_exception(exc, phase="before_request")
+            # A workflow logs the text of a refusal: clause C9 reads it.
+            texts.append(raised.message)
+            return raised.type
+        return RETAINED if capture.retained_route_since(logged) else ADMITTED
+
     # A column without a routing file (a toy column) is built once.
     products: list[str | None] = [name for name, _path in column.routing] or [None]
     root_logger = logging.getLogger()
@@ -436,9 +513,16 @@ def _execute_admission(
     root_logger.addHandler(capture)
     root_logger.setLevel(logging.DEBUG)
     try:
+        if not _hears_routing():
+            # Without this a retained route would be read as an admitted one.
+            raise drivers.MatrixSetupError(
+                f"cell {cell.id}: a warning of the routing module would not "
+                "reach the cell, so it cannot tell what routing did with a role"
+            )
         for product in products:
             view = column if product is None else column.routed_by(product)
             where = "the column" if product is None else f"the {product} routing file"
+            directory = tmp_path / (product or "column")
             if product is not None:
                 seen.append(
                     Admitted(
@@ -448,42 +532,22 @@ def _execute_admission(
                     )
                 )
             for capability in matrix_columns.ROLE_BY_CAPABILITY:
-                directory = tmp_path / (product or "column") / capability
-                directory.mkdir(parents=True)
-                got = ADMITTED
-                try:
-                    with played_by.open(
-                        view,
-                        capability=capability,
-                        lens=cell.lens,  # type: ignore[arg-type]
-                        script=plan.script,
-                        tmp_path=directory,
-                    ) as bound:
-                        frozen = bound.provider.freeze()
-                        # From here on every provider request is a late request.
-                        bound.provider.end_of_cell()
-                        for _ in range(2):  # a second close() must be a no-op
-                            try:
-                                bound.backend.close()
-                            except Exception as exc:  # noqa: BLE001 - observed as C8
-                                close_raised = Raised.from_exception(exc, phase="close")
-                                break
-                        provider_ledger.requests.extend(frozen.requests)
-                        provider_ledger.extra += frozen.extra
-                        provider_ledger.seam_problems.extend(frozen.seam_problems)
-                        late += bound.provider.final_counts()[1]
-                        children.extend(bound.children())
-                        ports.append(bound.provider.port)
-                        secrets.extend(bound.secrets)
-                        texts.append(_debug_text(bound.log_dirs, _LogCapture()))
-                except (netguard.NetworkGuardViolation, drivers.MatrixSetupError):
-                    raise  # the matrix's own failures are not observations
-                except Exception as exc:  # noqa: BLE001 - a refusal is the observation
-                    raised = Raised.from_exception(exc, phase="before_request")
-                    got = raised.type
-                    # A workflow logs the text of a refusal: clause C9 reads it.
-                    texts.append(raised.message)
+                got = build(view, capability, directory / capability)
                 seen.append(Admitted(capability, got, where))
+            if not inputs:
+                continue
+            shipped = view.as_shipped()
+            kept = sorted(set(played_by.overlay(shipped, {})) & set(inputs))
+            if kept:
+                raise drivers.MatrixSetupError(
+                    f"cell {cell.id}: the driver adds {kept} to the routing file "
+                    "it is asked to build from as shipped"
+                )
+            for capability in matrix_columns.ROLE_BY_CAPABILITY:
+                got = build(shipped, capability, directory / f"{capability}-as-shipped")
+                seen.append(
+                    Admitted(matrix_cells.as_shipped(capability), got, f"{where} as shipped")
+                )
         settlement = replace(
             contract.settle(
                 baseline,

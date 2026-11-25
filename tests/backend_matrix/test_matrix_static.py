@@ -1550,11 +1550,22 @@ def test_routing_overlay_is_a_closed_list() -> None:
     assert set(matrix_columns.ALLOWED_OVERLAY) <= set(REAL_KINDS)
     for fields in matrix_columns.ALLOWED_OVERLAY.values():
         assert all(re.fullmatch(r"extra\.[a-z_]+", name) for name in fields)
+    # An admission input is one of those fields. The driver of a kind that
+    # has one adds it to the shipped routes of every column, and on the view
+    # of the file as shipped it adds none of them and everything else.
+    listed = {name for fields in matrix_columns.ALLOWED_OVERLAY.values() for name in fields}
+    assert set(matrix_columns.ADMISSION_OVERLAY) <= listed
     for kind in sorted(drivers.load()):
         allowed = set(matrix_columns.ALLOWED_OVERLAY.get(kind, ()))
+        inputs = set(matrix_columns.admission_inputs(kind))
+        assert inputs == allowed & set(matrix_columns.ADMISSION_OVERLAY)
         for column in (item for item in cells.all_columns() if item.kind == kind):
             overlay = drivers.get(kind).overlay(column, matrix_columns.SCRIPTED_ENV)
-            assert set(overlay) <= allowed
+            assert inputs <= set(overlay) <= allowed
+            as_shipped = drivers.get(kind).overlay(
+                column.as_shipped(), matrix_columns.SCRIPTED_ENV
+            )
+            assert set(as_shipped) == set(overlay) - inputs
 
 
 def test_difference_tables_are_total_and_cite_their_fallbacks() -> None:

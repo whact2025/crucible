@@ -13,6 +13,7 @@ P04 rules on synthetic ledgers and inventories.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import http.client
@@ -27,7 +28,7 @@ import sys
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -47,6 +48,7 @@ from assay import (
 )
 
 from crucible.backends.config import BackendRouting, RoleConfig, load_routing
+from crucible.backends.features import FeatureAdmissionError
 from crucible.backends.pricing import ModelPricing
 
 from . import cells, contract, declarations, ledger, netguard, runner
@@ -85,6 +87,7 @@ from .scenarios import (
     D_STRUCT_UNQUALIFIED,
     GUARDED,
     PACK_A,
+    PACK_B,
     SCENARIOS,
     SCHEMA_ANSWER,
     SCHEMA_FINAL_ANSWER,
@@ -2537,18 +2540,24 @@ def _registry_cell(document: dict[str, Any], gap: str, cell: str) -> dict[str, A
     return next(item for item in document["registry"][gap]["cells"] if item["cell"] == cell)
 
 
-def _with_an_entry_of_its_own() -> dict[str, Any]:
+# A cell of pack B that has no entry: an admission cell is green by its
+# definition, since its pin states what routing does.
+_PACK_B_CELL = "deepseek/S51/primary/raw"
+
+
+def _with_an_entry_of_its_own(cell: str = "deepseek/S13/primary/raw") -> dict[str, Any]:
     """The shipped ledger with one known gap more, its entry last in ``known_gaps``.
 
     An entry for a test to break. It stands on a cell that has none, under a
     record that is made to list the cell, and the ceiling of its pack is
     raised by the one, so H03 says nothing of it as it stands. It is no entry
-    of the shipped ledger, so the fix of a gap edits no test for it.
+    of the shipped ledger, so the fix of a gap edits no test for it. The
+    cell is one of pack A unless the test names another.
     """
 
-    cell = "deepseek/S13/primary/raw"
     assert LEDGER.entry(cell) is None
-    current = dict(cells.world().current(cell))
+    world = cells.world()
+    current = dict(world.current(cell))
     document = _document()
     document["registry"]["M01"]["cells"].append(
         {"cell": cell, "observed_under": current, "closes_under": current}
@@ -2556,7 +2565,10 @@ def _with_an_entry_of_its_own() -> dict[str, Any]:
     document["known_gaps"].append(
         {"cell": cell, "observed_under": current, "codes": {"secret:leak": "M01"}}
     )
-    document["ceilings"]["max_known_gaps"]["pack_a"] += 1
+    before = ledger.pack_counts(LEDGER, world)
+    after = ledger.pack_counts(ledger.parse(document), world)
+    (pack,) = (name for name in after if after[name] != before.get(name, 0))
+    document["ceilings"]["max_known_gaps"][pack] += 1
     return document
 
 
@@ -2755,11 +2767,19 @@ def test_h03_registry_rules() -> None:
     }
 
     # H02 has no code for a set beyond pack A, so a cell of such a set may be
-    # recorded only once its kind runs the set.
+    # recorded only once its kind runs the set. Every real kind runs pack B,
+    # so the state before is made here: S12, of which records list cells, is
+    # taken for a scenario of pack B, on kinds that run the two other sets.
     real = cells.world()
+    later = {**real.scenario_sets, "S12": PACK_B}
+    not_yet = {
+        kind: sets if kind == TOY_KIND else tuple(name for name in sets if name != PACK_B)
+        for kind, sets in cells.ENABLEMENT.items()
+    }
     assert "static:registry_cell_early" in _problem_codes(
-        scenario_sets={**real.scenario_sets, "S12": "pack_b"}
+        scenario_sets=later, enabled_sets=not_yet
     )
+    assert "static:registry_cell_early" not in _problem_codes(scenario_sets=later)
 
     # A static registry cell is generated from the start, or the record is wrong.
     ungenerated = _document()
@@ -2827,6 +2847,32 @@ def _without_an_entry_of(pack: str) -> dict[str, Any]:
         if ledger.pack_counts(ledger.parse(fewer), world).get(pack, 0) < count:
             return fewer
     raise MatrixSetupError(f"the ledger holds no entry that counts under {pack}")
+
+
+def _without_the_entries_of(pack: str, document: dict[str, Any]) -> dict[str, Any]:
+    """``document`` less every entry that counts under ``pack``.
+
+    Nothing else is edited, the ceilings least of all. The entries are taken
+    by their place, as above: which entries a pack holds, and how many, is
+    the ledger's statement.
+    """
+
+    world = cells.world()
+
+    def count(known_gaps: list[Any]) -> int:
+        held = ledger.parse({**document, "known_gaps": known_gaps})
+        return ledger.pack_counts(held, world).get(pack, 0)
+
+    kept = list(document["known_gaps"])
+    left = count(kept)
+    index = 0
+    while left and index < len(kept):
+        fewer = kept[:index] + kept[index + 1 :]
+        if count(fewer) < left:
+            kept, left = fewer, left - 1
+        else:
+            index += 1
+    return {**copy.deepcopy(document), "known_gaps": copy.deepcopy(kept)}
 
 
 def _constructed(_cell: str) -> str:
@@ -3032,33 +3078,78 @@ def test_h03_holds_a_gap_open_while_its_record_waits_for_a_ruling() -> None:
 
 def test_the_grade_h03_reads_is_that_of_the_replies_the_dialect_answers_a_cell_from() -> None:
     world = cells.world()
+    grades = matrix_envelopes.GRADES
+
+    def stated(name: str) -> str:
+        """The grade an envelope states of itself, read from its file."""
+
+        text = (matrix_envelopes.ROOT / f"{name}.yaml").read_text(encoding="utf-8")
+        return str(yaml.safe_load(text)["provenance"]["grade"])
 
     # Read without playing the cell: the script of the cell's variant, each
-    # step rendered by the dialect of its kind against a blank request.
-    assert world.grade("deepseek/S23a/primary/raw") == "constructed"
-    assert world.grade("deepseek/S01/primary/raw") == "documented"
-    assert world.grade("kimi/S23c/secondary/raw") == "constructed"
-    assert world.grade("openai_compat:hosted/S23b/primary/raw") == "constructed"
-    assert world.grade("openai_compat:hosted/S01/primary/guarded") == "documented"
-    assert world.grade("openai_compat:hosted/S03/primary/guarded") == "constructed"
-    assert world.grade("claude/S23c/primary/raw") == "constructed"
+    # step rendered by the dialect of its kind against a blank request. The
+    # examples are what the envelopes state: on every cell of a real column
+    # the grade is that of the weakest envelope the cell is answered from,
+    # as the file of that envelope has it.
+    answered_kinds: set[str] = set()
+    for cell in cells.behaviour_cells():
+        if cell.column.kind == TOY_KIND:
+            continue
+        names = cells.answered_from(cell.id)
+        weakest = max((stated(name) for name in names), key=grades.index, default=None)
+        assert world.grade(cell.id) == weakest, cell.id
+        if names:
+            answered_kinds.add(cell.column.kind)
+    # The examples are there on every real kind; a cell that is answered
+    # from no envelope (an admission cell calls nothing) has no grade.
+    assert answered_kinds == set(matrix_columns.REAL_KINDS)
+    assert cells.answered_from(_PACK_B_CELL) == () and world.grade(_PACK_B_CELL) is None
+    # No grade is written here for a cell of a record that closes on a
+    # grade, and no envelope of such a cell is named: the fix of such a gap
+    # brings a reply of a better grade first, and edits nothing here. The
+    # literals stand on cells that no such record lists. They hold the
+    # dialect: one that answered the plain call, the tool round or the
+    # content-filter stop of these columns from an envelope of another
+    # grade, or from another envelope, fails here.
+    graded = {
+        item.cell
+        for record in LEDGER.registry.values()
+        if record.closes_on_grade
+        for item in record.cells
+    }
+    literal = {
+        "claude/S01/primary/raw": "constructed",
+        "deepseek/S01/primary/raw": "documented",
+        "kimi/S23a/secondary/raw": "constructed",
+        "openai_compat:hosted/S01/primary/guarded": "documented",
+        "openai_compat:hosted/S03/primary/guarded": "constructed",
+    }
+    answered = {
+        "deepseek/S01/primary/raw": ("deepseek_responses/deepseek.completion",),
+        "openai_compat:hosted/S04/primary/raw": (
+            "openai_chat/gateway.tool_call",
+            "openai_chat/gateway.completion",
+        ),
+    }
+    assert graded and not graded & {*literal, *answered}
+    for cell_id, grade in literal.items():
+        assert world.grade(cell_id) == grade, cell_id
+    for cell_id, envelope_names in answered.items():
+        assert cells.answered_from(cell_id) == envelope_names, cell_id
     # A toy cell is answered from no envelope, and a static cell from nothing.
     assert world.grade(TOY_CELLS[0].id) is None
     assert world.grade("all/H03/-/static") is None
-    assert cells.answered_from("deepseek/S23c/primary/raw") == (
-        "deepseek_responses/deepseek.refusal_http_policy",
-    )
-    assert cells.answered_from("openai_compat:hosted/S04/primary/raw") == (
-        "openai_chat/gateway.tool_call",
-        "openai_chat/gateway.completion",
-    )
 
 
 def test_h03_entry_rules() -> None:
+    world = cells.world()
+    # What the ceiling of pack A limits: the entries of that pack, and not
+    # the length of the list, which holds those of pack B as well.
+    pack_a = ledger.pack_counts(LEDGER, world)["pack_a"]
     on_canary = _document()
     canary = next(cell.id for cell in TOY_CELLS if SCENARIOS[cell.scenario].canary)
     # At its ceiling, whatever room the shipped ceiling leaves today.
-    on_canary["ceilings"]["max_known_gaps"]["pack_a"] = len(on_canary["known_gaps"])
+    on_canary["ceilings"]["max_known_gaps"]["pack_a"] = pack_a
     on_canary["known_gaps"].append(
         {"cell": canary, "observed_under": {}, "codes": {"request.unconsumed": "G02"}}
     )
@@ -3083,11 +3174,22 @@ def test_h03_entry_rules() -> None:
     assert "static:entry_code_invalid" in _problem_codes(invalid)
 
     ceiling = _document()
-    ceiling["ceilings"]["max_known_gaps"]["pack_a"] = len(ceiling["known_gaps"]) - 1
+    ceiling["ceilings"]["max_known_gaps"]["pack_a"] = pack_a - 1
     assert "static:ceiling_exceeded" in _problem_codes(ceiling)
     exact = _document()
-    exact["ceilings"]["max_known_gaps"]["pack_a"] = len(exact["known_gaps"])
+    exact["ceilings"]["max_known_gaps"]["pack_a"] = pack_a
     assert _problem_codes(exact) == set()
+    # An entry of pack B counts under the ceiling of pack B and under no
+    # other: with the entry there, each pack is still held to its own count.
+    other = _with_an_entry_of_its_own(_PACK_B_CELL)
+    counts = ledger.pack_counts(ledger.parse(other), world)
+    assert counts["pack_a"] == pack_a and counts["pack_b"] == len(other["known_gaps"]) - pack_a
+    assert _problem_codes(other) == set()
+    other["ceilings"]["max_known_gaps"]["pack_a"] = pack_a - 1
+    assert _problem_codes(other) == {"static:ceiling_exceeded"}
+    other["ceilings"]["max_known_gaps"]["pack_a"] = pack_a
+    other["ceilings"]["max_known_gaps"]["pack_b"] = counts["pack_b"] - 1
+    assert _problem_codes(other) == {"static:ceiling_exceeded"}
 
     reference = _document()
     reference["registry"]["M01"]["cells"].append(
@@ -3188,12 +3290,38 @@ def test_h03_holds_a_frozen_ceiling_to_the_count_of_its_pack() -> None:
     assert _problem_codes(rising) == set()
     del rising["ceilings"]["frozen"]
     assert ledger.parse(rising).frozen == frozenset() and _problem_codes(rising) == set()
-    # A frozen pack that holds no entry has a ceiling of nothing.
-    empty = _document()
-    empty["ceilings"]["frozen"] = ["pack_a", "pack_b"]
-    assert not counts.get("pack_b") and _problem_codes(empty) == set()
+    # An entry of another pack does not count under a frozen ceiling: with
+    # an entry of pack B there, the ceiling of pack A is still the count of
+    # pack A, and stays where it is.
+    other = _with_an_entry_of_its_own(_PACK_B_CELL)
+    assert ledger.pack_counts(ledger.parse(other), world) == {
+        **counts,
+        "pack_b": counts.get("pack_b", 0) + 1,
+    }
+    assert other["ceilings"]["max_known_gaps"]["pack_a"] == LEDGER.ceilings["pack_a"]
+    assert _problem_codes(other) == set()
+    # A frozen pack that holds no entry has a ceiling of nothing. Pack B is
+    # emptied for it, whatever the ledger holds there: every entry of the
+    # pack goes, by its place, the one of this test among them. What H03
+    # says of the entries that went is read first, with the pack not frozen:
+    # an entry may be one that H03 does not let go for a reason of its own.
+    empty = _without_the_entries_of("pack_b", other)
+    assert len(empty["known_gaps"]) == counts["pack_a"]
+    assert not ledger.pack_counts(ledger.parse(empty), world).get("pack_b")
+    empty["ceilings"]["max_known_gaps"]["pack_b"] = 0
+    empty["ceilings"]["frozen"] = sorted(LEDGER.frozen - {"pack_b"})
+    unfrozen = _problem_codes(empty)
+    assert refused not in unfrozen
+    empty["ceilings"]["frozen"] = sorted(LEDGER.frozen | {"pack_b"})
+    assert _problem_codes(empty) == unfrozen
     empty["ceilings"]["max_known_gaps"]["pack_b"] = 1
-    assert _problem_codes(empty) == {"static:ceiling_not_the_count"}
+    assert _problem_codes(empty) == unfrozen | {refused}
+    (found,) = (
+        item
+        for item in ledger.integrity_problems(ledger.parse(empty), world)
+        if item.code == refused
+    )
+    assert "pack_b" in found.detail and "frozen" in found.detail
     # What the rule cannot see is one change that deletes an entry and writes
     # another: the count and the number stand as they were. The new entry is
     # then in the diff of that change, on a cell that had none.
@@ -3929,6 +4057,170 @@ def test_an_admission_cell_calls_nothing_and_is_held_to_its_subjects(tmp_path: P
         assert contract.clause_of(code) == contract.SCENARIO
 
 
+class _LogsAtBuild(toy.ToyDriver):
+    """A toy driver that logs one warning while it builds the text role."""
+
+    def __init__(self, logger: str, words: str, *, then_refuses: bool = False) -> None:
+        super().__init__()
+        self._logger, self._words, self._refuses = logger, words, then_refuses
+
+    @contextlib.contextmanager
+    def open(self, column: Column, *, capability: str, **arguments: Any) -> Iterator[Any]:
+        with super().open(column, capability=capability, **arguments) as bound:
+            if capability == "text":
+                logging.getLogger(self._logger).warning(
+                    "routing: %s a route: a reason", self._words
+                )
+                if self._refuses:
+                    raise FeatureAdmissionError("refused after the warning")
+            yield bound
+
+
+def test_an_admission_cell_tells_a_route_that_routing_retained_from_one_it_admitted(
+    tmp_path: Path,
+) -> None:
+    cell = next(cell for cell in TOY_CELLS if SCENARIOS[cell.scenario].admission)
+    expected = cells.expected_admission(cell)
+    admitted, retained = contract.ADMITTED, contract.RETAINED
+    logger, words = matrix_columns.ROUTING_LOGGER, matrix_columns.RETAINED_ROUTE
+
+    def played(
+        name: str, driver: toy.ToyDriver | None = None, pin: Mapping[str, str] = expected
+    ) -> frozenset[str]:
+        return runner.execute(cell, tmp_path / name, driver=driver, admission=pin).report.codes
+
+    # The warning of the routing module during the build of a role says that
+    # the role was built although the profile of its route does not meet it.
+    # The build that logged it is retained, and no build after it.
+    assert played("retained", _LogsAtBuild(logger, words)) == {
+        f"admission:text:{retained}!={admitted}"
+    }
+    # Held to a pin that says so the same play is clean, and an honest build
+    # is not: a profile that comes to meet its role changes the pin.
+    pinned = {**expected, "text": retained}
+    assert played("pinned", _LogsAtBuild(logger, words), pinned) == frozenset()
+    assert played("met", None, pinned) == {f"admission:text:{admitted}!={retained}"}
+    # The same words under another logger are not that warning, and neither
+    # is another warning of the routing module.
+    assert played("other-logger", _LogsAtBuild(f"{logger}.other", words)) == frozenset()
+    assert played("other-words", _LogsAtBuild(logger, "ignored a setting of")) == frozenset()
+    # A role that is refused after the warning is refused.
+    assert played("refused", _LogsAtBuild(logger, words, then_refuses=True)) == {
+        f"admission:text:FeatureAdmissionError!={admitted}"
+    }
+    # A cell that cannot hear the routing module could not tell the two
+    # apart, and says so: where the warning would not reach the root logger
+    # the play is a setup error, never a role read as admitted.
+    routing = logging.getLogger(logger)
+    was = (routing.level, routing.propagate, logging.root.manager.disable)
+    mutes = {
+        "level": lambda: routing.setLevel(logging.ERROR),
+        "disabled": lambda: logging.disable(logging.WARNING),
+        "no-propagation": lambda: setattr(routing, "propagate", False),
+    }
+    for name, mute in mutes.items():
+        try:
+            mute()
+            with pytest.raises(MatrixSetupError, match="would not reach the cell"):
+                played(name, _LogsAtBuild(logger, words))
+        finally:
+            routing.setLevel(was[0])
+            routing.propagate = was[1]
+            logging.disable(was[2])
+    assert played("heard", _LogsAtBuild(logger, words), pinned) == frozenset()
+    # The logger is that of the module routing lives in. That the words are
+    # those of its warning is held where the product logs it: by an
+    # admission cell of a real column that is pinned retained. Without one,
+    # nothing would hold the words to the product.
+    assert logger == load_routing.__module__
+    assert any(
+        row[capability] == retained
+        for row in cells.load_inventory().admission
+        for capability in matrix_columns.ROLE_BY_CAPABILITY
+    )
+
+
+class _BoundByItsDriver(toy.ToyDriver):
+    """A toy route that is built only with what its driver binds to it."""
+
+    def __init__(
+        self, field: str, *, admits_as_shipped: bool = False, keeps_its_overlay: bool = False
+    ) -> None:
+        super().__init__()
+        self._field, self._admits, self._keeps = field, admits_as_shipped, keeps_its_overlay
+
+    def overlay(self, column: Column, env: Mapping[str, str]) -> Mapping[str, str]:
+        if column.shipped and not self._keeps:
+            return {}
+        return {self._field: "bound"}
+
+    @contextlib.contextmanager
+    def open(self, column: Column, **arguments: Any) -> Iterator[Any]:
+        if not self.overlay(column, {}) and not self._admits:
+            raise FeatureAdmissionError(f"the toy route of column {column.id} is not bound")
+        with super().open(column, **arguments) as bound:
+            yield bound
+
+
+def test_an_admission_cell_asks_again_on_the_file_as_shipped_where_its_driver_binds_an_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = next(cell for cell in TOY_CELLS if SCENARIOS[cell.scenario].admission)
+    (field,) = matrix_columns.ADMISSION_OVERLAY
+    refusal = "FeatureAdmissionError"
+    bound = cells.expected_admission(cell)
+    shipped = {cells.as_shipped(name): refusal for name in matrix_columns.ROLE_BY_CAPABILITY}
+    both = {**bound, **shipped}
+
+    def played(name: str, driver: toy.ToyDriver, pin: Mapping[str, str]) -> frozenset[str]:
+        return runner.execute(cell, tmp_path / name, driver=driver, admission=pin).report.codes
+
+    # The driver of this kind may add nothing that routing reads to admit a
+    # route, so every capability is asked for once: a pin that states the
+    # file as shipped names subjects the cell never saw.
+    assert matrix_columns.admission_inputs(TOY_KIND) == ()
+    assert cells.admission_subjects(TOY_KIND) == cells.ADMISSION_SUBJECTS
+    assert played("once", _BoundByItsDriver(field), both) == {
+        f"admission:{subject}:unseen!={refusal}" for subject in shipped
+    }
+
+    # A kind whose driver binds such a field (and the path of a peer, which
+    # is none) is asked a second time on the file as shipped.
+    peer = "extra.cli_path"
+    assert peer in matrix_columns.ALLOWED_OVERLAY[matrix_columns.CLAUDE_KIND]
+    monkeypatch.setitem(matrix_columns.ALLOWED_OVERLAY, TOY_KIND, (peer, field))
+    assert matrix_columns.admission_inputs(TOY_KIND) == (field,)
+    assert cells.admission_subjects(TOY_KIND) == (*cells.ADMISSION_SUBJECTS, *shipped)
+    honest = runner.execute(
+        cell, tmp_path / "honest", driver=_BoundByItsDriver(field), admission=both
+    )
+    assert honest.report.codes == frozenset()
+    assert set(honest.report.outcomes) == {"C0", "C8", "C9", contract.SCENARIO}
+    assert honest.observation.provider.request_count == 0
+    assert honest.observation.debug_dump_text.count("is not bound") == len(shipped)
+    # A file that routing admits as shipped, where the pin says it is
+    # refused: the gate opened, and the pin changes with it.
+    assert played("opened", _BoundByItsDriver(field, admits_as_shipped=True), both) == {
+        f"admission:{subject}:{contract.ADMITTED}!={refusal}" for subject in shipped
+    }
+    # A pin that does not state the second play leaves it unpinned.
+    assert played("unpinned", _BoundByItsDriver(field), bound) == {
+        f"admission:{subject}:{refusal}!=unpinned" for subject in shipped
+    }
+    # A driver that binds its input to the file it is asked to read as
+    # shipped would play the first build twice under another name.
+    with pytest.raises(MatrixSetupError, match="asked to build from as shipped"):
+        played("kept", _BoundByItsDriver(field, keeps_its_overlay=True), both)
+
+    # The view names the same column and the same routing file.
+    column = matrix_columns.real_columns()[0]
+    view = column.routed_by(matrix_columns.COLUMN_PRODUCT).as_shipped()
+    assert view.shipped and not column.shipped
+    assert dataclasses.replace(view, shipped=False) == column.routed_by(
+        matrix_columns.COLUMN_PRODUCT
+    )
+
+
 def test_an_admission_cell_of_a_real_column_needs_its_pin_and_a_pin_its_cell() -> None:
     blocked = _standin("blocked")
     generated = cells.generate(
@@ -4020,6 +4312,32 @@ def test_an_admission_cell_of_a_real_column_needs_its_pin_and_a_pin_its_cell() -
         cells.parse_inventory({**inventory, "admission": [{**row, "cell": "S51"}]})
     with pytest.raises(MatrixSetupError, match="pinned twice"):
         cells.parse_inventory({**inventory, "admission": [row, dict(row)]})
+    # A row of a kind whose driver binds an admission input states each
+    # capability on the file as shipped too; a row of another kind may not,
+    # and a cell of such a kind is held to the whole row.
+    bound_kind = next(
+        kind for kind in matrix_columns.ALLOWED_OVERLAY if matrix_columns.admission_inputs(kind)
+    )
+    as_shipped = {
+        cells.as_shipped(name): "FeatureAdmissionError"
+        for name in matrix_columns.ROLE_BY_CAPABILITY
+    }
+    bound_cell = Cell(dataclasses.replace(_standin("primary"), kind=bound_kind), "S51", "raw")
+    bound_row = {**row, "cell": bound_cell.id, **as_shipped}
+    assert set(as_shipped).isdisjoint(cells.ADMISSION_SUBJECTS)
+    assert cells.parse_inventory({**inventory, "admission": [bound_row]}).admission == (
+        bound_row,
+    )
+    assert cells.expected_admission(bound_cell, [bound_row]) == {
+        name: value for name, value in bound_row.items() if name not in ("cell", "reason")
+    }
+    for wrong in (
+        {**row, "cell": bound_cell.id},
+        {**row, **as_shipped},
+        {name: value for name, value in bound_row.items() if name != cells.as_shipped("text")},
+    ):
+        with pytest.raises(MatrixSetupError, match="admission row"):
+            cells.parse_inventory({**inventory, "admission": [wrong]})
     with pytest.raises(MatrixSetupError, match="unknown shape"):
         cells.parse_inventory(
             {name: value for name, value in inventory.items() if name != "admission"}
