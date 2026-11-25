@@ -914,7 +914,9 @@ def test_claude_driver_reads_one_private_name_and_patches_none() -> None:
         name for name in imported if any(part.startswith("_") for part in name.split("."))
     ]
     assert driver.fidelity == "wire" and driver.dialect == "claude_cli"
-    assert len(driver.bypassed_layers) == 2 and driver.inexpressible == {}
+    assert len(driver.bypassed_layers) == 2
+    # The one step the frames of the tool cannot carry: a refusal part.
+    assert list(driver.inexpressible) == ["S23b/Refuse(refusal_part)"]
     # Nothing of the product is replaced: the driver sets no attribute and
     # uses no patching helper.
     called = {
@@ -1060,6 +1062,9 @@ def test_a_test_that_requires_a_worker_environment_carries_the_marker() -> None:
     assert paired > 0
 
 
+_APP_SERVER_INEXPRESSIBLE = ["S23a/Refuse(content_filter)", "S23b/Refuse(refusal_part)"]
+
+
 def test_codex_drivers_touch_only_the_seams_they_list() -> None:
     def imported(tree: ast.Module) -> list[str]:
         return sorted(
@@ -1110,7 +1115,10 @@ def test_codex_drivers_touch_only_the_seams_they_list() -> None:
     assert all(hasattr(adapter, name) for name in private)
     assert not {name for name in called(legacy) if "setattr" in name or "patch" in name}
     assert driver.fidelity == "wire" and driver.dialect == "codex_app_server"
-    assert len(driver.bypassed_layers) == 3 and driver.inexpressible == {}
+    assert len(driver.bypassed_layers) == 3
+    # What the notifications of the app-server cannot carry: a finish reason
+    # of a model response and a refusal part of a message.
+    assert list(driver.inexpressible) == _APP_SERVER_INEXPRESSIBLE
 
     # The official-SDK column. Of the worker client the driver uses public
     # names only; its seams are the two module globals it hands to the launch
@@ -1135,7 +1143,10 @@ def test_codex_drivers_touch_only_the_seams_they_list() -> None:
     assert not {name for name in called(official) if "setattr" in name or "patch" in name}
     assert {"launch.at_subprocess", "launch.at_asyncio"} <= called(official)
     assert driver.fidelity == "wire" and driver.dialect == "codex_app_server"
-    assert len(driver.bypassed_layers) == 3 and driver.inexpressible == {}
+    assert len(driver.bypassed_layers) == 3
+    # What the notifications of the app-server cannot carry: a finish reason
+    # of a model response and a refusal part of a message.
+    assert list(driver.inexpressible) == _APP_SERVER_INEXPRESSIBLE
     # Both columns answer from the same envelopes, through the same peer.
     assert driver.envelopes == drivers.get(matrix_columns.CODEX_LEGACY_KIND).envelopes
     # That dialect names no served model (it refuses the step that would),
@@ -1150,6 +1161,90 @@ def test_codex_drivers_touch_only_the_seams_they_list() -> None:
     assert _import_problems(_tree("peers/codex_worker.py")) == []
     for module, name in launch.ASYNCIO_SEAMS:
         assert hasattr(importlib.import_module(module), name), (module, name)
+
+
+def _private_product_names_replaced(tree: ast.Module, functions: AbstractSet[str]) -> set[str]:
+    """The private names of the product that the named functions of a module replace.
+
+    A replacement is a call of a ``setattr`` method (the patching helper of
+    pytest) on a name the module imports from the product, with an attribute
+    that begins with an underscore.
+    """
+
+    imported = {
+        alias.asname or alias.name: f"{node.module}.{alias.name}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and not node.level
+        and (node.module or "").split(".")[0] in {"crucible", "assay"}
+        for alias in node.names
+    }
+    found: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in functions:
+            continue
+        for call in ast.walk(node):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "setattr"
+                and len(call.args) >= 2
+                and isinstance(call.args[1], ast.Constant)
+                and str(call.args[1].value).startswith("_")
+            ):
+                continue
+            parts: list[str] = []
+            target = call.args[0]
+            while isinstance(target, ast.Attribute):
+                parts.append(target.attr)
+                target = target.value
+            if isinstance(target, ast.Name) and target.id in imported:
+                name = str(call.args[1].value)
+                found.add(".".join([imported[target.id], *reversed(parts), name]))
+    return found
+
+
+def test_the_private_names_a_required_proof_replaces_are_listed_beside_the_proofs() -> None:
+    # A required proof is evidence an entry of the ledger leans on, as a
+    # cell is. What a driver replaces of the product is in its list of
+    # private seams; what a required proof replaces is in the list beside the
+    # proofs, module by module, and the report of a run prints both.
+    assert set(cells.PROOF_SEAMS) <= set(cells.REQUIRED_PROOFS)
+    for module, proofs in cells.REQUIRED_PROOFS.items():
+        names = {proof.split("[", 1)[0] for proof in proofs}
+        replaced = _private_product_names_replaced(_tree(f"{module}.py"), names)
+        assert replaced == set(cells.PROOF_SEAMS.get(module, ())), module
+    for seams in cells.PROOF_SEAMS.values():
+        for seam in seams:
+            owner, _, name = seam.rpartition(".")
+            module_name, _, class_name = owner.rpartition(".")
+            assert name.startswith("_")
+            assert hasattr(getattr(importlib.import_module(module_name), class_name), name)
+    for kind in sorted(drivers.load()):
+        described = matrix_report.describe_kind(kind)
+        assert described["proof_seams"] == list(
+            cells.PROOF_SEAMS.get(cells.module_of(kind), ())
+        )
+        assert described["private_seams"] == list(drivers.get(kind).private_seams)
+    assert matrix_report.describe_kind(matrix_columns.CLAUDE_KIND)["proof_seams"]
+    # The rule sees what it is there for: a proof that replaces private names
+    # nobody listed, on a class and through a module alias. A public name and
+    # a test that is no required proof are not its subject.
+    lying = ast.parse(
+        "from crucible.backends import kimi as adapter\n"
+        "from crucible.backends.claude import ClaudeBackend\n"
+        "def test_proof(monkeypatch):\n"
+        "    monkeypatch.setattr(ClaudeBackend, '_invoke_once', None)\n"
+        "    monkeypatch.setattr(adapter.KimiBackend, '_result_from_outcome', None)\n"
+        "    monkeypatch.setattr(ClaudeBackend, 'attach_toolset', None)\n"
+        "def test_other(monkeypatch):\n"
+        "    monkeypatch.setattr(ClaudeBackend, '_tool_authority_digest', None)\n"
+    )
+    assert _private_product_names_replaced(lying, {"test_proof"}) == {
+        "crucible.backends.claude.ClaudeBackend._invoke_once",
+        "crucible.backends.kimi.KimiBackend._result_from_outcome",
+    }
+    assert _private_product_names_replaced(lying, {"test_missing"}) == set()
 
 
 def test_every_envelope_is_rendered_by_a_dialect_and_exists() -> None:

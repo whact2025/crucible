@@ -142,6 +142,10 @@ class ProviderLedger:
     # What the replay rule of a stateless dialect says of the scripted
     # requests (:class:`StatelessDialect`); empty where the dialect has none.
     replay_problems: list[str] = field(default_factory=list)
+    # Whether the wire of the exchange has a field for the turn count of a
+    # call (:class:`TurnControlDialect`). Where it has none, a request
+    # without a turn control says nothing about the adapter.
+    turn_control_field: bool = False
 
     @property
     def request_count(self) -> int:
@@ -231,12 +235,48 @@ class CacheCountingDialect(Protocol):
         """The counts of cache reads and writes ``reply`` states; ``None`` for none."""
 
 
+@runtime_checkable
+class TurnControlDialect(Protocol):
+    """A dialect of a wire that has a field for the turn count of a call.
+
+    Such a dialect reads the field into :attr:`SeenRequest.turn_control`, and
+    the ledger keeps that the wire has one
+    (:attr:`ProviderLedger.turn_control_field`). On such a wire a request
+    without the count is an adapter that kept the count to itself; on a wire
+    without the field every request is without it. The scenario of the
+    suite's turn count asks for the count on the first kind of wire only.
+    """
+
+    turn_control_field: bool
+
+
+def answered_from(dialect: Dialect, script: ProviderScript) -> tuple[str, ...]:
+    """The envelopes ``dialect`` renders the steps of ``script`` from, in order.
+
+    Read without an exchange: each step is rendered against a blank request,
+    as the provider renders it when it is built. What a dialect adds only for
+    a later state of a session (a terminal that the request of a turn
+    selects) is not in it, so this names envelopes a play of the script uses
+    and may not name them all.
+    """
+
+    blank = dialect.parse("POST", dialect.path, {}, b"{}", credential="")
+    names: list[str] = []
+    for step in (*script.steps, *((script.tail,) if script.tail else ())):
+        reply = dialect.render(step.step if isinstance(step, Loop) else step, blank, "")
+        if reply.envelope is not None:
+            names.append(reply.envelope)
+        names.extend(reply.envelopes)
+    return tuple(names)
+
+
 class ToyDialect:
     """The toy driver's own wire: one JSON request and reply per model turn."""
 
     name = "toy"
     path = "/toy/v1/turn"
     user_agent = "crucible-matrix-toy/1"
+    turn_control_field = True  # ``max_turns`` in the body of a request
 
     def parse(
         self,
@@ -429,6 +469,8 @@ class LoopbackProvider:
         self._frozen: ProviderLedger | None = None
         if isinstance(self._dialect, CacheCountingDialect):
             self._ledger.cache_counts = []
+        if isinstance(self._dialect, TurnControlDialect):
+            self._ledger.turn_control_field = self._dialect.turn_control_field
         # A step the dialect cannot render, or a reply whose cache counts it
         # cannot read back, is a setup error here, in the test's thread, not a
         # dropped connection inside the server's.

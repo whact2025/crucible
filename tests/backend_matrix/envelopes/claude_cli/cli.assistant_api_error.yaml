@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The frame the command-line tool emits in the place of a model turn when
+# the provider rejected the request: a local message that no model wrote,
+# marked with the category of the error. Nothing was observed of the real
+# tool (see cli.init).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: assistant_api_error
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.AssistantMessage whose error is the value
+    "invalid_request" of claude_agent_sdk.types.AssistantMessageError, as
+    parsed by claude_agent_sdk._internal.message_parser.parse_message (case
+    "assistant", which reads the error beside the message)
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    The error category is one of the closed list the pinned SDK types for
+    an assistant frame; "invalid_request" is the one for a request the
+    provider rejected. That the frame names the placeholder model
+    "<synthetic>", carries the error text as its one text block and bills
+    nothing has no source but the adapter, which admits exactly that pair of
+    category and placeholder (crucible/backends/claude.py, the closed list
+    of error categories of an assistant frame); the error text is a fixed
+    sentence of this envelope. So this envelope shows only that the adapter
+    accepts what it was written to accept.
+
+status: 200
+
+body:
+  type: assistant
+  message:
+    id: {slot: response_id}
+    type: message
+    role: assistant
+    model: <synthetic>
+    content:
+      - type: text
+        text: "API Error: 400 The request was rejected because it violates the usage policy."
+    stop_reason: null
+    stop_sequence: null
+    usage:
+      input_tokens: 0
+      output_tokens: 0
+      cache_creation_input_tokens: 0
+      cache_read_input_tokens: 0
+  parent_tool_use_id: null
+  error: invalid_request
+  session_id: {slot: session_id}
+  uuid: {slot: frame_id}

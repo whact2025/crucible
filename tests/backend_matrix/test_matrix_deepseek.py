@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 from crucible.backends import deepseek as adapter
 
@@ -41,8 +42,8 @@ from .drivers import MatrixSetupError
 from .drivers import deepseek as driver
 from .peers import launch
 from .provider import LoopbackProvider, Reply, SeenRequest, SentCall
-from .scenarios import SCENARIOS, history_replayed
-from .script import READ_A, Call, ProviderScript, Say, ServedAs, Step
+from .scenarios import SCENARIOS, TEXT, history_replayed
+from .script import READ_A, Call, ProviderScript, Refuse, Say, ServedAs, Step
 
 # Every test here runs the locked worker: a missing environment is an error.
 pytestmark = pytest.mark.matrix_worker
@@ -706,7 +707,21 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
     blank = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
     seen_types: set[str] = set()
 
-    for step in (Say("the answer"), Call(READ_A)):
+    terminals = {
+        "Say": ("response.completed", "ResponseCompletedEvent"),
+        "Call": ("response.completed", "ResponseCompletedEvent"),
+        # A response a content filter stopped ends as an incomplete one; a
+        # response that declines in a refusal part is a completed one.
+        "content_filter": ("response.incomplete", "ResponseIncompleteEvent"),
+        "refusal_part": ("response.completed", "ResponseCompletedEvent"),
+    }
+    steps: tuple[Step, ...] = (
+        Say("the answer"),
+        Call(READ_A),
+        Refuse("content_filter"),
+        Refuse("refusal_part"),
+    )
+    for step in steps:
         events = dialect.render(step, blank, "call-1").body
         # The test starts the locked interpreter itself, through the launcher
         # of the suite fixture: it runs under the harness, in mode guard.
@@ -733,15 +748,135 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
         # cache-write counter that the vendor documents none of and that the
         # live route did not send. The envelope leaves it out on purpose.
         name, member, errors = report["events"][-1]
-        assert (name, member) == ("response.completed", "ResponseCompletedEvent")
+        assert (name, member) == terminals[getattr(step, "form", type(step).__name__)]
         assert errors == ["response.usage.input_tokens_details.cache_write_tokens: missing"]
 
     assert {"ResponseTextDeltaEvent", "ResponseFunctionCallArgumentsDoneEvent"} <= seen_types
+    # The refusal part travels in the two events the pinned SDK types for it.
+    assert {"ResponseRefusalDeltaEvent", "ResponseRefusalDoneEvent"} <= seen_types
     assert locked_worker_launch.journal is not None
     assert [(item["mode"], item["form"]) for item in locked_worker_launch.journal.launches()] == [
         ("guard", "-c")
-    ] * 2
+    ] * len(steps)
     assert locked_worker_launch.violations() == []
+    # The third refusal is no stream: a rejected request is answered with an
+    # error object of the SDK's four fields, bills nothing and names no model.
+    rejected = dialect.render(Refuse("http_policy"), blank, "call-1")
+    assert (rejected.status, rejected.raw, rejected.usage, rejected.served_model) == (
+        400,
+        None,
+        None,
+        None,
+    )
+    assert set(rejected.body) == {"error"}
+    assert set(rejected.body["error"]) == {"code", "message", "param", "type"}
+    assert rejected.envelope == "deepseek_responses/deepseek.refusal_http_policy"
+
+
+class _AnswersWhereItShouldRefuse(driver.DeepSeekResponsesDialect):
+    """Renders a refusal as a plain answer: the provider never refuses."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, Refuse):
+            step = Say("an answer where the script refuses", step.usage)
+        return super().render(step, seen, call_id)
+
+
+def test_a_refusal_that_is_never_sent_fails_the_cell_whatever_its_entry(
+    tmp_path: Path,
+) -> None:
+    class Lying(driver.DeepSeekDriver):
+        def _dialect(self, journal: launch.Journal, interpreter: str) -> Any:
+            return _AnswersWhereItShouldRefuse(journal=journal, interpreter=interpreter)
+
+    # The entry of the cell is strict: a provider side that answers instead
+    # of refusing yields other codes, and the cell fails as a different
+    # deviation instead of staying an expected failure.
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation"):
+        runner.run_cell(
+            Cell(COLUMN, "S23a", "raw"),
+            tmp_path,
+            preflight={DEEPSEEK_KIND: None},
+            known=LEDGER,
+            driver=Lying(),
+        )
+
+
+class _CutsTheTurnCount:
+    """The backend of a cell behind a ceiling on the turn count that it states nowhere."""
+
+    def __init__(self, inner: Any, ceiling: int) -> None:
+        self._inner, self._ceiling = inner, ceiling
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def invoke(self, invocation: Any) -> Any:
+        return self._inner.invoke(
+            dataclasses.replace(invocation, max_turns=min(invocation.max_turns, self._ceiling))
+        )
+
+
+def test_a_silent_turn_ceiling_does_not_close_the_gap_of_the_suites_turn_count(
+    played: Callable[[str], runner.Execution], tmp_path: Path
+) -> None:
+    ceiling = adapter._MAX_TOOL_ROUNDS
+
+    class Clamping(driver.DeepSeekDriver):
+        @contextlib.contextmanager
+        def open(self, column: Any, **named: Any) -> Any:
+            with super().open(column, **named) as bound:
+                bound.backend = _CutsTheTurnCount(bound.backend, ceiling)
+                yield bound
+
+    cell = Cell(COLUMN, "S11", "raw")
+    entry = LEDGER.entry(cell.id)
+    assert entry is not None and set(entry.codes.values()) == {"G15"}
+
+    # Today the adapter refuses the suite's turn count before it asks the
+    # provider anything: the cell is the expected failure of the gap.
+    honest = played("S11")
+    assert honest.plan.max_turns > ceiling
+    assert honest.observation.raised is not None
+    assert honest.observation.provider.request_count == 0
+    assert honest.report.codes == set(entry.codes)
+
+    # The lying counterpart: the count is cut to the adapter's ceiling and
+    # the call goes ahead. One completion needs one turn, the wire of the
+    # route carries no turn control, and the result is a clean finish: no
+    # code of the gap is left, and nothing says that a ceiling was applied.
+    clamped = _played("S11", tmp_path, driver=Clamping())
+    result = clamped.observation.result
+    assert result is not None and result.error is None
+    assert (result.stop_reason, result.final_message) == ("end_turn", TEXT)
+    assert [request.turn_control for request in _matched(clamped)] == [None]
+    assert not clamped.observation.provider.turn_control_field
+    assert clamped.current == {"turn_limit": "hard"}
+    column_wide = {item.code for item in LEDGER.column_wide if item.kind == DEEPSEEK_KIND}
+    clean_finish = LEDGER.entry(Cell(COLUMN, "S01", "raw").id)
+    assert clean_finish is not None
+    # What the cell then shows is what every clean finish of the column
+    # shows: the terminal name of another record.
+    left = clamped.report.codes - column_wide
+    assert left and left == set(clean_finish.codes) and set(clean_finish.codes.values()) == {"M05"}
+
+    # So the ledger that such a change leaves has no code of the gap on its
+    # one cell. Whether a ceiling that is applied in silence is the closing
+    # state of the gap is not ruled, and until it is the integrity check
+    # holds the gap open whatever the cell shows.
+    document = yaml.safe_load(ledger.LEDGER_PATH.read_text(encoding="utf-8"))
+    (known,) = (item for item in document["known_gaps"] if item.get("cell") == cell.id)
+    known["codes"] = {code: "M05" for code in sorted(left)}
+    document["registry"]["M05"]["cells"].append(
+        {
+            "cell": cell.id,
+            "observed_under": dict(clamped.current),
+            "closes_under": dict(clamped.current),
+        }
+    )
+    found = ledger.integrity_problems(ledger.parse(document), cells.world())
+    assert {item.code for item in found} == {"static:registry_closed_before_ruling"}
+    assert [cell.id in item.detail for item in found] == [True]
 
 
 def test_every_cell_of_the_column_is_graded_by_the_envelopes_it_used(
@@ -749,15 +884,23 @@ def test_every_cell_of_the_column_is_graded_by_the_envelopes_it_used(
 ) -> None:
     text, tools = played("S01"), played("S04")
 
+    loop = {"deepseek_responses/deepseek.completion", "deepseek_responses/deepseek.tool_call"}
+    refusals = set(DRIVER.envelopes) - loop
     assert set(text.observation.provider.envelopes) == {"deepseek_responses/deepseek.completion"}
-    assert set(tools.observation.provider.envelopes) == set(DRIVER.envelopes)
+    assert set(tools.observation.provider.envelopes) == loop
     assert set(DRIVER.envelopes) == {
         name for name in envelopes.all_envelopes() if name.startswith("deepseek_responses/")
     }
-    # Both envelopes rest on the vendor's documentation and on the live
-    # adapter-level check; neither is a recording.
-    assert {envelopes.load(name).grade for name in DRIVER.envelopes} == {"documented"}
+    # The two envelopes of the tool loop rest on the vendor's documentation
+    # and on the live adapter-level check; neither is a recording.
+    assert {envelopes.load(name).grade for name in loop} == {"documented"}
     assert text.grade == tools.grade == "documented"
+    # No refusal of the route was observed or is documented: the three
+    # envelopes of a refusal are built to the types of the pinned SDK, and a
+    # cell that is answered from one is graded so.
+    assert len(refusals) == 3
+    assert {envelopes.load(name).grade for name in refusals} == {"constructed"}
+    assert played("S23a").grade == "constructed"
     # The schema answer of the planner shape travels in the prompt, once, and
     # in no provider field: what the route declares.
     assert SCENARIOS["S04"].governing == ("structured_output",)

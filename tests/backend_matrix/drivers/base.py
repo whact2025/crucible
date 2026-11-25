@@ -78,6 +78,13 @@ class Driver(Protocol):
     def envelopes(self) -> tuple[str, ...]:
         """Every envelope the driver's dialect renders from, by name."""
 
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        """The envelopes the driver's dialect answers ``script`` from, by name.
+
+        Read without a backend and without an exchange: static cell H03 asks
+        it for the grade of the replies a cell is answered from.
+        """
+
     def preflight(self) -> None: ...
 
     def overlay(self, column: Column, env: Mapping[str, str]) -> Mapping[str, str]: ...

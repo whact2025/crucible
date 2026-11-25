@@ -31,7 +31,14 @@ turn of several model responses is decided by how the envelope fills the
 ``last`` counters of a usage notification, which no source in reach states.
 It plays both readings and leaves with whatever settles the point. The
 ledger carries the point as a known gap that is unconfirmed and its record
-leans on this test, so the verifier requires it by name too, on both cells.
+leans on this test, so the verifier requires it by name too, on every cell
+whose turn has several responses; a twin of it plays the guarded cells, where
+the limit guard replaces the result and its codes do not say what it missed.
+One more test is required by name and does hold a known gap, because no code
+of its cell names it: the result of a dispatch-budget denial reports no usage
+for the responses the provider billed. The fix of that gap turns the test
+into the opposite assertion. The lying counterparts of the twin and of that
+test are beside them.
 
 The two lying counterparts it shares with the app-server column are defined
 in that column's module.
@@ -48,9 +55,10 @@ from typing import Any, Mapping
 
 import pytest
 
+from assay import Usage
 from crucible.backends import codex_official_worker as worker_client
 
-from . import cells, declarations, envelopes, ledger, runner, toolsets
+from . import cells, contract, declarations, envelopes, ledger, runner, toolsets
 from . import columns as matrix_columns
 from .cells import Cell
 from .columns import CANARY_CREDENTIAL, CODEX_OFFICIAL_KIND
@@ -60,7 +68,7 @@ from .peers import codex_app_server as peer_program
 from .peers import codex_worker as stage
 from .peers import launch, worker_harness
 from .scenarios import D_CDX_SERVED, SCENARIOS, SYSTEM, USER
-from .script import READ_A, READ_B, Call, ProviderScript, Say
+from .script import READ_A, READ_B, Call, ProviderScript, Refuse, Say
 from .test_matrix_codex import LastAsTheTurnSoFar, presenting_a_served_model
 
 pytestmark = pytest.mark.matrix_worker
@@ -437,7 +445,7 @@ def test_a_turn_of_one_response_reports_the_tokens_the_provider_billed(
     assert billed.input_tokens > 0 < billed.output_tokens
 
 
-@pytest.mark.parametrize("scenario", ["S03", "S04"])
+@pytest.mark.parametrize("scenario", cells.SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE)
 def test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last(
     scenario: str, tmp_path: Path, request: pytest.FixtureRequest
 ) -> None:
@@ -456,10 +464,17 @@ def test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last(
     worker) rewrites this test.
     """
 
-    # The verifier requires this test by name on both cells: the record of the
-    # ledger leans on it, and a run without it is refused.
+    # The verifier requires this test by name on every cell: the record of the
+    # ledger leans on it, and a run without it is refused. No entry attributes
+    # a code to that record on a scenario this test does not play.
     assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_OFFICIAL_KIND]]
     cell = Cell(COLUMN, scenario, "raw")
+    attributed = {
+        ledger.parse_cell_id(entry.cell)[1]
+        for entry in LEDGER.entries
+        if "R05" in entry.codes.values()
+    }
+    assert attributed <= set(cells.SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE)
     one = _played(scenario, tmp_path / "one-response")
     driver = _OtherReadingOfLast()
     turn = runner.execute(
@@ -488,6 +503,295 @@ def test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last(
     # not about the size of the usage are the same under both.
     assert turn.report.codes <= one.report.codes
     assert all(code.startswith("usage.") for code in one.report.codes - turn.report.codes)
+
+
+GUARD_CODES = frozenset({"guard:limit_evidence_incomplete", "guard:revoked"})
+# The evidence the limit guard names as missing on a result that flags its
+# token usage incomplete and nothing else.
+TOKEN_EVIDENCE = "invocation_limits.token_usage_complete"
+
+
+def _usage_codes(execution: runner.Execution) -> set[str]:
+    return {code for code in execution.report.codes if code.startswith("usage.")}
+
+
+def _more_than_the_two_findings(one: runner.Execution, turn: runner.Execution) -> list[str]:
+    """Why two plays of a guarded cell show more than the two findings of the route.
+
+    ``one`` is the cell under the envelope's reading of ``last`` (one model
+    response), ``turn`` the same cell under the other reading (the turn so
+    far).
+    """
+
+    problems: list[str] = []
+    # The usage code goes with the reading ...
+    if not _usage_codes(one):
+        problems.append("the cell shows no usage code under the reading of the envelope")
+    if _usage_codes(turn):
+        problems.append(f"{sorted(_usage_codes(turn))} stay under the other reading")
+    # ... and nothing else moves with it.
+    moved = {
+        code for code in one.report.codes ^ turn.report.codes if not code.startswith("usage.")
+    }
+    if moved:
+        problems.append(f"{sorted(moved)} move with the reading and are no usage codes")
+    for name, execution in (("one response", one), ("the turn so far", turn)):
+        # The guard replaced the result and revoked the backend ...
+        if not GUARD_CODES <= execution.report.codes:
+            problems.append(f"under {name} the limit guard did not replace the result")
+        # ... for the token flag and for no other evidence.
+        result = execution.observation.result
+        named = None if result is None else getattr(result.error, "missing", None)
+        if named != (TOKEN_EVIDENCE,):
+            problems.append(f"under {name} the limit guard names {named} as missing")
+    return problems
+
+
+@pytest.mark.parametrize("scenario", cells.GUARDED_SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE)
+def test_what_a_guarded_turn_of_several_responses_shows_rests_on_the_reading_of_last(
+    scenario: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """The twin of the test above, on the cells where the limit guard replaces the result.
+
+    In the guarded lens the guard replaces the result of this route for its
+    incomplete evidence and revokes the backend. Its two codes then stand
+    for the kind and the stop reason of the turn it replaced, and say
+    neither which evidence was missing nor what that turn reported. So an
+    entry on such a cell could cover more than the two findings of the
+    route. This test plays the cell under both readings of ``last``: the
+    usage code goes with the reading and nothing else moves, the two guard
+    codes stay, and under both the guard names the token flag as the only
+    evidence it misses.
+    """
+
+    # The verifier requires this test by name on every guarded cell whose
+    # entry attributes a code to the unconfirmed record: a run without it is
+    # refused, and no such entry stands on a scenario this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_OFFICIAL_KIND]]
+    guarded = {
+        ledger.parse_cell_id(entry.cell)[1]
+        for entry in LEDGER.entries
+        if "R05" in entry.codes.values() and ledger.parse_cell_id(entry.cell)[3] == "guarded"
+    }
+    played = set(cells.GUARDED_SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE)
+    assert guarded <= played <= set(cells.SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE)
+    cell = Cell(COLUMN, scenario, "guarded")
+    one = _played(scenario, tmp_path / "one-response", "guarded")
+    driver = _OtherReadingOfLast()
+    turn = runner.execute(
+        cell, tmp_path / "turn-so-far", driver=driver, differences=LEDGER.differences_for(cell.id)
+    )
+    (dialect,) = driver.dialects
+    billed = one.observation.provider.billed
+    whole = one.observation.provider.billed_total()
+
+    # The same exchange through the same seam under both readings, and a turn
+    # of several responses.
+    for execution in (one, turn):
+        assert execution.report.seam_problems == ()
+        assert execution.report.outcomes["C0"].status == "ok"
+    assert turn.observation.provider.billed == billed and len(billed) > 1
+    assert dialect.differs_from_the_second_response_on(len(billed))
+    # The guard keeps the usage of the result it replaces: the last response
+    # under one reading, the whole turn under the other.
+    assert _tokens(one) == (billed[-1].input_tokens, billed[-1].output_tokens)
+    assert _tokens(turn) == (whole.input_tokens, whole.output_tokens)
+    assert _more_than_the_two_findings(one, turn) == []
+
+
+def _showing(execution: runner.Execution, code: str) -> runner.Execution:
+    """The same play with one deviation more, booked under the clause of ``code``."""
+
+    clause = contract.clause_of(code)
+    outcome = execution.report.outcomes[clause]
+    more = dataclasses.replace(
+        outcome,
+        status="deviation",
+        deviations=(*outcome.deviations, contract.Deviation(code, "of the lying counterpart")),
+    )
+    report = dataclasses.replace(
+        execution.report, outcomes={**execution.report.outcomes, clause: more}
+    )
+    return dataclasses.replace(execution, report=report)
+
+
+def _missing(execution: runner.Execution, *missing: str) -> runner.Execution:
+    """The same play with a guard that names this evidence as missing."""
+
+    result = execution.observation.result
+    assert result is not None and result.error is not None
+    error = dataclasses.replace(result.error, missing=missing)
+    observation = dataclasses.replace(
+        execution.observation, result=dataclasses.replace(result, error=error)
+    )
+    return dataclasses.replace(execution, observation=observation)
+
+
+def test_the_guarded_twin_fails_on_what_an_entry_on_a_guarded_cell_must_not_cover(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the twin, on its first cell. Two are plays:
+    # the cell under one reading twice, and the raw cell of the scenario,
+    # which the guard does not replace. Two are the honest play with one thing
+    # made up: a code that is not about the size of the usage and shows under
+    # one reading only, and a guard that names a second flag as missing.
+    scenario = cells.GUARDED_SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE[0]
+    cell = Cell(COLUMN, scenario, "guarded")
+    one = _played(scenario, tmp_path / "one-response", "guarded")
+    turn = runner.execute(
+        cell,
+        tmp_path / "turn-so-far",
+        driver=_OtherReadingOfLast(),
+        differences=LEDGER.differences_for(cell.id),
+    )
+    raw = Cell(COLUMN, scenario, "raw")
+    unguarded = runner.execute(
+        raw,
+        tmp_path / "raw",
+        driver=_OtherReadingOfLast(),
+        differences=LEDGER.differences_for(raw.id),
+    )
+
+    assert _more_than_the_two_findings(one, turn) == []
+    # The reading decides nothing: the usage code is there under both, or
+    # under neither.
+    assert _more_than_the_two_findings(one, one) != []
+    assert _more_than_the_two_findings(turn, turn) != []
+    # The guard did not replace the result of the other reading.
+    assert not GUARD_CODES & unguarded.report.codes
+    assert _more_than_the_two_findings(one, unguarded) != []
+    # Something that is not the size of the usage moves with the reading.
+    assert _more_than_the_two_findings(_showing(one, "digest.mismatch:served_model"), turn) != []
+    assert _more_than_the_two_findings(one, _showing(turn, "digest.mismatch:served_model")) != []
+    # The guard misses more than the token flag, under either reading.
+    second = "invocation_limits.cost_complete"
+    assert _more_than_the_two_findings(_missing(one, TOKEN_EVIDENCE, second), turn) != []
+    assert _more_than_the_two_findings(one, _missing(turn, TOKEN_EVIDENCE, second)) != []
+    assert _more_than_the_two_findings(one, _missing(turn, second)) != []
+
+
+# -- the usage of a denied turn: a known gap that no code names --------------------
+
+DENIAL = cells.DISPATCH_DENIAL_ON_THE_OFFICIAL_CODEX_ROUTE
+# The record of the ledger whose cell the proof below plays.
+DENIAL_GAP = "R09"
+
+
+def _usage_of_a_denied_turn(execution: runner.Execution) -> list[str]:
+    """Why a play is not a denial result that reports no usage for what was billed."""
+
+    result = execution.observation.result
+    assert result is not None
+    problems: list[str] = []
+    if result.completeness.token_usage_complete or result.completeness.cost_complete:
+        problems.append("the result flags its accounting complete")
+    billed = execution.observation.provider.billed_total()
+    if not billed.input_tokens or not billed.output_tokens:
+        problems.append("the provider billed nothing")
+    if result.usage != Usage():
+        problems.append("the result reports usage")
+    trace = result.execution_trace
+    if trace is None or any(event.kind == "usage" for event in trace.events):
+        problems.append("the trace of the result holds a usage event, or there is no trace")
+    return problems
+
+
+def test_the_result_of_a_dispatch_budget_denial_reports_no_usage_for_what_the_provider_billed(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because no code of the cell shows it.
+
+    When a workflow's tool-dispatch budget denies a call, the adapter cancels
+    the turn. The worker of this route publishes usage only when a turn ends,
+    so the result of the denial is built without any: it reports no token, no
+    cost and no usage event for responses the provider billed. It flags its
+    accounting incomplete, which is all its cell shows (known gap R09), and
+    clause C6 takes any number below the bill for honest on a result that is
+    flagged so, down to none. This test compares what no clause compares.
+    The fix of that gap turns it into the opposite assertion.
+    """
+
+    # The verifier requires this test by name: the entry of the record leans
+    # on it, and a run without it is refused. No entry attributes a code to
+    # that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_OFFICIAL_KIND]]
+    kind, scenario, role, lens = ledger.parse_cell_id(DENIAL)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+    attributed = {entry.cell for entry in LEDGER.entries if DENIAL_GAP in entry.codes.values()}
+    assert attributed <= {DENIAL}
+
+    execution = _played(scenario, tmp_path, lens)
+    result = execution.observation.result
+
+    # The play is the denial the scenario scripts: the kind and the stop
+    # reason are the ones it asks for, one call reached the ToolSet, and the
+    # provider was asked for nothing after the denied call.
+    assert execution.report.seam_problems == () and result is not None
+    for clause in ("C0", "C2", "C3", "C10"):
+        assert execution.report.outcomes[clause].status == "ok", clause
+    assert result.error is not None and execution.observation.provider.extra == 0
+    assert _usage_of_a_denied_turn(execution) == []
+
+
+def test_the_proof_of_the_denied_turn_fails_on_a_result_that_carries_usage(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the proof above. One is a play: the app-server
+    # route builds the result of the same denial from what the attempt it
+    # cancelled had captured, flags the same accounting incomplete and reports
+    # every response the provider billed. Two are the result of this route
+    # with one thing made up: the provider's bill written into it, and a
+    # usage event in its trace. The last is the same result of a provider
+    # that billed nothing, which says nothing about a billed response.
+    _kind, scenario, role, lens = ledger.parse_cell_id(DENIAL)
+    (sibling,) = (
+        column
+        for column in matrix_columns.real_columns()
+        if (column.kind, column.role) == (matrix_columns.CODEX_LEGACY_KIND, role)
+    )
+    carried = Cell(sibling, scenario, lens)
+    app_server = runner.execute(
+        carried, tmp_path / "app-server", differences=LEDGER.differences_for(carried.id)
+    )
+    honest = _played(scenario, tmp_path / "official", lens)
+    result, billed = honest.observation.result, honest.observation.provider.billed_total()
+    assert result is not None and result.execution_trace is not None
+
+    def with_result(**changed: Any) -> runner.Execution:
+        observation = dataclasses.replace(
+            honest.observation, result=dataclasses.replace(result, **changed)
+        )
+        return dataclasses.replace(honest, observation=observation)
+
+    assert _usage_of_a_denied_turn(honest) == []
+    # The same denial on the route that keeps what its attempt captured.
+    assert app_server.report.seam_problems == ()
+    assert _tokens(app_server) == (billed.input_tokens, billed.output_tokens)
+    assert _usage_of_a_denied_turn(app_server) != []
+    # The bill, or a part of it, in the result of this route.
+    reported = Usage(input_tokens=billed.input_tokens, output_tokens=billed.output_tokens)
+    assert _usage_of_a_denied_turn(with_result(usage=reported)) != []
+    assert _usage_of_a_denied_turn(with_result(usage=Usage(output_tokens=1))) != []
+    assert _usage_of_a_denied_turn(with_result(usage=Usage(cost_usd=0.01))) != []
+    # A usage event in the trace of a result that reports none.
+    sibling_result = app_server.observation.result
+    assert sibling_result is not None and sibling_result.execution_trace is not None
+    (event,) = (item for item in sibling_result.execution_trace.events if item.kind == "usage")
+    events = result.execution_trace.events
+    trace = dataclasses.replace(
+        result.execution_trace,
+        events=(
+            *events[:-1],
+            dataclasses.replace(event, sequence=len(events) - 1),
+            dataclasses.replace(events[-1], sequence=len(events)),
+        ),
+    )
+    assert _usage_of_a_denied_turn(with_result(execution_trace=trace)) != []
+    # A provider that billed nothing.
+    unbilled = dataclasses.replace(
+        honest.observation, provider=dataclasses.replace(honest.observation.provider, billed=[])
+    )
+    assert _usage_of_a_denied_turn(dataclasses.replace(honest, observation=unbilled)) != []
 
 
 # -- the served model: the wire names none ----------------------------------------
@@ -587,7 +891,12 @@ def test_the_notifications_validate_against_the_vendor_types_in_the_locked_inter
     }
     seen = dialect.parse("POST", dialect.path, {}, json.dumps(evidence).encode(), credential="")
     frames: dict[str, Any] = {}
-    replies = (dialect.render(Call(READ_A), seen, "call-2"), dialect.render(Say("x"), seen, "c"))
+    replies = (
+        dialect.render(Call(READ_A), seen, "call-2"),
+        dialect.render(Say("x"), seen, "c"),
+        # The terminal of a turn the provider refused for its policy.
+        dialect.render(Refuse("http_policy"), seen, "c"),
+    )
     for reply in replies:
         for name, frame in zip(reply.envelopes, reply.body["frames"], strict=True):
             frames[name] = frame

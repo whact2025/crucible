@@ -91,6 +91,26 @@ class _LogCapture(logging.Handler):
             self.lines.append(str(record.msg))
 
 
+def shared_tool_authority_digest(
+    toolset: Any, *, capability: str, context_budget: int | None
+) -> str:
+    """The shared tool-authority digest of a ToolSet: what clause C7 holds a trace to.
+
+    Computed by the product's public function from the object a cell
+    attaches, under the capability of the cell's scenario and the context
+    budget of its plan, never taken from an adapter.
+    """
+
+    return tool_authority_digest(
+        toolset,
+        capability=capability,
+        approval_policy=APPROVAL_POLICY_PER_CALL_EXACT,
+        bridge_protocol=TOOL_AUTHORITY_BRIDGE_PROTOCOL,
+        bridge_version=TOOL_AUTHORITY_BRIDGE_VERSION,
+        context_budget=context_budget,
+    )
+
+
 def _required_steps(script: ProviderScript) -> int:
     return sum(1 for step in script.steps if not isinstance(step, Loop) or step.at_least)
 
@@ -344,12 +364,9 @@ def execute(
         tool_authority_digest=(
             None
             if fixture is None
-            else tool_authority_digest(
+            else shared_tool_authority_digest(
                 fixture.toolset,
                 capability=scenario.capability,
-                approval_policy=APPROVAL_POLICY_PER_CALL_EXACT,
-                bridge_protocol=TOOL_AUTHORITY_BRIDGE_PROTOCOL,
-                bridge_version=TOOL_AUTHORITY_BRIDGE_VERSION,
                 context_budget=plan.context_budget,
             )
         ),

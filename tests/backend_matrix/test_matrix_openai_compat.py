@@ -32,6 +32,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 from openai.resources.chat.completions import Completions
 from openai.types.chat import ChatCompletion
+from openai.types.shared import ErrorObject
 
 from . import cells, contract, declarations, envelopes, ledger, netguard, runner, tap
 from . import columns as matrix_columns
@@ -47,7 +48,17 @@ from .scenarios import (
     SCHEMA_FINAL_ANSWER,
     history_replayed,
 )
-from .script import READ_A, READ_B, Call, ProviderScript, Say, ServedAs, Step, TokenUsage
+from .script import (
+    READ_A,
+    READ_B,
+    Call,
+    ProviderScript,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+    TokenUsage,
+)
 
 LEDGER = ledger.load()
 KINDS = (HOSTED_GATEWAY_KIND, LOCAL_GATEWAY_KIND)
@@ -740,6 +751,16 @@ def test_the_weakest_envelope_a_cell_used_is_its_grade(tmp_path: Path) -> None:
     }
     assert envelopes.weakest(()) is None
     assert envelopes.weakest(["openai_chat/gateway.completion"]) == "documented"
+    # What static cell H03 reads of a cell without playing it is what a play
+    # of the cell is answered from: for the cells above and for the three
+    # forms of refusal, whose gap may close only on a reply of a better grade.
+    for (kind, scenario), grade in grades.items():
+        assert cells.grade_of(f"{kind}/{scenario}/primary/raw") == grade
+    for index, scenario in enumerate(("S23a", "S23b", "S23c")):
+        refused = _played(hosted, scenario, tmp_path / f"refused-{index}")
+        answered = cells.answered_from(refused.cell.id)
+        assert set(answered) == set(refused.observation.provider.envelopes) != set()
+        assert cells.grade_of(refused.cell.id) == refused.grade == "constructed"
 
 
 def test_envelope_rules_refuse_what_a_renderer_or_a_recording_must_not_do() -> None:
@@ -901,6 +922,76 @@ def test_a_finalisation_request_that_went_wrong_fails_the_cell_whatever_its_entr
             preflight={HOSTED_GATEWAY_KIND: None},
             known=LEDGER,
             driver=_with_dialect(_SchemaOnEveryRequest),
+        )
+
+
+# -- the three forms of refusal --------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", ["gateway", "local"])
+def test_the_three_refusals_are_what_the_installed_sdk_types_for_them(provider: str) -> None:
+    dialect = gateway.OpenAIChatDialect(provider, host=None, route_credential=False)
+    asked = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
+    billed = TokenUsage(7, 3)
+
+    filtered = dialect.render(Refuse("content_filter", billed), asked, "call-1")
+    declined = dialect.render(Refuse("refusal_part", billed), asked, "call-2")
+    rejected = dialect.render(Refuse("http_policy"), asked, "call-3")
+    stopped = ChatCompletion.model_validate(filtered.body).choices[0]
+    refused = ChatCompletion.model_validate(declined.body).choices[0]
+
+    assert [reply.envelope for reply in (filtered, declined, rejected)] == [
+        f"openai_chat/{provider}.{gateway.REFUSALS[form]}"
+        for form in ("content_filter", "refusal_part", "http_policy")
+    ]
+    # A filter stop: the finish reason says so and the content is omitted.
+    assert (stopped.finish_reason, stopped.message.content) == ("content_filter", None)
+    assert stopped.message.refusal is None
+    # A refusal part: the refusal field is filled, the finish is a plain stop.
+    assert (refused.finish_reason, refused.message.content) == ("stop", None)
+    assert refused.message.refusal
+    # Both replies are billed and name the model that was asked for.
+    for reply in (filtered, declined):
+        assert (reply.status, reply.usage, reply.served_model) == (200, billed, "asked")
+    # A rejected request: the error object of the SDK, nothing billed, no
+    # model named, no completion.
+    assert (rejected.status, rejected.usage, rejected.served_model) == (400, None, None)
+    error = ErrorObject.model_validate(rejected.body["error"])
+    assert set(rejected.body) == {"error"} and error.code and error.message
+    assert set(rejected.body["error"]) == set(ErrorObject.model_fields)
+
+
+class _AnswersWhereItShouldRefuse(gateway.OpenAIChatDialect):
+    """Renders a refusal as a plain completion: the provider never refuses."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, Refuse):
+            step = Say("an answer where the script refuses", step.usage)
+        return super().render(step, seen, call_id)
+
+
+@pytest.mark.parametrize("scenario", ["S23a", "S23b", "S23c"])
+def test_a_refusal_that_is_never_sent_fails_the_cell_whatever_its_entry(
+    scenario: str, tmp_path: Path
+) -> None:
+    cell = Cell(_column(HOSTED_GATEWAY_KIND), scenario, "raw")
+    honest = _played(cell.column, scenario, tmp_path / "honest")
+
+    # The honest cell is answered from the envelope of its form of refusal,
+    # through the SDK, and from nothing else.
+    assert honest.observation.provider.envelopes == [
+        f"openai_chat/gateway.{gateway.REFUSALS[honest.plan.script.steps[0].form]}"  # type: ignore[union-attr]
+    ]
+    assert honest.observation.provider.request_count == 1
+    # Its entry is strict: a provider side that answers instead of refusing
+    # yields other codes, and the cell fails as a different deviation.
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation"):
+        runner.run_cell(
+            cell,
+            tmp_path / "lying",
+            preflight={HOSTED_GATEWAY_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_AnswersWhereItShouldRefuse),
         )
 
 

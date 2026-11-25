@@ -7,7 +7,9 @@ JUnit says whether a cell passed, failed or was an expected failure. This
 report says why: the deviation codes, the gaps the ledger attributes them to,
 the variant each governing declared value selected, the declared differences
 in force, the outcome of every clause that applies, the grade of the weakest
-envelope the provider answered from, and what the driver of the kind bypasses.
+envelope the provider answered from, and what the driver of the kind bypasses,
+with the private names of the product that it and the required proofs of the
+kind's module replace.
 
 One file per pytest process, written beside the JUnit file when the run has
 one (``test-results-3.xml`` gives ``matrix-report-3.json``). JUnit properties
@@ -21,7 +23,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from . import declarations, drivers, ledger
+from . import cells, declarations, drivers, ledger
 from .contract import Deviation
 from .scenarios import SCENARIOS
 
@@ -127,20 +129,25 @@ def path_beside(junit: str | Path) -> Path:
     return junit.with_name(name + ".json")
 
 
+def describe_kind(kind: str) -> dict[str, Any]:
+    """What the evidence of a driven kind leans on, said once per kind."""
+
+    driver = drivers.get(kind)
+    return {
+        "dialect": driver.dialect,
+        "fidelity": driver.fidelity,
+        "bypassed_layers": list(driver.bypassed_layers),
+        "private_seams": list(driver.private_seams),
+        "proof_seams": list(cells.PROOF_SEAMS.get(cells.module_of(kind), ())),
+        "envelopes": list(driver.envelopes),
+    }
+
+
 def document() -> dict[str, Any]:
     """The report of this process."""
 
     kinds = sorted({record["kind"] for record in _CELLS.values()} & drivers.registered_kinds())
-    described: dict[str, Mapping[str, Any]] = {}
-    for kind in kinds:
-        driver = drivers.get(kind)
-        described[kind] = {
-            "dialect": driver.dialect,
-            "fidelity": driver.fidelity,
-            "bypassed_layers": list(driver.bypassed_layers),
-            "private_seams": list(driver.private_seams),
-            "envelopes": list(driver.envelopes),
-        }
+    described: dict[str, Mapping[str, Any]] = {kind: describe_kind(kind) for kind in kinds}
     return {
         "schema_version": REPORT_SCHEMA,
         "kinds": described,

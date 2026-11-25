@@ -113,7 +113,10 @@ SUCCESS_AT_TURN_LIMIT = "success_at_turn_limit"
 LIMIT_AFTER_TERMINAL = "limit_after_terminal"
 EXTRA_TOOL_REQUEST = "extra_tool_request"
 SEND_TURN_CONTROL = "send_turn_control"
+ONE_TURN_FEWER = "one_turn_fewer"
 OWN_TURN_CEILING = "own_turn_ceiling"
+SILENT_TURN_CEILING = "silent_turn_ceiling"
+DROP_TURN_CONTROL = "drop_turn_control"
 BUDGET_STOP_AS_TRANSPORT = "budget_stop_as_transport"
 IGNORE_USD_BUDGET = "ignore_usd_budget"
 CONTEXT_LIMIT_STOP = "context_limit_stop"
@@ -301,6 +304,12 @@ class HonestBackend:
             system = "You are a helpful assistant."
         if self._profile.turn_limit != "unsupported" or SEND_TURN_CONTROL in self._faults:
             body["max_turns"] = invocation.max_turns
+            if SILENT_TURN_CEILING in self._faults:
+                # A ceiling of the adapter's own, applied and said nowhere.
+                body["max_turns"] = min(invocation.max_turns, _OWN_TURN_CEILING)
+        if DROP_TURN_CONTROL in self._faults:
+            # The turn count stays with the adapter: the provider is told none.
+            body.pop("max_turns", None)
         if EMPTY_TOOL_RESULTS in self._faults:
             results = [{"id": item["id"], "text": ""} for item in results]
         answered = [] if FORGET_EARLIER_ROUNDS in self._faults else list(run.answered)
@@ -420,6 +429,11 @@ class HonestBackend:
                 if isinstance(outcome, InvocationResult):
                     return outcome
                 results.append({"id": str(call["id"]), "text": outcome})
+            if ONE_TURN_FEWER in self._faults and limited and turn >= invocation.max_turns - 1:
+                # One turn before the count it was asked for, after the tool
+                # call of the turn it did run: the limit is typed and nothing
+                # of the result says that a turn is missing.
+                return self._turn_limit(run, turn, [], timeout)
             if at_limit:
                 # round_boundary: one last request without tools, usage counted.
                 reply = self._exchange(run, turn + 1, results, [], timeout)
@@ -760,6 +774,9 @@ class ToyDriver:
     inexpressible: Mapping[str, str] = {}
     envelopes: tuple[str, ...] = ()  # the toy dialect renders its own replies
 
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        return ()  # no envelope: the toy dialect renders its own replies
+
     def __init__(self, faults: frozenset[str] = frozenset()) -> None:
         self.faults = faults
 
@@ -1074,12 +1091,44 @@ LIARS: tuple[Liar, ...] = (
         ("C2",),
         needs={"turn_limit": "hard"},
     ),
+    # A typed turn limit one turn early: only the count of tool-bearing
+    # requests the provider saw shows it.
+    _liar(
+        "S10a",
+        ONE_TURN_FEWER,
+        ("request.unconsumed",),
+        ("C0",),
+        needs={"turn_limit": "hard"},
+    ),
     _liar(
         "S11",
         OWN_TURN_CEILING,
         (f"raise:ValueError{_BEFORE}", "request.unconsumed"),
         ("S", "C0"),
         rehearses=("G15",),
+    ),
+    # The suite's turn count is cut to a ceiling of the adapter's own and the
+    # call succeeds: one completion needs one turn, so only the turn control
+    # on the wire shows it.
+    _liar(
+        "S11",
+        SILENT_TURN_CEILING,
+        ("request.content:turn_control",),
+        ("S",),
+        needs={"turn_limit": "hard"},
+    ),
+    # The route declares an enforced turn limit, its wire has a field for the
+    # count, and the adapter keeps the count to itself: nothing of the result
+    # of one completion shows it.
+    *(
+        _liar(
+            "S11",
+            DROP_TURN_CONTROL,
+            ("request.content:turn_control",),
+            ("S",),
+            needs={"turn_limit": declared},
+        )
+        for declared in ("hard", "provider_stop")
     ),
     _liar("S11", NO_REQUEST_EVENT, ("event.missing:request/-",), ("S",)),
     _liar("S11", TWO_REQUEST_EVENTS, ("event.extra:request/-",), ("S",)),

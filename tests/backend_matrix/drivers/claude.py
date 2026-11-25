@@ -59,8 +59,8 @@ from .. import envelopes as envelope_files
 from .. import netguard
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import claude_cli as peer_program
-from ..provider import LoopbackProvider, Reply, SeenRequest
-from ..script import Call, ProviderScript, Say, ServedAs, Step
+from ..provider import LoopbackProvider, Reply, SeenRequest, answered_from
+from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
@@ -73,6 +73,10 @@ _ENTRYPOINT_ENV = "CLAUDE_CODE_ENTRYPOINT"
 _STREAM_FLAGS = ("--output-format", "--input-format")
 _OVERLAY_FIELD = "extra.cli_path"
 _PEER_FAILURES = ("unsupported", "crashed")
+# The forms of refusal the frames of the tool can carry: a model turn that
+# ends on the refusal stop reason, and a request the provider rejected. A
+# message the tool relays has no refusal part.
+REFUSALS = ("content_filter", "http_policy")
 # The kernel refuses an interpreter line longer than this.
 _MAX_INTERPRETER_LINE = 250
 
@@ -128,6 +132,7 @@ class ClaudeCliDialect:
     name = "claude_cli"
     path = "/claude-cli/v1/turn"
     provider = "cli"
+    turn_control_field = True  # ``--max-turns`` on the command line of the tool
     behaviours: tuple[str, ...] = (
         "init",
         "assistant_text",
@@ -135,6 +140,12 @@ class ClaudeCliDialect:
         "tool_result",
         "result",
         "result_structured",
+        # The tool's own turn terminal, and the two refusals its frames carry.
+        "result_max_turns",
+        "assistant_refusal",
+        "result_refusal",
+        "assistant_api_error",
+        "result_api_error",
     )
 
     @property
@@ -272,7 +283,13 @@ class ClaudeCliDialect:
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
-        if not isinstance(step, (Say, Call)):
+        if isinstance(step, Refuse) and step.form not in REFUSALS:
+            raise MatrixSetupError(
+                f"the {self.name} dialect cannot render a refusal of the form "
+                f"{step.form!r}: a message the tool relays has no refusal part, so "
+                "the cell is pinned not expressible in the inventory"
+            )
+        if not isinstance(step, (Say, Call, Refuse)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
                 "the scenario that needs it adds the envelope with its liar"
@@ -292,27 +309,39 @@ class ClaudeCliDialect:
                 envelope.fill({**slots, "session_id": session_id, "frame_id": str(uuid.uuid4())})
             )
 
-        # The tool's own terminals are emulated from pack A on.
-        refusal = None
+        # The tool's own turn terminal is emulated by the peer, which ends the
+        # session after the last turn it is allowed (see below): a turn beyond
+        # the allowance is a turn the peer must never ask for. Its budget
+        # terminal is not emulated: no scenario spends a budget between turns.
+        unplayed = None
         if seen.turn_control is not None and turn > seen.turn_control:
-            refusal = (
+            unplayed = (
                 f"turn {turn} was asked for beyond --max-turns {seen.turn_control}: "
-                "the tool's turn terminal is not emulated before pack A"
+                "the peer ends a session at its turn terminal"
             )
         elif seen.budget_control is not None and seen.budget_control <= rate.compute_cost(
             input_tokens=int(spent.get("input_tokens", 0)),
             output_tokens=int(spent.get("output_tokens", 0)),
         ):
-            refusal = (
+            unplayed = (
                 f"turn {turn} was asked for with --max-budget-usd "
                 f"{seen.budget_control} already spent: the tool's budget terminal "
-                "is not emulated before pack A"
+                "between two turns is not emulated"
             )
-        if refusal is not None:
-            return Reply(200, {"frames": [], "call": None, "unsupported": refusal})
+        if unplayed is not None:
+            return Reply(200, {"frames": [], "call": None, "unsupported": unplayed})
 
         if turn <= 1:
             frame("init")
+        if isinstance(step, Refuse) and step.form == "http_policy":
+            # The provider rejected the request: the tool emits a local
+            # message in the place of the model turn, then an error terminal,
+            # and exits with a status other than zero. Nothing is billed.
+            frame("assistant_api_error", response_id=f"msg_{call_id}")
+            frame("result_api_error", turns=turn)
+            return Reply(
+                200, {"frames": frames, "call": None, "exit": 1}, envelopes=tuple(used)
+            )
         for item in _records(evidence.get("tool_results")):
             frame(
                 "tool_result",
@@ -344,7 +373,7 @@ class ClaudeCliDialect:
                 tool_name=f"mcp__{server}__{binding.name}",
                 tool_input=arguments,
             )
-            body = {
+            body: dict[str, Any] = {
                 "frames": frames,
                 "call": {
                     "id": call_id,
@@ -353,8 +382,53 @@ class ClaudeCliDialect:
                     "arguments": arguments,
                 },
             }
+            if seen.turn_control is not None and turn >= seen.turn_control:
+                # The session has used up its turn allowance with this turn.
+                # The tool then reports the turn terminal instead of asking
+                # the model again, and exits with a status other than zero.
+                # The peer plays it after the tool call of this turn; the
+                # frame is rendered here, with the accounting of the session
+                # so far, so that no reply shape lives in the peer.
+                spent_in = int(spent.get("input_tokens", 0)) + usage.input_tokens
+                spent_out = int(spent.get("output_tokens", 0)) + usage.output_tokens
+                played, frames = frames, []
+                frame(
+                    "result_max_turns",
+                    # One more than the allowance: the turn that was not run.
+                    turns=turn + 1,
+                    served_model=served,
+                    input_tokens=spent_in,
+                    output_tokens=spent_out,
+                    cost_usd=rate.compute_cost(
+                        input_tokens=spent_in, output_tokens=spent_out
+                    ),
+                )
+                body["frames"], body["turn_limit"] = played, {"frames": frames, "exit": 1}
             return Reply(
                 200, body, usage, served, (step.slot, call_id, arguments), envelopes=tuple(used)
+            )
+        if isinstance(step, Refuse):
+            # The provider's safety system stopped the turn: a billed message
+            # without content, then the terminal of the session.
+            frame("assistant_refusal", **turn_slots)
+            refused_in = int(spent.get("input_tokens", 0)) + usage.input_tokens
+            refused_out = int(spent.get("output_tokens", 0)) + usage.output_tokens
+            frame(
+                "result_refusal",
+                turns=turn,
+                served_model=served,
+                input_tokens=refused_in,
+                output_tokens=refused_out,
+                cost_usd=rate.compute_cost(
+                    input_tokens=refused_in, output_tokens=refused_out
+                ),
+            )
+            return Reply(
+                200,
+                {"frames": frames, "call": None, "exit": 0},
+                usage,
+                served,
+                envelopes=tuple(used),
             )
         answer: Any = None
         if seen.schema_field:
@@ -514,7 +588,8 @@ class ClaudeDriver:
     fidelity: Literal["wire", "worker_protocol"] = "wire"
     bypassed_layers: tuple[str, ...] = (
         "the vendor command-line tool (a scripted peer is started in its place; "
-        "its tool loop, session accounting and schema extraction are emulated)",
+        "its tool loop, session accounting, schema extraction and turn terminal "
+        "are emulated)",
         "the provider (the peer takes each model turn from scripted envelopes)",
     )
     # Read, not patched: the version the peer answers the version probe with.
@@ -539,6 +614,9 @@ class ClaudeDriver:
     @property
     def envelopes(self) -> tuple[str, ...]:
         return self._dialect().envelope_names()
+
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        return answered_from(self._dialect(), script)
 
     def _dialect(self) -> ClaudeCliDialect:
         return ClaudeCliDialect()

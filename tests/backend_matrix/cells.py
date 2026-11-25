@@ -27,13 +27,13 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import pytest
 import yaml  # type: ignore[import-untyped]
 
 from . import columns as matrix_columns
-from . import declarations, drivers, ledger
+from . import declarations, drivers, envelopes, ledger
 from .columns import REAL_KINDS, TOY_KIND, Column
 from .contract import ADMITTED, CLAUSES
 from .drivers import toy
@@ -50,23 +50,24 @@ from .scenarios import (
     difference_alternatives,
     difference_variants,
     governing_fields,
+    plan_for,
 )
 
 INVENTORY_PATH = Path(__file__).with_name("inventory.yaml")
 INVENTORY_SCHEMA = "crucible.backend-matrix.inventory.v1"
 
 # Which scenario sets run on which kind. A real kind gets the starter set with
-# its driver, then pack A, and pack B after it.
+# its driver, then pack A, and pack B after it. Every real kind runs pack A.
 ENABLEMENT: Mapping[str, tuple[str, ...]] = {
     TOY_KIND: (STARTER, PACK_A, PACK_B),
     **{kind: () for kind in REAL_KINDS},
-    matrix_columns.HOSTED_GATEWAY_KIND: (STARTER,),
-    matrix_columns.LOCAL_GATEWAY_KIND: (STARTER,),
-    matrix_columns.CLAUDE_KIND: (STARTER,),
-    matrix_columns.DEEPSEEK_KIND: (STARTER,),
-    matrix_columns.KIMI_KIND: (STARTER,),
-    matrix_columns.CODEX_LEGACY_KIND: (STARTER,),
-    matrix_columns.CODEX_OFFICIAL_KIND: (STARTER,),
+    matrix_columns.HOSTED_GATEWAY_KIND: (STARTER, PACK_A),
+    matrix_columns.LOCAL_GATEWAY_KIND: (STARTER, PACK_A),
+    matrix_columns.CLAUDE_KIND: (STARTER, PACK_A),
+    matrix_columns.DEEPSEEK_KIND: (STARTER, PACK_A),
+    matrix_columns.KIMI_KIND: (STARTER, PACK_A),
+    matrix_columns.CODEX_LEGACY_KIND: (STARTER, PACK_A),
+    matrix_columns.CODEX_OFFICIAL_KIND: (STARTER, PACK_A),
 }
 # A secondary column runs these sets. A blocked column runs these scenarios
 # as soon as its kind is driven, whatever sets the kind runs: what a blocked
@@ -108,6 +109,38 @@ STATIC_TESTS: Mapping[str, tuple[str, bool]] = {
 # did not pass, so it must have run too.
 CANARY_CHECK = "test_canary_passed_for_every_column"
 STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
+# The scenarios of the official Codex column whose turn has several model
+# responses and ends in a result: where known gap R05 shows.
+SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE: tuple[str, ...] = (
+    "S03",
+    "S04",
+    "S10a",
+    "S18",
+    "S40",
+)
+# Those of them that run in the guarded lens too: where the limit guard
+# replaces the result (known gap R04) of a turn that shows R05.
+GUARDED_SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE: tuple[str, ...] = (
+    "S03",
+    "S04",
+    "S10a",
+)
+# The cell of the official Codex column whose result is that of a
+# dispatch-budget denial: where known gap R09 shows.
+DISPATCH_DENIAL_ON_THE_OFFICIAL_CODEX_ROUTE = ledger.cell_id(
+    matrix_columns.CODEX_OFFICIAL_KIND, "S12", "primary", "raw"
+)
+# The cell of the app-server Codex column whose result is that of the same
+# denial: where known gap R08 shows.
+DISPATCH_DENIAL_ON_THE_APP_SERVER_CODEX_ROUTE = ledger.cell_id(
+    matrix_columns.CODEX_LEGACY_KIND, "S12", "primary", "raw"
+)
+# The cells of the Claude kind that attach a ToolSet with write names and end
+# in a result of the attempt: where known gap R13 shows.
+WRITES_ON_THE_CLAUDE_COLUMNS: tuple[str, ...] = tuple(
+    ledger.cell_id(matrix_columns.CLAUDE_KIND, "S40", role, "raw")
+    for role in ("primary", "secondary")
+)
 # Proofs a module holds beside its cells, which the verifier requires by name:
 # product behaviour that no clause states, so no cell's verdict shows when it
 # stops. The DeepSeek adapter revalidates the pin of its worker before every
@@ -131,9 +164,31 @@ STATIC_CHECK = "test_every_static_cell_of_the_inventory_was_judged"
 # reports for a turn of several responses is known gap R05 of the ledger,
 # unconfirmed: its one code shows only while the cost is flagged complete, so
 # the record leans on the test that plays both readings of the usage
-# notification on the two cells of such a turn, and that test is held here
-# too, cell by cell.
+# notification on the raw cell of every scenario whose turn has several
+# responses, and that test is held here too, cell by cell. In the guarded lens
+# the limit guard replaces the result of such a turn, and its two codes say
+# neither which evidence the guard missed nor what the turn it replaced
+# reported: a twin of that test plays both readings on every guarded cell
+# whose entry names R05. The result of a dispatch-budget denial on the route
+# reports no usage for the responses the provider billed (known gap R09), and
+# it flags its accounting incomplete, so no clause compares it with anything:
+# only a proof shows it, and shows when it stops.
+# On the app-server route the result of the same denial flags its accounting
+# incomplete too (known gap R08) and reports every response the provider
+# billed. While its entry stands no clause compares what it reports either,
+# and a result that had lost its usage would show the same two codes: only a
+# proof holds the numbers.
+# On a write the trace of the Claude adapter binds a tool-authority digest
+# that is not the shared one (known gap R13). The one code of its cells says
+# that the digest differs, not why: only the proof that plays the write of
+# each Claude column shows that the value is the digest of the same tools
+# without a path scope, and that nothing else stands behind the code.
 REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
+    MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]: tuple(
+        "test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope"
+        f"[{kind}/{role}]"
+        for kind, _scenario, role, _lens in map(ledger.parse_cell_id, WRITES_ON_THE_CLAUDE_COLUMNS)
+    ),
     MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND]: (
         "test_the_probe_and_the_request_launch_run_under_the_harness",
     ),
@@ -144,12 +199,150 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
         "test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_diagnostic",
         "test_the_bounds_of_an_honest_interval_are_the_shipped_price_of_what_was_billed",
     ),
+    MODULE_BY_KIND[matrix_columns.CODEX_LEGACY_KIND]: (
+        "test_the_result_of_a_dispatch_budget_denial_reports_every_response_the_provider_billed",
+    ),
     MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]: (
         "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
-        "test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last[S03]",
-        "test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last[S04]",
+        *(
+            f"test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last[{name}]"
+            for name in SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE
+        ),
+        *(
+            "test_what_a_guarded_turn_of_several_responses_shows_rests_on_the_reading_of_last"
+            f"[{name}]"
+            for name in GUARDED_SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE
+        ),
+        "test_the_result_of_a_dispatch_budget_denial_reports_no_usage_for_what_the_provider_billed",
     ),
 }
+# The private names of the product that a required proof replaces in the test
+# process, by module: what the proof leans on beside the seams of its driver.
+# The report of a run prints them with the driver's own list. The proof of the
+# Claude module binds the adapter's hash to the ToolSet that was attached, to
+# show what its cell is left with once that one cause is removed.
+PROOF_SEAMS: Mapping[str, tuple[str, ...]] = {
+    MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]: (
+        "crucible.backends.claude.ClaudeBackend._tool_authority_digest",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class RecordProof:
+    """A required proof that the known-gap entries of a registry record lean on."""
+
+    module: str
+    test: str
+    # How an item of the test names the cell it plays: one item whatever the
+    # cell (""), one for every scenario, or one for every column.
+    per: Literal["", "scenario", "column"] = ""
+    # The lens of the entries that lean on it; every lens where none is named.
+    lens: str | None = None
+
+    def item(self, cell: str | None) -> str | None:
+        """The pytest item an entry on ``cell`` leans on, if it leans on this test.
+
+        ``None`` for ``cell`` is a column-wide entry: it names no cell, so it
+        leans on a test only where one item of the test stands for the record.
+        """
+
+        if cell is None:
+            return None if self.per else self.test
+        kind, scenario, role, lens = ledger.parse_cell_id(cell)
+        if self.lens is not None and lens != self.lens:
+            return None
+        if self.per == "scenario":
+            return f"{self.test}[{scenario}]"
+        if self.per == "column":
+            return f"{self.test}[{kind}/{role}]"
+        return self.test
+
+
+# The proofs that the entries of a registry record lean on. A proof holds what
+# the codes of an entry do not say: the cause of a code, or a number that no
+# clause compares while the entry stands. So an entry must not outlive it:
+# static cell H03 fails when an entry attributes a code to a record of this
+# table and the verifier does not require the item of the proof that plays the
+# entry's cell (static:entry_proof_not_required). A change that deletes a
+# proof and its name from the list above therefore deletes the entries that
+# lean on it, or fails. Each proof refuses, for its part, an entry that
+# attributes a code to its record on a cell it does not play.
+# The official Codex route: while the column-wide flag code of R04 stands,
+# clause C6 compares no reported token with the provider's ledger on any cell
+# of the kind, and the test of a turn of one response does. The usage code of
+# R05 rests on the reading of `last`: the test that plays both readings on
+# the raw cell of the entry's scenario and, for an entry on a guarded cell,
+# its twin. The result of a dispatch-budget denial is compared by no clause
+# on either Codex route while its entry stands (R08, R09). The digest code
+# of a write on the Claude columns says that the digest differs, not why
+# (R13).
+_CLAUDE_MODULE = MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]
+_APP_SERVER_MODULE = MODULE_BY_KIND[matrix_columns.CODEX_LEGACY_KIND]
+_OFFICIAL_MODULE = MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]
+RECORD_PROOFS: Mapping[str, tuple[RecordProof, ...]] = {
+    "R04": (
+        RecordProof(
+            _OFFICIAL_MODULE,
+            "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
+        ),
+    ),
+    "R05": (
+        RecordProof(
+            _OFFICIAL_MODULE,
+            "test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last",
+            per="scenario",
+        ),
+        RecordProof(
+            _OFFICIAL_MODULE,
+            "test_what_a_guarded_turn_of_several_responses_shows_rests_on_the_reading_of_last",
+            per="scenario",
+            lens=GUARDED,
+        ),
+    ),
+    "R08": (
+        RecordProof(
+            _APP_SERVER_MODULE,
+            "test_the_result_of_a_dispatch_budget_denial_reports_every_response_the_provider_billed",
+        ),
+    ),
+    "R09": (
+        RecordProof(
+            _OFFICIAL_MODULE,
+            "test_the_result_of_a_dispatch_budget_denial_reports_no_usage_for_what_the_provider_billed",
+        ),
+    ),
+    "R13": (
+        RecordProof(
+            _CLAUDE_MODULE,
+            "test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope",
+            per="column",
+        ),
+    ),
+}
+
+
+def proofs_leaned_on(gap: str, cell: str | None) -> tuple[tuple[str, str], ...]:
+    """The pytest items (module, name) an entry leans on that names ``gap`` on ``cell``.
+
+    ``cell`` is the cell of a known-gap entry, or ``None`` for a column-wide
+    entry. Empty for a record that leans on no proof.
+    """
+
+    return tuple(
+        (proof.module, name)
+        for proof in RECORD_PROOFS.get(gap, ())
+        for name in (proof.item(cell),)
+        if name is not None
+    )
+
+
+def required_proof_items() -> frozenset[tuple[str, str]]:
+    """The pytest items (module, name) the verifier requires by name beside the cells."""
+
+    return frozenset(
+        (module, name) for module, names in REQUIRED_PROOFS.items() for name in names
+    )
 
 
 @dataclass(frozen=True)
@@ -449,6 +642,38 @@ def cost_bounded_guarded_cells() -> frozenset[str]:
     )
 
 
+@functools.cache
+def answered_from(cell: str) -> tuple[str, ...]:
+    """The envelopes the dialect of a cell's kind answers the cell from, by name.
+
+    Read without playing the cell: the script of the variant that the routed
+    profile of the cell's column selects, each step rendered by the driver of
+    the kind against a blank request. The optional tail that a declared
+    difference adds is not in it. A static cell, an admission cell and a
+    cell of a kind without a driver are answered from nothing.
+    """
+
+    kind, scenario, role, _lens = ledger.parse_cell_id(cell)
+    defined = SCENARIOS.get(scenario)
+    if defined is None or defined.admission or kind not in drivers.load():
+        return ()
+    columns = [item for item in all_columns() if (item.kind, item.role) == (kind, role)]
+    if not columns:
+        raise MatrixSetupError(f"cell {cell} names no column")
+    variants = declarations.select(defined.differences, declarations.routed(columns[0]))
+    return drivers.get(kind).answers(plan_for(defined, variants).script)
+
+
+def grade_of(cell: str) -> str | None:
+    """The grade of the weakest envelope a cell is answered from, if any.
+
+    What static cell H03 holds a gap about a provider's replies to: such a
+    gap cannot close on a cell while this is weaker than its record allows.
+    """
+
+    return envelopes.weakest(answered_from(cell))
+
+
 def cells_of(kinds: Sequence[str]) -> tuple[Cell, ...]:
     """The cells a test module of these kinds parametrises over; never empty."""
 
@@ -612,4 +837,7 @@ def world() -> ledger.World:
         difference_alternatives=difference_alternatives(),
         wire_differences={D_CDX_SERVED: matrix_columns.UNNAMED_SERVED_MODEL_KINDS},
         route_differences={D_COST_BOUND_UNRANKED: cost_bounded_guarded_cells()},
+        grade=grade_of,
+        proofs_leaned_on=proofs_leaned_on,
+        required_proofs=required_proof_items(),
     )

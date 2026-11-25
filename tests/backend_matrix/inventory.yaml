@@ -8,7 +8,11 @@
 #   the verifier (`python -m tests.backend_matrix.verify`) compares them with
 #   the JUnit files of a run. A real kind has no behaviour cell until its
 #   driver lands. The comments on the counts name scenario sets (the starter
-#   set, pack A); the head of ledger.yaml says what the sets are.
+#   set, pack A); the head of ledger.yaml says what the sets are. Pack A is
+#   ten cells on a column: the turn limit in both lenses, and the suite's
+#   turn count, the dispatch-budget denial, the USD overrun, the byte
+#   budget, the three forms of refusal and the write as progress in the raw
+#   lens; less the forms of refusal that are pinned not expressible below.
 # not_evaluated: (cell, clause) pairs a cell cannot evaluate for a reason of
 #   its driver. An unpinned pair fails the cell, and so does a pinned pair
 #   whose clause was evaluated. Which clauses apply to a cell is computed from
@@ -18,7 +22,10 @@
 #   wire of a kind cannot carry, each with its reason and, under `checklist`,
 #   the capability the missing cell would have checked. This is the only way
 #   to mark a cell so. A row has no field for a declared value: no
-#   declaration, route extra or admission outcome selects it.
+#   declaration, route extra or admission outcome selects it. Five rows
+#   today, all on reference kinds and all on forms of refusal: the frames
+#   of the Claude tool have no refusal part, and the notifications of the
+#   Codex app-server have neither a finish reason nor a refusal part.
 # worker_skip_files: by worker kind, the test files (relative to tests/) that
 #   carry a skipif on that worker's interpreter while its H01 cell is a known
 #   gap. File names, not counts: static cell H01 reports a marker in a listed
@@ -36,7 +43,8 @@
 #   cell whose own entry shows that the check did not run (a raise, a guard
 #   rewrite, the cost flagged incomplete) needs no row. Static cell H03
 #   rejects a row that is listed twice or names a cell that could not owe the
-#   gap. Empty today.
+#   gap. The rows today are all on the refusal that is an HTTP rejection:
+#   nothing is billed there, so the scenario waives the accounting flags.
 # admission: for each admission cell (S51) of a real column, what the cell
 #   must see today: the word the profile catalogs of both products have for
 #   the column (availability), and for each capability a workflow can ask
@@ -52,20 +60,23 @@ schema_version: crucible.backend-matrix.inventory.v1
 cell_counts:
   # The starter set and pack A (17 cells) and S51 on each toy column.
   toy: 72
-  # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
-  claude: 14
-  # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
-  "codex:legacy": 7
-  # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
-  "codex:official": 7
-  # Starter set: S00, and S01, S03, S04 in both lenses, on the one column.
-  deepseek: 7
-  # Starter set on the two diagnostic columns (7 each); S00, S01 in both
-  # lenses and S51 on the blocked column.
-  kimi: 18
-  # Starter set: S00, and S01, S03, S04 in both lenses, on each column.
-  "openai_compat:hosted": 14
-  "openai_compat:local": 7
+  # Starter set (S00, and S01, S03, S04 in both lenses: 7 cells) and pack A
+  # without the refusal part (9 cells), on each of the two columns.
+  claude: 32
+  # Starter set (7 cells) and pack A with one form of refusal, the policy
+  # error (8 cells), on the one column.
+  "codex:legacy": 15
+  # Starter set (7 cells) and pack A with one form of refusal, the policy
+  # error (8 cells), on the one column.
+  "codex:official": 15
+  # Starter set (7 cells) and pack A (10 cells) on the one column.
+  deepseek: 17
+  # Starter set and pack A on the two diagnostic columns (17 each); S00,
+  # S01 in both lenses and S51 on the blocked column.
+  kimi: 38
+  # Starter set (7 cells) and pack A (10 cells) on each column.
+  "openai_compat:hosted": 34
+  "openai_compat:local": 17
 
 not_evaluated:
   - scenario: S00
@@ -77,9 +88,124 @@ not_evaluated:
       The seam canary proves that the real layers ran and checks C0 only, so
       that it can pass on a column that has contract gaps.
 
-not_expressible: []
+not_expressible:
+  - scenario: S23b
+    kind: "claude"
+    step: Refuse(refusal_part)
+    reason: >-
+      The frames of the command-line tool relay the message of the provider,
+      whose content blocks have no refusal part (the block types of
+      anthropic.types.Message in the pinned SDK): a refusal of this provider
+      is the stop reason of the message, which is the content-filter form.
+    checklist: >-
+      a reply that declines in a refusal part of its message is typed as
+      rejected content and is not retried
+  - scenario: S23a
+    kind: "codex:legacy"
+    step: Refuse(content_filter)
+    reason: >-
+      The notifications of the app-server carry no finish reason of a model
+      response (the generated types of the vendor's protocol in the pinned
+      official SDK): a reply that a content filter stopped cannot be told
+      from any other on this wire. A refusal reaches the client as a failed
+      turn whose error names a policy, which is the HTTP-policy form.
+    checklist: >-
+      a reply that a content filter stopped is typed as rejected content and
+      is not retried
+  - scenario: S23b
+    kind: "codex:legacy"
+    step: Refuse(refusal_part)
+    reason: >-
+      The notifications of the app-server carry an agent message as text
+      and have no refusal part (the generated types of the vendor's protocol
+      in the pinned official SDK). A refusal reaches the client as a failed
+      turn whose error names a policy, which is the HTTP-policy form.
+    checklist: >-
+      a reply that declines in a refusal part of its message is typed as
+      rejected content and is not retried
+  - scenario: S23a
+    kind: "codex:official"
+    step: Refuse(content_filter)
+    reason: >-
+      The notifications of the app-server carry no finish reason of a model
+      response (the generated types of the vendor's protocol in the pinned
+      official SDK): a reply that a content filter stopped cannot be told
+      from any other on this wire. A refusal reaches the client as a failed
+      turn whose error names a policy, which is the HTTP-policy form.
+    checklist: >-
+      a reply that a content filter stopped is typed as rejected content and
+      is not retried
+  - scenario: S23b
+    kind: "codex:official"
+    step: Refuse(refusal_part)
+    reason: >-
+      The notifications of the app-server carry an agent message as text
+      and have no refusal part (the generated types of the vendor's protocol
+      in the pinned official SDK). A refusal reaches the client as a failed
+      turn whose error names a policy, which is the HTTP-policy form.
+    checklist: >-
+      a reply that declines in a refusal part of its message is typed as
+      rejected content and is not retried
 
-column_wide_not_owed: []
+column_wide_not_owed:
+  - cell: openai_compat:hosted/S23c/primary/raw
+    code: "pricing:none"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the cost flag, and the adapter flags the cost of the error
+      result incomplete: pricing evidence is asked only of a result that
+      flags its cost complete.
+  - cell: openai_compat:hosted/S23c/secondary/raw
+    code: "pricing:none"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the cost flag, and the adapter flags the cost of the error
+      result incomplete: pricing evidence is asked only of a result that
+      flags its cost complete.
+  - cell: openai_compat:local/S23c/primary/raw
+    code: "pricing:none"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the cost flag, and the adapter flags the cost of the error
+      result incomplete: pricing evidence is asked only of a result that
+      flags its cost complete.
+  - cell: kimi/S23c/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the accounting flags: the check that reports this code is
+      not asked of its result.
+  - cell: kimi/S23c/primary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the accounting flags: the check that reports this code is
+      not asked of its result.
+  - cell: kimi/S23c/secondary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the accounting flags: the check that reports this code is
+      not asked of its result.
+  - cell: kimi/S23c/secondary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the accounting flags: the check that reports this code is
+      not asked of its result.
+  - cell: codex:official/S23c/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the accounting flags: the check that reports this code is
+      not asked of its result.
+  - cell: codex:official/S23c/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The scenario is a request the service rejects before it bills anything,
+      so it waives the cost flag, and the adapter flags the cost of the error
+      result incomplete: pricing evidence is asked only of a result that
+      flags its cost complete.
 
 worker_skip_files: {}
 

@@ -432,6 +432,62 @@ def no_turn_control(obs: Observation, _ref: Reference) -> list[Deviation]:
     ]
 
 
+def turn_control_as_asked(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """A turn control on the wire is the suite's turn count, as the call asked.
+
+    One completion needs one turn, so an adapter that cuts the count to a
+    ceiling of its own returns the same result as one that hands it on: the
+    turn control of the request is the one place that shows the difference.
+    Asserted where a request carries one. Whether a request owes one follows
+    from what the route declares and from its wire (``turn_count_in_request``);
+    how an adapter whose wire has no field for a turn count reports a ceiling
+    of its own is not asserted here.
+    """
+
+    asked = suite_default_max_turns()
+    sent = sorted(
+        {
+            request.turn_control
+            for request in _matched(obs)
+            if request.turn_control is not None and request.turn_control != asked
+        }
+    )
+    if not sent:
+        return []
+    return [
+        Deviation(
+            "request.content:turn_control",
+            f"the call asked for {asked} turns and a request carries a turn "
+            f"control of {sent[0]}",
+        )
+    ]
+
+
+def turn_count_in_request(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """Every request carries the turn count, where its wire has a field for one.
+
+    Asked of a route that declares that its turn limit is enforced where the
+    provider is. On a wire that has a field for the count, a request without
+    it is an adapter that kept the count to itself: the session has no limit
+    but what the other side applies unasked, and the result of one
+    completion does not show it. A wire without the field carries no count
+    from any adapter, so there the check says nothing.
+    """
+
+    requests = _matched(obs)
+    untold = [request for request in requests if request.turn_control is None]
+    if not obs.provider.turn_control_field or not untold:
+        return []  # with no request at all C0 reports the script
+    return [
+        Deviation(
+            "request.content:turn_control",
+            f"{len(untold)} of {len(requests)} request(s) carry no turn control "
+            "on a wire that has a field for one and a route that declares an "
+            "enforced turn limit",
+        )
+    ]
+
+
 def budget_in_request(obs: Observation, _ref: Reference) -> list[Deviation]:
     if any(request.budget_control == BUDGET_USD for request in _matched(obs)):
         return []
@@ -778,7 +834,9 @@ _ALL: tuple[Scenario, ...] = (
         toolset=READ,
         lenses=LENSES,
         plan=lambda: Plan(
-            ProviderScript((Loop(Call(READ_A), limit=TURN_LIMIT),)),
+            # Every turn of the count is asked of the provider: a limit that
+            # is typed after fewer leaves the loop unconsumed.
+            ProviderScript((Loop(Call(READ_A), limit=TURN_LIMIT, at_least=TURN_LIMIT),)),
             expect=Expectation(
                 kind="max_turns",
                 stop=("max_turns",),
@@ -827,8 +885,35 @@ _ALL: tuple[Scenario, ...] = (
             ProviderScript((Say(TEXT),)),
             expect=replace(CLEAN, events=("request/-",)),
             max_turns=suite_default_max_turns(),
-            checks=_CLEAN_TEXT_CHECKS,
+            checks=(*_CLEAN_TEXT_CHECKS, turn_control_as_asked),
         ),
+        # An enforced turn limit is declared as hard or as provider_stop, and
+        # the product places both where the provider is. Such a route owes
+        # the count in every request on a wire that has a field for one. The
+        # other values enforce nothing there: the adapter counts between
+        # rounds or after the fact, or the route claims no turn limit.
+        differences={
+            "turn_limit": {
+                "hard": FALLBACK(
+                    "turn_count_in_request",
+                    "crucible/backends/limits.py:364-373 (hard is enforced at "
+                    "the provider)",
+                ),
+                "provider_stop": FALLBACK(
+                    "turn_count_in_request",
+                    "crucible/backends/limits.py:364-373 (provider_stop is "
+                    "enforced by the provider)",
+                ),
+                "round_boundary": BASE,
+                "post_hoc": BASE,
+                "unsupported": BASE,
+            }
+        },
+        fallbacks={
+            "turn_count_in_request": lambda plan: replace(
+                plan, checks=(*plan.checks, turn_count_in_request)
+            ),
+        },
     ),
     Scenario(
         id="S12",

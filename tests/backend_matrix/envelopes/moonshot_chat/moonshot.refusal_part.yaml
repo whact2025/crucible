@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed chat completion in which the model declines: the reply is
+# billed, has no content and carries the refusal in the refusal field of its
+# delta, in the dialect of the Moonshot route.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: refusal_part
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletionChunk objects whose first delta is an
+    openai.types.chat.chat_completion_chunk.ChoiceDelta with the refusal
+    field set and no content
+  sdk_version: openai 2.14.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach: no refusal was
+    induced against the route, and no source read for it states that it
+    fills the refusal field. The field is the one the pinned SDK types for
+    the refusal message of the model; the refusal text is a fixed sentence
+    of this envelope and the finish reason is "stop"; the chunk kinds and their order (a
+    finish chunk that repeats the usage, then a statistics chunk with empty
+    choices, then the closing message, which is no JSON document) and the
+    usage keys are those of the completion envelope, which were observed
+    live for a plain reply; the usage is that of a request that read nothing
+    from the cache, so it carries no count of cache reads; no reasoning is
+    scripted, so the reasoning counter is zero. So this envelope
+    proves that such a stream parses through the pinned SDK, not that the
+    route sends it.
+
+status: 200
+body:
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          role: assistant
+          refusal: The request was declined.
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta: {}
+        finish_reason: stop
+        usage:
+          prompt_tokens: {slot: input_tokens}
+          completion_tokens: {slot: output_tokens}
+          total_tokens: {slot: total_tokens}
+          prompt_tokens_details:
+            cache_write_tokens: 0
+          completion_tokens_details:
+            reasoning_tokens: 0
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices: []
+    usage:
+      prompt_tokens: {slot: input_tokens}
+      completion_tokens: {slot: output_tokens}
+      total_tokens: {slot: total_tokens}
+      prompt_tokens_details:
+        cache_write_tokens: 0
+      completion_tokens_details:
+        reasoning_tokens: 0
+  - "[DONE]"

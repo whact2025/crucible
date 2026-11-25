@@ -126,8 +126,14 @@ def _record(inner: Any, log: list[Dispatch]) -> None:
     inner.dispatch = dispatch
 
 
-def build(spec: ToolsetSpec, workspace: Path) -> Fixture:
-    """Build the fixture in a fresh ``workspace`` directory."""
+def build(spec: ToolsetSpec, workspace: Path, *, scoped: bool = True) -> Fixture:
+    """Build the fixture in a fresh ``workspace`` directory.
+
+    A writer states one path scope, the file its script writes. With
+    ``scoped`` false it is the same tools with no path scope stated: what a
+    cell attaches is always the scoped one, and a proof builds the other to
+    say which authority a digest names.
+    """
 
     workspace.mkdir(parents=True, exist_ok=False)
     (workspace / NOTES_FILE).write_text(_NOTES, encoding="utf-8")
@@ -138,7 +144,7 @@ def build(spec: ToolsetSpec, workspace: Path) -> Fixture:
             ToolContext(
                 workspace_root=workspace,
                 repo_root=workspace,
-                write_scope=(WRITE_FILE,),
+                write_scope=(WRITE_FILE,) if scoped else (),
             )
         )
         _record(inner, fixture.log)

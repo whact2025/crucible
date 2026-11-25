@@ -75,6 +75,7 @@ from .provider import (
     SeenRequest,
     StatelessDialect,
     ToyDialect,
+    TurnControlDialect,
 )
 from .scenarios import (
     BUDGET_USD,
@@ -94,7 +95,9 @@ from .scenarios import (
     history_replayed,
     no_overshoot,
     plan_for,
+    suite_default_max_turns,
     tool_events_paired,
+    turn_count_in_request,
 )
 from .script import READ_A, Call, Loop, ProviderScript, Refuse, Say, ServedAs, Step
 from .toolsets import BINDINGS
@@ -915,6 +918,94 @@ def test_pricing_evidence_is_asked_only_of_a_result_that_flags_its_cost_complete
     assert raised.unasked == frozenset() and "C6" not in raised.evaluated()
 
 
+def test_a_flag_the_scenario_waives_is_not_asked_of_the_result(tmp_path: Path) -> None:
+    """A column-wide flag code is owed only where the scenario owes the flag.
+
+    A refusal the provider never billed carries no usage, so its scenario
+    waives the accounting flags and the terminal flag: the clauses run, and
+    the checks that would report a false flag are not asked. A kind whose
+    every result flags its accounting incomplete owes that column-wide code
+    wherever the flag is owed, and not on such a cell.
+    """
+
+    waived = "flag:token_usage_complete=False"
+    kind = cells.toy_columns()[0].kind
+    known = dataclasses.replace(
+        LEDGER,
+        registry={
+            **LEDGER.registry,
+            "G99": ledger.GapRecord(
+                "G99", "synthetic", "matrix", "low", column_wide=((kind, waived),)
+            ),
+        },
+        column_wide=(ledger.ColumnWide(kind, waived, "G99"),),
+    )
+
+    def verdict(execution: runner.Execution, report: Report) -> None:
+        ledger.compare(
+            known,
+            execution.cell.id,
+            report.codes,
+            current=execution.current,
+            evaluated=report.evaluated(),
+            unasked=report.unasked,
+        )
+
+    def incomplete(execution: runner.Execution) -> Report:
+        """The same cell, with a result that flags its accounting incomplete."""
+
+        result, _trace = _result_and_trace(execution)
+        untold = dataclasses.replace(
+            result.completeness, token_usage_complete=False, cost_complete=False
+        )
+        return contract.evaluate(
+            dataclasses.replace(
+                execution.observation,
+                result=dataclasses.replace(
+                    result, completeness=untold, pricing_evidence=None
+                ),
+            ),
+            execution.plan.expect,
+            execution.reference,
+            lens="raw",
+            toolset=False,
+            checks=execution.plan.checks,
+        )
+
+    # The unbilled refusal: its scenario owes none of the three flags.
+    unbilled = _honest(tmp_path / "unbilled", "S23c")
+    assert not set(unbilled.plan.expect.flags) & {"token_usage_complete", "cost_complete"}
+    assert "C6" in unbilled.report.evaluated()
+    for report in (unbilled.report, incomplete(unbilled)):
+        assert report.codes == frozenset()
+        assert {waived, "flag:cost_complete=False", "flag:terminal_complete=False"} <= (
+            report.unasked
+        )
+        verdict(unbilled, report)  # the column-wide code is not owed: the cell passes
+    # The trace flag is waived by no scenario: its check is always asked.
+    assert "flag:trace_complete=False" not in unbilled.report.unasked
+
+    # The lying counterpart: a billed refusal owes the accounting flags. The
+    # code is owed there, and an honest result is "gap fixed"; a result that
+    # flags its accounting incomplete is the expected failure.
+    billed = _honest(tmp_path / "billed", "S23a")
+    assert waived not in billed.report.unasked
+    with pytest.raises(ledger.LedgerMismatch, match="gap fixed: column-wide"):
+        verdict(billed, billed.report)
+    untold = incomplete(billed)
+    assert waived in untold.codes and waived not in untold.unasked
+    with pytest.raises(XFAILED, match="G99"):
+        # The one ledgered code of the two the result shows.
+        ledger.compare(
+            known,
+            billed.cell.id,
+            {waived},
+            current=billed.current,
+            evaluated=untold.evaluated(),
+            unasked=untold.unasked,
+        )
+
+
 def test_c8_c9_and_c10_report_what_the_cell_left_and_dispatched(tmp_path: Path) -> None:
     execution = _honest(tmp_path, "S03")
     log = execution.observation.toolset_log
@@ -1593,6 +1684,73 @@ def test_the_ledger_keeps_what_each_billed_reply_said_of_the_cache() -> None:
     # is built, in the thread of the test.
     with pytest.raises(MatrixSetupError, match="cannot be read back"):
         LoopbackProvider(script, credential="c", dialect=_CannotReadItsReplies())
+
+
+class _NoTurnField(ToyDialect):
+    """The toy wire, read as a wire that has no field for a turn count."""
+
+    turn_control_field = False
+
+    def parse(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        credential: str,
+    ) -> SeenRequest:
+        seen = super().parse(method, path, headers, body, credential=credential)
+        return dataclasses.replace(seen, turn_control=None)
+
+
+def test_the_turn_count_is_owed_only_on_a_wire_that_has_a_field_for_it() -> None:
+    script = ProviderScript((Say("one"),))
+    reference = _reference()
+    asked = suite_default_max_turns()
+
+    def exchange(dialect: ToyDialect, body: dict[str, Any]) -> ProviderLedger:
+        with LoopbackProvider(script, credential="c", dialect=dialect) as provider:
+            assert _ask(provider, body)[0] == 200
+            return provider.freeze()
+
+    def controls(seen: ProviderLedger) -> list[int | None]:
+        return [request.turn_control for request in seen.requests if request.matched]
+
+    # The ledger keeps what the dialect says of its wire. On a wire with a
+    # field for the count a request without it is named ...
+    assert isinstance(ToyDialect(), TurnControlDialect)
+    told, untold = exchange(ToyDialect(), {"max_turns": asked}), exchange(ToyDialect(), {})
+    assert told.turn_control_field and untold.turn_control_field
+    assert (controls(told), controls(untold)) == ([asked], [None])
+    assert turn_count_in_request(_observation(provider=told), reference) == []
+    (found,) = turn_count_in_request(_observation(provider=untold), reference)
+    assert found.code == "request.content:turn_control"
+    assert contract.clause_of(found.code) == contract.SCENARIO
+    # ... and on a wire without one no adapter can send it, so the same
+    # request says nothing. A ledger of no exchange claims no such field.
+    silent = exchange(_NoTurnField(), {"max_turns": asked})
+    assert not silent.turn_control_field and controls(silent) == [None]
+    assert turn_count_in_request(_observation(provider=silent), reference) == []
+    assert not ProviderLedger().turn_control_field
+    # The scenario asks it under the two declared values that place the
+    # enforcement of a limit where the provider is, and under no other.
+    scenario = SCENARIOS["S11"]
+    enforced = {"hard", "provider_stop"}
+    assert {
+        value
+        for value, variant in scenario.differences["turn_limit"].items()
+        if variant.kind == "FALLBACK"
+    } == enforced
+    declared = set()
+    for cell in TOY_CELLS:
+        if cell.scenario != scenario.id:
+            continue
+        routed = declarations.routed(cell.column)
+        plan = plan_for(scenario, declarations.select(scenario.differences, routed))
+        assert (turn_count_in_request in plan.checks) == (routed.turn_limit in enforced), cell.id
+        declared.add(routed.turn_limit)
+    assert enforced <= declared and declared - enforced
 
 
 def test_an_envelope_key_slot_is_a_whole_key_filled_with_a_string() -> None:
@@ -2379,31 +2537,66 @@ def _registry_cell(document: dict[str, Any], gap: str, cell: str) -> dict[str, A
     return next(item for item in document["registry"][gap]["cells"] if item["cell"] == cell)
 
 
-def test_h03_rejects_an_entry_whose_cell_its_gap_does_not_list() -> None:
+def _with_an_entry_of_its_own() -> dict[str, Any]:
+    """The shipped ledger with one known gap more, its entry last in ``known_gaps``.
+
+    An entry for a test to break. It stands on a cell that has none, under a
+    record that is made to list the cell, and the ceiling of its pack is
+    raised by the one, so H03 says nothing of it as it stands. It is no entry
+    of the shipped ledger, so the fix of a gap edits no test for it.
+    """
+
+    cell = "deepseek/S13/primary/raw"
+    assert LEDGER.entry(cell) is None
+    current = dict(cells.world().current(cell))
     document = _document()
-    document["known_gaps"][0]["codes"] = {"static:worker_skip": "G02"}
+    document["registry"]["M01"]["cells"].append(
+        {"cell": cell, "observed_under": current, "closes_under": current}
+    )
+    document["known_gaps"].append(
+        {"cell": cell, "observed_under": current, "codes": {"secret:leak": "M01"}}
+    )
+    document["ceilings"]["max_known_gaps"]["pack_a"] += 1
+    return document
+
+
+def test_h03_rejects_an_entry_whose_cell_its_gap_does_not_list() -> None:
+    document = _with_an_entry_of_its_own()
+    assert _problem_codes(document) == set()
+    document["known_gaps"][-1]["codes"] = {"static:worker_skip": "G02"}
 
     assert "static:entry_not_in_registry" in _problem_codes(document)
 
 
 def test_h03_rejects_a_registry_cell_that_is_not_generated_once_its_kind_runs_the_set() -> None:
-    enabled = {**cells.ENABLEMENT, "deepseek": (STARTER, PACK_A)}
+    # Every real kind runs pack A, so a pack A cell of a record that the
+    # generator no longer yields is a cell that vanished.
+    fewer = cells.world().generated - {"deepseek/S11/primary/raw"}
 
-    assert "static:registry_cell_not_generated" in _problem_codes(enabled_sets=enabled)
+    assert "static:registry_cell_not_generated" in _problem_codes(generated=fewer)
     assert "static:registry_cell_not_generated" not in _problem_codes()
+    # A kind that did not run the set would owe no such cell; it would owe the
+    # expected failure of its H02 cell instead (the registry rules, below).
+    starter_only = {**cells.ENABLEMENT, "deepseek": (STARTER,)}
+    assert "static:registry_cell_not_generated" not in _problem_codes(
+        generated=fewer, enabled_sets=starter_only
+    )
 
 
 def test_h03_rejects_a_not_expressible_row_on_a_registry_cell_without_a_ruling() -> None:
-    row = {"scenario": "S12", "kind": "kimi", "step": "Call", "reason": "r", "checklist": "c"}
+    # A form of refusal that one record alone lists on the kind.
+    row = {"scenario": "S23c", "kind": "kimi", "step": "Refuse", "reason": "r", "checklist": "c"}
     ruled = _document()
-    ruled["registry"]["G02"]["ruling"] = "owner, 2026-11-18: the cell is withdrawn"
+    ruled["registry"]["G10"]["ruling"] = "owner, 2026-11-18: the cells are withdrawn"
 
     assert "static:not_expressible_registry_cell" in _problem_codes(not_expressible=(row,))
     assert "static:not_expressible_registry_cell" not in _problem_codes(
         ruled, not_expressible=(row,)
     )
     # S12 has one form, so it cannot be pinned on an open-weight kind at all.
-    assert "static:not_expressible_pack_a" in _problem_codes(ruled, not_expressible=(row,))
+    one_form = {**row, "scenario": "S12", "step": "Call"}
+    assert "static:not_expressible_pack_a" in _problem_codes(not_expressible=(one_form,))
+    assert "static:not_expressible_pack_a" not in _problem_codes(not_expressible=(row,))
 
 
 def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
@@ -2426,6 +2619,14 @@ def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
         "M07",
         "R04",
         "R05",
+        "R07",
+        "R08",
+        "R09",
+        "R10",
+        "R11",
+        "R12",
+        "R13",
+        "R14",
     }
     # With a cell of the record withdrawn the ruling is what H03 asks for.
     # Either the cell is pinned not expressible ...
@@ -2435,11 +2636,13 @@ def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
     pinned = _problem_codes(withdrawing, not_expressible=(row,))
     assert "static:registry_ruling_unused" not in pinned
     # ... or it is no longer generated although its kind runs the set: with
-    # the entries of the two cells deleted, nothing is left to object to.
+    # the entries of the two cells deleted, and the frozen ceiling of their
+    # pack lowered by the two, nothing is left to object to.
     gone = {item["cell"] for item in withdrawing["registry"]["M07"]["cells"]}
     withdrawing["known_gaps"] = [
         item for item in withdrawing["known_gaps"] if item.get("cell") not in gone
     ]
+    _lowered(withdrawing)
     fewer = cells.world().generated - gone
     assert _problem_codes(withdrawing, generated=fewer) == set()
     # Without the ruling the same withdrawal is refused, cell by cell.
@@ -2471,15 +2674,17 @@ def test_h03_keeps_one_form_of_a_multi_form_pack_a_scenario_on_open_weight_kinds
 
 
 def test_h03_rejects_closes_under_that_differs_without_a_named_change() -> None:
-    cell = "deepseek/S10a/primary/raw"
+    # A registry cell that is generated and has no entry of its own.
+    cell = "deepseek/S13/primary/raw"
+    assert LEDGER.entry(cell) is None
     document = _document()
-    _registry_cell(document, "G14", cell)["closes_under"] = {"turn_limit": "unsupported"}
+    _registry_cell(document, "G14", cell)["closes_under"] = {"usd_limit": "unsupported"}
 
     assert "static:registry_closes_under" in _problem_codes(document)
 
     document["registry"]["G14"]["declaration_change"] = {
-        "field": "turn_limit",
-        "from": "hard",
+        "field": "usd_limit",
+        "from": "post_hoc",
         "to": "unsupported",
         "citation": "an owner ruling",
     }
@@ -2522,14 +2727,26 @@ def test_h03_registry_rules() -> None:
     del _registry_cell(unpredicted, "G15", "deepseek/S11/primary/raw")["predicted"]
     assert "static:registry_prediction_missing" in _problem_codes(unpredicted)
 
-    # Without the H02 entry of its kind, a predicted cell would be invisible.
-    unreachable = _document()
-    unreachable["known_gaps"] = [
-        item
-        for item in unreachable["known_gaps"]
-        if item.get("cell") != "deepseek/H02/-/static"
-    ]
-    assert "static:registry_cell_unreachable" in _problem_codes(unreachable)
+    # On a kind that does not run pack A, a recorded pack A cell is visible
+    # only through the expected failure of the kind's H02 cell. No kind is in
+    # that state today and no H02 cell has an entry, so a kind that stopped
+    # running pack A would leave its recorded cells unreachable...
+    starter_only = {**cells.ENABLEMENT, "deepseek": (STARTER,)}
+    assert LEDGER.entry("deepseek/H02/-/static") is None
+    assert "static:registry_cell_unreachable" in _problem_codes(enabled_sets=starter_only)
+    # ...unless the H02 cell of the kind is an expected failure again.
+    reachable = _document()
+    reachable["ceilings"]["max_known_gaps"]["pack_a"] += 1
+    reachable["known_gaps"].append(
+        {
+            "cell": "deepseek/H02/-/static",
+            "observed_under": {},
+            "codes": {"static:pack_a_not_enabled": "G20"},
+        }
+    )
+    assert "static:registry_cell_unreachable" not in _problem_codes(
+        reachable, enabled_sets=starter_only
+    )
 
     # A weakened declaration is seen even before the cell's column is driven.
     weakened = dataclasses.replace(cells.world(), current=lambda _cell: {"turn_limit": "unsupported"})
@@ -2560,6 +2777,283 @@ def test_h03_registry_rules() -> None:
     assert _problem_codes() == set()
 
 
+def _lowered(document: dict[str, Any]) -> dict[str, Any]:
+    """``document`` with every frozen ceiling lowered by the entries that left its pack.
+
+    What the change that takes an entry of a frozen pack away does in the
+    same change: the shipped ceiling, less the shipped count of the pack,
+    plus its count now.
+    """
+
+    world = cells.world()
+    before = ledger.pack_counts(LEDGER, world)
+    after = ledger.pack_counts(ledger.parse(document), world)
+    for pack in document["ceilings"].get("frozen") or ():
+        gone = before.get(pack, 0) - after.get(pack, 0)
+        document["ceilings"]["max_known_gaps"][pack] = LEDGER.ceilings[pack] - gone
+    return document
+
+
+def _without_the_codes_of(gap: str) -> dict[str, Any]:
+    """The shipped ledger as a fix of ``gap`` leaves it: no entry names the gap.
+
+    The fix lowers the ceiling of a frozen pack by the entries it deleted.
+    """
+
+    document = _document()
+    for item in document["known_gaps"]:
+        if "codes" in item:
+            item["codes"] = {code: owner for code, owner in item["codes"].items() if owner != gap}
+    document["known_gaps"] = [
+        item for item in document["known_gaps"] if "column_wide" in item or item["codes"]
+    ]
+    return _lowered(document)
+
+
+def _without_an_entry_of(pack: str) -> dict[str, Any]:
+    """The shipped ledger less the first entry that counts under ``pack``.
+
+    Nothing else is edited, the ceilings least of all: what a fix that
+    forgot the ceiling leaves. The entry is taken by its place and not by
+    its gap, so the fix of a gap edits no test for it.
+    """
+
+    world = cells.world()
+    count = ledger.pack_counts(LEDGER, world).get(pack, 0)
+    shipped = _document()
+    for index in range(len(shipped["known_gaps"])):
+        fewer = copy.deepcopy(shipped)
+        del fewer["known_gaps"][index]
+        if ledger.pack_counts(ledger.parse(fewer), world).get(pack, 0) < count:
+            return fewer
+    raise MatrixSetupError(f"the ledger holds no entry that counts under {pack}")
+
+
+def _constructed(_cell: str) -> str:
+    return "constructed"
+
+
+def _closed_below_grade(document: dict[str, Any], world: ledger.World) -> list[str]:
+    """What H03 says of the cells that closed on a reply below their record's grade."""
+
+    return [
+        item.detail
+        for item in ledger.integrity_problems(ledger.parse(document), world)
+        if item.code == "static:registry_closed_below_grade"
+    ]
+
+
+def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -> None:
+    # The lying counterpart: a fix of G18 made its three cells green, the
+    # comparator asked for the codes of the gap to go, and they went, while
+    # each cell is answered from a reply that was constructed from the types
+    # of an SDK, a shape no provider is known to send. The grade is given
+    # here and not read from the shipped envelopes, and the ledger is the
+    # shipped one without the codes of the gap, so the test says the same
+    # once the gap is fixed on better replies.
+    closed = _without_the_codes_of("G18")
+    listed = {item.cell for item in LEDGER.registry["G18"].cells}
+    # Constructed replies for the cells of this record and a recorded one
+    # for every other cell: whether another graded record is closed, and on
+    # what, is the ledger's statement, so its fix edits nothing here.
+    constructed = dataclasses.replace(
+        cells.world(), grade=lambda cell: "constructed" if cell in listed else "recorded"
+    )
+    found = _closed_below_grade(closed, constructed)
+
+    assert _problem_codes(closed, grade=_constructed) == {"static:registry_closed_below_grade"}
+    assert len(found) == len(listed) == 3
+    assert all(any(cell in detail for detail in found) for cell in listed)
+    # The same deletion on replies of the grade the record names is a fix.
+    for grade in ("documented", "recorded"):
+        assert _problem_codes(closed, grade=lambda _cell, grade=grade: grade) == set()
+    # With the grades of the shipped envelopes the rule names exactly the
+    # cells of the record that a weaker reply still answers.
+    real = cells.world()
+    grades = matrix_envelopes.GRADES
+    weaker = {
+        cell
+        for cell in listed
+        if real.grade(cell) in grades[grades.index("documented") + 1 :]
+    }
+    named = _closed_below_grade(closed, real)
+    assert {cell for cell in listed if any(cell in detail for detail in named)} == weaker
+    assert len(named) == len(weaker)
+    # The rule reads the codes an entry attributes to the record, not whether
+    # the cell has an entry: one that stands for another gap only does not
+    # keep this gap open.
+    cell = sorted(listed)[0]
+    elsewhere = _without_the_codes_of("G18")
+    elsewhere["known_gaps"] = [
+        item for item in elsewhere["known_gaps"] if item.get("cell") != cell
+    ]
+    elsewhere["registry"]["M01"]["cells"].append(
+        {"cell": cell, "observed_under": {}, "closes_under": {}}
+    )
+    elsewhere["known_gaps"].append(
+        {"cell": cell, "observed_under": {}, "codes": {"secret:leak": "M01"}}
+    )
+    # The frozen ceiling follows whatever that leaves of the count of its
+    # pack: which cells of the gap keep an entry for another record is the
+    # ledger's statement, and no number of this test.
+    _lowered(elsewhere)
+    assert ledger.parse(elsewhere).entry(cell) is not None
+    assert _problem_codes(elsewhere, grade=_constructed) == {
+        "static:registry_closed_below_grade"
+    }
+    assert any(cell in detail for detail in _closed_below_grade(elsewhere, constructed))
+    # The shipped ledger states the grade for every gap whose substance is
+    # what a provider sends, and on the reference columns for every gap
+    # whose substance is what the vendor's tool relays of such a reply or
+    # sends when a session is stopped; the rule holds each of them.
+    graded = {record.id for record in LEDGER.registry.values() if record.closes_on_grade}
+    assert set(ledger.PROVIDER_FACT_GAPS) & set(LEDGER.registry) <= graded
+    # The rule holds a cell for as long as its record lists it, and a record
+    # is permanent: the graded records are named and their cells counted
+    # here, so that no record drops the field and no cell leaves its record
+    # together with its code. The design's list holds the field of the
+    # open-weight records that are on it; nothing else holds the field of a
+    # record of origin ``reference`` or of the matrix.
+    counted = {
+        "G10": 2,
+        "G18": 3,
+        "G35": 9,
+        "M10": 2,
+        "R07": 2,
+        "R08": 1,
+        "R09": 1,
+        "R10": 2,
+        "R11": 2,
+        "R14": 1,
+    }
+    assert graded == set(counted)
+    assert {gap: len(LEDGER.registry[gap].cells) for gap in counted} == counted
+    references = {gap for gap in graded if LEDGER.registry[gap].origin == "reference"}
+    assert references == {"R07", "R08", "R09", "R10", "R11", "R14"}
+    # What the record of each says its cells are answered from today. A
+    # cell of a reference may be answered from several frames; its grade is
+    # that of the weakest, and each of these is constructed. A change that
+    # brings another frame into the script of such a cell, or regrades one,
+    # rewrites this.
+    tool_call = {
+        "codex_app_server/app_server.tool_call_started",
+        "codex_app_server/app_server.token_usage_updated",
+    }
+    answered = {
+        "R07": {"claude_cli/cli.init", "claude_cli/cli.assistant_tool_use"},
+        "R08": tool_call,
+        "R09": tool_call,
+        "R10": {
+            "claude_cli/cli.init",
+            "claude_cli/cli.assistant_refusal",
+            "claude_cli/cli.result_refusal",
+        },
+        "R11": {
+            "claude_cli/cli.init",
+            "claude_cli/cli.assistant_api_error",
+            "claude_cli/cli.result_api_error",
+        },
+        "R14": {"codex_app_server/app_server.turn_failed_policy"},
+    }
+    assert set(answered) == references
+    for gap, frames in answered.items():
+        for item in LEDGER.registry[gap].cells:
+            assert set(cells.answered_from(item.cell)) == frames, item.cell
+            assert cells.grade_of(item.cell) == "constructed", item.cell
+    for gap in sorted(graded):
+        assert _problem_codes(_without_the_codes_of(gap), grade=_constructed) == {
+            "static:registry_closed_below_grade"
+        }, gap
+    # A record of a gap the closure rule lists cannot drop the field ...
+    ungraded = _document()
+    del ungraded["registry"]["G18"]["closes_on_grade"]
+    assert _problem_codes(ungraded) == {"static:registry_grade_missing"}
+    # ... and the field names a grade above the weakest one, or the record
+    # says nothing.
+    for grade in ("constructed", "guessed", ""):
+        unknown = _document()
+        unknown["registry"]["G18"]["closes_on_grade"] = grade
+        with pytest.raises(MatrixSetupError, match="closes_on_grade"):
+            ledger.parse(unknown)
+    # A gap that is no provider fact closes on whatever its cells are
+    # answered from: a record without the field is not held.
+    assert LEDGER.registry["G17"].closes_on_grade is None
+    assert _problem_codes(_without_the_codes_of("G17")) == set()
+
+
+def test_h03_holds_a_gap_open_while_its_record_waits_for_a_ruling() -> None:
+    # The lying counterpart: a change made the one cell of G15 stop raising by
+    # cutting the turn count to a ceiling of the adapter's own, the comparator
+    # asked for the codes of the gap to go, and they went. The closing state
+    # of the gap is a ceiling that is reported, or a refusal at routing. What
+    # "reported" asks of a route whose wire carries no turn control is stated
+    # by no clause, so the cell cannot show that state: the record says that
+    # a ruling is owed first, and the integrity check holds the gap open
+    # whatever its cell shows.
+    cell = "deepseek/S11/primary/raw"
+    closed = _without_the_codes_of("G15")
+    assert ledger.parse(closed).entry(cell) is None
+
+    assert _problem_codes(closed) == {"static:registry_closed_before_ruling"}
+    record = LEDGER.registry["G15"]
+    assert record.awaits_ruling and [item.cell for item in record.cells] == [cell]
+    (held,) = ledger.integrity_problems(ledger.parse(closed), cells.world())
+    assert cell in held.detail and record.awaits_ruling in held.detail
+    # What such a change leaves on the cell is the terminal name of another
+    # record. The code is written out here and not read from an entry of
+    # that record: those go with its own fix. An entry that stands for that
+    # record only does not keep this gap open.
+    elsewhere = _document()
+    (entry,) = (item for item in elsewhere["known_gaps"] if item.get("cell") == cell)
+    current = dict(cells.world().current(cell))
+    entry["codes"] = {"event.terminal:response.completed!=end_turn": "M05"}
+    elsewhere["registry"]["M05"]["cells"].append(
+        {"cell": cell, "observed_under": current, "closes_under": current}
+    )
+    assert ledger.parse(elsewhere).entry(cell) is not None
+    assert _problem_codes(elsewhere) == {"static:registry_closed_before_ruling"}
+    # The change that enters the ruling makes the scenario assert it and
+    # takes the field away: the same two ledgers are then a fix.
+    for document in (closed, elsewhere):
+        del document["registry"]["G15"]["awaits_ruling"]
+        assert _problem_codes(document) == set()
+    # The field is the question that is owed an answer, in words.
+    for text in ("", " ", None, True):
+        blank = _document()
+        blank["registry"]["G15"]["awaits_ruling"] = text
+        with pytest.raises(MatrixSetupError, match="awaits_ruling"):
+            ledger.parse(blank)
+    # A record that waits for no ruling closes when its cells stop deviating,
+    # and the shipped ledger, in which the gap is open, is clean.
+    assert LEDGER.registry["G17"].awaits_ruling is None
+    assert _problem_codes(_without_the_codes_of("G17")) == set()
+    assert _problem_codes() == set()
+
+
+def test_the_grade_h03_reads_is_that_of_the_replies_the_dialect_answers_a_cell_from() -> None:
+    world = cells.world()
+
+    # Read without playing the cell: the script of the cell's variant, each
+    # step rendered by the dialect of its kind against a blank request.
+    assert world.grade("deepseek/S23a/primary/raw") == "constructed"
+    assert world.grade("deepseek/S01/primary/raw") == "documented"
+    assert world.grade("kimi/S23c/secondary/raw") == "constructed"
+    assert world.grade("openai_compat:hosted/S23b/primary/raw") == "constructed"
+    assert world.grade("openai_compat:hosted/S01/primary/guarded") == "documented"
+    assert world.grade("openai_compat:hosted/S03/primary/guarded") == "constructed"
+    assert world.grade("claude/S23c/primary/raw") == "constructed"
+    # A toy cell is answered from no envelope, and a static cell from nothing.
+    assert world.grade(TOY_CELLS[0].id) is None
+    assert world.grade("all/H03/-/static") is None
+    assert cells.answered_from("deepseek/S23c/primary/raw") == (
+        "deepseek_responses/deepseek.refusal_http_policy",
+    )
+    assert cells.answered_from("openai_compat:hosted/S04/primary/raw") == (
+        "openai_chat/gateway.tool_call",
+        "openai_chat/gateway.completion",
+    )
+
+
 def test_h03_entry_rules() -> None:
     on_canary = _document()
     canary = next(cell.id for cell in TOY_CELLS if SCENARIOS[cell.scenario].canary)
@@ -2570,16 +3064,22 @@ def test_h03_entry_rules() -> None:
     )
     assert {"static:entry_on_canary", "static:ceiling_exceeded"} <= _problem_codes(on_canary)
 
-    unused = _document()
-    unused["known_gaps"][0]["cell"] = "all/H09/-/static"
+    # The entry each of the following breaks is one of the test's own, last
+    # in the list: which entries the shipped ledger holds, and in which
+    # order, is the ledger's statement.
+    assert _problem_codes(_with_an_entry_of_its_own()) == set()
+
+    unused = _with_an_entry_of_its_own()
+    unused["known_gaps"][-1]["cell"] = "all/H09/-/static"
     assert "static:entry_unused" in _problem_codes(unused)
 
-    observed = _document()
-    observed["known_gaps"][0]["observed_under"] = {"turn_limit": "hard"}
+    observed = _with_an_entry_of_its_own()
+    assert "turn_limit" not in observed["known_gaps"][-1]["observed_under"]
+    observed["known_gaps"][-1]["observed_under"] = {"turn_limit": "hard"}
     assert "static:entry_observed_under" in _problem_codes(observed)
 
-    invalid = _document()
-    invalid["known_gaps"][0]["codes"] = {"decl.changed:turn_limit": "G04"}
+    invalid = _with_an_entry_of_its_own()
+    invalid["known_gaps"][-1]["codes"] = {"decl.changed:turn_limit": "G04"}
     assert "static:entry_code_invalid" in _problem_codes(invalid)
 
     ceiling = _document()
@@ -2608,16 +3108,21 @@ def test_h03_entry_rules() -> None:
     wide["known_gaps"][-1]["ruling"] = "the owner accepts it as a gap of the reference"
     assert _problem_codes(wide) == set()
 
-    duplicate = _document()
-    duplicate["known_gaps"].append(copy.deepcopy(duplicate["known_gaps"][0]))
+    duplicate = _with_an_entry_of_its_own()
+    duplicate["known_gaps"].append(copy.deepcopy(duplicate["known_gaps"][-1]))
     assert "static:entry_duplicate" in _problem_codes(duplicate)
 
-    empty = _document()
-    empty["known_gaps"][0]["codes"] = {}
+    empty = _with_an_entry_of_its_own()
+    empty["known_gaps"][-1]["codes"] = {}
     assert _problem_codes(empty) == {"static:entry_without_codes"}
     # The comparator does not let such an entry excuse a passing cell either.
     with pytest.raises(ledger.LedgerMismatch, match="gap fixed, delete the entry"):
-        ledger.compare(ledger.parse(empty), empty["known_gaps"][0]["cell"], set(), current={})
+        ledger.compare(
+            ledger.parse(empty),
+            empty["known_gaps"][-1]["cell"],
+            set(),
+            current=empty["known_gaps"][-1]["observed_under"],
+        )
 
     differing = _document()
     differing["ceilings"]["max_declared_differences"] = len(differing["declared_differences"]) - 1
@@ -2632,6 +3137,168 @@ def test_h03_entry_rules() -> None:
     assert _problem_codes(wide) == {"static:entry_not_in_registry"}
     wide["registry"]["G02"]["column_wide"] = [{"kind": "kimi", "code": "pricing:none"}]
     assert _problem_codes(wide) == set()
+
+
+def test_h03_holds_a_frozen_ceiling_to_the_count_of_its_pack() -> None:
+    world = cells.world()
+    counts = ledger.pack_counts(LEDGER, world)
+    # The shipped ledger states the ceiling of pack A frozen. A frozen
+    # ceiling only falls, and no run has the history to see a number rise.
+    # So it is held to the count of its pack, and never above the number it
+    # was frozen at: an entry that a ruling admits after the freeze raises
+    # that number here, in the change that writes the entry.
+    assert LEDGER.frozen == {"pack_a"}
+    assert LEDGER.ceilings["pack_a"] == counts["pack_a"] <= 84
+    assert _problem_codes() == set()
+
+    # The lying counterpart: a fix deleted its entry and left the ceiling.
+    # That opens room under a number that says it only falls, and a later
+    # entry would fit into it with no edit of the ceiling at all. The entry
+    # is the first the ledger holds in the pack, whichever gap it stands
+    # for: the fix of a gap deletes entries and edits nothing here.
+    refused = "static:ceiling_not_the_count"
+    forgot = _without_an_entry_of("pack_a")
+    assert forgot["ceilings"] == _document()["ceilings"]
+    # The same fix with the ceiling lowered by the entry it deleted.
+    fixed = _lowered(copy.deepcopy(forgot))
+    assert fixed["ceilings"]["max_known_gaps"]["pack_a"] == LEDGER.ceilings["pack_a"] - 1
+    assert fixed["known_gaps"] == forgot["known_gaps"]
+    # Of the fix that forgot H03 says the code of the ceiling, beside what
+    # it says of the same deletion once the ceiling is lowered: the entry
+    # may be one that H03 does not let go for a reason of its own.
+    lowered = _problem_codes(fixed)
+    assert refused not in lowered and _problem_codes(forgot) == lowered | {refused}
+    (found,) = (
+        item
+        for item in ledger.integrity_problems(ledger.parse(forgot), world)
+        if item.code == refused
+    )
+    assert "pack_a" in found.detail and "frozen" in found.detail
+    # A frozen ceiling above the count is refused however it came about, and
+    # one below the count is exceeded, as any ceiling is.
+    for moved, code in ((1, "static:ceiling_not_the_count"), (-1, "static:ceiling_exceeded")):
+        other = _document()
+        other["ceilings"]["max_known_gaps"]["pack_a"] += moved
+        assert _problem_codes(other) == {code}, moved
+    # While the entries of a pack still land its ceiling may leave room: the
+    # rule binds a pack once the ledger states it frozen, and not before.
+    rising = _document()
+    rising["ceilings"]["frozen"] = []
+    rising["ceilings"]["max_known_gaps"]["pack_a"] += 36
+    assert _problem_codes(rising) == set()
+    del rising["ceilings"]["frozen"]
+    assert ledger.parse(rising).frozen == frozenset() and _problem_codes(rising) == set()
+    # A frozen pack that holds no entry has a ceiling of nothing.
+    empty = _document()
+    empty["ceilings"]["frozen"] = ["pack_a", "pack_b"]
+    assert not counts.get("pack_b") and _problem_codes(empty) == set()
+    empty["ceilings"]["max_known_gaps"]["pack_b"] = 1
+    assert _problem_codes(empty) == {"static:ceiling_not_the_count"}
+    # What the rule cannot see is one change that deletes an entry and writes
+    # another: the count and the number stand as they were. The new entry is
+    # then in the diff of that change, on a cell that had none.
+    # The field names packs that have a ceiling, once each.
+    for value in (["pack_c"], ["pack_a", "pack_a"], "pack_a", [1], {"pack_a": True}):
+        unknown = _document()
+        unknown["ceilings"]["frozen"] = value
+        with pytest.raises(MatrixSetupError, match="ceilings.frozen"):
+            ledger.parse(unknown)
+
+
+def _leaned_on(known: ledger.Ledger, gaps: Any = None) -> set[tuple[str, str]]:
+    """The proofs the entries of ``known`` lean on, for every record or for ``gaps``."""
+
+    def wanted(gap: str) -> bool:
+        return gaps is None or gap in gaps
+
+    return {
+        item
+        for entry in known.entries
+        for gap in set(entry.codes.values())
+        if wanted(gap)
+        for item in cells.proofs_leaned_on(gap, entry.cell)
+    } | {
+        item
+        for scope in known.column_wide
+        if wanted(scope.gap)
+        for item in cells.proofs_leaned_on(scope.gap, None)
+    }
+
+
+def test_h03_refuses_an_entry_that_outlives_a_proof_it_leans_on() -> None:
+    world = cells.world()
+    required = cells.required_proof_items()
+    owed = _leaned_on(LEDGER)
+
+    # A proof holds what the codes of an entry do not say. The records whose
+    # entries lean on one are named here, so that a row of the table cannot
+    # go with its proof while an entry still names the record.
+    assert set(cells.RECORD_PROOFS) == {"R04", "R05", "R08", "R09", "R13"}
+    assert set(cells.RECORD_PROOFS) <= set(LEDGER.registry)
+    # Each of them is named by an entry today, and every proof those entries
+    # lean on is one the verifier requires by name.
+    for gap in cells.RECORD_PROOFS:
+        assert _leaned_on(LEDGER, {gap}), gap
+    assert owed and owed <= required == world.required_proofs
+    assert _problem_codes() == set()
+
+    # The lying counterpart: a change deleted a proof and its name from the
+    # list the verifier requires and left the entries that lean on it. Every
+    # test of the package is green without the proof, and the verifier calls
+    # a run without it complete. Shown for every proof an entry leans on.
+    for module, name in sorted(owed):
+        found = ledger.integrity_problems(
+            LEDGER, dataclasses.replace(world, required_proofs=required - {(module, name)})
+        )
+        assert found and {item.code for item in found} == {
+            "static:entry_proof_not_required"
+        }, name
+        assert all(f"{module}::{name}" in item.detail for item in found), name
+    # An entry leans on the item of the proof that plays its own cell, and
+    # on no other: without the twin of one guarded cell, the entry of that
+    # cell is named and no entry of another scenario or lens.
+    raw, twin = cells.RECORD_PROOFS["R05"]
+    cell = "codex:official/S10a/primary/guarded"
+    assert twin.item(cell.replace("guarded", "raw")) is None and twin.item(None) is None
+    assert raw.item(None) is None and raw.item(cell) == f"{raw.test}[S10a]"
+    without = required - {(twin.module, str(twin.item(cell)))}
+    (named,) = ledger.integrity_problems(LEDGER, dataclasses.replace(world, required_proofs=without))
+    assert f"entry {cell} names R05" in named.detail
+    # A column-wide entry names no cell: it leans on a test of which one
+    # item stands for the record. Without that item both column-wide
+    # entries of the record are named, and each of its cell entries.
+    (one,) = cells.RECORD_PROOFS["R04"]
+    wide = [scope for scope in LEDGER.column_wide if scope.gap == "R04"]
+    on_cells = [entry for entry in LEDGER.entries if "R04" in entry.codes.values()]
+    found = ledger.integrity_problems(
+        LEDGER, dataclasses.replace(world, required_proofs=required - {(one.module, one.test)})
+    )
+    assert wide and on_cells and len(found) == len(wide) + len(on_cells)
+    assert sum(item.detail.startswith("column-wide ") for item in found) == len(wide)
+    # The same deletion with the entries of the record gone is what the fix
+    # of the record may do: a record that no entry names leans on nothing.
+    for gap in sorted(cells.RECORD_PROOFS):
+        fixed = _without_the_codes_of(gap)
+        fixed["known_gaps"] = [
+            item
+            for item in fixed["known_gaps"]
+            if "column_wide" not in item or item["column_wide"]["gap"] != gap
+        ]
+        fewer = required - _leaned_on(LEDGER, {gap})
+        assert fewer != required
+        assert "static:entry_proof_not_required" not in _problem_codes(
+            _lowered(fixed), required_proofs=fewer
+        ), gap
+    # A record that is not in the table leans on nothing: with no proof
+    # required at all, the entries H03 names are those of the table's records.
+    assert cells.proofs_leaned_on("G17", "deepseek/S40/primary/raw") == ()
+    found = ledger.integrity_problems(
+        LEDGER, dataclasses.replace(world, required_proofs=frozenset())
+    )
+    assert {item.code for item in found} == {"static:entry_proof_not_required"}
+    assert {item.detail.split(" names ")[1].split(",")[0] for item in found} == set(
+        cells.RECORD_PROOFS
+    )
 
 
 def _difference(document: dict[str, Any], name: str) -> dict[str, Any]:
@@ -2754,7 +3421,8 @@ def test_h03_declared_difference_rules() -> None:
     unranked = list(shipped[D_COST_BOUND_UNRANKED].cells)
     assert set(selected) == {D_COST_BOUND_UNRANKED}
     assert set(unranked) == selected[D_COST_BOUND_UNRANKED] == cells.cost_bounded_guarded_cells()
-    assert len(unranked) == 6 and all(
+    # S01, S03, S04 and the turn limit, on the two diagnostic columns.
+    assert len(unranked) == 8 and all(
         ledger.parse_cell_id(cell)[2:] in (("primary", GUARDED), ("secondary", GUARDED))
         and declarations.cost_bounded(
             column,

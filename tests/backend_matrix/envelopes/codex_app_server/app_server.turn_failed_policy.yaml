@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal notification of a turn that the provider refused for its
+# usage policy before any model response: the turn failed, and its error
+# names the policy. Nothing was observed of the real tool: the frame is
+# emulated, so every cell that uses this envelope rests on an emulation of
+# the reference.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: turn_failed_policy
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai_codex.generated.v2_all.TurnCompletedNotification with a Turn whose
+    status is the TurnStatus value failed and whose error is a TurnError
+    with the CodexErrorInfoValue cyberPolicy (method turn/completed in
+    openai_codex.generated.notification_registry); the method is one of
+    codex_app_server_sdk.protocol.TURN_COMPLETED_METHODS
+  sdk_version: openai-codex 0.144.4, codex-app-server-sdk 0.3.2
+  reason: >-
+    The notification is the one of a completed turn (app_server.turn_completed)
+    with the status "failed" and an error, which the generated type of the
+    vendor says is "only populated when the Turn's status is failed". The
+    error holds the required message and, as its kind, the one value of the
+    vendor's closed list of error kinds that names a policy of the provider.
+    The protocol has no finish reason of a model response and no refusal
+    part of a message, so this is the only form of refusal its notifications
+    can carry. No refusal was induced and nothing was observed: when the
+    real tool reports this kind, whether an error notification precedes the
+    terminal and what the message says are not known; the message is a
+    fixed sentence of this envelope. Nothing is billed.
+
+status: 200
+
+body:
+  method: turn/completed
+  params:
+    threadId: {slot: thread_id}
+    turn:
+      id: {slot: turn_id}
+      items: []
+      status: failed
+      error:
+        message: The request was rejected because it violates the usage policy.
+        codexErrorInfo: cyberPolicy
+        additionalDetails: null

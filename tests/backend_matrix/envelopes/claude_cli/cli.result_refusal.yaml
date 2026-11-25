@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal frame of a session whose model turn was refused. Nothing was
+# observed of the real tool (see cli.init): how the tool ends such a session
+# is emulated, so every cell that uses this envelope rests on an emulation
+# of the reference.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: result_refusal
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.ResultMessage, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "result")
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    No source in reach states how the tool ends a session whose only model
+    turn was refused. This frame is the terminal of a text answer
+    (cli.result) with an empty result text and, as its stop reason, the stop
+    reason of the last model turn, which is how the turn-limit terminal of
+    the tool reports its stop reason. The subtype "success" and is_error
+    false are the reading that a refused turn is a turn the provider
+    completed and billed; a tool that reports an error result there would
+    need another envelope.
+    The session accounting (usage, turn count, cost and the usage record per
+    model) is emulated as in the terminal frame of a text answer, and its
+    two parts that have no source but the adapter are the same
+    (cli.result).
+
+status: 200
+
+body:
+  type: result
+  subtype: success
+  is_error: false
+  duration_ms: 1
+  duration_api_ms: 1
+  num_turns: {slot: turns}
+  result: ""
+  stop_reason: refusal
+  session_id: {slot: session_id}
+  total_cost_usd: {slot: cost_usd}
+  usage:
+    input_tokens: {slot: input_tokens}
+    output_tokens: {slot: output_tokens}
+    cache_creation_input_tokens: 0
+    cache_read_input_tokens: 0
+  modelUsage:
+    "${slot:served_model}":
+      inputTokens: {slot: input_tokens}
+      outputTokens: {slot: output_tokens}
+      cacheReadInputTokens: 0
+      cacheCreationInputTokens: 0
+      webSearchRequests: 0
+      costUSD: {slot: cost_usd}
+      contextWindow: 200000
+      maxOutputTokens: 64000
+      canonicalModel: {slot: served_model}
+      provider: firstParty
+  uuid: {slot: frame_id}
