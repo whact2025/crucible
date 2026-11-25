@@ -192,6 +192,14 @@ ALLOWED_OVERLAY: Mapping[str, tuple[str, ...]] = {
     "codex:legacy": ("extra.cli_path",),
     DEEPSEEK_KIND: ("extra.expected_worker_runtime_fingerprint",),
 }
+# The overlay fields that routing reads when it admits a route: what a run
+# binds to a shipped route before routing builds it. An admission cell of a
+# kind that overlays one asks for every capability a second time on the
+# routing file as shipped, where the driver adds none of them
+# (``Column.as_shipped``). The path of a scripted peer is no such field:
+# routing admits the route without it, and what is built there is the
+# vendor's tool, which the matrix never starts.
+ADMISSION_OVERLAY: tuple[str, ...] = ("extra.expected_worker_runtime_fingerprint",)
 
 # Routing role by the capability a cell asks for.
 ROLE_BY_CAPABILITY: Mapping[str, str] = {
@@ -199,6 +207,14 @@ ROLE_BY_CAPABILITY: Mapping[str, str] = {
     "read_only": "architect_planner",
     "workspace_write": "implementer",
 }
+
+# What routing logs, and under which logger, when it builds a route under
+# diagnostic admission although the profile of the route does not meet what
+# the role asks: the logger of the routing module and the words of its
+# warning. An admission cell reads the records of each build for it, to tell
+# such a build from one whose profile met the role.
+ROUTING_LOGGER = BackendRouting.__module__
+RETAINED_ROUTE = "diagnostic feature admission retained rejected route"
 
 # One uniform matrix rate for behaviour cells; shipped prices are not a
 # behaviour cell's business, and no static cell checks them yet. One
@@ -231,6 +247,9 @@ class Column:
     model: str
     routing: tuple[tuple[str, Path], ...] = ()
     features: BackendFeatureSet | None = None
+    # True on the view of a column whose routing file is read as shipped
+    # (``as_shipped``): a driver adds no admission input to its routes there.
+    shipped: bool = False
 
     @property
     def id(self) -> str:
@@ -253,6 +272,17 @@ class Column:
         return dataclasses.replace(
             self, routing=((COLUMN_PRODUCT, self.routing_path(product)),)
         )
+
+    def as_shipped(self) -> Column:
+        """This column with its routing file read as shipped.
+
+        A driver may add to a shipped route what a run binds to it before
+        routing admits it (``ADMISSION_OVERLAY``). On the returned column it
+        adds none of that, for a cell that asks what routing does with the
+        file alone.
+        """
+
+        return dataclasses.replace(self, shipped=True)
 
 
 def build_columns(
@@ -514,6 +544,14 @@ def overlaid_routing(
             name: overlaid(config, routing.for_role(name).backend)
             for name, config in routing.roles.items()
         },
+    )
+
+
+def admission_inputs(kind: str) -> tuple[str, ...]:
+    """The overlay fields of ``kind`` that routing reads when it admits a route."""
+
+    return tuple(
+        name for name in ALLOWED_OVERLAY.get(kind, ()) if name in ADMISSION_OVERLAY
     )
 
 

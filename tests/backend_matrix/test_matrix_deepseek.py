@@ -33,6 +33,7 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 
 from crucible.backends import deepseek as adapter
+from crucible.backends.features import FeatureAdmissionError
 
 from . import cells, declarations, envelopes, ledger, netguard, runner
 from . import columns as matrix_columns
@@ -216,6 +217,47 @@ def test_the_route_is_the_shipped_one_with_the_captured_fingerprint_as_its_only_
     assert _tree(project) == before
     # Nothing of the cell went through the suite's own interposer.
     assert locked_worker_launch.journal is None
+
+
+def test_the_file_as_shipped_is_refused_for_its_missing_fingerprint_before_a_worker_starts(
+    tmp_path: Path,
+) -> None:
+    # The admission cell asks for every capability a second time on the
+    # routing file as shipped, and its pin says that routing refuses all
+    # three. The pin holds the type of the refusal; this is what it is about.
+    cell = Cell(COLUMN, "S51", "raw")
+    pinned = cells.expected_admission(cell)
+    capabilities = tuple(matrix_columns.ROLE_BY_CAPABILITY)
+    assert {pinned[cells.as_shipped(name)] for name in capabilities} == {
+        FeatureAdmissionError.__name__
+    }
+    assert [name for name, _path in COLUMN.routing] == sorted(matrix_columns.PRODUCTS)
+
+    for product in matrix_columns.PRODUCTS:
+        view = COLUMN.routed_by(product).as_shipped()
+        # There the driver binds nothing to the routes.
+        assert DRIVER.overlay(view, {}) == {} != DRIVER.overlay(COLUMN.routed_by(product), {})
+        for capability in capabilities:
+            directory = tmp_path / product / capability
+            directory.mkdir(parents=True)
+            # The one thing the shipped route lacks is the fingerprint of the
+            # worker runtime, which it leaves to the run.
+            with pytest.raises(
+                FeatureAdmissionError,
+                match=r"rejected: an exact expected_worker_runtime_fingerprint is required$",
+            ):
+                with DRIVER.open(
+                    view,
+                    capability=capability,
+                    lens="raw",
+                    script=ProviderScript(()),
+                    tmp_path=directory,
+                ):
+                    raise AssertionError("routing built the adapter from the file as shipped")
+            # Routing refused before it built anything: no worker was
+            # started, not even to be probed.
+            assert launch.Journal(directory / "worker-harness").launches() == []
+    assert os.environ.get("DEEPSEEK_API_KEY") is None
 
 
 def test_the_preflight_of_the_session_sees_the_environment_a_cell_sees(

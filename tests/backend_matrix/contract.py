@@ -1174,15 +1174,21 @@ def _outcome(deviations: Sequence[Deviation]) -> ClauseOutcome:
 
 
 ADMITTED = "admitted"
+# Routing built the adapter and logged that the profile of the route does not
+# meet what the role asks: what diagnostic admission does with a role that
+# enforcing admission refuses.
+RETAINED = "retained"
 
 
 @dataclass(frozen=True)
 class Admitted:
     """What an admission cell saw of one subject, and where.
 
-    A subject is a capability a workflow can ask routing for, or the word the
-    profile catalog has for the column. ``got`` is :data:`ADMITTED`, the type
-    of the exception routing refused with, or the catalog's word.
+    A subject is a capability a workflow can ask routing for, the same
+    capability on the routing file as shipped, or the word the profile
+    catalog has for the column. ``got`` is :data:`ADMITTED`,
+    :data:`RETAINED`, the type of the exception routing refused with, or the
+    catalog's word.
     """
 
     subject: str

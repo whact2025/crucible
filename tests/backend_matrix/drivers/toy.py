@@ -161,10 +161,13 @@ FINAL_SCHEMA_REQUEST = "final_schema_request"
 GUARD_ON_OTHER_PROFILE = "guard_on_other_profile"
 BUILT_FOR_OTHER_MODEL = "built_for_other_model"
 # Faults of the build, for the admission scenario: the writer role is refused
-# although nothing gates the column, or a backend asks its provider something
-# while it is built.
+# although nothing gates the column, a backend asks its provider something
+# while it is built, or the read-only role is built as diagnostic admission
+# builds a role whose requirements the profile of the route does not meet,
+# with the warning routing logs for it.
 REFUSE_WRITER = "refuse_writer"
 REQUEST_AT_BUILD = "request_at_build"
+RETAIN_REJECTED_ROUTE = "retain_rejected_route"
 
 
 @dataclass
@@ -839,14 +842,22 @@ class ToyDriver:
                 faults=self.faults,
             )
             role = matrix_columns.ROLE_BY_CAPABILITY[capability]
+            route = f"{TOY_KIND}/{column.model} for role {role!r}"
             bind_as_routing(
                 backend,
                 self.guarded_profile(profile),
                 lens=lens,
-                route=f"{TOY_KIND}/{column.model} for role {role!r}",
+                route=route,
                 # Every open-weight route is diagnostic; the toy rehearses them.
                 admission="diagnostic",
             )
+            if RETAIN_REJECTED_ROUTE in self.faults and capability == "read_only":
+                logging.getLogger(matrix_columns.ROUTING_LOGGER).warning(
+                    "routing: %s %s: %s",
+                    matrix_columns.RETAINED_ROUTE,
+                    route,
+                    "the toy profile does not meet what the role asks",
+                )
             if REQUEST_AT_BUILD in self.faults:
                 backend._send("GET", "/toy/v1/models", None, 5.0)
             try:
@@ -1198,8 +1209,9 @@ LIARS: tuple[Liar, ...] = (
         rehearses=("G03",),
         composite=True,
     ),
-    # Admission: a capability the column's pin admits is refused, and a
-    # backend that is only built asks its provider something.
+    # Admission: a capability the column's pin admits is refused, a backend
+    # that is only built asks its provider something, and a role is built
+    # although the profile of its route does not meet what the role asks.
     _liar(
         "S51",
         REFUSE_WRITER,
@@ -1207,4 +1219,10 @@ LIARS: tuple[Liar, ...] = (
         ("S",),
     ),
     _liar("S51", REQUEST_AT_BUILD, ("request.extra",), ("C0",)),
+    _liar(
+        "S51",
+        RETAIN_REJECTED_ROUTE,
+        ("admission:read_only:retained!=admitted",),
+        ("S",),
+    ),
 )

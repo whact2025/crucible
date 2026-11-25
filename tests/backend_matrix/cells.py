@@ -57,27 +57,34 @@ INVENTORY_PATH = Path(__file__).with_name("inventory.yaml")
 INVENTORY_SCHEMA = "crucible.backend-matrix.inventory.v1"
 
 # Which scenario sets run on which kind. A real kind gets the starter set with
-# its driver, then pack A, and pack B after it. Every real kind runs pack A.
+# its driver, then pack A, and pack B after it. Every real kind runs all
+# three: a scenario of pack B runs on the primary column of each kind from
+# the change that defines it.
 ENABLEMENT: Mapping[str, tuple[str, ...]] = {
     TOY_KIND: (STARTER, PACK_A, PACK_B),
     **{kind: () for kind in REAL_KINDS},
-    matrix_columns.HOSTED_GATEWAY_KIND: (STARTER, PACK_A),
-    matrix_columns.LOCAL_GATEWAY_KIND: (STARTER, PACK_A),
-    matrix_columns.CLAUDE_KIND: (STARTER, PACK_A),
-    matrix_columns.DEEPSEEK_KIND: (STARTER, PACK_A),
-    matrix_columns.KIMI_KIND: (STARTER, PACK_A),
-    matrix_columns.CODEX_LEGACY_KIND: (STARTER, PACK_A),
-    matrix_columns.CODEX_OFFICIAL_KIND: (STARTER, PACK_A),
+    matrix_columns.HOSTED_GATEWAY_KIND: (STARTER, PACK_A, PACK_B),
+    matrix_columns.LOCAL_GATEWAY_KIND: (STARTER, PACK_A, PACK_B),
+    matrix_columns.CLAUDE_KIND: (STARTER, PACK_A, PACK_B),
+    matrix_columns.DEEPSEEK_KIND: (STARTER, PACK_A, PACK_B),
+    matrix_columns.KIMI_KIND: (STARTER, PACK_A, PACK_B),
+    matrix_columns.CODEX_LEGACY_KIND: (STARTER, PACK_A, PACK_B),
+    matrix_columns.CODEX_OFFICIAL_KIND: (STARTER, PACK_A, PACK_B),
 }
-# A secondary column runs these sets. A blocked column runs these scenarios
-# as soon as its kind is driven, whatever sets the kind runs: what a blocked
-# profile shows is its seam, one plain call and what routing admits.
+# A secondary column runs these sets: pack B runs on the primary column of
+# a kind only. A blocked column runs these scenarios as soon as its kind is
+# driven, whatever sets the kind runs: what a blocked profile shows is its
+# seam, one plain call and what routing admits.
 SECONDARY_SETS: tuple[str, ...] = (STARTER, PACK_A)
 BLOCKED_SCENARIOS: tuple[str, ...] = ("S00", "S01", "S51")
 # What an admission cell reads from the profile catalog and asks routing for:
-# the subjects of its pin.
+# the subjects of its pin. Where the driver of a kind adds an admission input
+# to the routing file (``columns.ADMISSION_OVERLAY``), the cell asks for each
+# capability again on the file as shipped, and the pin states that too
+# (``admission_subjects``).
 AVAILABILITY = "availability"
 ADMISSION_SUBJECTS: tuple[str, ...] = (AVAILABILITY, *matrix_columns.ROLE_BY_CAPABILITY)
+AS_SHIPPED = "_as_shipped"
 STATIC_SCENARIOS: tuple[str, ...] = ("P01", "P02", "P04", "H01", "H02", "H03", "H04")
 
 # Where each cell is judged. One test module per driver family, because the
@@ -432,16 +439,16 @@ def parse_inventory(document: Any) -> Inventory:
         )
     admission = tuple(document["admission"] or ())
     for row in admission:
-        if (
-            not isinstance(row, dict)
-            or set(row) != {"cell", *ADMISSION_SUBJECTS, "reason"}
-            or not all(isinstance(value, str) and value.strip() for value in row.values())
+        if not isinstance(row, dict) or not isinstance(row.get("cell"), str):
+            raise MatrixSetupError(f"admission row {row!r} must state a cell")
+        subjects = admission_subjects(ledger.parse_cell_id(row["cell"])[0])
+        if set(row) != {"cell", *subjects, "reason"} or not all(
+            isinstance(value, str) and value.strip() for value in row.values()
         ):
             raise MatrixSetupError(
-                f"admission row {row!r} must state a cell, {list(ADMISSION_SUBJECTS)} "
+                f"admission row {row!r} must state a cell, {list(subjects)} "
                 "and the reason"
             )
-        ledger.parse_cell_id(row["cell"])
     if len({row["cell"] for row in admission}) != len(admission):
         raise MatrixSetupError("an admission cell is pinned twice")
     return Inventory(
@@ -602,6 +609,28 @@ def behaviour_cells() -> tuple[Cell, ...]:
     return generated
 
 
+def as_shipped(capability: str) -> str:
+    """The subject of ``capability`` asked for on the routing file as shipped."""
+
+    return f"{capability}{AS_SHIPPED}"
+
+
+def admission_subjects(kind: str) -> tuple[str, ...]:
+    """The subjects the pin of an admission cell of ``kind`` states.
+
+    The catalog's word and each capability; and each capability on the
+    routing file as shipped, where the driver of the kind adds an admission
+    input to that file for every other play.
+    """
+
+    if not matrix_columns.admission_inputs(kind):
+        return ADMISSION_SUBJECTS
+    return (
+        *ADMISSION_SUBJECTS,
+        *(as_shipped(capability) for capability in matrix_columns.ROLE_BY_CAPABILITY),
+    )
+
+
 def expected_admission(
     cell: Cell, pins: Sequence[Mapping[str, str]] | None = None
 ) -> dict[str, str]:
@@ -617,7 +646,7 @@ def expected_admission(
     rows = load_inventory().admission if pins is None else pins
     for row in rows:
         if row["cell"] == cell.id:
-            return {name: row[name] for name in ADMISSION_SUBJECTS}
+            return {name: row[name] for name in admission_subjects(cell.column.kind)}
     raise MatrixSetupError(f"admission cell {cell.id} has no pin in inventory.yaml")
 
 

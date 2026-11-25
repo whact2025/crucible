@@ -951,12 +951,13 @@ def test_a_trace_that_presents_a_served_model_fails_the_cell(tmp_path: Path) -> 
 
     # In force on every cell of the column that asserts a result: the wire of
     # the kind names no served model (static cell H03 holds the ledger to it).
+    # The canary asserts none, and neither does the admission cell, which
+    # calls nothing.
     assert COLUMN.kind in matrix_columns.UNNAMED_SERVED_MODEL_KINDS
     assert in_force == (D_CDX_SERVED,)
-    assert all(
-        LEDGER.differences_for(item.id) == (() if SCENARIOS[item.scenario].canary else in_force)
-        for item in CELLS
-    )
+    for item in CELLS:
+        asserts_none = SCENARIOS[item.scenario].canary or SCENARIOS[item.scenario].admission
+        assert LEDGER.differences_for(item.id) == (() if asserts_none else in_force), item.id
     # The wire names no served model, so the provider side names none ...
     assert honest.observation.provider.served_models == []
     assert honest.observation.result is not None

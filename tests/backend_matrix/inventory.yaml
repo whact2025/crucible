@@ -8,11 +8,13 @@
 #   the verifier (`python -m tests.backend_matrix.verify`) compares them with
 #   the JUnit files of a run. A real kind has no behaviour cell until its
 #   driver lands. The comments on the counts name scenario sets (the starter
-#   set, pack A); the head of ledger.yaml says what the sets are. Pack A is
-#   ten cells on a column: the turn limit in both lenses, and the suite's
-#   turn count, the dispatch-budget denial, the USD overrun, the byte
-#   budget, the three forms of refusal and the write as progress in the raw
-#   lens; less the forms of refusal that are pinned not expressible below.
+#   set, pack A, pack B); the head of ledger.yaml says what the sets are.
+#   Pack A is ten cells on a column: the turn limit in both lenses, and the
+#   suite's turn count, the dispatch-budget denial, the USD overrun, the
+#   byte budget, the three forms of refusal and the write as progress in the
+#   raw lens; less the forms of refusal that are pinned not expressible
+#   below. Pack B runs on the primary column of a kind: one cell there for
+#   each lens of each of its scenarios.
 # not_evaluated: (cell, clause) pairs a cell cannot evaluate for a reason of
 #   its driver. An unpinned pair fails the cell, and so does a pinned pair
 #   whose clause was evaluated. Which clauses apply to a cell is computed from
@@ -48,12 +50,32 @@
 # admission: for each admission cell (S51) of a real column, what the cell
 #   must see today: the word the profile catalogs of both products have for
 #   the column (availability), and for each capability a workflow can ask
-#   routing for (text, read_only, workspace_write) either `admitted` or the
-#   type of the exception routing refuses with before it builds the adapter.
-#   It pins today's gates, so it changes in the change that opens or closes
-#   one. Every admission cell of a real column has exactly one row and every
-#   row such a cell, or collection fails. A toy column stands behind no gate
-#   and has no row.
+#   routing for (text, read_only, workspace_write) one of three outcomes.
+#   `admitted`: routing built the adapter and logged no requirement of the
+#   role that the profile of the route lacks. `retained`: routing built the
+#   adapter and logged such a requirement, which it does on a route that
+#   asks for diagnostic admission; the cell reads the warning of the routing
+#   module for it. Or the type of the exception routing refuses with before
+#   it builds the adapter.
+#   Where the driver of a kind adds to the shipped routes something that
+#   routing reads when it admits them (`ADMISSION_OVERLAY` in columns.py:
+#   the fingerprint of the worker runtime, which a run binds to a DeepSeek
+#   route), the cell asks for each capability a second time on the file as
+#   shipped, and the row states the outcome of that too (text_as_shipped,
+#   read_only_as_shipped, workspace_write_as_shipped).
+#   A row pins today's gates, so it changes in the change that opens or
+#   closes one. Every admission cell of a real column has exactly one row
+#   and every row such a cell, or collection fails. A toy column stands
+#   behind no gate and has no row. The cell runs on the primary column of
+#   every real kind and on a blocked column.
+#   The cell asks routing as the driver of its column asks for every cell:
+#   no native shell, no trusted project instructions, an explicit working
+#   directory, on the shipped routes. What routing refuses to a caller that
+#   asks otherwise, or to a writer route without its opt-in where the
+#   shipped route carries it, no cell of the matrix plays. The tests of the
+#   routing module hold those refusals: tests/test_backends_config.py for
+#   the Kimi routes, tests/test_backends_deepseek.py for the DeepSeek
+#   routes.
 
 schema_version: crucible.backend-matrix.inventory.v1
 
@@ -61,22 +83,25 @@ cell_counts:
   # The starter set and pack A (17 cells) and S51 on each toy column.
   toy: 72
   # Starter set (S00, and S01, S03, S04 in both lenses: 7 cells) and pack A
-  # without the refusal part (9 cells), on each of the two columns.
-  claude: 32
-  # Starter set (7 cells) and pack A with one form of refusal, the policy
-  # error (8 cells), on the one column.
-  "codex:legacy": 15
-  # Starter set (7 cells) and pack A with one form of refusal, the policy
-  # error (8 cells), on the one column.
-  "codex:official": 15
-  # Starter set (7 cells) and pack A (10 cells) on the one column.
-  deepseek: 17
-  # Starter set and pack A on the two diagnostic columns (17 each); S00,
-  # S01 in both lenses and S51 on the blocked column.
-  kimi: 38
-  # Starter set (7 cells) and pack A (10 cells) on each column.
-  "openai_compat:hosted": 34
-  "openai_compat:local": 17
+  # without the refusal part (9 cells), on each of the two columns; S51 on
+  # the primary column.
+  claude: 33
+  # Starter set (7 cells), pack A with one form of refusal, the policy
+  # error (8 cells), and S51, on the one column.
+  "codex:legacy": 16
+  # Starter set (7 cells), pack A with one form of refusal, the policy
+  # error (8 cells), and S51, on the one column.
+  "codex:official": 16
+  # Starter set (7 cells), pack A (10 cells) and S51 on the one column.
+  deepseek: 18
+  # Starter set and pack A on the two diagnostic columns (17 each) and S51
+  # on the primary one; S00, S01 in both lenses and S51 on the blocked
+  # column.
+  kimi: 39
+  # Starter set (7 cells) and pack A (10 cells) on each column; S51 on the
+  # primary column of each kind.
+  "openai_compat:hosted": 35
+  "openai_compat:local": 18
 
 not_evaluated:
   - scenario: S00
@@ -210,6 +235,62 @@ column_wide_not_owed:
 worker_skip_files: {}
 
 admission:
+  - cell: claude/S51/primary/raw
+    availability: runtime_required
+    text: admitted
+    read_only: admitted
+    workspace_write: admitted
+    reason: >-
+      Every route of the file enforces feature admission, and the profile
+      routing computes for the route meets what each of the three roles
+      asks: routing builds the adapter for every capability. The catalogs
+      call the profile runtime_required; routing itself does not act on
+      that word.
+  - cell: codex:legacy/S51/primary/raw
+    availability: runtime_required
+    text: admitted
+    read_only: admitted
+    workspace_write: admitted
+    reason: >-
+      Every route of the file enforces feature admission, and the profile
+      routing computes for the route meets what each of the three roles
+      asks: routing builds the adapter for every capability. The catalogs
+      call the profile runtime_required; routing itself does not act on
+      that word.
+  - cell: codex:official/S51/primary/raw
+    availability: diagnostic
+    text: admitted
+    read_only: admitted
+    workspace_write: admitted
+    reason: >-
+      Every route of the file asks for diagnostic admission, and the profile
+      routing computes for the route meets what each of the three roles
+      asks: routing builds the adapter for every capability and logs no
+      requirement that the profile lacks, so none of the three is retained.
+      The catalogs call the profile diagnostic; routing itself does not act
+      on that word.
+  - cell: deepseek/S51/primary/raw
+    availability: diagnostic
+    text: admitted
+    read_only: admitted
+    workspace_write: admitted
+    text_as_shipped: FeatureAdmissionError
+    read_only_as_shipped: FeatureAdmissionError
+    workspace_write_as_shipped: FeatureAdmissionError
+    reason: >-
+      The shipped file asks for diagnostic admission on every route, carries
+      the diagnostic writer opt-in on the writer role and names no
+      fingerprint of the worker runtime: it leaves that to the run. As
+      shipped, routing refuses every capability for the missing fingerprint
+      before it builds anything. With the fingerprint that the cell
+      captures from the installed worker bound to the routes, as every
+      other cell of the column binds it, routing builds the adapter for
+      every capability and logs no requirement that the profile lacks. So
+      no route of this kind is built before a run has bound the worker: a
+      qualification gate and no code defect (it was known as G19 before the
+      matrix was built; a gate has no record in the registry of the
+      ledger). The catalogs call the profile diagnostic; routing itself
+      does not act on that word.
   - cell: kimi/S51/blocked/raw
     availability: blocked
     text: admitted
@@ -222,3 +303,48 @@ admission:
       matrix was built; a gate has no record in the registry of the ledger).
       The text and the read-only role are built. The catalogs call the
       profile blocked; routing itself does not act on that word.
+  - cell: kimi/S51/primary/raw
+    availability: diagnostic
+    text: admitted
+    read_only: admitted
+    workspace_write: admitted
+    reason: >-
+      The route asks for diagnostic admission and carries the diagnostic
+      writer opt-in, so routing builds the writer role too, on the confined
+      boundary the cell asks for (no native shell, no project instructions,
+      an explicit working directory), and logs no requirement that the
+      profile lacks: the other side of the gate that the blocked column of
+      the kind pins. The catalogs call the profile diagnostic; routing
+      itself does not act on that word.
+  - cell: openai_compat:hosted/S51/primary/raw
+    availability: diagnostic
+    text: retained
+    read_only: retained
+    workspace_write: admitted
+    reason: >-
+      Every route of the file asks for diagnostic admission, under which
+      routing refuses no role for what the profile of the route lacks: it
+      builds the adapter and logs the requirement. The profile declares no
+      structured output, which the roles of the text and of the read-only
+      capability ask for, so routing retains those two; the writer role
+      asks for nothing that the profile lacks. No route of this kind
+      enforces admission: a qualification gate and no code defect (it was
+      known as G40 before the matrix was built; a gate has no record in the
+      registry of the ledger). The catalogs call the profile diagnostic;
+      routing itself does not act on that word.
+  - cell: openai_compat:local/S51/primary/raw
+    availability: diagnostic
+    text: retained
+    read_only: retained
+    workspace_write: admitted
+    reason: >-
+      Every route of the file asks for diagnostic admission, under which
+      routing refuses no role for what the profile of the route lacks: it
+      builds the adapter and logs the requirement. The profile declares no
+      structured output, which the roles of the text and of the read-only
+      capability ask for, so routing retains those two; the writer role
+      asks for nothing that the profile lacks. No route of this kind
+      enforces admission: a qualification gate and no code defect (it was
+      known as G40 before the matrix was built; a gate has no record in the
+      registry of the ledger). The catalogs call the profile diagnostic;
+      routing itself does not act on that word.
