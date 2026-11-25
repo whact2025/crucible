@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal frame of a session that used up its turn allowance. Nothing
+# was observed of the real tool here (see cli.init): when the tool sends this
+# frame and what its counters hold is emulated, so every cell that uses this
+# envelope rests on an emulation of the reference.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: result_max_turns
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.ResultMessage with is_error true and the subtype
+    "error_max_turns", as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "result")
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    The subtype is the one the pinned SDK names for this terminal: its
+    reader says that the tool emits a result with is_error true, "e.g.
+    error_max_turns", and then exits with a status other than zero on
+    purpose (claude_agent_sdk._internal.query, where a trailing process
+    error is replaced by the error result). The frame has no result text and
+    no errors list, both optional in the SDK's type. Its stop reason is that
+    of the last model turn, a tool call, and its turn count is one more than
+    the allowance: both are the shape that the tests of the product state
+    for this terminal (tests/test_backends_claude.py, the turn-limit
+    terminal), with no vendor source in reach. That the tool runs the tool
+    call of its last allowed turn before it stops is a choice of the
+    scripted peer.
+    The session accounting (usage, turn count, cost and the usage record per
+    model) is emulated as in the terminal frame of a text answer, and its
+    two parts that have no source but the adapter are the same
+    (cli.result).
+
+status: 200
+
+body:
+  type: result
+  subtype: error_max_turns
+  is_error: true
+  duration_ms: 1
+  duration_api_ms: 1
+  num_turns: {slot: turns}
+  stop_reason: tool_use
+  session_id: {slot: session_id}
+  total_cost_usd: {slot: cost_usd}
+  usage:
+    input_tokens: {slot: input_tokens}
+    output_tokens: {slot: output_tokens}
+    cache_creation_input_tokens: 0
+    cache_read_input_tokens: 0
+  modelUsage:
+    "${slot:served_model}":
+      inputTokens: {slot: input_tokens}
+      outputTokens: {slot: output_tokens}
+      cacheReadInputTokens: 0
+      cacheCreationInputTokens: 0
+      webSearchRequests: 0
+      costUSD: {slot: cost_usd}
+      contextWindow: 200000
+      maxOutputTokens: 64000
+      canonicalModel: {slot: served_model}
+      provider: firstParty
+  uuid: {slot: frame_id}

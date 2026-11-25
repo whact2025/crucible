@@ -19,6 +19,12 @@ none. The peer is a program of its own: its journal keeps no value of the
 environment it was started in, and the network guard of the package runs
 inside it.
 
+One test is held by name for the verifier, because no code of its cell shows
+what it holds: the result of a dispatch-budget denial reports every response
+the provider billed. That result flags its accounting incomplete, which the
+ledger carries as a known gap, and while it does no clause compares what it
+reports. The lying counterparts of that test are beside it.
+
 Two lying counterparts are shared with the module of the official-SDK column,
 which plays them on its own driver: :class:`LastAsTheTurnSoFar` and
 :func:`presenting_a_served_model`.
@@ -46,10 +52,11 @@ from typing import Any, Iterator, Mapping
 
 import pytest
 
+from assay import Usage
 from crucible.backends import codex as adapter
 from crucible.backends.config import load_routing
 
-from . import cells, declarations, ledger, runner, toolsets
+from . import cells, contract, declarations, ledger, runner, toolsets
 from . import columns as matrix_columns
 from .cells import Cell
 from .columns import CANARY_CREDENTIAL, CODEX_LEGACY_KIND, COLUMN_PRODUCT, Column
@@ -64,6 +71,8 @@ from .script import READ_A, READ_B, Call, ProviderScript, Refuse, Say, ServedAs,
 
 LEDGER = ledger.load()
 KINDS = (CODEX_LEGACY_KIND,)
+# The envelope of the one refusal the notifications of the app-server carry.
+_REFUSED_TURN = "codex_app_server/app_server.turn_failed_policy"
 CELLS = cells.cells_of(KINDS)
 (COLUMN,) = (column for column in matrix_columns.real_columns() if column.kind in KINDS)
 # The product's loopback tool server logs under its module name.
@@ -434,10 +443,11 @@ def test_tool_calls_travel_to_the_tool_server_of_the_route(tmp_path: Path) -> No
     assert len({request.evidence["pid"] for request in requests}) == 1
     assert len({request.evidence["turn_id"] for request in requests}) == 1
     assert execution.observation.result is not None
-    # Every notification of the cell was rendered from an envelope.
+    # Every notification of the cell was rendered from an envelope: all of
+    # them but the terminal of a turn the provider refused.
     assert set(execution.observation.provider.envelopes) == set(
         codex_driver.CodexLegacyDriver().envelopes
-    )
+    ) - {_REFUSED_TURN}
     assert execution.grade == "constructed"
 
 
@@ -661,6 +671,245 @@ def test_the_green_of_the_accounting_does_not_rest_on_what_last_holds(
     )
 
 
+# -- the usage of a denied turn: what the entry of its cell does not show ---------
+
+DENIAL = cells.DISPATCH_DENIAL_ON_THE_APP_SERVER_CODEX_ROUTE
+# The record of the ledger whose cell the proof below plays.
+DENIAL_GAP = "R08"
+
+
+def _judged(execution: runner.Execution, **changed: Any) -> frozenset[str]:
+    """The codes of a play as the contract judges it with fields of its result changed."""
+
+    result = execution.observation.result
+    assert result is not None
+    observation = dataclasses.replace(
+        execution.observation, result=dataclasses.replace(result, **changed)
+    )
+    scenario = SCENARIOS[execution.cell.scenario]
+    return contract.evaluate(
+        observation,
+        execution.plan.expect,
+        execution.reference,
+        lens=execution.cell.lens,
+        toolset=scenario.toolset is not None,
+        canary=scenario.canary,
+        checks=execution.plan.checks,
+    ).codes
+
+
+def _usage_codes_once_flagged_complete(execution: runner.Execution) -> set[str]:
+    """What clause C6 says of the usage a result reports, once the result claims it complete.
+
+    Clause C6 holds a result that flags its token usage and its cost complete
+    to the tokens of every response the provider billed and to their price on
+    the rate card; of one that flags them incomplete it takes any number below
+    the bill for honest. This judges the same observation again with the two
+    flags of its result set, by the contract itself, and keeps the codes that
+    are about the size of the usage.
+    """
+
+    result = execution.observation.result
+    assert result is not None
+    claimed = dataclasses.replace(
+        result.completeness, token_usage_complete=True, cost_complete=True
+    )
+    return {
+        code
+        for code in _judged(execution, completeness=claimed)
+        if code.startswith("usage.")
+    }
+
+
+def _short_of_the_bill(execution: runner.Execution) -> list[str]:
+    """Why a play is not a result that reports every response the provider billed."""
+
+    result = execution.observation.result
+    assert result is not None
+    problems: list[str] = []
+    billed = execution.observation.provider.billed
+    if len(billed) < 2 or not all(item.input_tokens and item.output_tokens for item in billed):
+        problems.append("the provider billed fewer than two responses, or one for nothing")
+    short = _usage_codes_once_flagged_complete(execution)
+    if short:
+        problems.append(
+            f"flagged complete, the usage the result reports would show {sorted(short)}"
+        )
+    trace = result.execution_trace
+    if trace is None or not any(event.kind == "usage" for event in trace.events):
+        problems.append("the trace of the result holds no usage event, or there is no trace")
+    return problems
+
+
+def test_the_result_of_a_dispatch_budget_denial_reports_every_response_the_provider_billed(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because no code of the cell shows it.
+
+    When a workflow's tool-dispatch budget denies a call, the adapter cancels
+    the attempt and builds the result of the denial from what that attempt
+    had captured: every response the provider billed. It flags its token
+    usage and its cost incomplete, which is all its cell shows (known gap
+    R08), and clause C6 takes any number below the bill for honest on a
+    result that is flagged so, down to none. So while the entry of the cell
+    stands no clause compares what the result reports, and a result that had
+    lost its usage would be the same expected failure. This test compares
+    it: judged as a result that flags its accounting complete, the result of
+    the denial shows no code about the size of its usage, and its trace
+    holds a usage event. A fix that lets the route flag the accounting of a
+    settled turn complete lets the cell compare these numbers itself; this
+    test and its lying counterparts then go with the entry.
+    """
+
+    # The verifier requires this test by name: the entry of the record leans
+    # on it, and a run without it is refused. No entry attributes a code to
+    # that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_LEGACY_KIND]]
+    kind, scenario, role, lens = ledger.parse_cell_id(DENIAL)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+    attributed = {entry.cell for entry in LEDGER.entries if DENIAL_GAP in entry.codes.values()}
+    assert attributed <= {DENIAL}
+
+    execution = _played(scenario, tmp_path, lens)
+    result = execution.observation.result
+
+    # The play is the denial the scenario scripts: the kind and the stop
+    # reason are the ones it asks for, one call reached the ToolSet, and the
+    # provider was asked for nothing after the denied call.
+    assert execution.report.seam_problems == () and result is not None
+    for clause in ("C0", "C2", "C3", "C10"):
+        assert execution.report.outcomes[clause].status == "ok", clause
+    assert result.error is not None and execution.observation.provider.extra == 0
+    assert _short_of_the_bill(execution) == []
+
+
+def _without_its_usage(result: Any) -> Any:
+    """``result`` as an adapter that had lost the usage of the turn would return it.
+
+    No token, no cost, no usage event in the trace and no priced segment:
+    what the result of the same denial is on the official-SDK route today.
+    """
+
+    trace, evidence = result.execution_trace, result.pricing_evidence
+    kept = [event for event in trace.events if event.kind != "usage"]
+    return dataclasses.replace(
+        result,
+        usage=Usage(),
+        execution_trace=dataclasses.replace(
+            trace,
+            events=tuple(
+                dataclasses.replace(event, sequence=index) for index, event in enumerate(kept)
+            ),
+        ),
+        pricing_evidence=None if evidence is None else dataclasses.replace(evidence, segments=()),
+    )
+
+
+class _LosesTheUsageOfTheTurn(codex_driver.CodexLegacyDriver):
+    """Its backend returns every result without the usage the adapter had built into it."""
+
+    @contextlib.contextmanager
+    def open(self, column: Column, **named: Any) -> Iterator[Any]:
+        with super().open(column, **named) as bound:
+            invoke = bound.backend.invoke
+
+            def invoke_and_lose(invocation: Any) -> Any:
+                return _without_its_usage(invoke(invocation))
+
+            bound.backend.invoke = invoke_and_lose
+            yield bound
+
+
+def _handed_to_the_comparator(execution: runner.Execution) -> tuple[Any, ...]:
+    """Everything of a play that the comparator of the ledger decides its verdict by."""
+
+    report = execution.report
+    return report.codes, report.evaluated(), report.unasked, dict(execution.current)
+
+
+def test_the_proof_of_the_billed_denial_fails_on_a_result_that_lost_its_usage(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the proof above. One is a play: a backend
+    # that returns the result of the same denial without the usage its
+    # attempt had captured. The cell does not see it. The result flags its
+    # accounting incomplete either way, so the comparator is handed the same
+    # for both plays and says of the lying one what it says of the honest
+    # one; on a cell whose result flags its accounting complete the same
+    # backend is named by clause C6. The others are the honest result with
+    # one thing made up: one response short, one token short, the cost gone,
+    # the usage event gone; and a provider that billed one response, or
+    # nothing.
+    _kind, scenario, _role, lens = ledger.parse_cell_id(DENIAL)
+    cell = Cell(COLUMN, scenario, lens)
+    in_force = LEDGER.differences_for(cell.id)
+    honest = _played(scenario, tmp_path / "honest", lens)
+    lost = runner.execute(
+        cell, tmp_path / "lost", driver=_LosesTheUsageOfTheTurn(), differences=in_force
+    )
+    plain = Cell(COLUMN, "S01", "raw")
+    seen = runner.execute(
+        plain,
+        tmp_path / "seen",
+        driver=_LosesTheUsageOfTheTurn(),
+        differences=LEDGER.differences_for(plain.id),
+    )
+    result = honest.observation.result
+    billed = honest.observation.provider.billed
+    assert result is not None and result.execution_trace is not None and len(billed) == 2
+
+    def with_result(**changed: Any) -> runner.Execution:
+        observation = dataclasses.replace(
+            honest.observation, result=dataclasses.replace(result, **changed)
+        )
+        return dataclasses.replace(honest, observation=observation)
+
+    def billing(*responses: Any) -> runner.Execution:
+        provider = dataclasses.replace(honest.observation.provider, billed=list(responses))
+        return dataclasses.replace(
+            honest, observation=dataclasses.replace(honest.observation, provider=provider)
+        )
+
+    assert _short_of_the_bill(honest) == []
+    # The play: the same denial, and a result that reports nothing of it.
+    dropped = lost.observation.result
+    assert lost.report.seam_problems == () and dropped is not None
+    assert lost.observation.provider.billed == billed and dropped.usage == Usage()
+    assert dropped.completeness == result.completeness
+    assert _handed_to_the_comparator(lost) == _handed_to_the_comparator(honest)
+    assert _short_of_the_bill(lost) != []
+    # Where a result flags its accounting complete the cell names the loss.
+    assert seen.observation.result is not None
+    assert seen.observation.result.completeness.token_usage_complete
+    assert {"usage.input_tokens:lt", "usage.output_tokens:lt"} <= seen.report.codes
+    # One response of the two, in either order; one token; the cost.
+    usage = result.usage
+    for response in billed:
+        one = dataclasses.replace(
+            usage, input_tokens=response.input_tokens, output_tokens=response.output_tokens
+        )
+        assert _short_of_the_bill(with_result(usage=one)) != []
+    for name in ("input_tokens", "output_tokens"):
+        fewer = dataclasses.replace(usage, **{name: getattr(usage, name) - 1})
+        assert _short_of_the_bill(with_result(usage=fewer)) != []
+    assert usage.cost_usd > 0
+    assert _short_of_the_bill(with_result(usage=dataclasses.replace(usage, cost_usd=0.0))) != []
+    # The numbers as billed, and no usage event in the trace.
+    silent = dataclasses.replace(
+        result.execution_trace, events=_without_its_usage(result).execution_trace.events
+    )
+    assert _short_of_the_bill(with_result(execution_trace=silent)) != []
+    # A provider that billed one response, or nothing: "every response" would
+    # then say nothing of a turn of several.
+    assert _short_of_the_bill(billing(billed[0])) != []
+    assert _short_of_the_bill(billing()) != []
+    # More than the bill is no lower bound: the cell itself names that,
+    # whatever the result flags.
+    more = dataclasses.replace(usage, input_tokens=usage.input_tokens + 1)
+    assert _judged(honest) == honest.report.codes
+    assert _judged(honest, usage=more) == honest.report.codes | {"usage.input_tokens:gt"}
+
+
 def presenting_a_served_model(driver: type[Any]) -> Any:
     """A driver like ``driver`` whose backend presents the requested model as the served one.
 
@@ -822,12 +1071,66 @@ def test_the_dialect_reads_the_session_and_answers_only_what_it_has_an_envelope_
     answered["tool_results"][0]["is_error"] = True
     failed = dialect.render(Say("done"), _parsed(dialect, answered), "call-2")
     assert failed.body["frames"] == [] and "has no envelope" in failed.body["unsupported"]
-    for step in (ServedAs(Say("x"), "-other"), Refuse("content_filter")):
-        with pytest.raises(MatrixSetupError, match="does not render"):
-            dialect.render(step, seen, "call-1")  # type: ignore[arg-type]
+    with pytest.raises(MatrixSetupError, match="does not render"):
+        dialect.render(ServedAs(Say("x"), "-other"), seen, "call-1")
+    # The notifications carry one form of refusal: a failed turn whose error
+    # names a policy of the provider. It is billed nothing and names no
+    # model. The two other forms have no place on this wire and are pinned
+    # not expressible in the inventory.
+    refused = dialect.render(Refuse("http_policy"), seen, "call-1")
+    (terminal,) = refused.body["frames"]
+    assert terminal["method"] == "turn/completed"
+    assert terminal["params"]["turn"]["status"] == "failed"
+    assert terminal["params"]["turn"]["error"]["codexErrorInfo"] == "cyberPolicy"
+    assert terminal["params"]["turn"]["error"]["message"]
+    assert (refused.usage, refused.served_model, refused.call) == (None, None, None)
+    assert refused.envelopes == (_REFUSED_TURN,) and refused.body["call"] is None
+    for form in ("content_filter", "refusal_part"):
+        with pytest.raises(MatrixSetupError, match="cannot render a refusal of the form"):
+            dialect.render(Refuse(form), seen, "call-1")  # type: ignore[arg-type]
+    assert list(codex_driver.CodexLegacyDriver().inexpressible) == [
+        "S23a/Refuse(content_filter)",
+        "S23b/Refuse(refusal_part)",
+    ]
     with pytest.raises(NotImplementedError):
         codex_driver.CodexAppServerDialect().launch_problems({}, [], seen)
     assert dialect.envelope_names() == codex_driver.CodexLegacyDriver().envelopes
+
+
+class _AnswersWhereItShouldRefuse(codex_driver.LegacyDialect):
+    """Renders a refusal as a plain answer: the provider never refuses."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, Refuse):
+            step = Say("an answer where the script refuses")
+        return super().render(step, seen, call_id)
+
+
+def test_a_refused_turn_is_typed_as_rejected_content_and_a_turn_that_is_not_refused_fails(
+    tmp_path: Path,
+) -> None:
+    cell = Cell(COLUMN, "S23c", "raw")
+    honest = runner.run_cell(cell, tmp_path / "honest", preflight={KINDS[0]: None}, known=LEDGER)
+
+    # The cell passes with no entry: the turn failed with the policy of the
+    # provider as its error, in one request for a model response, and the
+    # adapter types that as rejected content that is not to be retried.
+    result = honest.observation.result
+    assert honest.report.codes == frozenset() and LEDGER.entry(cell.id) is None
+    assert honest.observation.provider.envelopes == [_REFUSED_TURN]
+    assert honest.observation.provider.request_count == 1
+    assert result is not None and result.error is not None
+    assert (result.error.kind, result.error.retriable) == ("content_rejected", False)
+    # The lying counterpart: a provider side that answers instead of refusing
+    # is a success where the scenario expects a refusal, and the cell fails.
+    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation.*content_rejected"):
+        runner.run_cell(
+            cell,
+            tmp_path / "lying",
+            preflight={KINDS[0]: None},
+            known=LEDGER,
+            driver=_with_dialect(_AnswersWhereItShouldRefuse),
+        )
 
 
 class _Unplayable(codex_driver.LegacyDialect):

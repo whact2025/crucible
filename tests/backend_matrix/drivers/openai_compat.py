@@ -43,13 +43,19 @@ from .. import columns as matrix_columns
 from .. import envelopes as envelope_files
 from .. import netguard, tap
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
-from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall
-from ..script import Call, ProviderScript, Say, ServedAs, Step
+from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall, answered_from
+from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
 _SDK = "openai"
 _CREATED = 1_700_000_000
+# The behaviour class of each form of refusal: one envelope per form.
+REFUSALS = {
+    "content_filter": "refusal_content_filter",
+    "refusal_part": "refusal_part",
+    "http_policy": "refusal_http_policy",
+}
 
 
 def _text(content: Any) -> str:
@@ -106,7 +112,7 @@ class OpenAIChatDialect:
     def envelope_names(self) -> tuple[str, ...]:
         return tuple(
             f"{self.name}/{self._provider}.{behaviour}"
-            for behaviour in ("completion", "tool_call")
+            for behaviour in ("completion", "tool_call", *REFUSALS.values())
         )
 
     def parse(
@@ -233,12 +239,18 @@ class OpenAIChatDialect:
                 # The wire carries the arguments as a JSON document in a string.
                 "tool_arguments": json.dumps(arguments, sort_keys=True),
             }
+        elif isinstance(step, Refuse):
+            behaviour, call, slots = REFUSALS[step.form], None, {}
         else:
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
                 "the scenario that needs it adds the envelope with its liar"
             )
         envelope = envelope_files.load(f"{self.name}/{self._provider}.{behaviour}")
+        if envelope.status != 200:
+            # A request the service rejects is answered with its error object
+            # alone: nothing is billed and no model is named.
+            return Reply(envelope.status, envelope.fill(slots), envelope=envelope.name)
         usage = step.usage
         slots.update(
             response_id=f"chatcmpl-{call_id}",
@@ -390,6 +402,9 @@ class _GatewayDriver:
     @property
     def envelopes(self) -> tuple[str, ...]:
         return self._dialect().envelope_names()
+
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        return answered_from(self._dialect(), script)
 
     def preflight(self) -> None:
         for module in (_SDK, "httpx"):

@@ -13,7 +13,12 @@ A cell computes its deviation codes; ``ledger.yaml`` says what is expected.
 - The *gap registry* is permanent. It lists every cell of a gap with the
   declared values it was observed under and must close under, so a fix that
   deletes its entry leaves the passing cell pinned, and a declaration cannot
-  be weakened to close a gap unless the record names that change.
+  be weakened to close a gap unless the record names that change. A record
+  whose gap is what a provider sends, or on a reference column what the
+  vendor's tool relays of such a reply or sends when a session is stopped,
+  names the grade of scripted reply on which its cells may close: a cell of
+  such a record cannot lose the codes of the gap while it is answered from
+  a weaker reply.
 - A *declared difference* is a named alternative contract with a product
   citation, an owner and a date. Either a variant of a difference table
   asserts it (a declared value selects it), or a scenario defines it and the
@@ -22,9 +27,15 @@ A cell computes its deviation codes; ``ledger.yaml`` says what is expected.
   extra of their routing file selects: the clause asserts the alternative
   itself there, and the entry lists exactly the cells of those routes. No
   other one touches a clause.
+- The *ceilings* limit the known gaps of each pack. One that still rises may
+  leave room. One the ledger states frozen is the count of its pack, so the
+  change that takes an entry away lowers it, and a new entry cannot be
+  written into room a fix left.
 - ``integrity_problems`` is static cell H03: registry, entries, declared
   differences, inventory and oracle rules, over a :class:`World` that tests
-  may build synthetically.
+  may build synthetically. The world also says which proofs an entry leans
+  on (tests that hold what its codes do not say) and which the verifier
+  requires by name: an entry may not outlive a proof it leans on.
 - Only real-kind behaviour cells and the static cells H01 and H02 may be known
   gaps. The other static cells are the matrix's own integrity checks:
   ``judge_static`` never consults the ledger for them, and H03 rejects an
@@ -43,6 +54,7 @@ import yaml  # type: ignore[import-untyped]
 
 from .contract import CLAUSES, Deviation, clause_of
 from .drivers.base import MatrixSetupError
+from .envelopes import GRADES
 
 LEDGER_PATH = Path(__file__).with_name("ledger.yaml")
 LEDGER_SCHEMA = "crucible.backend-matrix.ledger.v1"
@@ -56,6 +68,19 @@ CODE_FIXABLE_HIGH_GAPS: tuple[str, ...] = (
     "G02", "G03", "G04", "G14", "G15", "G16",
     "G17", "G18", "G20", "G28", "G29", "G30",
 )  # fmt: skip
+# The gaps whose substance is what a provider sends: refusal shapes, the
+# output-token cut, an empty completion, the bodies of a rate limit and of a
+# server error, an alias reply. A fix of such a gap proves nothing on a reply
+# that was only constructed from the types of an SDK, so static cell H03
+# requires that a registry record of one names the grade its cells close on.
+# A record of origin ``reference`` that names a grade is not on this list:
+# the self-test of the graded records holds its field and counts its cells.
+PROVIDER_FACT_GAPS: tuple[str, ...] = (
+    "G09", "G10", "G13", "G18", "G21", "G25", "G27", "G34", "G35",
+)  # fmt: skip
+# The grades a record may name: every grade but the weakest, which any reply
+# has.
+CLOSING_GRADES: tuple[str, ...] = GRADES[:-1]
 ORIGINS = frozenset({"gap list", "reference", "matrix"})
 SEVERITIES = frozenset({"high", "medium", "low"})
 # Sets whose absence on a kind the H02 cell reports; pack B has no such code.
@@ -102,6 +127,16 @@ class GapRecord:
     column_wide: tuple[tuple[str, str], ...] = ()
     declaration_change: DeclarationChange | None = None
     ruling: str | None = None
+    # The weakest grade of scripted reply on which a cell of the record may
+    # stop carrying a code of the gap; ``None`` where the gap is no fact about
+    # what a provider sends or, on a reference column, about what the
+    # vendor's tool relays of such a reply or sends when a session is stopped.
+    closes_on_grade: str | None = None
+    # The question that is owed a ruling before the gap may close: what its
+    # closing state asks where no clause states it yet. While it stands no
+    # cell of the record may stop carrying a code of the gap; ``None`` where
+    # the cells of the record can show the closing state as it is stated.
+    awaits_ruling: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +179,9 @@ class Ledger:
     entries: tuple[Entry, ...] = ()
     column_wide: tuple[ColumnWide, ...] = ()
     differences: tuple[DeclaredDifference, ...] = ()
+    # The packs whose ceiling the ledger states frozen: such a ceiling is the
+    # count of its pack, where a ceiling that still rises may leave room.
+    frozen: frozenset[str] = frozenset()
 
     def entry(self, cell: str) -> Entry | None:
         for item in self.entries:
@@ -199,8 +237,19 @@ def parse(document: Any) -> Ledger:
     if root["schema_version"] != LEDGER_SCHEMA:
         raise MatrixSetupError(f"ledger: schema_version must be {LEDGER_SCHEMA!r}")
     ceilings = _fields(
-        root["ceilings"], "ceilings", {"max_known_gaps", "max_declared_differences"}
+        root["ceilings"], "ceilings", {"max_known_gaps", "max_declared_differences"}, {"frozen"}
     )
+    packs = {str(name) for name in (ceilings["max_known_gaps"] or {})}
+    frozen = ceilings.get("frozen") or []
+    if (
+        not isinstance(frozen, list)
+        or not all(isinstance(name, str) and name in packs for name in frozen)
+        or len(set(frozen)) != len(frozen)
+    ):
+        raise MatrixSetupError(
+            "ledger: ceilings.frozen must list, once each, packs that "
+            f"max_known_gaps names ({sorted(packs)})"
+        )
     registry: dict[str, GapRecord] = {}
     for gap, raw in (root["registry"] or {}).items():
         where = f"registry.{gap}"
@@ -208,10 +257,25 @@ def parse(document: Any) -> Ledger:
             raw,
             where,
             {"title", "origin", "severity"},
-            {"cells", "column_wide", "declaration_change", "ruling"},
+            {
+                "cells",
+                "column_wide",
+                "declaration_change",
+                "ruling",
+                "closes_on_grade",
+                "awaits_ruling",
+            },
         )
         if record["origin"] not in ORIGINS or record["severity"] not in SEVERITIES:
             raise MatrixSetupError(f"ledger: {where} has an unknown origin or severity")
+        if "closes_on_grade" in record and record["closes_on_grade"] not in CLOSING_GRADES:
+            raise MatrixSetupError(
+                f"ledger: {where}.closes_on_grade must be one of {list(CLOSING_GRADES)}"
+            )
+        awaits = None
+        if "awaits_ruling" in record:
+            # One line, so that static cell H03 can quote the question.
+            awaits = " ".join(_text(record["awaits_ruling"], f"{where}.awaits_ruling").split())
         cells = []
         for raw_cell in record.get("cells") or ():
             item = _fields(
@@ -257,6 +321,8 @@ def parse(document: Any) -> Ledger:
             ),
             declaration_change=change,
             ruling=record.get("ruling"),
+            closes_on_grade=record.get("closes_on_grade"),
+            awaits_ruling=awaits,
         )
     entries: list[Entry] = []
     column_wide: list[ColumnWide] = []
@@ -310,6 +376,7 @@ def parse(document: Any) -> Ledger:
         entries=tuple(entries),
         column_wide=tuple(column_wide),
         differences=tuple(differences),
+        frozen=frozenset(frozen),
     )
 
 
@@ -436,6 +503,14 @@ def judge_static(ledger: Ledger, cell: str, problems: Sequence[Deviation]) -> No
 # -- integrity (static cell H03) -------------------------------------------
 
 
+def _ungraded(_cell: str) -> str | None:
+    return None
+
+
+def _leans_on_nothing(_gap: str, _cell: str | None) -> Sequence[tuple[str, str]]:
+    return ()
+
+
 @dataclass(frozen=True)
 class World:
     """What the ledger is checked against. ``cells.world()`` builds the real one."""
@@ -477,12 +552,41 @@ class World:
     # routes that the clause holds to the alternative). Such a difference is
     # in force on exactly those cells.
     route_differences: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # The grade of the weakest scripted reply the dialect of a cell's kind
+    # answers the cell from, read without playing it; ``None`` where a cell is
+    # answered from no envelope.
+    grade: Callable[[str], str | None] = _ungraded
+    # The proofs an entry leans on that attributes a code to a registry
+    # record: the pytest items (module, name) that hold what the codes of the
+    # entry do not say, by gap id and by the cell of the entry (``None`` for a
+    # column-wide entry). And the items the verifier requires by name beside
+    # the cells: an entry must not outlive a proof it leans on.
+    proofs_leaned_on: Callable[[str, str | None], Sequence[tuple[str, str]]] = (
+        _leans_on_nothing
+    )
+    required_proofs: frozenset[tuple[str, str]] = frozenset()
 
 
 def _pack(world: World, scenario: str) -> str:
     if scenario in world.static_scenarios:
         return "pack_a"
     return "pack_a" if world.scenario_sets.get(scenario) in H02_SETS else "pack_b"
+
+
+def pack_counts(ledger: Ledger, world: World) -> dict[str, int]:
+    """The known gaps of each pack: what a ceiling of the ledger limits.
+
+    An entry counts under the pack of its scenario, an entry on a static cell
+    and every column-wide entry under pack A.
+    """
+
+    counts: dict[str, int] = {}
+    for entry in ledger.entries:
+        pack = _pack(world, parse_cell_id(entry.cell)[1])
+        counts[pack] = counts.get(pack, 0) + 1
+    if ledger.column_wide:
+        counts["pack_a"] = counts.get("pack_a", 0) + len(ledger.column_wide)
+    return counts
 
 
 def _withdrawn(world: World, cell: str, pinned: AbstractSet[tuple[Any, Any]]) -> bool:
@@ -516,7 +620,22 @@ def _registry_problems(ledger: Ledger, world: World) -> list[Deviation]:
     pinned = {
         (row.get("kind"), row.get("scenario")) for row in world.not_expressible
     }
+    for gap in PROVIDER_FACT_GAPS:
+        listed = ledger.registry.get(gap)
+        if listed is not None and listed.closes_on_grade is None:
+            out.append(
+                Deviation(
+                    "static:registry_grade_missing",
+                    f"{gap} is a gap about what a provider sends and its record "
+                    "names no closes_on_grade: its cells could close on a reply "
+                    "that was only constructed",
+                )
+            )
     for record in ledger.registry.values():
+        if record.closes_on_grade is not None:
+            out.extend(_closed_below_grade(ledger, world, record))
+        if record.awaits_ruling is not None:
+            out.extend(_closed_before_ruling(ledger, world, record))
         # A ruling on a record is the licence to withdraw a cell of it, and
         # nothing else: one that withdraws none keeps a gap under a licence
         # nobody asked for. A ruling that keeps a gap belongs in its entries.
@@ -637,14 +756,99 @@ def _registry_problems(ledger: Ledger, world: World) -> list[Deviation]:
     return out
 
 
+def _closed_below_grade(ledger: Ledger, world: World, record: GapRecord) -> list[Deviation]:
+    """The cells of ``record`` that closed on a reply weaker than the record allows.
+
+    A cell is closed for a gap when no code of its entry is attributed to the
+    gap any more, whether or not the entry still stands for another one. The
+    comparator asks for that deletion as soon as the cell stops deviating,
+    whatever the cell was answered from; this rule holds the deletion back
+    until a reply of the named grade answers the cell.
+    """
+
+    assert record.closes_on_grade is not None
+    needed = GRADES.index(record.closes_on_grade)
+    out: list[Deviation] = []
+    for item in record.cells:
+        if item.cell not in world.generated:
+            continue  # the registry rules say what a cell that is not generated owes
+        entry = ledger.entry(item.cell)
+        if entry is not None and record.id in entry.codes.values():
+            continue
+        grade = world.grade(item.cell)
+        if grade is not None and GRADES.index(grade) > needed:
+            out.append(
+                Deviation(
+                    "static:registry_closed_below_grade",
+                    f"{record.id} cell {item.cell} carries no code of the gap and "
+                    f"is answered from a reply of grade {grade}: the gap is what "
+                    "a provider or a vendor tool sends, and its record lets a cell "
+                    "close on "
+                    f"{record.closes_on_grade} or better",
+                )
+            )
+    return out
+
+
+def _closed_before_ruling(ledger: Ledger, world: World, record: GapRecord) -> list[Deviation]:
+    """The cells of ``record`` that closed while the record waits for a ruling.
+
+    The record names a question about the closing state of its gap that no
+    clause answers yet, so a cell of the record cannot show that state: one
+    that stops deviating says only that the adapter changed. As in the rule
+    above, a cell is closed for a gap when no code of its entry is attributed
+    to the gap any more. The change that enters the ruling makes the scenario
+    assert what was ruled and takes the field off the record.
+    """
+
+    assert record.awaits_ruling is not None
+    out: list[Deviation] = []
+    for item in record.cells:
+        if item.cell not in world.generated:
+            continue  # the registry rules say what a cell that is not generated owes
+        entry = ledger.entry(item.cell)
+        if entry is not None and record.id in entry.codes.values():
+            continue
+        out.append(
+            Deviation(
+                "static:registry_closed_before_ruling",
+                f"{record.id} cell {item.cell} carries no code of the gap while "
+                f"its record waits for a ruling ({record.awaits_ruling}): no "
+                "clause states the closing state of the gap yet, so the cell "
+                "cannot show it",
+            )
+        )
+    return out
+
+
+def _unrequired_proofs(
+    world: World, gap: str, cell: str | None, where: str
+) -> list[Deviation]:
+    """The proofs an entry leans on that the verifier does not require by name.
+
+    A proof holds what the codes of an entry do not say. A run without it is
+    a complete run for the verifier once its name is off the required list,
+    so an entry that still names the record would stand on nothing.
+    """
+
+    return [
+        Deviation(
+            "static:entry_proof_not_required",
+            f"{where} names {gap}, whose entries lean on the proof {module}::{name}, "
+            "and the verifier does not require that proof by name: the entry would "
+            "outlive what it rests on",
+        )
+        for module, name in world.proofs_leaned_on(gap, cell)
+        if (module, name) not in world.required_proofs
+    ]
+
+
 def _entry_problems(ledger: Ledger, world: World) -> list[Deviation]:
     out: list[Deviation] = []
     seen: set[str] = set()
-    counts: dict[str, int] = {}
     for entry in ledger.entries:
         kind, scenario, _role, lens = parse_cell_id(entry.cell)
         where = f"entry {entry.cell}"
-        counts[_pack(world, scenario)] = counts.get(_pack(world, scenario), 0) + 1
         if entry.cell in seen:
             out.append(Deviation("static:entry_duplicate", f"{where} appears twice"))
         seen.add(entry.cell)
@@ -669,6 +873,8 @@ def _entry_problems(ledger: Ledger, world: World) -> list[Deviation]:
             )
         if not entry.codes:
             out.append(Deviation("static:entry_without_codes", f"{where} expects nothing"))
+        for gap in sorted(set(entry.codes.values())):
+            out.extend(_unrequired_proofs(world, gap, entry.cell, where))
         if kind in world.reference_kinds and lens != STATIC_LENS and not entry.ruling:
             out.append(
                 Deviation(
@@ -708,7 +914,11 @@ def _entry_problems(ledger: Ledger, world: World) -> list[Deviation]:
                     )
                 )
     for scope in ledger.column_wide:
-        counts["pack_a"] = counts.get("pack_a", 0) + 1
+        out.extend(
+            _unrequired_proofs(
+                world, scope.gap, None, f"column-wide {scope.code} on {scope.kind}"
+            )
+        )
         if scope.kind == world.toy_kind:
             out.append(
                 Deviation(
@@ -733,12 +943,28 @@ def _entry_problems(ledger: Ledger, world: World) -> list[Deviation]:
                     f"{scope.gap}'s column-wide scope",
                 )
             )
-    for pack, count in sorted(counts.items()):
-        if count > ledger.ceilings.get(pack, 0):
+    counts = pack_counts(ledger, world)
+    for pack in sorted(set(counts) | set(ledger.ceilings)):
+        count, ceiling = counts.get(pack, 0), ledger.ceilings.get(pack, 0)
+        if count > ceiling:
             out.append(
                 Deviation(
                     "static:ceiling_exceeded",
-                    f"{count} known gaps in {pack}, ceiling {ledger.ceilings.get(pack, 0)}",
+                    f"{count} known gaps in {pack}, ceiling {ceiling}",
+                )
+            )
+        elif count < ceiling and pack in ledger.frozen:
+            # A frozen ceiling only falls, and CI has no history to hold a
+            # number to its past. So it is held to the count: the change
+            # that takes an entry away lowers it, and an entry that is new
+            # cannot be written into room an earlier fix left without
+            # raising the number.
+            out.append(
+                Deviation(
+                    "static:ceiling_not_the_count",
+                    f"{count} known gaps in {pack} under its ceiling of {ceiling}, "
+                    "which the ledger states frozen: a frozen ceiling is the count "
+                    "of its pack, and the change that takes an entry away lowers it",
                 )
             )
     if len(ledger.differences) > ledger.max_declared_differences:

@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed response in which the model declines: the events of one
+# response of the DeepSeek Responses route whose output message holds a
+# refusal part where a text answer holds its text. It is billed and ends
+# with the terminal of a completed response.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: deepseek_responses
+provider: deepseek
+behaviour: refusal_part
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    the events of the completion envelope with the refusal events in the
+    place of the text events (openai.types.responses
+    ResponseRefusalDeltaEvent and ResponseRefusalDoneEvent) and a
+    ResponseOutputMessage whose one content part is a ResponseOutputRefusal
+  sdk_version: openai 2.53.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach: the vendor's
+    guide to its Responses route (primary source, read 2026-11-18) lists the
+    events of a stream and names no refusal event or refusal part, and no
+    refusal was induced against the route. The part and its two events are
+    those the pinned SDK types for a refusal; their order is the order in
+    which the SDK's types build a content part up, as in the completion
+    envelope; the refusal text is a fixed sentence of this envelope; the
+    usage block and the remaining keys are those of the completion
+    envelope. So this envelope proves that such a stream parses through the
+    pinned SDK, not that the route sends it.
+
+status: 200
+body:
+  - type: response.created
+    sequence_number: 0
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.in_progress
+    sequence_number: 1
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.output_item.added
+    sequence_number: 2
+    output_index: 0
+    item:
+      id: {slot: item_id}
+      type: message
+      role: assistant
+      status: in_progress
+      content: []
+  - type: response.content_part.added
+    sequence_number: 3
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    part:
+      type: refusal
+      refusal: ""
+  - type: response.refusal.delta
+    sequence_number: 4
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    delta: The request was declined.
+  - type: response.refusal.done
+    sequence_number: 5
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    refusal: The request was declined.
+  - type: response.content_part.done
+    sequence_number: 6
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    part:
+      type: refusal
+      refusal: The request was declined.
+  - type: response.output_item.done
+    sequence_number: 7
+    output_index: 0
+    item:
+      id: {slot: item_id}
+      type: message
+      role: assistant
+      status: completed
+      content:
+        - type: refusal
+          refusal: The request was declined.
+  - type: response.completed
+    sequence_number: 8
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: completed
+      model: {slot: served_model}
+      output:
+        - id: {slot: item_id}
+          type: message
+          role: assistant
+          status: completed
+          content:
+            - type: refusal
+              refusal: The request was declined.
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage:
+        input_tokens: {slot: input_tokens}
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: {slot: output_tokens}
+        output_tokens_details:
+          reasoning_tokens: 0
+        total_tokens: {slot: total_tokens}

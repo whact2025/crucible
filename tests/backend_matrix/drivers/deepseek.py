@@ -52,10 +52,11 @@ from .. import columns as matrix_columns
 from .. import envelopes as envelope_files
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import launch
-from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall
-from ..script import Call, ProviderScript, Say, ServedAs, Step
+from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall, answered_from
+from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
+from .openai_compat import REFUSALS
 
 _SDK = "openai"
 _WORKER_PROJECT = launch.REPOSITORY / "backends" / "deepseek_worker"
@@ -124,7 +125,7 @@ class DeepSeekResponsesDialect:
     def envelope_names(self) -> tuple[str, ...]:
         return tuple(
             f"{self.name}/{self.provider}.{behaviour}"
-            for behaviour in ("completion", _TOOL_CALL)
+            for behaviour in ("completion", _TOOL_CALL, *REFUSALS.values())
         )
 
     def parse(
@@ -280,12 +281,20 @@ class DeepSeekResponsesDialect:
                 # Reasoning is part of the output tokens the provider bills.
                 "reasoning_tokens": step.usage.output_tokens // 2,
             }
+        elif isinstance(step, Refuse):
+            behaviour, call = REFUSALS[step.form], None
+            # Only the form that declines in an output message has an item.
+            slots = {"item_id": f"msg-{call_id}"} if step.form == "refusal_part" else {}
         else:
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
                 "the scenario that needs it adds the envelope with its liar"
             )
         envelope = envelope_files.load(f"{self.name}/{self.provider}.{behaviour}")
+        if envelope.status != 200:
+            # A request the service rejects is answered with its error object
+            # alone, no stream: nothing is billed and no model is named.
+            return Reply(envelope.status, envelope.fill(slots), envelope=envelope.name)
         usage = step.usage
         slots.update(
             response_id=f"resp-{call_id}",
@@ -426,6 +435,9 @@ class DeepSeekDriver:
     @property
     def envelopes(self) -> tuple[str, ...]:
         return DeepSeekResponsesDialect().envelope_names()
+
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        return answered_from(DeepSeekResponsesDialect(), script)
 
     @property
     def interpreter(self) -> Path:

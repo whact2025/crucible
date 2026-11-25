@@ -82,9 +82,48 @@ run time and typed nowhere in the package.
 The scenarios come in three sets (`backend_matrix/scenarios.py`): the starter
 set (`S00`, `S01`, `S03`, `S04`), pack A (limits on turns, tool dispatch, cost
 and tool-result bytes, refusals, a write as progress) and pack B (the
-admission scenario `S51` so far). The toy columns run all three. A real kind
-runs the starter set today (`ENABLEMENT` in `backend_matrix/cells.py`), and
-its static cell `H02` is a known gap until it runs pack A.
+admission scenario `S51` so far). The toy columns run all three. Every real
+kind runs the starter set and pack A (`ENABLEMENT` in
+`backend_matrix/cells.py`); the static cell `H02` of a kind that did not
+would report it. On a column pack A is ten cells: the turn limit (`S10a`) in
+both lenses and, in the raw lens, the suite's default turn count (`S11`), the
+dispatch-budget denial (`S12`), the USD overrun of one response (`S13`), the
+tool-result byte budget (`S18`), three forms of refusal (`S23a` a
+content-filter stop, `S23b` a refusal part of the message, `S23c` an HTTP
+policy rejection) and a write as progress (`S40`). The primary and the
+secondary column of a kind run both sets; a blocked column runs its three
+scenarios. A form of refusal that the wire of a kind cannot carry is pinned
+not expressible in [the inventory](backend_matrix/inventory.yaml) and has no
+cell: the refusal part on the Claude columns, the content-filter stop and
+the refusal part on both Codex kinds. No such pin exists on an open-weight
+kind.
+
+The two turn cells hold a count. The turn limit asks every turn of the count
+of the provider, so a limit that is typed after fewer tool-bearing requests
+leaves the script unconsumed. The suite's turn count holds a turn control on
+the wire to the count the call asked for. On a route that declares an
+enforced turn limit (`hard` or `provider_stop`) it also holds every request
+to carry the count, where the wire has a field for one; a dialect says
+whether its wire does. Of the real kinds only the Claude wire has one: on
+every other real column that cell cannot tell an adapter that takes the
+count from one that cuts it to a ceiling of its own, and how such a ceiling
+is reported is stated by no clause. A registry record whose closing state no
+clause states yet names the question that is owed a ruling
+(`awaits_ruling`), and static cell `H03` fails when a cell of such a record
+carries no code of the gap, whatever the cell shows: the change that enters
+the ruling makes the scenario assert it and takes the field off the record.
+The record of the DeepSeek turn ceiling waits for one.
+
+Two static cells run on the toy columns only: `P01` (the protocol surface)
+and `P02` (the profile binding). So on a real column no cell asserts that the
+backend instance declares the profile routing computes for its route, or that
+its limits resolve as that profile implies. The variant of a scenario is
+selected from the routed profile, never from the instance, so an instance
+cannot choose its expectation; and clause C7 compares the profile digest of
+the trace with the routed profile on every result cell, which stands in for
+the first half. The DeepSeek column has no such stand-in: its trace binds no
+profile digest, which is a column-wide known gap, so nothing there ties the
+instance to its route.
 
 A cell computes deviation codes from a closed vocabulary
 (`backend_matrix/contract.py`), and
@@ -97,10 +136,16 @@ A cell computes deviation codes from a closed vocabulary
   "different deviation" for any other set, and with `decl.changed` when the
   route's declaration moved.
 
-A fix deletes its entry in the same change. Only a behaviour cell of a real
-backend and the static cells `H01` and `H02` can have an entry: the toy cells
-and the other static cells check the matrix itself and are never expected
-failures. The gap registry in the same file is permanent, and
+A fix deletes its entry in the same change. The ledger counts its entries
+under two ceilings, one for the starter set with pack A and one for pack B,
+and states a ceiling frozen (`ceilings.frozen`) once every cell it counts
+passes or has its entry. A frozen ceiling is the count of its entries, and
+static cell `H03` fails on any other number: the change that deletes an
+entry lowers it by one, so no later entry fits into room that a fix left.
+Only a behaviour cell of a real backend and the static cells `H01` and `H02`
+can have an entry: the toy cells and the other static cells check the matrix
+itself and are never expected failures. The gap registry in the same file is
+permanent, and
 [the declaration snapshot](backend_matrix/declared_profiles.yaml) pins every
 column's declared profile, so a declaration cannot be weakened to turn a cell
 green. Nothing in the package skips: skip and xfail markers are refused at
@@ -136,7 +181,16 @@ sanitised, and the control handshake preceded the prompt. The peer's journal
 names the variables of its environment and keeps none of their values beyond
 the three the canary reads. Nothing was observed of the real tool, so every
 frame of the peer is `constructed` and its session accounting is an emulation.
-What the peer does not emulate ends the cell as a setup error, never as an
+The peer emulates one terminal of the tool: a session that has used up its
+turn allowance ends, after the tool call of its last allowed turn, with the
+error result the pinned SDK names for it (`error_max_turns`) and a status
+other than zero, and the model is not asked again. A refusal reaches the
+adapter in the two forms the frames of the tool can carry: a model turn whose
+stop reason is the refusal, and the error terminal of a request the provider
+rejected with an HTTP status, with the accounting the tests of the product
+state for that terminal. Every cell that rests on one of these frames
+rests on an emulation of the reference. What the peer does not emulate (the
+budget terminal between two turns) ends the cell as a setup error, never as an
 observation. A known gap on a reference column needs the owner's ruling in its
 ledger entry. A ruling that keeps a gap is always written in the entries of
 the gap: on a registry record a ruling is the licence to withdraw a cell of
@@ -165,6 +219,12 @@ envelope fills `last` with one model response, a choice no source states. The
 green of this column does not rest on it (its adapter reads the thread's
 total there); what the official-SDK column reports for a turn of several
 responses does, and the test modules of both columns play the other reading.
+The notifications carry one form of refusal: a turn that failed with an error
+whose kind names a policy of the provider. They have no finish reason of a
+model response and no refusal part of a message, so the two other forms are
+pinned not expressible on both Codex kinds. The route declares no turn
+control, so its turn-limit cell asserts that none is sent and that a finite
+script finishes cleanly.
 The wire of both Codex kinds names no served model; declared difference
 `D-CDX-SERVED` asserts on every result cell of those kinds that the trace
 records none, and static cell `H03` fails when the ledger's list leaves one
@@ -240,6 +300,31 @@ lies inside the worker's own environment, because such a program opens its
 sockets where the network guard does not see them: without the stage the
 bundled runtime never starts, and the attempt is a violation.
 
+Four known gaps of the reference columns lean on a proof that the verifier
+requires by name, because the codes of their cells do not say what the gap
+is, or what its record says of the result. On a write the trace of the
+Claude adapter binds a tool-authority digest
+that is not the shared one: the proof plays the write of both Claude columns
+and shows that the value is the shared digest of the same tools with no path
+scope stated, and that the cell shows no code once the adapter's hash is
+bound to the ToolSet that was attached. The result of a dispatch-budget
+denial on the official Codex route flags its accounting incomplete, which
+switches the comparison of its usage off: the proof shows that it reports no
+usage for responses the provider billed. On the app-server route the result
+of the same denial flags its accounting incomplete too, and reports every
+billed response; a result that had lost its usage would show the same two
+codes, so the proof judges the result as one that claims its accounting
+complete and finds no code about the size of its usage. Where the limit
+guard replaces a result of the official route, its two codes do not say what
+the guard missed: a twin of the test that plays both readings of `last`
+shows that the guard misses the token flag alone and that nothing but the
+usage code moves with the reading. Each proof has lying counterparts beside
+it that show it failing on what it is there to exclude. An entry must not
+outlive a proof it leans on: `RECORD_PROOFS` in `backend_matrix/cells.py`
+names, by registry record, the proofs its entries lean on, and static cell
+`H03` fails when an entry names such a record while the verifier does not
+require the proof that plays the entry's cell.
+
 A column whose profile the catalogs call blocked runs three scenarios as soon
 as its kind is driven: the canary, the plain call and the admission scenario
 `S51`. An admission cell builds a backend for every capability a workflow can
@@ -280,7 +365,20 @@ A scripted reply is an envelope under `backend_matrix/envelopes/<dialect>/`
 with only its slots filled, and each envelope states where its shape comes
 from: `recorded` from the provider, `documented` by the vendor or a live
 observation, or `constructed` to satisfy the SDK's types. The weakest envelope
-a cell used is its grade. An envelope names the SDK release it was built for
+a cell used is its grade. The envelopes of a refusal are `constructed` on
+every dialect: no refusal of a provider was observed or is documented in
+reach, so a gap that a refusal cell shows cannot be closed on them. The
+registry record of a gap that is about what a provider sends names the grade
+its cells close on (`closes_on_grade`), and so does, on a reference column,
+the record of a gap that is about what the vendor's tool relays of such a
+reply or sends when a session is stopped. Static cell `H03` fails when a
+cell of such a record carries no code of the gap while the dialect of its
+kind still answers it from a weaker envelope: the comparator asks for an
+entry to go as soon as its cell is green, and this holds the deletion back
+until a reply of that grade answers the cell. A cell of a reference may be
+answered from several frames, and every one of them has to be of that grade
+before its entry can go. An
+envelope names the SDK release it was built for
 in one field, `sdk_version`, as `<distribution> <version>`. A static test
 holds each to what reads the dialect, the test environment or a worker's
 lock, so a lock that moves fails there until the envelope was read against
@@ -368,10 +466,17 @@ entry of its own or by a column-wide entry of its kind. A column-wide gap is
 owed on every behaviour cell of the kind whose definition has the clause of
 its code, except the seam canary, a cell whose own entry shows that the check
 did not run (a raise, a guard rewrite, the cost flagged incomplete) and a
-cell the inventory pins under `column_wide_not_owed` with its reason. A run
+cell the inventory pins under `column_wide_not_owed` with its reason: a cell
+whose scenario waives the flag that asks for the check (a refusal that is an
+HTTP rejection bills nothing, so it owes no accounting flag), where the cell
+itself does not ask it either. A run
 that writes a JUnit file also writes
 `matrix-report-<n>.json` beside it: the codes, gaps, declared values, clause
-outcomes and grade of every cell the process judged.
+outcomes and grade of every cell the process judged, and for each kind what
+its driver bypasses and the private names of the product that the driver and
+the required proofs of the kind's module replace. The names a required proof
+replaces are listed beside the proofs (`PROOF_SEAMS`), and a static test
+holds that list to what the proofs replace.
 
 ## Live tests
 

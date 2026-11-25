@@ -16,10 +16,20 @@ it came through the structured output of the terminal frame, and that what
 the peer does not emulate fails a cell as a setup error. The peer is a program
 of its own: its journal keeps no value of the environment it was started in,
 and the network guard of the package runs inside it.
+
+What the cells of these columns show today is the ledger's business. One test
+is required by name by the verifier all the same, because it holds a known
+gap of the reference to its cause: on a write the trace binds a
+tool-authority digest that is not the shared one, the one code of the cell
+does not say why, and the test shows that the value is the digest of the same
+tools without a path scope and that nothing else stands behind the code. Its
+lying counterparts are beside it. It replaces one private name of the
+adapter in this process, which is listed beside the required proofs.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import importlib.metadata
@@ -28,17 +38,25 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import pytest
 from anthropic.types import Message as ProviderMessage
 from claude_agent_sdk import types as sdk_types
 from claude_agent_sdk._internal.message_parser import parse_message
+from claude_agent_sdk._internal.transport import subprocess_cli as sdk_cli
 
 from assay import Invocation
+from crucible.backends.claude import ClaudeBackend
 from crucible.backends.config import load_routing
+from crucible.backends.tool_authority import (
+    APPROVAL_POLICY_PER_CALL_EXACT,
+    TOOL_AUTHORITY_BRIDGE_PROTOCOL,
+    TOOL_AUTHORITY_BRIDGE_VERSION,
+    tool_authority_digest,
+)
 
-from . import cells, declarations, envelopes, ledger, netguard, runner, toolsets
+from . import cells, contract, declarations, envelopes, ledger, netguard, runner, toolsets
 from . import columns as matrix_columns
 from .cells import Cell
 from .columns import CANARY_CREDENTIAL, CLAUDE_KIND, COLUMN_PRODUCT, Column
@@ -46,8 +64,30 @@ from .drivers import MatrixSetupError
 from .drivers import claude as claude_driver
 from .peers import claude_cli as peer_program
 from .provider import LoopbackProvider, Reply, SeenRequest
-from .scenarios import BASE_POLICY, SCENARIOS, SCHEMA, SCHEMA_ANSWER, SCHEMA_KEY, SYSTEM, USER
-from .script import READ_A, READ_B, Call, ProviderScript, Refuse, Say, ServedAs, Step, TokenUsage
+from .scenarios import (
+    BASE_POLICY,
+    SCENARIOS,
+    SCHEMA,
+    SCHEMA_ANSWER,
+    SCHEMA_KEY,
+    SYSTEM,
+    TEXT,
+    TURN_LIMIT,
+    USER,
+    suite_default_max_turns,
+)
+from .script import (
+    READ_A,
+    READ_B,
+    Call,
+    Cut,
+    ProviderScript,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+    TokenUsage,
+)
 
 LEDGER = ledger.load()
 KINDS = (CLAUDE_KIND,)
@@ -603,8 +643,14 @@ def test_the_dialect_reads_the_command_line_and_answers_only_what_it_has_an_enve
     assert dialect.render(Say("x"), plain, "1").served_model == "asked"
     renamed = dialect.render(ServedAs(Say("x")), plain, "1")
     assert renamed.served_model == renamed.body["frames"][1]["message"]["model"] == "asked-served"
-    with pytest.raises(MatrixSetupError, match="does not render Refuse yet"):
-        dialect.render(Refuse("content_filter"), plain, "1")
+    # A step without an envelope is refused, and so is the one form of
+    # refusal the frames of the tool cannot carry (it is pinned not
+    # expressible in the inventory).
+    with pytest.raises(MatrixSetupError, match="does not render Cut yet"):
+        dialect.render(Cut(), plain, "1")
+    with pytest.raises(MatrixSetupError, match="has no refusal part"):
+        dialect.render(Refuse("refusal_part"), plain, "1")
+    assert list(claude_driver.ClaudeDriver().inexpressible) == ["S23b/Refuse(refusal_part)"]
     assert set(dialect.envelope_names()) == {
         name for name in envelopes.all_envelopes() if name.startswith(f"{dialect.name}/")
     }
@@ -632,25 +678,117 @@ def test_what_the_peer_does_not_emulate_is_refused_not_improvised() -> None:
     assert "unsupported" not in dialect.render(Say("x"), within, "call-1").body
 
 
-def test_a_session_that_needs_the_tools_turn_terminal_is_a_setup_error_not_an_observation(
-    tmp_path: Path,
-) -> None:
+def test_the_turn_terminal_and_the_two_refusals_parse_through_the_installed_sdk() -> None:
+    dialect = claude_driver.ClaudeCliDialect()
+    rate = matrix_columns.matrix_rate("asked")
+
+    # The last allowed turn (the fifth of five) asks for a tool: the reply
+    # carries the frames of that turn and, apart from them, the turn terminal
+    # the peer plays after the tool call.
+    last = dialect.render(
+        Call(READ_A, usage=TokenUsage(11, 5)), _turn(turn=5, spent=(40, 20)), "call-5"
+    )
+    assert [frame["type"] for frame in last.body["frames"]] == ["assistant"]
+    assert last.body["turn_limit"]["exit"] == 1
+    (limit,) = (parse_message(frame) for frame in last.body["turn_limit"]["frames"])
+    assert isinstance(limit, sdk_types.ResultMessage)
+    assert (limit.subtype, limit.is_error, limit.result, limit.errors) == (
+        "error_max_turns",
+        True,
+        None,
+        None,
+    )
+    # The stop reason of the last model turn, and one turn more than allowed.
+    assert (limit.stop_reason, limit.num_turns) == ("tool_use", 6)
+    # The accounting of the session so far, this turn included.
+    assert limit.usage is not None and limit.model_usage is not None
+    assert (limit.usage["input_tokens"], limit.usage["output_tokens"]) == (51, 25)
+    assert limit.total_cost_usd == rate.compute_cost(input_tokens=51, output_tokens=25)
+    assert list(limit.model_usage) == ["asked"]
+    assert last.envelopes == (
+        "claude_cli/cli.assistant_tool_use",
+        "claude_cli/cli.result_max_turns",
+    )
+    # A turn before the last carries no terminal.
+    assert "turn_limit" not in dialect.render(Call(READ_A), _turn(turn=4), "call-4").body
+
+    # A turn the safety system of the provider stopped: a billed message
+    # without content, then a terminal that names the same stop reason.
+    stopped = dialect.render(Refuse("content_filter", TokenUsage(7, 3)), _turn(), "call-1")
+    _opened, refused_turn, ended = (parse_message(frame) for frame in stopped.body["frames"])
+    assert isinstance(refused_turn, sdk_types.AssistantMessage)
+    assert (refused_turn.content, refused_turn.stop_reason) == ([], "refusal")
+    message = ProviderMessage.model_validate(stopped.body["frames"][1]["message"])
+    assert (message.stop_reason, message.model, message.content) == ("refusal", "asked", [])
+    assert isinstance(ended, sdk_types.ResultMessage)
+    assert (ended.subtype, ended.is_error, ended.stop_reason, ended.result) == (
+        "success",
+        False,
+        "refusal",
+        "",
+    )
+    assert ended.usage is not None
+    assert (ended.usage["input_tokens"], ended.usage["output_tokens"]) == (7, 3)
+    assert (stopped.usage, stopped.served_model, stopped.body["exit"]) == (
+        TokenUsage(7, 3),
+        "asked",
+        0,
+    )
+
+    # A request the provider rejected: a local message that no model wrote,
+    # marked with the error category, then an error terminal with the HTTP
+    # status. Nothing is billed, no model is named, and the tool exits with
+    # a status other than zero.
+    rejected = dialect.render(Refuse("http_policy"), _turn(), "call-1")
+    _opened, local, failed = (parse_message(frame) for frame in rejected.body["frames"])
+    assert isinstance(local, sdk_types.AssistantMessage)
+    assert (local.error, local.model) == ("invalid_request", "<synthetic>")
+    assert isinstance(failed, sdk_types.ResultMessage)
+    assert (failed.subtype, failed.is_error, failed.api_error_status) == ("success", True, 400)
+    # The accounting of the terminal as the tests of the product state it: a
+    # usage of zero, a cost of zero, the text of the local message as the
+    # result text, and a usage record that names the placeholder model only.
+    assert failed.usage == dict.fromkeys(
+        (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ),
+        0,
+    )
+    assert (failed.model_usage, failed.total_cost_usd) == ({"<synthetic>": {}}, 0.0)
+    assert [sdk_types.TextBlock(text=str(failed.result))] == local.content
+    assert failed.stop_reason is None
+    assert (rejected.usage, rejected.served_model, rejected.body["exit"]) == (None, None, 1)
+    assert rejected.envelopes == (
+        "claude_cli/cli.init",
+        "claude_cli/cli.assistant_api_error",
+        "claude_cli/cli.result_api_error",
+    )
+
+
+class _PastTheTurnLimit(claude_driver.ClaudeDriver):
+    """Its peer does not stop at the turn allowance: it asks for one more turn."""
+
+    faults = (peer_program.SKIP_TURN_TERMINAL,)
+
+
+def _one_turn_session(played_by: claude_driver.ClaudeDriver, tmp_path: Path) -> Any:
+    """One turn is allowed, and the model asks for a tool in it."""
+
     fixture = toolsets.build(toolsets.READ, tmp_path / "workspace")
-    opened = claude_driver.ClaudeDriver().open(
+    opened = played_by.open(
         _column(),
         capability="read_only",
         lens="raw",
+        # A second model turn is scripted and must never be asked for.
         script=ProviderScript((Call(READ_A), Say("never reached"))),
         tmp_path=tmp_path,
     )
-
-    # One turn is allowed and the model asks for a tool: the real tool would
-    # end the session on its turn limit. The peer does not play that yet, so
-    # whatever the adapter makes of the dead session is not evidence.
-    refused = pytest.raises(MatrixSetupError, match=r"did not play the session.*--max-turns 1")
-    with refused, opened as bound:
+    with opened as bound:
         bound.backend.attach_toolset(fixture.toolset)
-        bound.backend.invoke(
+        result = bound.backend.invoke(
             Invocation(
                 system=SYSTEM,
                 user=USER,
@@ -660,7 +798,134 @@ def test_a_session_that_needs_the_tools_turn_terminal_is_a_setup_error_not_an_ob
                 policy=BASE_POLICY,
             )
         )
+        seen = bound.provider.freeze()
+    return fixture, result, seen
+
+
+def test_a_session_that_uses_up_its_turns_ends_at_the_turn_terminal_of_the_tool(
+    tmp_path: Path,
+) -> None:
+    fixture, result, seen = _one_turn_session(claude_driver.ClaudeDriver(), tmp_path / "honest")
+
+    # The tool ran the call of its one allowed turn, reported its turn
+    # terminal and was not asked for another model turn: the adapter types
+    # the limit from that terminal, with the accounting the terminal carries.
     assert [item.name for item in fixture.log] == [toolsets.BINDINGS[READ_A].name]
+    assert (seen.request_count, seen.extra, seen.unconsumed) == (1, 0, 1)
+    assert seen.envelopes[-1] == "claude_cli/cli.result_max_turns"
+    assert result.error is not None and result.error.kind == "max_turns"
+    assert result.stop_reason == "max_turns"
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (120, 30)
+    assert result.completeness.terminal_complete
+
+    # The lying counterpart: a peer that does not stop there asks for a turn
+    # beyond the allowance. That is no observation of the adapter: the
+    # provider side refuses to answer it, and the cell is a setup error.
+    with pytest.raises(MatrixSetupError, match=r"did not play the session.*--max-turns 1"):
+        _one_turn_session(_PastTheTurnLimit(), tmp_path / "lying")
+
+
+class _AnotherTurnCount:
+    """The backend of a cell, called with another turn count than the cell asks for."""
+
+    def __init__(self, inner: Any, count: Callable[[int], int]) -> None:
+        self._inner, self._count = inner, count
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def invoke(self, invocation: Invocation) -> Any:
+        return self._inner.invoke(
+            dataclasses.replace(invocation, max_turns=self._count(invocation.max_turns))
+        )
+
+
+class _EnforcesAnotherTurnCount(claude_driver.ClaudeDriver):
+    """Stands for an adapter that keeps a turn count of its own and says so nowhere."""
+
+    def __init__(self, count: Callable[[int], int]) -> None:
+        self._count = count
+
+    @contextlib.contextmanager
+    def open(self, column: Column, **named: Any) -> Iterator[Any]:
+        with super().open(column, **named) as bound:
+            bound.backend = _AnotherTurnCount(bound.backend, self._count)
+            yield bound
+
+
+def test_an_adapter_that_keeps_a_turn_count_of_its_own_fails_the_turn_cells(
+    tmp_path: Path,
+) -> None:
+    def controls(execution: runner.Execution) -> list[int | None]:
+        return [request.turn_control for request in execution.observation.provider.requests]
+
+    # The turn limit. Asked for two turns, the adapter hands the count to the
+    # tool, the model is asked twice and the limit is typed after the second
+    # turn. One turn fewer is a typed limit too, with the same events and
+    # flags: only the turn the provider was never asked for shows it.
+    honest = _played(_column(), "S10a", tmp_path / "honest")
+    fewer = _played(
+        _column(),
+        "S10a",
+        tmp_path / "fewer",
+        driver=_EnforcesAnotherTurnCount(lambda asked: asked - 1),
+    )
+    assert honest.report.codes == frozenset()
+    assert controls(honest) == [TURN_LIMIT] * TURN_LIMIT
+    assert controls(fewer) == [TURN_LIMIT - 1]
+    for execution in (honest, fewer):
+        result = execution.observation.result
+        assert result is not None and result.error is not None
+        assert (result.stop_reason, result.error.kind) == ("max_turns", "max_turns")
+    assert fewer.report.codes == {"request.unconsumed"}
+
+    # The suite's turn count. One completion needs one turn, so a ceiling of
+    # the adapter's own below the count changes nothing of the result: the
+    # turn control on the wire is the one place that shows it.
+    asked = suite_default_max_turns()
+    plain = _played(_column(), "S11", tmp_path / "plain")
+    clamped = _played(
+        _column(),
+        "S11",
+        tmp_path / "clamped",
+        driver=_EnforcesAnotherTurnCount(lambda count: min(count, 5)),
+    )
+    assert plain.report.codes == frozenset() and controls(plain) == [asked]
+    assert controls(clamped) == [5] and asked > 5
+    assert clamped.report.codes == {"request.content:turn_control"}
+
+
+def test_an_adapter_that_tells_the_tool_no_turn_count_fails_the_suites_turn_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The route declares that its provider stops a session at the turn count,
+    # so the tool is owed the count on its command line. An adapter that keeps
+    # the count to itself is played by the SDK's own command line without it:
+    # the route takes that command line twice, when it builds its transport
+    # and before it starts the tool, and compares the two.
+    build = sdk_cli.SubprocessCLITransport._build_command
+
+    def without_turn_count(transport: Any) -> list[str]:
+        command = build(transport)
+        at = command.index("--max-turns")
+        return [*command[:at], *command[at + 2 :]]
+
+    monkeypatch.setattr(sdk_cli.SubprocessCLITransport, "_build_command", without_turn_count)
+    untold = _played(_column(), "S11", tmp_path / "untold")
+
+    # One completion under the suite's turn count: the result is the clean
+    # finish of the honest play, and only the request shows that the tool was
+    # told no count.
+    result = untold.observation.result
+    assert result is not None and result.error is None
+    assert (result.stop_reason, result.final_message) == ("end_turn", TEXT)
+    assert [request.turn_control for request in untold.observation.provider.requests] == [None]
+    assert untold.report.codes == {"request.content:turn_control"}
+    # The count is owed because of what the route declares and because the
+    # command line of the tool has a place for it.
+    assert SCENARIOS["S11"].governing == ("turn_limit",)
+    assert untold.current == {"turn_limit": "provider_stop"}
+    assert untold.observation.provider.turn_control_field
 
 
 # -- the peer as a program ---------------------------------------------------------------
@@ -1031,7 +1296,16 @@ def test_every_frame_of_a_cell_counts_towards_its_grade(tmp_path: Path) -> None:
     assert {envelopes.load(name).grade for name in claude_driver.ClaudeDriver().envelopes} == {
         "constructed"
     }
-    assert set().union(*used.values()) == set(claude_driver.ClaudeDriver().envelopes)
+    # The starter cells use the frames of a session that ends on an answer;
+    # the turn terminal of the tool and the frames of the two refusals are
+    # used by the limit and refusal cells alone.
+    assert set(claude_driver.ClaudeDriver().envelopes) - set().union(*used.values()) == named(
+        "result_max_turns",
+        "assistant_refusal",
+        "result_refusal",
+        "assistant_api_error",
+        "result_api_error",
+    )
     # The schema travels on the command line of every turn's session, and the
     # decoded answer comes back as the final message. Only the structured
     # output of the terminal frame carried it: both texts were the tool's note.
@@ -1140,6 +1414,269 @@ def _decoded(text: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return None
+
+
+# -- the digest a write binds: a known gap held to its cause -------------------------------
+
+WRITE_DIGEST_CODE = "digest.mismatch:tool_authority"
+# The record of the ledger whose cells the proof below plays.
+WRITE_DIGEST_GAP = "R13"
+PROOF_MODULE = cells.MODULE_BY_KIND[CLAUDE_KIND]
+
+
+def _write_cell(column: Column) -> Cell:
+    """The cell of a Claude column on which the proof of the write digest plays."""
+
+    (listed,) = (
+        item
+        for item in cells.WRITES_ON_THE_CLAUDE_COLUMNS
+        if ledger.parse_cell_id(item)[2] == column.role
+    )
+    _kind, scenario, _role, lens = ledger.parse_cell_id(listed)
+    return Cell(column, scenario, lens)
+
+
+def _trace_digest(execution: runner.Execution) -> str | None:
+    result = execution.observation.result
+    assert result is not None and result.execution_trace is not None
+    return result.execution_trace.tool_authority_digest
+
+
+def _unscoped_digest(execution: runner.Execution, workspace: Path) -> str:
+    """The shared digest of the tools a played cell attached, with no path scope stated."""
+
+    scenario = SCENARIOS[execution.cell.scenario]
+    assert scenario.toolset is not None
+    twin = toolsets.build(scenario.toolset, workspace, scoped=False)
+    return runner.shared_tool_authority_digest(
+        twin.toolset,
+        capability=scenario.capability,
+        context_budget=execution.plan.context_budget,
+    )
+
+
+def _not_the_digest_without_a_path_scope(execution: runner.Execution, unscoped: str) -> list[str]:
+    """The first half: why the digest of a played write is not the one of the known gap."""
+
+    problems: list[str] = []
+    carried = _trace_digest(execution)
+    if carried is None:
+        problems.append("the trace binds no tool-authority digest")
+    if carried == execution.reference.tool_authority_digest:
+        problems.append("the trace binds the shared digest of the attached ToolSet")
+    if carried != unscoped:
+        problems.append(
+            "the digest of the trace is not the shared digest of the same tools "
+            "with no path scope stated"
+        )
+    return problems
+
+
+def _more_than_the_one_cause(
+    as_is: runner.Execution, removed: runner.Execution, met: list[str]
+) -> list[str]:
+    """The second half: why the write shows more than the one cause of the known gap.
+
+    ``removed`` is the same cell played with the adapter's hash bound to the
+    ToolSet that was attached; ``met`` names what the adapter handed to its
+    hash instead, once for every time it did.
+    """
+
+    problems: list[str] = []
+    if not met:
+        problems.append("the adapter handed the attached ToolSet to its hash")
+    if removed.report.codes:
+        problems.append(
+            "with the hash bound to the attached ToolSet the cell still shows "
+            f"{sorted(removed.report.codes)}"
+        )
+    if _trace_digest(removed) != removed.reference.tool_authority_digest:
+        problems.append(
+            "with the hash bound to the attached ToolSet the trace does not bind "
+            "the shared digest"
+        )
+    before, after = _statuses(as_is), _statuses(removed)
+    moved = sorted(name for name in {*before, *after} if before.get(name) != after.get(name))
+    if moved != [contract.clause_of(WRITE_DIGEST_CODE)]:
+        problems.append(
+            f"the outcome of the clauses {moved} changed with the cause, not that "
+            "of the clause that compares the digest alone"
+        )
+    return problems
+
+
+def _statuses(execution: runner.Execution) -> dict[str, str]:
+    return {name: str(item.status) for name, item in execution.report.outcomes.items()}
+
+
+@pytest.mark.parametrize("column", COLUMNS, ids=lambda column: column.id)
+def test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope(
+    column: Column, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """A known gap of the reference, held to its one cause from both sides.
+
+    On a write the adapter hands its hash the wrapper that routes the
+    mutators to their isolated process, where it attached a ToolSet. The
+    cell then shows one code, which says that the digest of the trace is not
+    the shared one and nothing about why. This test says why, by what the
+    cell shows and without naming the wrapper: the digest is the shared one
+    of the same tools with no path scope stated; and with the hash bound to
+    the ToolSet that was attached, and nothing else of the adapter changed,
+    the cell shows no code at all. The ledger carries the code as a known
+    gap (R13) on the cells this test plays and on no other.
+    """
+
+    # The verifier requires this test by name on each column: the entries of
+    # the record lean on it, and a run without it is refused. No entry
+    # attributes a code to that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[PROOF_MODULE]
+    cell = _write_cell(column)
+    attributed = {
+        entry.cell for entry in LEDGER.entries if WRITE_DIGEST_GAP in entry.codes.values()
+    }
+    assert attributed <= set(cells.WRITES_ON_THE_CLAUDE_COLUMNS)
+    assert cell.id in cells.WRITES_ON_THE_CLAUDE_COLUMNS
+
+    as_is = _played(column, cell.scenario, tmp_path / "as-is", cell.lens)
+
+    # The one cause, removed: the adapter's hash bound to the ToolSet that was
+    # attached, whatever the adapter hands it. The one private name of the
+    # product this replaces is listed beside the required proofs.
+    attached: dict[int, Any] = {}
+    met: list[str] = []
+    attach, digest = ClaudeBackend.attach_toolset, ClaudeBackend._tool_authority_digest
+
+    def remembering(self: Any, toolset: Any, **more: Any) -> None:
+        attached[id(self)] = toolset
+        attach(self, toolset, **more)
+
+    def bound_to_what_was_attached(
+        self: Any, toolset: Any, *, context_budget: int | None
+    ) -> str:
+        if toolset is not attached[id(self)]:
+            met.append(type(toolset).__name__)
+        return digest(self, attached[id(self)], context_budget=context_budget)
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(ClaudeBackend, "attach_toolset", remembering)
+        patched.setattr(ClaudeBackend, "_tool_authority_digest", bound_to_what_was_attached)
+        removed = _played(column, cell.scenario, tmp_path / "cause-removed", cell.lens)
+    assert f"{ClaudeBackend.__module__}.{ClaudeBackend.__qualname__}._tool_authority_digest" in (
+        cells.PROOF_SEAMS[PROOF_MODULE]
+    )
+
+    # The cell as the ledger has it: a clean result of a write that is on
+    # disk, one code, no governing declared value.
+    for execution in (as_is, removed):
+        assert execution.report.seam_problems == ()
+        result = execution.observation.result
+        assert result is not None and result.error is None
+        assert execution.observation.write_applied is True
+    assert as_is.report.codes == {WRITE_DIGEST_CODE} and dict(as_is.current) == {}
+    # The first half: which digest the trace binds.
+    unscoped = _unscoped_digest(as_is, tmp_path / "twin")
+    assert unscoped != as_is.reference.tool_authority_digest
+    assert _not_the_digest_without_a_path_scope(as_is, unscoped) == []
+    # The second half: with that one cause removed nothing is left, and no
+    # clause but the one that compares the digest changed its outcome.
+    assert _more_than_the_one_cause(as_is, removed, met) == []
+
+
+def _hashing(change: Callable[..., str]) -> Callable[..., str]:
+    """A hash for the Claude adapter that ``change`` computes from what it is handed."""
+
+    def replaced(self: Any, toolset: Any, *, context_budget: int | None) -> str:
+        return change(self, toolset, context_budget)
+
+    return replaced
+
+
+def test_the_first_half_of_the_write_proof_fails_on_a_digest_that_is_wrong_for_another_reason(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the first half: the trace of the same write
+    # binds a digest that is not the shared one for another reason than the
+    # known gap names: the adapter hashes what it is handed under another
+    # context budget, or under another version of the bridge. The cell shows
+    # the same one code either way, so the entry alone would call both the
+    # known gap; the first half does not. (Another capability cannot be
+    # played on a write: the shared function refuses a writer under every
+    # capability but the one of the cell.)
+    column = _column()
+    cell = _write_cell(column)
+    digest = ClaudeBackend._tool_authority_digest
+
+    def another_budget(self: Any, toolset: Any, context_budget: int | None) -> str:
+        return digest(self, toolset, context_budget=(context_budget or 0) + 1)
+
+    def another_bridge(self: Any, toolset: Any, context_budget: int | None) -> str:
+        return tool_authority_digest(
+            toolset,
+            capability=self.capability,
+            approval_policy=APPROVAL_POLICY_PER_CALL_EXACT,
+            bridge_protocol=TOOL_AUTHORITY_BRIDGE_PROTOCOL,
+            bridge_version=TOOL_AUTHORITY_BRIDGE_VERSION + 1,
+            context_budget=context_budget,
+        )
+
+    honest = _played(column, cell.scenario, tmp_path / "honest", cell.lens)
+    unscoped = _unscoped_digest(honest, tmp_path / "twin")
+    assert _not_the_digest_without_a_path_scope(honest, unscoped) == []
+    for name, change in (("budget", another_budget), ("bridge", another_bridge)):
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(ClaudeBackend, "_tool_authority_digest", _hashing(change))
+            lying = _played(column, cell.scenario, tmp_path / name, cell.lens)
+        assert lying.report.seam_problems == ()
+        assert lying.report.codes == honest.report.codes == {WRITE_DIGEST_CODE}, name
+        assert _trace_digest(lying) != _trace_digest(honest), name
+        assert _not_the_digest_without_a_path_scope(lying, unscoped) != [], name
+
+
+def test_the_second_half_of_the_write_proof_fails_on_a_write_that_keeps_a_second_deviation(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the second half, each with the one cause of
+    # the known gap removed as the proof removes it. One keeps a deviation of
+    # another clause: the session accounting of the peer is short. One keeps
+    # the same code from a second cause: the hash is bound to the ToolSet that
+    # was attached and to another context budget. One never met the cause:
+    # the hash was handed the attached ToolSet all along.
+    column = _column()
+    cell = _write_cell(column)
+    honest = _played(column, cell.scenario, tmp_path / "honest", cell.lens)
+    attach, digest = ClaudeBackend.attach_toolset, ClaudeBackend._tool_authority_digest
+
+    def play(name: str, *, budget: int = 0, driver: Any = None) -> tuple[runner.Execution, list[str]]:
+        attached: dict[int, Any] = {}
+        met: list[str] = []
+
+        def remembering(self: Any, toolset: Any, **more: Any) -> None:
+            attached[id(self)] = toolset
+            attach(self, toolset, **more)
+
+        def bound(self: Any, toolset: Any, context_budget: int | None) -> str:
+            if toolset is not attached[id(self)]:
+                met.append(type(toolset).__name__)
+            asked = context_budget if not budget else (context_budget or 0) + budget
+            return digest(self, attached[id(self)], context_budget=asked)
+
+        more = {} if driver is None else {"driver": driver}
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(ClaudeBackend, "attach_toolset", remembering)
+            patched.setattr(ClaudeBackend, "_tool_authority_digest", _hashing(bound))
+            return _played(column, cell.scenario, tmp_path / name, cell.lens, **more), met
+
+    removed, met = play("removed")
+    assert _more_than_the_one_cause(honest, removed, met) == []
+    short, short_met = play("short", driver=_with_dialect(_UnderBilled))
+    assert short.report.seam_problems == () and WRITE_DIGEST_CODE not in short.report.codes
+    assert short.report.codes and _more_than_the_one_cause(honest, short, short_met) != []
+    twice, twice_met = play("twice", budget=1)
+    assert twice.report.codes == {WRITE_DIGEST_CODE}
+    assert _more_than_the_one_cause(honest, twice, twice_met) != []
+    # A play of a cell whose ToolSet the adapter does not wrap says nothing
+    # about the cause: the hash was handed what was attached.
+    assert _more_than_the_one_cause(honest, removed, []) != []
 
 
 # -- the module ends with the canary check --------------------------------------------

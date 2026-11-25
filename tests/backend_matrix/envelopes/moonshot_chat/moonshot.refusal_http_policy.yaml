@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A request the Moonshot service rejects for its usage policy before any
+# completion: an HTTP 400 with an error object, no stream and no usage.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: refusal_http_policy
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    an HTTP 400 whose JSON body holds an error object of the fields of
+    openai.types.shared.ErrorObject (code, message, param, type), which the
+    pinned SDK raises as openai.BadRequestError with that object as its body
+  sdk_version: openai 2.14.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach: no policy
+    rejection was induced against the route, and no source read for it
+    states the status, the error type or the error code it answers one
+    with (the vendor documents an HTTP 400 for a request it rejects for an
+    unsupported cache parameter, which is another rejection). The status is
+    the one the SDK maps to its bad-request error; the four fields are those
+    of the SDK's error object; the code and the type are the vendor-neutral
+    spellings of the API the route is compatible with, and the message is a
+    fixed sentence of this envelope. So this envelope proves that the pinned
+    SDK raises a typed status error for such a reply, not that the route
+    sends it.
+
+status: 400
+body:
+  error:
+    message: The request was rejected because it violates the usage policy.
+    type: invalid_request_error
+    param: null
+    code: content_policy_violation

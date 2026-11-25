@@ -63,7 +63,7 @@ from .drivers.base import GUARD_POLICY
 from .peers import launch, worker_harness
 from .provider import CacheCounts, LoopbackProvider, Reply, SeenRequest, SentCall
 from .scenarios import D_COST_BOUND_UNRANKED, SCENARIOS, history_replayed
-from .script import READ_A, Call, ProviderScript, Say, ServedAs, Step
+from .script import READ_A, Call, ProviderScript, Refuse, Say, ServedAs, Step
 
 # Every test here runs the locked worker: a missing environment is an error.
 pytestmark = pytest.mark.matrix_worker
@@ -1823,7 +1823,14 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
     dialect = driver.MoonshotChatDialect()
     blank = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
 
-    for step in (Say("the answer"), Call(READ_A)):
+    # The two replies of the tool loop, and the two refusals that are streams.
+    steps: tuple[Step, ...] = (
+        Say("the answer"),
+        Call(READ_A),
+        Refuse("content_filter"),
+        Refuse("refusal_part"),
+    )
+    for step in steps:
         chunks = dialect.render(step, blank, "call-1").body
         assert chunks[-1] == "[DONE]"
         # The test starts the locked interpreter itself, through the launcher
@@ -1846,8 +1853,65 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
     assert locked_worker_launch.journal is not None
     assert [(item["mode"], item["form"]) for item in locked_worker_launch.journal.launches()] == [
         ("guard", "-c")
-    ] * 2
+    ] * len(steps)
     assert locked_worker_launch.violations() == []
+    # A filter stop names the filter as its finish reason and carries no
+    # text; a refusal part fills the refusal field of its first delta. Both
+    # are billed like a plain reply of a request that read nothing from the
+    # cache: the provider ledger records "no count of cache reads".
+    filtered = dialect.render(Refuse("content_filter"), blank, "call-1")
+    declined = dialect.render(Refuse("refusal_part"), blank, "call-1")
+    assert [chunk["choices"][0]["finish_reason"] for chunk in filtered.body[:2]] == [
+        None,
+        "content_filter",
+    ]
+    assert filtered.body[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    assert declined.body[0]["choices"][0]["delta"]["refusal"]
+    assert "content" not in declined.body[0]["choices"][0]["delta"]
+    for reply in (filtered, declined):
+        assert reply.usage is not None and reply.served_model == "asked"
+        assert dialect.cache_counts(reply) == CacheCounts(None, 0)
+    # The third refusal is no stream: a rejected request is answered with an
+    # error object of the SDK's four fields, bills nothing and names no model.
+    rejected = dialect.render(Refuse("http_policy"), blank, "call-1")
+    assert (rejected.status, rejected.raw, rejected.usage, rejected.served_model) == (
+        400,
+        None,
+        None,
+        None,
+    )
+    assert set(rejected.body) == {"error"}
+    assert set(rejected.body["error"]) == {"code", "message", "param", "type"}
+    assert rejected.envelope == "moonshot_chat/moonshot.refusal_http_policy"
+
+
+class _AnswersWhereItShouldRefuse(driver.MoonshotChatDialect):
+    """Renders a refusal as a plain answer: the provider never refuses."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, Refuse):
+            step = Say("an answer where the script refuses", step.usage)
+        return super().render(step, seen, call_id)
+
+
+def test_a_refusal_that_is_never_sent_fails_the_cell_whatever_its_entry(
+    tmp_path: Path,
+) -> None:
+    class Lying(driver.KimiDriver):
+        def _dialect(self, journal: launch.Journal) -> Any:
+            return _AnswersWhereItShouldRefuse(journal=journal, interpreter=str(self.interpreter))
+
+    # The entry of the cell is strict: a provider side that answers instead
+    # of refusing yields other codes, and the cell fails as a different
+    # deviation instead of staying an expected failure.
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation"):
+        runner.run_cell(
+            Cell(PRIMARY, "S23c", "raw"),
+            tmp_path,
+            preflight={KIMI_KIND: None},
+            known=LEDGER,
+            driver=Lying(),
+        )
 
 
 def test_every_cell_of_the_columns_is_graded_by_the_envelopes_it_used(
@@ -1855,15 +1919,22 @@ def test_every_cell_of_the_columns_is_graded_by_the_envelopes_it_used(
 ) -> None:
     text, tools = played("S01"), played("S04")
 
+    loop = {"moonshot_chat/moonshot.completion", "moonshot_chat/moonshot.tool_call"}
+    refusals = set(DRIVER.envelopes) - loop
     assert set(text.observation.provider.envelopes) == {"moonshot_chat/moonshot.completion"}
-    assert set(tools.observation.provider.envelopes) == set(DRIVER.envelopes)
+    assert set(tools.observation.provider.envelopes) == loop
     assert set(DRIVER.envelopes) == {
         name for name in envelopes.all_envelopes() if name.startswith("moonshot_chat/")
     }
-    # Both envelopes rest on the vendor's documentation and on what the live
-    # checks of the route recorded; neither is a recording.
-    assert {envelopes.load(name).grade for name in DRIVER.envelopes} == {"documented"}
+    # The two envelopes of the tool loop rest on the vendor's documentation
+    # and on what the live checks of the route recorded; neither is a
+    # recording.
+    assert {envelopes.load(name).grade for name in loop} == {"documented"}
     assert text.grade == tools.grade == "documented"
+    # No refusal of the route was observed or is documented in reach: the
+    # three envelopes of a refusal are built to the types of the pinned SDK.
+    assert len(refusals) == 3
+    assert {envelopes.load(name).grade for name in refusals} == {"constructed"}
     # The schema answer of the planner shape travels in the prompt, once, and
     # in no provider field: what the route declares.
     assert SCENARIOS["S04"].governing == ("structured_output",)

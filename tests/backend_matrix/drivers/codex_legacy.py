@@ -61,14 +61,17 @@ from .. import envelopes as envelope_files
 from .. import netguard
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import codex_app_server as peer_program
-from ..provider import LoopbackProvider, Reply, SeenRequest
-from ..script import Call, ProviderScript, Say, Step
+from ..provider import LoopbackProvider, Reply, SeenRequest, answered_from
+from ..script import Call, ProviderScript, Refuse, Say, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
 _SDK_MODULE = "codex_app_server_sdk"
 _OVERLAY_FIELD = "extra.cli_path"
 _PEER_FAILURES = ("unsupported", "crashed")
+# The one form of refusal the notifications of the app-server can carry: a
+# request the provider rejects for its policy.
+REFUSAL = "http_policy"
 # The three requests that open a session, in the order a client sends them.
 _OPENING = ("initialize", "thread/start", "turn/start")
 # The kernel refuses an interpreter line longer than this.
@@ -144,6 +147,9 @@ class CodexAppServerDialect:
         "raw_response_completed",
         "token_usage_updated",
         "turn_completed",
+        # The one refusal the notifications can carry: a failed turn whose
+        # error names a policy of the provider.
+        "turn_failed_policy",
     )
 
     def __init__(self, *, client: str = "") -> None:
@@ -293,7 +299,14 @@ class CodexAppServerDialect:
     # -- answering it ------------------------------------------------------------
 
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
-        if not isinstance(step, (Say, Call)):
+        if isinstance(step, Refuse) and step.form != REFUSAL:
+            raise MatrixSetupError(
+                f"the {self.name} dialect cannot render a refusal of the form "
+                f"{step.form!r}: the protocol has no finish reason of a model "
+                "response and no refusal part of a message, so the cell is pinned "
+                "not expressible in the inventory"
+            )
+        if not isinstance(step, (Say, Call, Refuse)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__}: the "
                 "wire names no served model, and every other step lands with the "
@@ -337,6 +350,11 @@ class CodexAppServerDialect:
                 tool_input=item.get("arguments"),
                 tool_result=item.get("content"),
             )
+        if isinstance(step, Refuse):
+            # The provider refused the request for its policy: the turn fails
+            # before any model response, and nothing is billed.
+            frame("turn_failed_policy")
+            return Reply(200, {"frames": frames, "call": None}, envelopes=tuple(used))
         usage = step.usage
 
         def account() -> None:
@@ -638,6 +656,9 @@ class CodexLegacyDriver:
     @property
     def envelopes(self) -> tuple[str, ...]:
         return CodexAppServerDialect().envelope_names()
+
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        return answered_from(CodexAppServerDialect(), script)
 
     def _dialect(self) -> CodexAppServerDialect:
         return LegacyDialect(client=sdk_client())

@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# One model turn that the provider's safety system stopped, as the
+# command-line tool would relay it: a billed message without content whose
+# stop reason is the refusal. Nothing was observed of the real tool (see
+# cli.init).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: assistant_refusal
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.AssistantMessage, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case
+    "assistant"); the inner message validates as anthropic.types.Message
+    whose stop_reason is the value "refusal" of anthropic.types.StopReason
+  sdk_version: claude-agent-sdk 0.2.121, anthropic 0.112.0
+  reason: >-
+    The frame is the one of a text turn (cli.assistant_text) with an empty
+    content list and the stop reason "refusal", which is the value the
+    provider's SDK types for a turn its safety system declined. No refusal
+    was induced and no source in reach states what the real tool relays for
+    such a turn, or whether the turn carries partial text. So this envelope
+    proves that the frame parses, not that the tool sends it.
+
+status: 200
+
+body:
+  type: assistant
+  message:
+    id: {slot: response_id}
+    type: message
+    role: assistant
+    model: {slot: served_model}
+    content: []
+    stop_reason: refusal
+    stop_sequence: null
+    usage:
+      input_tokens: {slot: input_tokens}
+      output_tokens: {slot: output_tokens}
+      cache_creation_input_tokens: 0
+      cache_read_input_tokens: 0
+  parent_tool_use_id: null
+  session_id: {slot: session_id}
+  uuid: {slot: frame_id}

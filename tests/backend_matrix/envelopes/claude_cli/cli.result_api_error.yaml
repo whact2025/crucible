@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal frame of a session whose request the provider rejected with
+# an HTTP status. Nothing was observed of the real tool (see cli.init): the
+# frame is emulated, so every cell that uses this envelope rests on an
+# emulation of the reference.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: result_api_error
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.ResultMessage with is_error true, the subtype
+    "success" and api_error_status set, as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "result")
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    The pinned SDK types api_error_status as the HTTP status of the failing
+    call of the provider "when is_error is True and subtype is 'success'",
+    emitted by the tool since a release it names; that is the shape of this
+    frame, with the status of a rejected request. The accounting of the
+    frame is the one the tests of the product state for this terminal
+    (tests/test_backends_claude.py, the terminal that confirms a local
+    API-error message), with no vendor source in reach: a usage of zero in
+    its four counters, a cost of zero, the text of the local message as the
+    result text, and a usage record per model that names the placeholder
+    model of that message and holds no field. The SDK types all four as
+    optional, so a tool that leaves one out would need another envelope; a
+    frame without them hides what the adapter makes of the accounting the
+    product's tests give it. Those tests build the terminal with a helper
+    whose default stop reason is that of a finished turn; that default is
+    not taken for a statement about a rejected request, and the stop reason
+    is left out, as the SDK allows.
+
+status: 200
+
+body:
+  type: result
+  subtype: success
+  is_error: true
+  api_error_status: 400
+  duration_ms: 1
+  duration_api_ms: 1
+  num_turns: {slot: turns}
+  result: "API Error: 400 The request was rejected because it violates the usage policy."
+  session_id: {slot: session_id}
+  total_cost_usd: 0.0
+  usage:
+    input_tokens: 0
+    output_tokens: 0
+    cache_creation_input_tokens: 0
+    cache_read_input_tokens: 0
+  modelUsage:
+    "<synthetic>": {}
+  uuid: {slot: frame_id}

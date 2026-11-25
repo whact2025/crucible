@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A chat completion that a content filter stopped: the reply is billed, has
+# no visible text and names the filter as its finish reason, as a local
+# OpenAI-compatible model server would send it.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: local
+behaviour: refusal_content_filter
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletion whose one choice has the finish_reason
+    "content_filter", a value of the closed vocabulary of
+    openai.types.chat.chat_completion.Choice.finish_reason, and a message
+    without content
+  sdk_version: openai 2.44.0
+  notes: >-
+    No local model server was run or observed, and the serving recipes of
+    the model family (primary sources, read 2026-11-18) document launch
+    flags and parsers, not a reply that a filter stopped. The finish reason
+    is the one the SDK types for it, the content is null because the SDK
+    describes it as omitted, and the usage block is the one of a plain
+    completion. So this envelope proves that such a reply parses through the
+    SDK, not that a given server sends it.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices:
+    - index: 0
+      message:
+        role: assistant
+        content: null
+      finish_reason: content_filter
+  usage:
+    prompt_tokens: {slot: input_tokens}
+    completion_tokens: {slot: output_tokens}
+    total_tokens: {slot: total_tokens}

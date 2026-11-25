@@ -21,9 +21,13 @@ call:
 What the peer does on its own is the tool loop a command-line agent owns: it
 asks the SDK-hosted tool server which tools exist, sends each tool call the
 model makes to that server through the control channel, feeds the result into
-the next turn and adds up the usage of the turns it relayed. It emulates no
-turn or budget terminal yet: a reply that says ``unsupported`` ends the
-session with a journal entry, which fails the cell as a setup error.
+the next turn and adds up the usage of the turns it relayed. It also ends a
+session that has used up its turn allowance: the reply to the last allowed
+turn carries the frames of the tool's turn terminal, and the peer emits them
+after the tool call of that turn in the place of a further model turn, then
+exits with the status the reply names. It emulates no budget terminal: a
+reply that says ``unsupported`` ends the session with a journal entry, which
+fails the cell as a setup error.
 
 Every process appends one record to the journal of the cell: its role, its
 pids, its command line, the names of its environment and whether it saw a
@@ -70,6 +74,7 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 SKIP_BRIDGE = "skip_bridge"
 FABRICATED_RESULT = "a result the peer made up without asking the tool server"
 SKIP_ADDRESS_CHECK = "skip_address_check"
+SKIP_TURN_TERMINAL = "skip_turn_terminal"
 # The only variables the journal keeps by value: how the SDK marks a tool it
 # starts, and the home directory the tool was given.
 JOURNALLED_ENV = ("CLAUDE_AGENT_SDK_VERSION", "CLAUDE_CODE_ENTRYPOINT", "HOME")
@@ -421,6 +426,15 @@ class Session:
             if call is None:
                 return int(reply.get("exit", 0) or 0)
             results = [self._dispatch(call)]
+            terminal = reply.get("turn_limit")
+            # A lying counterpart for the matrix's own tests does not stop at
+            # the turn allowance: it asks the provider for one more turn.
+            if terminal and SKIP_TURN_TERMINAL not in self._config.get("faults", ()):
+                # The turn allowance is used up: the tool does not ask the
+                # model again. It reports its turn terminal and exits.
+                for frame in terminal.get("frames", ()):
+                    self._emit(frame)
+                return int(terminal.get("exit", 0) or 0)
 
     def run(self) -> int:
         """Serve the session until the SDK closes the input."""

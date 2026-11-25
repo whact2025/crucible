@@ -59,7 +59,7 @@ from .. import columns as matrix_columns
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import codex_worker as stage
 from ..peers import launch
-from ..provider import LoopbackProvider, SeenRequest
+from ..provider import LoopbackProvider, SeenRequest, answered_from
 from ..script import ProviderScript
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 from .codex_legacy import (
@@ -241,6 +241,9 @@ class CodexOfficialDriver:
     @property
     def envelopes(self) -> tuple[str, ...]:
         return CodexAppServerDialect().envelope_names()
+
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        return answered_from(CodexAppServerDialect(), script)
 
     @property
     def interpreter(self) -> Path:

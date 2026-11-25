@@ -6,7 +6,9 @@
 # known_gaps: a cell listed here is an expected failure only while it fails
 #   with exactly these codes. If it passes, the run fails with "gap fixed,
 #   delete the entry"; if it fails in another way, with "different deviation".
-#   A fix deletes its entry in the same change and edits nothing else here.
+#   A fix deletes its entry in the same change and, where the ceiling of the
+#   entry's pack is frozen, lowers that ceiling by one (see `ceilings`); it
+#   edits nothing else here.
 #   Only a behaviour cell of a real kind and the static cells H01 and H02 may
 #   be listed: a toy cell and the other static cells (P01, P02, P04, H03, H04)
 #   check the matrix itself and are never expected failures.
@@ -14,15 +16,37 @@
 #   cell stays pinned. `observed_under` and `closes_under` hold the governing
 #   declared values of the cell's scenario; they are equal unless the record
 #   names the `declaration_change` (field, from, to, citation) that is the
-#   gap's listed resolution. `predicted` holds the codes expected of the cell
-#   before the first run of its column; the first run corrects them.
+#   gap's listed resolution. `predicted` holds the codes expected of the
+#   cell before the first run of its column; the first run corrects them,
+#   except on a record that was closed before a cell saw it red, which keeps
+#   them as written.
 #   `origin` says where a gap comes from: `gap list` for one that was known
-#   before the matrix was built, `matrix` for one the matrix raised and
-#   `reference` for one found on a reference column.
+#   before the matrix was built, `matrix` for one the matrix raised or made
+#   a record of its own for and `reference` for one found on a reference
+#   column.
+#   `closes_on_grade` is set on a record whose gap is what a provider sends
+#   (a refusal shape, an error body) and, on a reference column, on a record
+#   whose gap is what the vendor's tool relays of such a reply or sends when
+#   a session is stopped: the weakest grade of scripted reply on which a
+#   cell of the record may stop carrying a code of the gap. Static cell H03
+#   fails when such a cell carries none while the dialect of its kind still
+#   answers it from a weaker reply, so a fix that turns the cell green on a
+#   reply constructed from the types of an SDK cannot delete the entry: a
+#   reply of the named grade comes first. A cell of a reference may be
+#   answered from several frames and its grade is that of the weakest of
+#   them, so every frame the cell is answered from has to be of the named
+#   grade before the entry can go.
+#   `awaits_ruling` is set on a record whose closing state no clause states
+#   yet, and names the question that is owed a ruling. Static cell H03 fails
+#   when a cell of such a record carries no code of the gap, whatever the
+#   cell shows, so a fix cannot delete the entry first: the change that
+#   enters the ruling makes the scenario assert what was ruled and takes
+#   the field off the record.
 #   A `column_wide` entry is one clause code that shows on every cell of a
 #   kind where its clause was evaluated and its check was asked (C6 asks for
-#   pricing evidence only of a result that flags its cost complete). It is
-#   owed there and tolerated nowhere else.
+#   pricing evidence only of a result that flags its cost complete, and a
+#   flag that the scenario of a cell waives is not asked of its result). It
+#   is owed there and tolerated nowhere else.
 # declared_differences: differences no feature field expresses. Each has a
 #   product citation, an owner, a date and the alternative contract asserted
 #   instead; a cell passes only if the alternative holds. Either a variant of
@@ -49,16 +73,26 @@
 #   S13, S18, S23a to S23c and S40: the limits (turns, tool dispatch, USD,
 #   tool-result bytes), the refusals and a write as progress. Pack B is the
 #   admission scenario S51 so far. The toy kind runs all three. A real kind
-#   runs the starter set today (`ENABLEMENT` in cells.py), and the static
-#   cell H02 of a driven kind reports static:pack_a_not_enabled until the
-#   kind runs pack A. A blocked column runs S00, S01 and S51 whatever sets
-#   its kind runs.
+#   runs the starter set and pack A (`ENABLEMENT` in cells.py); the static
+#   cell H02 of a driven kind reports static:pack_a_not_enabled for a kind
+#   that does not. A blocked column runs S00, S01 and S51 whatever sets its
+#   kind runs.
 # ceilings: counts may not exceed them. `pack_a` counts the entries on
 #   static cells and on scenarios of the starter set and of pack A, and
 #   every column-wide entry; `pack_b` counts those on scenarios of pack B.
-#   They rise while entries land and are frozen once pack A runs on every
-#   real kind (pack A) and once pack B is complete (pack B); after that they
-#   only fall.
+#   A ceiling rises while the entries of its pack land and is frozen once
+#   the pack runs on every real kind and every cell of it passes or has its
+#   entry; after that it only falls. Pack A runs on every real kind and
+#   every cell of it passes or has its entry: its ceiling is frozen at the
+#   count below, stated by the change that entered the last ruling on a
+#   reference cell of the pack, and from here on it only falls. The ceiling
+#   of pack B still rises.
+#   `frozen` names the packs whose ceiling is frozen. A frozen ceiling is
+#   the count of its pack, and static cell H03 fails on any other number
+#   (static:ceiling_not_the_count). So the change that takes an entry of a
+#   frozen pack away lowers the ceiling of that pack by one in the same
+#   change, and a later entry finds no room that a fix left: it has to
+#   raise a number that only falls.
 #
 # Cell ids read <kind>/<scenario>/<role>/<lens>.
 
@@ -66,8 +100,9 @@ schema_version: crucible.backend-matrix.ledger.v1
 
 ceilings:
   max_known_gaps:
-    pack_a: 35
+    pack_a: 84
     pack_b: 0
+  frozen: [pack_a]
   max_declared_differences: 4
 
 registry:
@@ -82,6 +117,13 @@ registry:
         predicted:
           - "kind:transport!=max_turns"
           - "event.missing:limit/tool_dispatch_budget"
+      # Observed at the first run of the secondary column. What else the
+      # two cells show is the shape of a result built from an outcome of the
+      # worker's exception classifier, which is another record (M11).
+      - cell: kimi/S12/secondary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["kind:transport!=max_turns", "event.missing:limit/tool_dispatch_budget"]
 
   G03:
     title: Kimi does not credit a write as progress (frozen wrapper handed to the mutation host)
@@ -93,6 +135,16 @@ registry:
         closes_under: {}
         # While G02 is open the denied read ends as a transport error; the
         # kind code becomes kind:max_turns!=none once G02 is fixed.
+        predicted:
+          - "progress:write_not_credited"
+          - "kind:transport!=none"
+          - "stop:tool_budget_exhausted!=end_turn"
+          - "dispatch.missing:read_a"
+          - "request.unconsumed"
+      # Observed at the first run of the secondary column.
+      - cell: kimi/S40/secondary/raw
+        observed_under: {}
+        closes_under: {}
         predicted:
           - "progress:write_not_credited"
           - "kind:transport!=none"
@@ -113,8 +165,10 @@ registry:
         observed_under: {}
         closes_under: {}
         predicted: ["static:worker_skip"]
-      # static:no_driven_column until the driver landed; the cell stays red
-      # until pack A runs on the columns.
+      # static:no_driven_column until the driver landed, then
+      # static:pack_a_not_enabled until pack A ran on the columns. Closed
+      # with pack A on the two diagnostic columns: the cell has no entry any
+      # more.
       - cell: kimi/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -127,12 +181,23 @@ registry:
     # The gap is the limit exits (turn limit, USD budget, tool-result byte
     # budget), and its cells are of pack A. Their predictions were made for
     # the initial release, where a limit event after the terminal made
-    # invoke raise. When the column was first driven that raise was gone:
-    # the update that moved the open-weight routes to their current models
-    # had given each limit exit a terminal of its own, so no cell of the
-    # matrix has seen this gap red as predicted. The predictions stay as
-    # written until the first run of pack A on the column corrects them.
-    # What the starter set shows about the terminal of an exit without a
+    # invoke raise and the paid usage was lost. Closed for pack A before any
+    # cell saw it: the update that moved the open-weight routes to their
+    # current models had given each limit exit a terminal of its own, so no
+    # cell of the matrix has seen that raise and no cell carries a code of
+    # this record. At the first run of pack A the turn limit and the USD
+    # overrun returned typed results with their limit event and a terminal
+    # named after the stop reason (the first cell is an expected failure for
+    # the tool-authority digest of G24 alone, the second for the column-wide
+    # code of G24 alone), and the byte budget ended the call with a typed
+    # stop of its own, which is another record, M14. The predictions are
+    # kept as they were written: they are the codes the cells show if the
+    # raise comes back, and a cell that shows them fails as a different or
+    # an unexpected deviation. Only a cell that shows the raise reopens this
+    # record. That the record is closed for pack A, and that only the raise
+    # reopens it, was ruled on 2026-11-24 by a decision panel that acts
+    # under a standing instruction of the release owner, who may overrule
+    # it. What the column shows about the terminal of an exit without a
     # limit is another record, M05.
     cells:
       - cell: deepseek/S10a/primary/raw
@@ -146,8 +211,8 @@ registry:
       - cell: deepseek/S18/primary/raw
         observed_under: {}
         closes_under: {}
-        # The call ends at the first result over the budget, so the rest of
-        # the script is never requested.
+        # As first written. The first run showed no raise and no code of
+        # this record on the cell; what the cell shows is M14's.
         predicted:
           - "raise:ValueError@after_request/assay.types.invocation"
           - "request.unconsumed"
@@ -156,10 +221,26 @@ registry:
     title: DeepSeek raises before transport for max_turns above 64
     origin: gap list
     severity: high
+    awaits_ruling: >-
+      what a turn ceiling of an adapter's own owes as its report on a route
+      whose wire carries no turn control
+    # The cell asks for the suite's turn count and one completion. It holds
+    # that the call returns a result from one request, that a turn control
+    # on the wire is the count that was asked for and, on a route that
+    # declares an enforced turn limit, that every request carries the count
+    # where the wire has a field for one. The wire of this route has none,
+    # so the cell cannot tell an adapter that takes the count from one that
+    # cuts it to a ceiling of its own and says so nowhere. The closing state
+    # of the gap is a ceiling that is applied and reported, or a refusal at
+    # routing with no request; what "reported" asks on this wire is stated
+    # by no clause yet. Until that is ruled the record waits
+    # (`awaits_ruling`): a fix that clamps makes the cell stop raising and
+    # leaves on it the terminal name that is M05's subject, which does not
+    # show that the gap is closed. Such a fix adds the cell to M05's record.
     cells:
       - cell: deepseek/S11/primary/raw
-        observed_under: {}
-        closes_under: {}
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
         predicted:
           - "raise:ValueError@before_request/crucible.backends.deepseek"
           - "request.unconsumed"
@@ -176,6 +257,12 @@ registry:
       - cell: deepseek/S04/primary/guarded
         observed_under: {structured_output: prompt_only}
         closes_under: {structured_output: prompt_only}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      # Observed at the first run of pack A: the two tool rounds before
+      # the turn limit are two request events.
+      - cell: deepseek/S10a/primary/guarded
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
         predicted: ["guard:limit_contract_violated", "guard:revoked"]
 
   G17:
@@ -197,6 +284,18 @@ registry:
     title: DeepSeek has no content-rejected path
     origin: gap list
     severity: high
+    closes_on_grade: documented
+    # Each of the three forms of refusal ends as a non-retriable transport
+    # error, as predicted: that kind is the whole of this gap. A response
+    # that a content filter stopped (the terminal of an incomplete response)
+    # is typed from its terminal; the name of that terminal event is M05's
+    # subject. A response whose message holds a refusal part and a request
+    # the service rejects with an HTTP status both end as an error of the
+    # worker; what the result of such an error loses beside its kind is
+    # another record, M13. The three replies are constructed from the types
+    # of the pinned SDK: no refusal of the route was observed or is
+    # documented, so the gap cannot be closed on these envelopes
+    # (`closes_on_grade`).
     cells:
       - cell: deepseek/S23a/primary/raw
         observed_under: {}
@@ -216,8 +315,9 @@ registry:
     origin: gap list
     severity: high
     cells:
-      # static:no_driven_column until the driver landed; the cell stays red
-      # until pack A runs on the column.
+      # static:no_driven_column until the driver landed, then
+      # static:pack_a_not_enabled until pack A ran on the column. Closed with
+      # pack A on the column: the cell has no entry any more.
       - cell: deepseek/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -251,6 +351,28 @@ registry:
         observed_under: {structured_output: prompt_only}
         closes_under: {structured_output: prompt_only}
         predicted: ["digest.mismatch:tool_authority"]
+      # Observed at the first run of pack A: every cell that attaches a
+      # ToolSet and returns a result.
+      - cell: deepseek/S10a/primary/raw
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S10a/primary/guarded
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S12/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["digest.mismatch:tool_authority"]
 
   G28:
     title: The gateway adapter records one request event per completion, which the limit guard rejects
@@ -281,6 +403,20 @@ registry:
       - cell: openai_compat:hosted/S04/secondary/guarded
         observed_under: {structured_output: unsupported}
         closes_under: {structured_output: unsupported}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      # Observed at the first run of pack A: the two tool rounds and the
+      # forced finalisation at the turn limit are three request events.
+      - cell: openai_compat:hosted/S10a/primary/guarded
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:hosted/S10a/secondary/guarded
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["guard:limit_contract_violated", "guard:revoked"]
+      - cell: openai_compat:local/S10a/primary/guarded
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
         predicted: ["guard:limit_contract_violated", "guard:revoked"]
 
   G29:
@@ -321,14 +457,33 @@ registry:
         observed_under: {structured_output: unsupported}
         closes_under: {structured_output: unsupported}
         predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      # Observed at the first run of pack A: the forced finalisation at the
+      # turn limit clears the flags in both lenses, on every column.
+      - cell: openai_compat:hosted/S10a/secondary/raw
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S10a/primary/guarded
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:hosted/S10a/secondary/guarded
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
+      - cell: openai_compat:local/S10a/primary/guarded
+        observed_under: {turn_limit: round_boundary}
+        closes_under: {turn_limit: round_boundary}
+        predicted: ["flag:token_usage_complete=False", "flag:cost_complete=False"]
 
   G30:
     title: Every gateway test stubs the client and the local route has no test; the columns are not driven
     origin: gap list
     severity: high
     cells:
-      # static:no_driven_column until the drivers landed; the cells stay red
-      # until pack A runs on the columns.
+      # static:no_driven_column until the drivers landed, then
+      # static:pack_a_not_enabled until pack A ran on the columns. Closed
+      # with pack A on the three columns: the cells have no entry any more.
       - cell: openai_compat:hosted/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -353,8 +508,9 @@ registry:
     origin: matrix
     severity: medium
     cells:
-      # static:no_driven_column until the driver landed; the cell stays red
-      # until pack A runs on the columns.
+      # static:no_driven_column until the driver landed, then
+      # static:pack_a_not_enabled until pack A ran on the columns. Closed
+      # with pack A on the columns: the cell has no entry any more.
       - cell: claude/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -365,8 +521,9 @@ registry:
     origin: matrix
     severity: medium
     cells:
-      # static:no_driven_column until the driver landed; the cell stays red
-      # until pack A runs on the column.
+      # static:no_driven_column until the driver landed, then
+      # static:pack_a_not_enabled until pack A ran on the column. Closed
+      # with pack A on the column: the cell has no entry any more.
       - cell: codex:legacy/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -377,8 +534,9 @@ registry:
     origin: matrix
     severity: medium
     cells:
-      # static:no_driven_column until the driver landed; the cell stays red
-      # until pack A runs on the column.
+      # static:no_driven_column until the driver landed, then
+      # static:pack_a_not_enabled until pack A ran on the column. Closed
+      # with pack A on the column: the cell has no entry any more.
       - cell: codex:official/H02/-/static
         observed_under: {}
         closes_under: {}
@@ -425,7 +583,7 @@ registry:
         closes_under: {structured_output: unsupported}
 
   M05:
-    title: The DeepSeek trace names the terminal event of a clean finish after the provider's terminal type, not after stop_reason
+    title: The DeepSeek trace names the terminal event of an exit without a limit after the provider's terminal type, not after stop_reason
     origin: matrix
     severity: low
     # Not predicted when the matrix was designed: the raw starter cells of
@@ -436,8 +594,9 @@ registry:
     # clean finish has stop_reason end_turn under a terminal event named
     # response.completed. Clause C4 asks for a terminal named after
     # stop_reason. The limit exits of the adapter end with a terminal of
-    # their own that is named so (they are G14's subject, not this record's),
-    # and in the guarded lens the limit guard renames the terminal itself
+    # their own that is named so (they are G14's subject, and what the
+    # byte-budget exit shows is M14's; not this record's), and in the
+    # guarded lens the limit guard renames the terminal itself
     # (crucible/backends/limits.py), so the code shows in the raw lens only.
     # Low: no product code reads the name of this adapter's terminal event
     # today; the one reader of a terminal's name is the limit guard's cost
@@ -459,6 +618,12 @@ registry:
       - cell: deepseek/S04/primary/raw
         observed_under: {structured_output: prompt_only}
         closes_under: {structured_output: prompt_only}
+      # Observed at the first run of pack A: a response the provider ends
+      # as incomplete is an exit without a limit too. Its stop_reason is
+      # error and its terminal event is named response.incomplete.
+      - cell: deepseek/S23a/primary/raw
+        observed_under: {}
+        closes_under: {}
 
   M06:
     title: The Kimi routes flag token and cost accounting incomplete for every reply that carries no cache-read count
@@ -575,6 +740,18 @@ registry:
     # R), where a reply that carries the count and lacks its closing message
     # leaves the same codes under another text; and the same two cells,
     # answered with a reply that carries the count, yield no code at all.
+    # The result of the two cells is built from an outcome of the worker's
+    # exception classifier, the outcome M11 records on the diagnostic
+    # routes. Here the reply is rejected while its frames are read, before
+    # any step has settled: the outcome carries no usage, no segment and no
+    # model, and no terminal was seen. A decision panel under the owner's
+    # standing instruction ruled on 2026-11-24 that the terminal code and
+    # the served-model code of the two cells stay in the two ruled entries
+    # of this record (the owner may overrule). A fix of M11 that changes
+    # what these cells show edits the two entries in the same change and
+    # says so. Such an edit only takes codes out of the two entries: a code
+    # that neither cell shows at the date of this ruling goes to a decision
+    # of its own before a ruled entry takes it.
     cells:
       - cell: kimi/S01/blocked/raw
         observed_under: {}
@@ -640,6 +817,299 @@ registry:
         observed_under: {structured_output: prompt_only}
         closes_under: {structured_output: prompt_only}
 
+  G07:
+    title: The Kimi turn-limit result disowns its terminal and records no limit event
+    origin: gap list
+    severity: medium
+    # As predicted: the error is typed (max_turns, not retriable) and the
+    # stop reason is max_turns, but the trace has no limit event and the
+    # result flags its terminal incomplete. Under the diagnostic limit guard
+    # the incomplete evidence revokes the next call: the guard leaves the
+    # adapter's result in place and refuses a second plain call.
+    cells:
+      - cell: kimi/S10a/primary/raw
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+      - cell: kimi/S10a/secondary/raw
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+      - cell: kimi/S10a/primary/guarded
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+      - cell: kimi/S10a/secondary/guarded
+        observed_under: {turn_limit: hard}
+        closes_under: {turn_limit: hard}
+
+  G08:
+    title: The Kimi USD-overrun result disowns its terminal and records no limit event
+    origin: gap list
+    severity: medium
+    # Predicted for the initial release with a stop reason that stayed
+    # end_turn. Corrected at the first run of pack A: the update that moved
+    # the open-weight routes to their current models typed the stop
+    # (budget_exhausted, with the error of that kind). What is left is the
+    # missing limit event and a terminal the result disowns. The cost the
+    # same cells report against the matrix rate card is another record, M12.
+    cells:
+      - cell: kimi/S13/primary/raw
+        observed_under: {usd_limit: post_hoc}
+        closes_under: {usd_limit: post_hoc}
+      - cell: kimi/S13/secondary/raw
+        observed_under: {usd_limit: post_hoc}
+        closes_under: {usd_limit: post_hoc}
+
+  G10:
+    title: Kimi types a policy rejection delivered as an HTTP error as a transport error
+    origin: gap list
+    severity: medium
+    closes_on_grade: documented
+    # As predicted: a request the service rejects with an HTTP 400 ends as a
+    # non-retriable transport error that keeps the status, not as a rejected
+    # content. A reply that a content filter stopped is typed as rejected
+    # content and passes (but for the column-wide accounting of M06); a
+    # reply that declines in its refusal field is another record, M10. The
+    # reply of this record is constructed from the types of the pinned SDK:
+    # the error shape of the service was not observed and is not documented
+    # in reach, so the gap cannot be closed on this envelope
+    # (`closes_on_grade`).
+    cells:
+      - cell: kimi/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S23c/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  G35:
+    title: The gateway adapter types a refusal as a transport error
+    origin: gap list
+    severity: medium
+    closes_on_grade: documented
+    # A reply that a content filter stopped and a reply that declines in the
+    # refusal field of its message both end as the adapter's empty-completion
+    # error, a retriable transport error: the finish reason and the refusal
+    # field are not read. Predicted for these two forms. The third form was
+    # not predicted and is entered here at the first run of pack A: a
+    # request the service rejects with an HTTP 400 ends as a non-retriable
+    # transport error that keeps the status. The three replies are
+    # constructed from the types of the SDK: no refusal of a gateway or of a
+    # local server was observed or is documented in reach, so the gap cannot
+    # be closed on these envelopes (`closes_on_grade`).
+    cells:
+      - cell: openai_compat:hosted/S23a/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:hosted/S23b/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:hosted/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:hosted/S23a/secondary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:hosted/S23b/secondary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:hosted/S23c/secondary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S23a/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S23b/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  G39:
+    title: The gateway adapter ends the call at a tool result over the byte budget instead of truncating it
+    origin: gap list
+    severity: medium
+    # Predicted as the stop reason alone. At the first run of pack A the
+    # cells show the whole of it: the first result over the context budget
+    # ends the call as a non-retriable transport error with the stop reason
+    # context_limit, so the result is dropped, not truncated, and the rest
+    # of the script is never requested. The same behaviour on the DeepSeek
+    # column is record M14.
+    cells:
+      - cell: openai_compat:hosted/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:hosted/S18/secondary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  M10:
+    title: Kimi does not read the refusal field of a reply, which ends as a retriable transport error
+    origin: matrix
+    severity: medium
+    closes_on_grade: documented
+    # Not predicted. Seen at the first run of pack A on the two diagnostic
+    # columns: a streamed reply whose delta carries the refusal in its
+    # refusal field, with no content, reaches the worker's vendor stack as
+    # an empty response. The call ends as a transport error that is marked
+    # retriable, where a refusal is rejected content and is not to be
+    # retried. What else the cells show is the shape of a result built from
+    # an outcome of the worker's exception classifier (M11). The reply is
+    # constructed from the types of the pinned SDK: no source in reach says
+    # that the service fills the refusal field, so the gap cannot be closed
+    # on this envelope (`closes_on_grade`).
+    cells:
+      - cell: kimi/S23b/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S23b/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  M11:
+    title: A Kimi result built from an outcome that the worker's exception classifier returned names no served model, disowns its terminal and leaves its cost interval uncovered
+    origin: matrix
+    severity: medium
+    # Not predicted as a gap of its own; the codes were seen beside those of
+    # G02 and G03 when the columns were first probed. Seen at the first run
+    # of pack A on the two diagnostic columns, on every cell whose call ends
+    # in an exception that the worker's classifier turns into the outcome it
+    # reports: the tool-budget denial (G02, and through it the write that is
+    # not credited, G03) and the empty response of a refusal field (M10).
+    # Each of those calls was billed and the provider named its model. An
+    # outcome the classifier returned carries no model identity and says
+    # that no terminal was seen; the parent adds the usage and the segments
+    # of the billed responses from its checkpoints and passes the rest on.
+    # So the result names no served model; where the scenario owes the
+    # terminal flag it is false; and on these routes, which opt into the
+    # cost upper bound, the cost interval holds a segment for every billed
+    # response and does not claim to cover the usage (of the conditions of
+    # its coverage only the two on the model identity fail), so the reported
+    # cost and the charge to the budget are both its lower bound.
+    # Which branch of the parent's result builder types the outcome is not
+    # the cause. Played on the dispatch-budget cell: with the tool-budget
+    # outcome typed by the builder as the fix of G02 is sketched, the two
+    # codes of G02 go and all three codes of this record stay. An outcome
+    # the worker types itself (a limit, a stop) carries the model identity.
+    # On S40 the codes go when the write is credited and the call ends
+    # cleanly (G03); on S23b they go when the reply of a refusal field no
+    # longer ends in an exception of the worker (M10). A change that closes
+    # codes of this record deletes them here in the same change.
+    # The same outcome builds the result of the two cells of the blocked
+    # column (kimi/S01/blocked/raw and guarded), where the strict route
+    # rejects the reply before any step has settled. That result has no
+    # usage and no cost interval, so the interval code of this record does
+    # not show there; its terminal code and its served-model code are booked
+    # under M07, in its two entries, which carry a ruling of 2026-11-21;
+    # that they stay there was ruled on 2026-11-24 by a decision panel that
+    # acts under a standing instruction of the release owner, who may
+    # overrule it. This record lists the cells of the two diagnostic routes
+    # only. A fix of this record that changes what the two blocked cells
+    # show edits their entries in the same change and says that it edits
+    # ruled entries of M07; such an edit only takes codes out of them, as
+    # record M07 says. One that leaves them says so in its design.
+    cells:
+      - cell: kimi/S12/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S12/secondary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S23b/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S23b/secondary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S40/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  M12:
+    title: A Kimi route under its cost policy reports a cost above the matrix rate card when one response overruns the budget (no fix is owed)
+    origin: matrix
+    severity: low
+    # Seen when the columns were first probed and again at the first run of
+    # pack A: on the USD overrun of a single response the result reports the
+    # lower bound of its cost interval, 0.0102 USD, where the matrix rate
+    # card prices the billed usage at 0.0100 USD. No fix is owed, and none is
+    # to be taken from this record. A route that opts into the cost upper
+    # bound prices a response from the literal rates of its cost policy, not
+    # from the pricing file, on purpose: the literal copy ties the parent
+    # adapter to the budget stop of its worker, and a price change that does
+    # not reach both fails closed. The matrix rate card is the reference of
+    # the reported cost on every column, and the shipped price row of the
+    # route's model is the reference of the two bounds of a segment (the
+    # ruling on M06). Those two references price this reply differently (an
+    # output-heavy reply: above 0.9 of the input in output tokens the lower
+    # bound at the shipped rates lies above the rate-card price), so the
+    # code cannot close while both rules stand. It closes when the rule that
+    # reads the shipped price row changes, or by a ruling of its own on
+    # which price binds the reported cost of such a route.
+    cells:
+      - cell: kimi/S13/primary/raw
+        observed_under: {usd_limit: post_hoc}
+        closes_under: {usd_limit: post_hoc}
+      - cell: kimi/S13/secondary/raw
+        observed_under: {usd_limit: post_hoc}
+        closes_under: {usd_limit: post_hoc}
+
+  M13:
+    title: A DeepSeek result built from an error of its worker reports no usage, names no served model and flags its trace incomplete
+    origin: matrix
+    severity: medium
+    # Not predicted. Seen at the first run of pack A on two forms of
+    # refusal, and it is not about refusals: it is what the adapter returns
+    # when its worker ends a request with an error. A response whose message
+    # holds a part that is no text is rejected by the worker, which accepts
+    # only text parts in a message, and the parent builds the result in its
+    # branch for a qualification failure of the worker: the worker's own
+    # error type does not reach it. The provider billed that response and
+    # named its model; the result reports a usage of zero with both
+    # accounting flags false, names no served model and flags its trace
+    # incomplete. A request the service answers with an HTTP error status
+    # ends as the worker's error by type, in the parent's branch for that
+    # error. Nothing was billed there and no model was named, and the trace
+    # is flagged incomplete all the same, so its terminal cannot be checked:
+    # that code shows on any cell whose request the service rejects with a
+    # status, whatever the scenario is about. The kind of the two results is
+    # G18's subject, not this record's.
+    cells:
+      - cell: deepseek/S23b/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: deepseek/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  M14:
+    title: The DeepSeek adapter ends the call at a tool result over the byte budget instead of truncating it
+    origin: matrix
+    severity: medium
+    # Seen at the first run of pack A on the column. The first tool result
+    # over the byte budget ends the call as a non-retriable transport error
+    # with the stop reason context_limit, after a limit event and a terminal
+    # of its own. Nothing raises, and the result keeps its usage and its
+    # four completeness flags; the tool result is dropped, not truncated,
+    # and the rest of the script is never requested. The scenario asks that
+    # the result is truncated and the turn finishes. This is the DeepSeek
+    # twin of what G39 holds for the gateway kinds: the same three codes and
+    # the same events. The behaviour was known before the matrix was built:
+    # the gap list carried it inside G14, as the byte-budget part of that
+    # gap's listed fix. It is a record of its own, at its own severity,
+    # because G14's raise was gone before a cell saw it. Booked here on
+    # 2026-11-24 by a decision panel that acts under a standing instruction
+    # of the release owner, who may overrule it.
+    cells:
+      - cell: deepseek/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+
   R04:
     title: The official Codex route flags its token usage incomplete on a reply that is not all cache-read, and its cost complete without pricing evidence
     origin: reference
@@ -649,12 +1119,15 @@ registry:
     # until the product is fixed. Ruled by the release owner in person on
     # 2026-11-21: asked whether to accept the two findings on the official
     # Codex route as known gaps and keep the real worker, the owner accepted
-    # both. That ruling is the `ruling` of every known-gap entry that names
-    # this record. Here it is restated and is not a field of the record: a
-    # ruling on a registry record is leave to withdraw the record's cells
-    # (H03 then accepts a cell that is pinned not expressible or no longer
-    # generated), which was not ruled. The severity is the one proposed with
-    # the finding; the ruling names none.
+    # both. That ruling is the `ruling` of the entries of the starter set
+    # that name this record and of its two column-wide entries. The entry of
+    # pack A that names it carries the ruling of a decision panel instead:
+    # the owner ruled on the finding, and that the cell of pack A shows it
+    # and nothing else is the panel's finding. Here it is restated and is
+    # not a field of the record: a ruling on a registry record is leave to
+    # withdraw the record's cells (H03 then accepts a cell that is pinned
+    # not expressible or no longer generated), which was not ruled. The
+    # severity is the one proposed with the finding; the ruling names none.
     # One accounting rule of both Codex transports for usage without a
     # cache-write counter, not a quirk of this route: on the same
     # notifications, without the exact usage notification, the app-server
@@ -676,7 +1149,9 @@ registry:
     # compares the reported tokens with the provider's ledger on this column
     # are two tests of the official module, both required by name by the
     # verifier (cells.REQUIRED_PROOFS): a turn of one response, and the test
-    # that plays both readings of `last` on a turn of several.
+    # that plays both readings of `last` on a turn of several, with its twin
+    # for the guarded lens; and, for the result of a dispatch-budget denial,
+    # a third, under the record of that cell (R09).
     column_wide:
       - {kind: "codex:official", code: "flag:token_usage_complete=False"}
       - {kind: "codex:official", code: "pricing:unreconciled"}
@@ -690,6 +1165,11 @@ registry:
       - cell: codex:official/S04/primary/guarded
         observed_under: {structured_output: native}
         closes_under: {structured_output: native}
+      # Observed at the first run of pack A: the guard replaces the result
+      # of the turn limit too.
+      - cell: codex:official/S10a/primary/guarded
+        observed_under: {turn_limit: unsupported}
+        closes_under: {turn_limit: unsupported}
 
   R05:
     title: On the official Codex route a turn of several model responses reports the usage of its last response (unconfirmed, reference emulated)
@@ -701,8 +1181,11 @@ registry:
     # is a defect, fixed. Ruled by the release owner in person on
     # 2026-11-21: asked whether to accept the two findings on the official
     # Codex route as known gaps and keep the real worker, the owner accepted
-    # both. That ruling is the `ruling` of every known-gap entry that names
-    # this record. Here it is restated and is not a field of the record: a
+    # both. That ruling is the `ruling` of the entries of the starter set
+    # that name this record. The entries of pack A that name it carry the
+    # ruling of a decision panel instead: the owner ruled on the finding,
+    # and that the cells of pack A show it and nothing else is the panel's
+    # finding. Here it is restated and is not a field of the record: a
     # ruling on a registry record is leave to withdraw the record's cells
     # (H03 then accepts a cell that is pinned not expressible or no longer
     # generated), which was not ruled.
@@ -750,30 +1233,481 @@ registry:
         observed_under: {structured_output: native}
         closes_under: {structured_output: native}
         predicted: ["usage.cost_usd:lt"]
+      # Observed at the first run of pack A, on its turns of several model
+      # responses: the turn limit of a route without a turn control (three
+      # tool rounds and the answer), the tool-result byte budget and the
+      # write as progress. The test named above plays both readings of
+      # `last` on the raw cell of each, and its twin
+      # (test_what_a_guarded_turn_of_several_responses_shows_rests_on_the_reading_of_last,
+      # required by name too) on every guarded cell whose entry names this
+      # record: there the usage code goes with the reading, the two guard
+      # codes of R04 stay, and the guard names the token flag as the only
+      # evidence it misses.
+      - cell: codex:official/S10a/primary/raw
+        observed_under: {turn_limit: unsupported}
+        closes_under: {turn_limit: unsupported}
+      - cell: codex:official/S10a/primary/guarded
+        observed_under: {turn_limit: unsupported}
+        closes_under: {turn_limit: unsupported}
+      - cell: codex:official/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: codex:official/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R07:
+    title: The Claude adapter flags token usage, cost and terminal incomplete on the result of a dispatch-budget denial, and the usage it reports there is not the same in every play
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # First run of pack A on the two columns, not predicted. A known gap of
+    # the reference by the ruling of a decision panel, not an answer of the
+    # release owner in person. That ruling is the `ruling` of every
+    # known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled.
+    # The scenario owes the two accounting flags and the terminal flag on
+    # every kind, and nothing was waived. When a workflow's tool-dispatch
+    # budget denies a call, the adapter cuts the session and builds its
+    # result in the handler of a classified exception inside the per-attempt
+    # function (crucible/backends/claude.py, _invoke_once), with the three
+    # flags false; the function that merges attempts (_finalize_attempts)
+    # keeps it. The kind, the stop reason, the limit event, the one dispatch
+    # and the tool-authority digest are as the scenario asks.
+    # What no code of the cells shows. The usage the result reports is what
+    # the stream had consumed when the session was cut: a billed response
+    # whose frame the adapter had received can be missing from it and from
+    # the usage events of the trace, and it differs between plays of the
+    # same billing. While the entries stand, clause C6 compares no reported
+    # usage with the provider's ledger on these two cells, where the Kimi
+    # cells of the same scenario are held to the exact numbers. The trace of
+    # a denial carries a second limit event, for the turn limit, and the
+    # text of the error names the turn limit; no clause reads either. The
+    # in-process tool bridge answers a denied call to the vendor tool as an
+    # ordinary error when its wait loop looks again; the adapter's cut comes
+    # before that answer, and with the cut delayed past it a further request
+    # reaches the provider (a forced run, not the product as shipped).
+    # The frames of the cells are constructed and nothing was observed of
+    # the real tool: whether a stopped tool can settle the accounting of the
+    # turn it was cut in is not known. A product test pins the three flags
+    # as they are (tests/test_backends_claude.py,
+    # test_agent_tool_dispatch_budget_denial_cancels_sdk_tool_loop).
+    # The severity is the panel's: the result fails closed and nothing is
+    # overspent. A development budget books such a call as accounting debt
+    # and withdraws its own authority, a caller behind the limit guard is
+    # refused its next call on the backend, the planning session marks the
+    # operation indeterminate, and the usage reported can understate the
+    # bill.
+    # The grade this record closes on is read today from the frame that
+    # opens a session and the frame of a tool call (`cli.init`,
+    # `cli.assistant_tool_use`); neither is what the tool sends when a
+    # session is stopped. The fix brings the frames of a stopped session
+    # into the steps the scenario's script renders, at grade `documented` or
+    # better, before an entry goes; a regrade of today's frames alone
+    # releases nothing.
+    cells:
+      - cell: claude/S12/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S12/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R08:
+    title: The app-server Codex route flags token usage and cost incomplete on the result of a dispatch-budget denial although it reports every billed response
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # First run of pack A on the column, not predicted. A known gap of the
+    # reference by the ruling of a decision panel, not an answer of the
+    # release owner in person. That ruling is the `ruling` of every
+    # known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled. One record for each
+    # Codex route: the two routes return different results from two branches
+    # of one site (R09).
+    # The scenario owes the accounting flags on every kind. When a
+    # workflow's tool-dispatch budget denies a call, the adapter cancels the
+    # attempt and builds its result in the denial branch of the attempt
+    # controller (crucible/backends/codex.py, _invoke_with_retries_core)
+    # from the result the cancelled attempt left: it takes the two
+    # accounting flags of that attempt, which are false, and flags the
+    # terminal complete. The result reports every response the provider
+    # billed. The incompleteness is a deliberate rule for an interrupted
+    # attempt, and it is a gap against the scenario all the same: a turn the
+    # tool settled is accounted complete by the same adapter, and whether an
+    # interrupted turn can be settled is not known. The other function that
+    # builds a denial result, for a ToolSet with write names
+    # (_override_with_terminal_dispatch), inherits the flags the same way,
+    # and no cell plays it.
+    # What no code of the cell shows. The HTTP tool bridge answers a denied
+    # call to the vendor tool as an ordinary error result when its wait loop
+    # looks again, and the adapter's cancellation comes before that answer
+    # by the bridge's interval between two looks. With the answer not
+    # delayed the cell shows a further request to the provider, and the
+    # route can then return all four flags true (a varied run, not the
+    # product as shipped): the tool loop is not held at the denial, and the
+    # entry does not say that it is. While the entry stands, clause C6
+    # compares no reported usage with the provider's ledger on this cell,
+    # and a result that had lost its usage would show the same two codes. A
+    # test of the app-server module that the verifier requires by name
+    # holds what the title says of the result
+    # (test_the_result_of_a_dispatch_budget_denial_reports_every_response_the_provider_billed):
+    # judged as a result that flags its accounting complete, the result of
+    # the denial shows no code about the size of its usage, and its trace
+    # holds a usage event. No entry attributes a code to this record on a
+    # cell that test does not play.
+    # The frames of the cell are constructed and nothing was observed of the
+    # real tool. Product tests pin the behaviour
+    # (tests/test_backends_codex.py,
+    # test_codex_source_budget_denial_cancels_tool_loop_without_retry;
+    # tests/test_codex_cancellation_evidence.py: what the attempt captured
+    # is kept, usage is never invented, and a turn that completed beside the
+    # denial is accounted complete).
+    # The severity is the panel's: the result fails closed and nothing is
+    # overspent. A development budget books such a call as accounting debt
+    # and withdraws its own authority, a caller behind the limit guard is
+    # refused its next call on the backend, the planning session marks the
+    # operation indeterminate, and with the bridge's answer not delayed the
+    # route can flag complete a result after a request that followed the
+    # denial.
+    # The grade this record closes on is read today from the frame of a tool
+    # call and the usage notification (`app_server.tool_call_started`,
+    # `app_server.token_usage_updated`); neither is what the tool sends when
+    # a turn is interrupted. The fix brings the frames of an interrupted
+    # turn into the steps the scenario's script renders, at grade
+    # `documented` or better, before the entry goes; a regrade of today's
+    # frames alone, for whatever reason, releases nothing.
+    cells:
+      - cell: codex:legacy/S12/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R09:
+    title: The official Codex route reports no usage on the result of a dispatch-budget denial and flags its accounting incomplete
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # First run of pack A on the column, not predicted. A known gap of the
+    # reference by the ruling of a decision panel, not an answer of the
+    # release owner in person. That ruling is the `ruling` of every
+    # known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled. One record for each
+    # Codex route (R08 is the app-server route).
+    # The result is built by the denial branch of the attempt controller, as
+    # on the app-server route, and here with no result of the cancelled
+    # attempt: the worker of this route publishes usage only in the payload
+    # that ends a turn, and a cancellation is raised again
+    # (crucible/backends/codex_official.py, _invoke_once). So the result
+    # reports no usage for responses the provider billed, flags both
+    # accounting flags false and the terminal complete. No code names that:
+    # clause C6 takes any number below the bill for honest on a result that
+    # flags its token usage incomplete. A test of the official module that
+    # the verifier requires by name holds it
+    # (test_the_result_of_a_dispatch_budget_denial_reports_no_usage_for_what_the_provider_billed).
+    # The entry of the cell lists the cost flag code. The token flag code is
+    # carried by the column-wide entry of R04; on this cell that flag is
+    # false because the cancelled attempt left no result, a cause of its
+    # own. The change that deletes that column-wide entry while this entry
+    # stands writes the code into this entry in the same change; the ruling
+    # of the entry provides for it.
+    # What the tool bridge does at a denial is as on the app-server route
+    # (R08), and the entry does not say that the route stops the vendor tool
+    # there: with the bridge's answer not delayed this cell shows a further
+    # request to the provider, keeps its two flag codes and still reports no
+    # usage (a varied run, not the product as shipped). The frames of the
+    # cell are constructed and nothing was observed of the real tool.
+    # What the fix meets: once the cost is flagged complete on this cell,
+    # the column-wide pricing code of R04 is owed here and a code of R05 is
+    # to be expected on a turn of several responses. Either the reading R05
+    # rests on is settled first, or the change brings the cells whose code
+    # set it changes, this cell among them, to a decision panel with their
+    # new code sets before it lands. On either way the scenario is on the
+    # list the proof of R05 plays before any entry attributes a code of R05
+    # to it.
+    # The severity is the panel's: the result fails closed and nothing is
+    # overspent. A development budget books such a call as accounting debt
+    # and withdraws its own authority, and a caller behind the limit guard
+    # is refused its next call on the backend; nothing is debited for the
+    # responses the provider billed.
+    # The grade this record closes on is read today from the frame of a tool
+    # call and the usage notification (`app_server.tool_call_started`,
+    # `app_server.token_usage_updated`); neither is what the tool sends when
+    # a turn is interrupted. The fix brings the frames of an interrupted
+    # turn into the steps the scenario's script renders, at grade
+    # `documented` or better, before the entry goes; a regrade of today's
+    # frames alone, for whatever reason, releases nothing.
+    cells:
+      - cell: codex:official/S12/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R10:
+    title: The Claude adapter returns a turn the provider refused as a result without an error (unconfirmed, reference emulated)
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # Unconfirmed. First run of pack A on the two columns, not predicted. A
+    # known gap of the reference by the ruling of a decision panel, not an
+    # answer of the release owner in person. That ruling is the `ruling` of
+    # every known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled.
+    # A session whose model turn ends on the provider's refusal stop reason
+    # comes back as a result without an error, with an empty message and
+    # every completeness flag true. The per-attempt function
+    # (crucible/backends/claude.py, _invoke_once) takes the stop reason of
+    # the terminal as it comes and has no rule for the refusal; its one rule
+    # for rejected content reads a raised exception. The clause is right: a
+    # refused turn is rejected content and is not retried, on every backend.
+    # The terminal of the cells is an emulation: the stop reason is a value
+    # the provider's SDK types, and how the command-line tool ends such a
+    # session was not observed. With a terminal that reports an error the
+    # cells show another kind, which the entries do not cover; under either
+    # terminal the adapter does not type the refusal as rejected content.
+    # Not covered by the entries, each as played or as read. A refused turn
+    # that bills no output token is typed a retriable transport error by the
+    # guard for an empty completion and is sent again from a retry budget of
+    # two (played at two and at three). Behind the limit guard the refused
+    # turn is rankable. A refusal after a write is a clean result with the
+    # write on disk, which the implement step classes a success. To a
+    # planner or a reviewer the empty message is a parse failure, and the
+    # turn is asked again, and billed, in the next round (by reading). The
+    # direct tool loop of the adapter ends on the refusal stop reason as on
+    # a finished turn (by reading; no column drives it). None of these is a
+    # cell.
+    # What has to rise before the record may close: all three envelopes the
+    # cells are answered from (cli.init, cli.assistant_refusal,
+    # cli.result_refusal), each with sources that state the frame as the
+    # envelope carries it, the usage mapping of the terminal and its usage
+    # record per model included. A source that names fewer fields than a
+    # frame carries changes the frame first, and the cells are then observed
+    # again. A recording of the real tool is no route inside this package.
+    # The fix has two steps that may be two changes. A refused turn is never
+    # sent again and never flagged retriable: that step changes no code of
+    # the cells and is not held by the grade. A refused turn is rejected
+    # content, ahead of the guard for an empty completion and of the
+    # turn-limit handling: that step deletes the entries and is held by it.
+    # The severity is medium while the record is unconfirmed. A refusal
+    # reported as a success, which is rankable behind the limit guard,
+    # speaks for a higher one; it is read again when a source states the
+    # terminal.
+    cells:
+      - cell: claude/S23a/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S23a/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R11:
+    title: The Claude adapter types a request the provider rejected with an HTTP 400 as a transport error where the scenario asks for rejected content (unconfirmed, reference emulated)
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # Unconfirmed, and no plain known gap: that the adapter is wrong here is
+    # not shown either way. First run of pack A on the two columns, not
+    # predicted. Entered by the ruling of a decision panel, not an answer of
+    # the release owner in person. That ruling is the `ruling` of every
+    # known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled.
+    # A request the provider rejects with an HTTP 400 ends as a transport
+    # error that is not retriable and keeps the status, built where the
+    # terminal of the session confirms the tool's local API-error message
+    # with an admitted status (crucible/backends/claude.py, _invoke_once,
+    # the branch for a pending API-error marker). The frames carry an error
+    # category of a closed list and a status, and no mark of a policy; by
+    # run the result of the adapter does not depend on the text of the
+    # error. On these frames a rejection for a policy cannot be told from
+    # any other rejected request. The frames are an emulation, and nothing
+    # is known of what the real tool relays of a policy rejection.
+    # The record ends in one of two ways, chosen by a later ruling before a
+    # scenario that plays an HTTP error for another reason is built on a
+    # Claude column. Either the adapter types the rejection from a signal a
+    # vendor source states: never from a status, a category or the text of
+    # this envelope, and without putting more of the provider's error text
+    # into a result, a trace or a log than the adapter keeps today. That
+    # needs all three envelopes the cells are answered from (cli.init,
+    # cli.assistant_api_error, cli.result_api_error), each with sources for
+    # the frame as carried, and a source that states a signal by which this
+    # wire marks a rejection for a policy; a recording of the real tool is
+    # no route inside this package. Or this form of refusal is pinned not
+    # expressible for the kind, by a ruling on this record and on R12, which
+    # lists the same cells, applied no earlier than the change in which a
+    # cell of a later scenario set carries R12; the content-filter stop
+    # (S23a) stays generated.
+    # The other code of the cells has another cause and another record
+    # (R12).
+    cells:
+      - cell: claude/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S23c/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R12:
+    title: The Claude adapter flags the cost of a confirmed API-error terminal complete and its pricing evidence incomplete
+    origin: reference
+    severity: medium
+    # First run of pack A on the two columns, not predicted. A known gap of
+    # the reference by the ruling of a decision panel, not an answer of the
+    # release owner in person. That ruling is the `ruling` of every
+    # known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled.
+    # On the terminal that confirms a local API-error message with an
+    # admitted status, the cost flag follows the cost field of the terminal,
+    # and the pricing evidence reconciles only when the accounting of the
+    # marker does (crucible/backends/claude.py, _invoke_once): the result
+    # flags its cost complete and its evidence incomplete. Clause C6 asks
+    # pricing evidence of every result that flags its cost complete, on
+    # every backend, and is unchanged. A product test pins the pair
+    # (tests/test_backends_claude.py,
+    # test_agent_sdk_confirmed_synthetic_auth_error_is_not_model_drift). The
+    # accounting fields of the emulated terminal are those that test states,
+    # with no vendor source; without them the cells do not show the code.
+    # The same pair is pinned on other terminals of the adapter, which no
+    # cell plays and this record does not cover.
+    # Who reads it: the planning workflow books accounting debt for a call
+    # whose evidence is missing or incomplete, whatever the flag says, and
+    # the roll-up of the complete workflow sets the remaining budget to zero
+    # for one call with incomplete evidence.
+    # The fix completes the pricing evidence where the terminal confirms a
+    # usage and a cost of zero with an admitted status. It does not clear
+    # the accounting flags of that terminal, which are the adapter's licence
+    # to retry a retriable status, and every other arm of the branch keeps
+    # its flags. It edits the one assertion that pins the pair on this
+    # terminal. No grade holds it: the substance is the adapter's own pair
+    # of flags.
+    # The severity is the panel's: medium, as R04 rates the same code. It
+    # errs on the closed side and nothing is billed.
+    # The other code of the cells has another cause and another record
+    # (R11). Three cells of the next scenario set, which play an HTTP error
+    # on the primary column, are ruled in advance for this code alone; the
+    # change that enters them after their first run adds them here, and
+    # nothing is entered before that run.
+    cells:
+      - cell: claude/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S23c/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R13:
+    title: On a write the Claude adapter's trace binds the tool-authority digest of the wrapper that hosts the mutators, which carries no path scope, not the digest of the attached ToolSet
+    origin: reference
+    severity: medium
+    # First run of pack A on the two columns, not predicted. A known gap of
+    # the reference by the ruling of a decision panel, not an answer of the
+    # release owner in person. That ruling is the `ruling` of every
+    # known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled.
+    # For one invocation the adapter replaces the attached ToolSet by the
+    # wrapper that routes the mutators to their isolated process, and the
+    # per-attempt function hashes that (crucible/backends/claude.py:
+    # _invoke_with_retries, _invoke_once). The direct tool loop is handed
+    # the wrapper too and hashes what it is given (chat_with_tools); no
+    # column drives it. The scope lookup of the shared digest reads path
+    # scopes from a snapshot, the progress bound, a composite or a built
+    # ToolSet and finds none on the wrapper
+    # (crucible/backends/tool_authority.py). So the value is the shared
+    # digest of the same tools with no path scope stated: the same whatever
+    # the write scope, the exact list or the deny list. Clause C7 holds
+    # every backend to the shared digest and is unchanged.
+    # The host of the same invocation is built from the attached ToolSet, so
+    # what may be written is enforced as attached; the digest takes no part
+    # in it. The Codex adapter hashes the attached ToolSet, and the Kimi
+    # adapter hashes the snapshot its host specification is built from.
+    # The code of the cells says that the digest differs, not why. A test of
+    # the Claude module that the verifier requires by name ties the cells to
+    # this cause, on both columns
+    # (test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope):
+    # the digest of the trace is the shared one of the same tools with no
+    # path scope stated, and with the hash bound to the ToolSet that was
+    # attached the cell shows no code. No entry attributes the code to this
+    # record on a cell that test does not play. The fixture of the cells
+    # states one of the three scope lists, so the fix brings its own tests
+    # for all three, on both sites.
+    # The severity is the panel's: the code and the clause of G24, which is
+    # medium; a present, well-formed and wrong value on every write, clean
+    # results included. Not high: no caller acts on the digest of a writer's
+    # trace, and the enforcement does not use it. No grade holds the record:
+    # the value is computed before any frame of the vendor tool is read.
+    cells:
+      - cell: claude/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S40/secondary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R14:
+    title: The official Codex route types a turn the provider failed for its policy as a retriable transport error
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # First run of pack A on the column, not predicted. A known gap of the
+    # official route by the ruling of a decision panel, not an answer of the
+    # release owner in person. That ruling is the `ruling` of every
+    # known-gap entry that names this record. It is not a field of the
+    # record: a ruling on a registry record is leave to withdraw the
+    # record's cells (H03 then accepts a cell that is pinned not expressible
+    # or no longer generated), which was not ruled.
+    # The helper of the pinned SDK that runs a turn raises for any failed
+    # turn. The worker turns any exception into a reply that names its type
+    # (crucible/backends/codex_worker/src/crucible_codex_worker/__main__.py)
+    # and the parent keeps the type only
+    # (crucible/backends/codex_official_worker.py). The handler of a worker
+    # invocation error in the per-attempt function of the route
+    # (crucible/backends/codex_official.py, _invoke_once) types it with the
+    # inherited classifier, whose default is a retriable transport error;
+    # the route's own branch for a failed turn, which types it not
+    # retriable, is not reached. So the same two codes answer every failed
+    # turn of the route, whatever error kind the notification names (played
+    # with every kind of the vendor's list and with none). The app-server
+    # route types the same notification by its kind
+    # (crucible/backends/codex.py), and its cell passes.
+    # The flag stands at a retry budget of one, which the cell plays: from a
+    # budget of two it is cleared by a rule on accounting. The request is
+    # sent once at every budget and nothing is billed.
+    # The record lists this cell and no other. A later cell of the route
+    # that shows the retriable flag from the same handler is never entered
+    # under this record, whose grade would then hold the flag half of the
+    # fix. And it is never one record with the typed error of a missing
+    # sign-in, which shows the same flag from another cause.
+    # The fix has two steps that may be two changes. The flag: a turn the
+    # provider failed for its policy is not flagged retriable at any retry
+    # budget, made where the worker's result is read and not at the
+    # classifier's default; that step is not held by the grade and takes the
+    # flag code off the entry. The kind: the worker reports the closed error
+    # kind of a failed turn and the adapter types a policy kind as rejected
+    # content, as the app-server route does; that step deletes the entry and
+    # lands only on a reply of the named grade.
+    # What lifts the hold: a vendor source, with its address and its date,
+    # which states that the tool ends a turn the provider refused for its
+    # policy as a failed turn of this kind. The shape of the notification
+    # alone, which the generated type states, is not enough: the frame of
+    # the cell is one constructed value, and the cell of the app-server
+    # column rests on it too.
+    cells:
+      - cell: codex:official/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
 
 known_gaps:
-  - cell: openai_compat:hosted/H02/-/static
-    observed_under: {}
-    codes: {"static:pack_a_not_enabled": G30}
-  - cell: openai_compat:local/H02/-/static
-    observed_under: {}
-    codes: {"static:pack_a_not_enabled": G30}
-  - cell: deepseek/H02/-/static
-    observed_under: {}
-    codes: {"static:pack_a_not_enabled": G20}
-  - cell: kimi/H02/-/static
-    observed_under: {}
-    codes: {"static:pack_a_not_enabled": G04}
-  - cell: claude/H02/-/static
-    observed_under: {}
-    codes: {"static:pack_a_not_enabled": M01}
-  - cell: codex:legacy/H02/-/static
-    observed_under: {}
-    codes: {"static:pack_a_not_enabled": M02}
-  - cell: codex:official/H02/-/static
-    observed_under: {}
-    codes: {"static:pack_a_not_enabled": M03}
-
   # The gateway columns, first run (starter set). On S04 guarded the guard
   # codes are G28's today; once G28 is fixed the guard reports the
   # incomplete accounting of G29 instead, and that fix edits the entry. The
@@ -831,6 +1765,109 @@ known_gaps:
       "guard:revoked": G28
       "flag:token_usage_complete=False": G29
       "flag:cost_complete=False": G29
+  # The gateway columns, first run of pack A. The turn limit ends in a
+  # forced finalisation that clears the accounting flags (G29), and in the
+  # guarded lens its three request events are a contract violation (G28).
+  # The first tool result over the byte budget ends the call (G39). No form
+  # of refusal is typed as rejected content (G35). The suite's turn count,
+  # the dispatch-budget denial, the USD overrun and the write as progress
+  # owe the column-wide code of G32 and nothing else.
+  - cell: openai_compat:hosted/S10a/primary/raw
+    observed_under: {turn_limit: round_boundary}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S10a/primary/guarded
+    observed_under: {turn_limit: round_boundary}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S18/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=none": G39
+      "stop:context_limit!=end_turn": G39
+      "request.unconsumed": G39
+  - cell: openai_compat:hosted/S23a/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+      "retriable:True": G35
+  - cell: openai_compat:hosted/S23b/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+      "retriable:True": G35
+  - cell: openai_compat:hosted/S23c/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+  - cell: openai_compat:hosted/S10a/secondary/raw
+    observed_under: {turn_limit: round_boundary}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S10a/secondary/guarded
+    observed_under: {turn_limit: round_boundary}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:hosted/S18/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=none": G39
+      "stop:context_limit!=end_turn": G39
+      "request.unconsumed": G39
+  - cell: openai_compat:hosted/S23a/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+      "retriable:True": G35
+  - cell: openai_compat:hosted/S23b/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+      "retriable:True": G35
+  - cell: openai_compat:hosted/S23c/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+  - cell: openai_compat:local/S10a/primary/raw
+    observed_under: {turn_limit: round_boundary}
+    codes:
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:local/S10a/primary/guarded
+    observed_under: {turn_limit: round_boundary}
+    codes:
+      "guard:limit_contract_violated": G28
+      "guard:revoked": G28
+      "flag:token_usage_complete=False": G29
+      "flag:cost_complete=False": G29
+  - cell: openai_compat:local/S18/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=none": G39
+      "stop:context_limit!=end_turn": G39
+      "request.unconsumed": G39
+  - cell: openai_compat:local/S23a/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+      "retriable:True": G35
+  - cell: openai_compat:local/S23b/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
+      "retriable:True": G35
+  - cell: openai_compat:local/S23c/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G35
   - column_wide: {kind: "openai_compat:hosted", code: "pricing:none", gap: G32}
   - column_wide: {kind: "openai_compat:local", code: "pricing:none", gap: G32}
 
@@ -866,6 +1903,68 @@ known_gaps:
     codes:
       "guard:limit_contract_violated": G16
       "guard:revoked": G16
+      "digest.mismatch:tool_authority": G24
+  # The DeepSeek column, first run of pack A. The turn limit and the USD
+  # overrun are typed results now (G14's raise is gone), and what they show
+  # is G24 alone; in the guarded lens the two tool rounds before the turn
+  # limit are two request events (G16). The suite's turn count is refused
+  # before transport (G15). The first tool result over the byte budget ends
+  # the call (M14: the byte-budget part of what G14 listed). No form of
+  # refusal is typed as rejected content (G18), and two of them end as an
+  # error of the worker, whose result loses more than its kind (M13). A
+  # write is not credited as progress (G17).
+  - cell: deepseek/S10a/primary/raw
+    observed_under: {turn_limit: hard}
+    codes:
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S10a/primary/guarded
+    observed_under: {turn_limit: hard}
+    codes:
+      "guard:limit_contract_violated": G16
+      "guard:revoked": G16
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S11/primary/raw
+    observed_under: {turn_limit: hard}
+    codes:
+      "raise:ValueError@before_request/crucible.backends.deepseek": G15
+      "request.unconsumed": G15
+  - cell: deepseek/S12/primary/raw
+    observed_under: {}
+    codes:
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S18/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=none": M14
+      "stop:context_limit!=end_turn": M14
+      "request.unconsumed": M14
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S23a/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G18
+      "event.terminal:response.incomplete!=error": M05
+  - cell: deepseek/S23b/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G18
+      "digest.missing:served_model": M13
+      "flag:token_usage_complete=False": M13
+      "flag:cost_complete=False": M13
+      "flag:trace_complete=False": M13
+  - cell: deepseek/S23c/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G18
+      "flag:trace_complete=False": M13
+  - cell: deepseek/S40/primary/raw
+    observed_under: {}
+    codes:
+      "progress:write_not_credited": G17
+      "kind:max_turns!=none": G17
+      "stop:tool_budget_exhausted!=end_turn": G17
+      "dispatch.missing:read_a": G17
+      "request.unconsumed": G17
       "digest.mismatch:tool_authority": G24
   - column_wide: {kind: deepseek, code: "digest.missing:feature_profile", gap: G24}
 
@@ -919,6 +2018,112 @@ known_gaps:
       green, and it is built only after a decision of its own on how the
       matrix plays the blocked column once binding is refused; without one
       this acceptance stands.
+  # The two diagnostic Kimi columns, first run of pack A. Every result cell
+  # owes the two column-wide codes of M06. The turn limit (G07) and the USD
+  # overrun (G08) are typed and disown their terminal without a limit event;
+  # the cost of the overrun against the matrix rate card is M12, for which
+  # no fix is owed. The dispatch-budget denial is a transport error (G02),
+  # and the write that is not credited ends in the same denial (G03). A
+  # refusal field is not read (M10) and an HTTP policy rejection is a
+  # transport error (G10); a content-filter stop is typed and owes M06
+  # alone, as do the suite's turn count and the byte budget. The three
+  # cells whose call ends in an exception that the worker's classifier
+  # turns into its outcome show the shape of such a result (M11). These
+  # entries need no ruling: the kind is no reference kind.
+  - cell: kimi/S10a/primary/raw
+    observed_under: {turn_limit: hard}
+    codes:
+      "event.missing:limit/max_turns": G07
+      "flag:terminal_complete=False": G07
+  - cell: kimi/S10a/primary/guarded
+    observed_under: {turn_limit: hard}
+    codes:
+      "event.missing:limit/max_turns": G07
+      "flag:terminal_complete=False": G07
+      "guard:revoked": G07
+  - cell: kimi/S12/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=max_turns": G02
+      "event.missing:limit/tool_dispatch_budget": G02
+      "flag:terminal_complete=False": M11
+      "digest.missing:served_model": M11
+      "usage.cost_bounds:uncovered": M11
+  - cell: kimi/S13/primary/raw
+    observed_under: {usd_limit: post_hoc}
+    codes:
+      "event.missing:limit/budget_usd": G08
+      "flag:terminal_complete=False": G08
+      "usage.cost_usd:gt": M12
+  - cell: kimi/S23b/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": M10
+      "retriable:True": M10
+      "digest.missing:served_model": M11
+      "usage.cost_bounds:uncovered": M11
+  - cell: kimi/S23c/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G10
+  - cell: kimi/S40/primary/raw
+    observed_under: {}
+    codes:
+      "progress:write_not_credited": G03
+      "kind:transport!=none": G03
+      "stop:tool_budget_exhausted!=end_turn": G03
+      "dispatch.missing:read_a": G03
+      "request.unconsumed": G03
+      "flag:terminal_complete=False": M11
+      "digest.missing:served_model": M11
+      "usage.cost_bounds:uncovered": M11
+  - cell: kimi/S10a/secondary/raw
+    observed_under: {turn_limit: hard}
+    codes:
+      "event.missing:limit/max_turns": G07
+      "flag:terminal_complete=False": G07
+  - cell: kimi/S10a/secondary/guarded
+    observed_under: {turn_limit: hard}
+    codes:
+      "event.missing:limit/max_turns": G07
+      "flag:terminal_complete=False": G07
+      "guard:revoked": G07
+  - cell: kimi/S12/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=max_turns": G02
+      "event.missing:limit/tool_dispatch_budget": G02
+      "flag:terminal_complete=False": M11
+      "digest.missing:served_model": M11
+      "usage.cost_bounds:uncovered": M11
+  - cell: kimi/S13/secondary/raw
+    observed_under: {usd_limit: post_hoc}
+    codes:
+      "event.missing:limit/budget_usd": G08
+      "flag:terminal_complete=False": G08
+      "usage.cost_usd:gt": M12
+  - cell: kimi/S23b/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": M10
+      "retriable:True": M10
+      "digest.missing:served_model": M11
+      "usage.cost_bounds:uncovered": M11
+  - cell: kimi/S23c/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": G10
+  - cell: kimi/S40/secondary/raw
+    observed_under: {}
+    codes:
+      "progress:write_not_credited": G03
+      "kind:transport!=none": G03
+      "stop:tool_budget_exhausted!=end_turn": G03
+      "dispatch.missing:read_a": G03
+      "request.unconsumed": G03
+      "flag:terminal_complete=False": M11
+      "digest.missing:served_model": M11
+      "usage.cost_bounds:uncovered": M11
   - column_wide: {kind: kimi, code: "flag:token_usage_complete=False", gap: M06}
     ruling: >-
       Decision panel, 2026-11-21, acting under a standing instruction the
@@ -952,9 +2157,334 @@ known_gaps:
       was added to clause C6 when this ruling was entered; the record of M06
       says what is held and what is not.
 
+  # The two Claude columns, first run of pack A. A reference kind: every
+  # entry carries the ruling of a decision panel on its cell and not an
+  # answer of the release owner in person; each text says so, and each
+  # covers its cell and nothing else that the columns show. The result of a
+  # dispatch-budget denial flags its accounting and its terminal incomplete
+  # (R07). A turn the provider refused comes back as a result without an
+  # error (R10, unconfirmed). A request the provider rejected with an HTTP
+  # status ends as a transport error (R11, unconfirmed), and its result
+  # flags the cost complete while its pricing evidence is incomplete (R12).
+  # On a write the trace binds a tool-authority digest without path scopes
+  # (R13). Every other cell of the two columns passes.
+  - cell: claude/S12/primary/raw
+    observed_under: {}
+    codes:
+      "flag:token_usage_complete=False": R07
+      "flag:cost_complete=False": R07
+      "flag:terminal_complete=False": R07
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red because the result the adapter
+      returns when a workflow's tool-dispatch budget denies a call flags its
+      token usage, its cost and its terminal incomplete although the
+      provider reported usage for every response; and whether the scenario
+      owes those flags where a vendor tool owns the tool loop. Decided, 3 of
+      3: the scenario owes the three flags on every kind, as it has since it
+      was built, and nothing was waived. The cell is accepted as a known gap
+      of the reference for this observation and no other: this cell, exactly
+      these three codes, no governing declared value, a result built by the
+      adapter's handler of a classified exception inside one attempt after
+      the adapter cut the session at the denial, with the seam canary, the
+      starter tool cells and the turn-limit cells of the column passing in
+      the same run and no further request reaching the provider in that run.
+      The usage such a result reports is what the adapter had read when it
+      cut the session; it is not the same in every play of the same billing,
+      this entry states no value and no verdict rests on one. A change of
+      the adapter that flags the terminal complete at a stop the adapter
+      made itself, and changes nothing else this cell shows, takes the
+      terminal code out of this entry under this ruling; the entry never
+      grows. The fix belongs to the Claude adapter and is a change of its
+      own, made after the change that entered this entry: the result of a
+      denial reports the same usage for the same billing, and its accounting
+      is flagged complete only where a documented or recorded stop of the
+      vendor tool shows it settled. That change deletes this entry in the
+      change in which this cell passes, and not while the cell is answered
+      from frames that were only constructed. The acceptance covers no other
+      code, cell, scenario, column or reference gap, no request after the
+      denied call, and not the same codes on a result the same handler
+      builds for another cause.
+  - cell: claude/S23a/primary/raw
+    observed_under: {}
+    codes:
+      "kind:none!=content_rejected": R10
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red only because a session whose model
+      turn ended on the provider's refusal stop reason is returned as a
+      result without an error and with an empty message, where the scenario
+      asks for rejected content. Decided, 3 of 3: accepted as a known gap of
+      the reference for this observation and no other: this cell, this one
+      code alone, no governing declared value, one provider request, the
+      turn billed and its usage reported in full with every completeness
+      flag true, the result returned where the adapter returns a session
+      that ended without an error, and the seam canary and the plain text
+      cells of the column passing in the same run. The frames of the cell
+      are an emulation: the stop reason is a value the provider's SDK types,
+      and how the command-line tool ends such a session was not observed;
+      with a terminal that reports an error the cell shows another kind,
+      which this acceptance does not cover. The fix belongs to the Claude
+      adapter and is a change of its own: a turn the provider refused is
+      rejected content and is not retried, on every path of the adapter that
+      reads a stop reason. The half of it that stops a refused turn from
+      being sent again or flagged retriable may land first as a change of
+      its own; it changes no code of this cell and is not held by the grade.
+      The record closes on grade documented: this entry is deleted in the
+      change in which the cell passes while every frame it is answered from
+      is of that grade, and not before. The acceptance covers no other code,
+      cell, column or reference gap, no refusal that bills no output, no
+      refusal after a write, no call behind the limit guard, and not the
+      same code on a cell of a later scenario set.
+  - cell: claude/S23c/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": R11
+      "pricing:unreconciled": R12
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red on two codes: a request the
+      provider rejected with an HTTP status ends as a transport error where
+      the scenario asks for rejected content, and the result flags its cost
+      complete while its pricing evidence is flagged incomplete. Decided, 3
+      of 3: both are accepted as known gaps of the reference for this
+      observation and no other, as two causes under two records: this cell,
+      these two codes and no third, no governing declared value, one
+      provider request, nothing billed, a transport error that is not
+      retriable and keeps the status, built where the terminal of the
+      session confirms the tool's local API-error message with an admitted
+      status, every completeness flag true, and the seam canary and the
+      plain text cells of the column passing in the same run. The frames are
+      an emulation, and the accounting fields of the terminal are those the
+      product's tests state, with no vendor source. The kind is unconfirmed:
+      the frames carry an error category of a closed list and a status and
+      no mark of a policy, the adapter's result does not depend on the error
+      text, and on these frames a rejection for a policy cannot be told from
+      any other rejected request. Its record closes on grade documented and
+      ends in one of two ways, chosen by a later ruling: the adapter types
+      the rejection from a signal a vendor source states, never from a
+      status, a category or the text of this envelope; or this form of
+      refusal is pinned not expressible for the kind by a ruling on the
+      record. The accounting: the fix belongs to the Claude adapter and is a
+      change of its own; it completes the pricing evidence of a terminal
+      that confirms a usage and a cost of zero with an admitted status, does
+      not clear that terminal's accounting flags, and takes that code off
+      this entry in the change in which the cell stops showing it. The
+      acceptance covers no other code, cell, column or reference gap, no
+      retried call, no call behind the limit guard, and no other terminal of
+      the adapter that shows the same pair.
+  - cell: claude/S40/primary/raw
+    observed_under: {}
+    codes:
+      "digest.mismatch:tool_authority": R13
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with the write cell of this reference, which is red only because
+      the tool-authority digest in its trace is not the digest of the
+      attached ToolSet. Decided, 3 of 3: accepted as a known gap of the
+      reference for this observation and no other: this cell, this one code
+      alone, no governing declared value, a result without an error whose
+      write is on disk, the digest in the trace being the one the adapter
+      hashes from the wrapper that routes the mutators to their isolated
+      process (equal to the shared digest of the same tools with no path
+      scope stated), and the starter tool cells of the column passing in the
+      same run. What the session may write is enforced from the attached
+      ToolSet and is not affected. The fix belongs to the Claude adapter and
+      is a change of its own, made after the change that entered this entry:
+      on every path that hosts mutators the trace binds the digest of the
+      attached ToolSet with every path scope it carries, as read for that
+      invocation, and that change deletes this entry. The acceptance covers
+      no other code, cell, column or reference gap, no trace without a
+      digest, and not the same code on a cell of a later pack.
+  - cell: claude/S12/secondary/raw
+    observed_under: {}
+    codes:
+      "flag:token_usage_complete=False": R07
+      "flag:cost_complete=False": R07
+      "flag:terminal_complete=False": R07
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red because the result the adapter
+      returns when a workflow's tool-dispatch budget denies a call flags its
+      token usage, its cost and its terminal incomplete although the
+      provider reported usage for every response; and whether the scenario
+      owes those flags where a vendor tool owns the tool loop. Decided, 3 of
+      3: the scenario owes the three flags on every kind, as it has since it
+      was built, and nothing was waived. The cell is accepted as a known gap
+      of the reference for this observation and no other: this cell, exactly
+      these three codes, no governing declared value, a result built by the
+      adapter's handler of a classified exception inside one attempt after
+      the adapter cut the session at the denial, with the seam canary, the
+      starter tool cells and the turn-limit cells of the column passing in
+      the same run and no further request reaching the provider in that run.
+      The usage such a result reports is what the adapter had read when it
+      cut the session; it is not the same in every play of the same billing,
+      this entry states no value and no verdict rests on one. A change of
+      the adapter that flags the terminal complete at a stop the adapter
+      made itself, and changes nothing else this cell shows, takes the
+      terminal code out of this entry under this ruling; the entry never
+      grows. The fix belongs to the Claude adapter and is a change of its
+      own, made after the change that entered this entry: the result of a
+      denial reports the same usage for the same billing, and its accounting
+      is flagged complete only where a documented or recorded stop of the
+      vendor tool shows it settled. That change deletes this entry in the
+      change in which this cell passes, and not while the cell is answered
+      from frames that were only constructed. The acceptance covers no other
+      code, cell, scenario, column or reference gap, no request after the
+      denied call, and not the same codes on a result the same handler
+      builds for another cause.
+  - cell: claude/S23a/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:none!=content_rejected": R10
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red only because a session whose model
+      turn ended on the provider's refusal stop reason is returned as a
+      result without an error and with an empty message, where the scenario
+      asks for rejected content. Decided, 3 of 3: accepted as a known gap of
+      the reference for this observation and no other: this cell, this one
+      code alone, no governing declared value, one provider request, the
+      turn billed and its usage reported in full with every completeness
+      flag true, the result returned where the adapter returns a session
+      that ended without an error, and the seam canary and the plain text
+      cells of the column passing in the same run. The frames of the cell
+      are an emulation: the stop reason is a value the provider's SDK types,
+      and how the command-line tool ends such a session was not observed;
+      with a terminal that reports an error the cell shows another kind,
+      which this acceptance does not cover. The fix belongs to the Claude
+      adapter and is a change of its own: a turn the provider refused is
+      rejected content and is not retried, on every path of the adapter that
+      reads a stop reason. The half of it that stops a refused turn from
+      being sent again or flagged retriable may land first as a change of
+      its own; it changes no code of this cell and is not held by the grade.
+      The record closes on grade documented: this entry is deleted in the
+      change in which the cell passes while every frame it is answered from
+      is of that grade, and not before. The acceptance covers no other code,
+      cell, column or reference gap, no refusal that bills no output, no
+      refusal after a write, no call behind the limit guard, and not the
+      same code on a cell of a later scenario set.
+  - cell: claude/S23c/secondary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": R11
+      "pricing:unreconciled": R12
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red on two codes: a request the
+      provider rejected with an HTTP status ends as a transport error where
+      the scenario asks for rejected content, and the result flags its cost
+      complete while its pricing evidence is flagged incomplete. Decided, 3
+      of 3: both are accepted as known gaps of the reference for this
+      observation and no other, as two causes under two records: this cell,
+      these two codes and no third, no governing declared value, one
+      provider request, nothing billed, a transport error that is not
+      retriable and keeps the status, built where the terminal of the
+      session confirms the tool's local API-error message with an admitted
+      status, every completeness flag true, and the seam canary and the
+      plain text cells of the column passing in the same run. The frames are
+      an emulation, and the accounting fields of the terminal are those the
+      product's tests state, with no vendor source. The kind is unconfirmed:
+      the frames carry an error category of a closed list and a status and
+      no mark of a policy, the adapter's result does not depend on the error
+      text, and on these frames a rejection for a policy cannot be told from
+      any other rejected request. Its record closes on grade documented and
+      ends in one of two ways, chosen by a later ruling: the adapter types
+      the rejection from a signal a vendor source states, never from a
+      status, a category or the text of this envelope; or this form of
+      refusal is pinned not expressible for the kind by a ruling on the
+      record. The accounting: the fix belongs to the Claude adapter and is a
+      change of its own; it completes the pricing evidence of a terminal
+      that confirms a usage and a cost of zero with an admitted status, does
+      not clear that terminal's accounting flags, and takes that code off
+      this entry in the change in which the cell stops showing it. The
+      acceptance covers no other code, cell, column or reference gap, no
+      retried call, no call behind the limit guard, and no other terminal of
+      the adapter that shows the same pair.
+  - cell: claude/S40/secondary/raw
+    observed_under: {}
+    codes:
+      "digest.mismatch:tool_authority": R13
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with the write cell of this reference, which is red only because
+      the tool-authority digest in its trace is not the digest of the
+      attached ToolSet. Decided, 3 of 3: accepted as a known gap of the
+      reference for this observation and no other: this cell, this one code
+      alone, no governing declared value, a result without an error whose
+      write is on disk, the digest in the trace being the one the adapter
+      hashes from the wrapper that routes the mutators to their isolated
+      process (equal to the shared digest of the same tools with no path
+      scope stated), and the starter tool cells of the column passing in the
+      same run. What the session may write is enforced from the attached
+      ToolSet and is not affected. The fix belongs to the Claude adapter and
+      is a change of its own, made after the change that entered this entry:
+      on every path that hosts mutators the trace binds the digest of the
+      attached ToolSet with every path scope it carries, as read for that
+      invocation, and that change deletes this entry. The acceptance covers
+      no other code, cell, column or reference gap, no trace without a
+      digest, and not the same code on a cell of a later pack.
+
+  # The app-server Codex column, first run of pack A. A reference kind: the
+  # entry carries the ruling of a decision panel on its cell and not an
+  # answer of the release owner in person; its text says so, and it covers
+  # nothing else that the column shows. The result of a dispatch-budget
+  # denial flags its accounting incomplete (R08). Every other cell of the
+  # column passes.
+  - cell: codex:legacy/S12/primary/raw
+    observed_under: {}
+    codes:
+      "flag:token_usage_complete=False": R08
+      "flag:cost_complete=False": R08
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red because the result the adapter
+      returns when a workflow's tool-dispatch budget denies a call flags its
+      token usage and its cost incomplete although the provider reported
+      usage for every response and the result reports all of it; and whether
+      the scenario owes those flags where a vendor tool owns the tool loop.
+      Decided, 3 of 3: the scenario owes the flags on every kind, and
+      nothing was waived. The cell is accepted as a known gap of the
+      reference for this observation and no other: this cell, exactly these
+      two codes, no governing declared value, a result built by the denial
+      branch of the adapter's attempt controller from what the attempt it
+      cancelled had captured, with the terminal flagged complete, with the
+      seam canary, the starter cells and the turn-limit cells of the column
+      passing in the same run and no further request reaching the provider
+      in that run. This entry does not say that the route stops the vendor
+      tool at the denial: the cancellation came before the tool bridge had
+      answered the denied call. The fix is a change of its own, made after
+      the change that entered this entry: a denied call is not answered
+      before the tool is stopped, the accounting of a turn the tool settled
+      is flagged complete, and usage is never invented for one it did not
+      settle. That change deletes this entry in the change in which this
+      cell passes, and not while the cell is answered from frames that were
+      only constructed. The acceptance covers no other code, cell, scenario,
+      column or reference gap, no request after the denied call, and not the
+      same codes on a result built at another site.
+
   # The official-SDK Codex column, first run (starter set). A reference
-  # column: every entry carries the release owner's ruling, the same text
-  # in each. The two accounting codes of R04 are column-wide; in the guarded
+  # column: the five entries of this block and the two column-wide entries
+  # of the column carry the release owner's ruling, the same text in each.
+  # The two accounting codes of R04 are column-wide; in the guarded
   # lens the limit guard replaces the result for its incomplete evidence and
   # revokes the backend. On a turn of several model responses the reported
   # cost is that of the last response (R05, unconfirmed: decided by the
@@ -1005,6 +2535,210 @@ known_gaps:
       Release owner in person, 2026-11-21. Asked: whether to accept the two
       findings on the official Codex route (records R04 and R05) as known
       gaps and keep the real worker. Decided: yes, both are accepted.
+  # The official-SDK Codex column, first run of pack A. The same two
+  # findings, on the cells of pack A whose turn has several model responses:
+  # the reported cost is that of the last response (R05), and in the guarded
+  # lens the limit guard replaces the result (R04). The release owner
+  # accepted the two findings as known gaps of the route when the column ran
+  # the starter set, and ruled on none of these cells. That these cells show
+  # the two findings and nothing else is the finding of a decision panel, so
+  # these entries carry the panel's ruling and not an answer of the owner in
+  # person. It covers nothing else that the column shows in pack A: the
+  # dispatch-budget denial (S12) and the HTTP policy rejection (S23c) are
+  # entered after these, each under a record of its own, with the ruling of
+  # a decision panel on that cell.
+  - cell: codex:official/S10a/primary/raw
+    observed_under: {turn_limit: unsupported}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column:
+      whether this cell may be entered under records R04 and R05, the two
+      findings on the official Codex route that the release owner accepted
+      as known gaps on 2026-11-21, although that answer was given when the
+      column ran the starter set and names no cell of pack A. Decided, 3 of
+      3: yes, for this cell and this code and nothing else. The owner ruled
+      on the findings, not on this cell; that the cell shows them and no
+      other deviation is the panel's finding. Beside the two column-wide
+      codes of R04 the cell fails with this one code, under the declared
+      values recorded here, on a turn of several model responses; the code
+      goes and no other code moves when the last-response usage field is
+      read as the turn so far (the test the record of R05 names plays the
+      raw cell of this scenario under both readings and is required by
+      name). R05 is unconfirmed. A change that alters the codes of this cell
+      does not edit this entry to fit: the entry is deleted in the change in
+      which the cell passes, and any other code set needs a ruling of its
+      own. The entry covers no other code, cell or column and no cell of a
+      later scenario set.
+  - cell: codex:official/S10a/primary/guarded
+    observed_under: {turn_limit: unsupported}
+    codes:
+      "guard:limit_evidence_incomplete": R04
+      "guard:revoked": R04
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column:
+      whether this cell may be entered under records R04 and R05, the two
+      findings on the official Codex route that the release owner accepted
+      as known gaps on 2026-11-21, although that answer was given when the
+      column ran the starter set and names no cell of pack A. Decided, 3 of
+      3: yes, for this cell and these three codes and nothing else. The
+      owner ruled on the findings, not on this cell; that the cell shows
+      them and no other deviation is the panel's finding. The limit guard
+      replaces the result of a route that flags its token usage incomplete
+      and revokes the backend (the two guard codes, R04), and the cost the
+      result reports is that of the last response of a turn of several (the
+      usage code, R05, unconfirmed). The scenario waives no completeness
+      flag, so a second flag that is false would show as a code of its own.
+      The test the record of R05 names plays this cell under both readings
+      of the last-response usage field too: the usage code goes, the two
+      guard codes stay, and the guard names the token flag as the only
+      evidence it misses. While the guard replaces the result, this cell is
+      no evidence about the kind and the stop reason of the turn it
+      replaced. A change that alters the codes of this cell does not edit
+      this entry to fit: the entry is deleted in the change in which the
+      cell passes, and any other code set needs a ruling of its own. The
+      entry covers no other code, cell or column and no cell of a later
+      scenario set.
+  - cell: codex:official/S18/primary/raw
+    observed_under: {}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column:
+      whether this cell may be entered under records R04 and R05, the two
+      findings on the official Codex route that the release owner accepted
+      as known gaps on 2026-11-21, although that answer was given when the
+      column ran the starter set and names no cell of pack A. Decided, 3 of
+      3: yes, for this cell and this code and nothing else. The owner ruled
+      on the findings, not on this cell; that the cell shows them and no
+      other deviation is the panel's finding. Beside the two column-wide
+      codes of R04 the cell fails with this one code, under the declared
+      values recorded here, on a turn of several model responses; the code
+      goes and no other code moves when the last-response usage field is
+      read as the turn so far (the test the record of R05 names plays the
+      raw cell of this scenario under both readings and is required by
+      name). R05 is unconfirmed. A change that alters the codes of this cell
+      does not edit this entry to fit: the entry is deleted in the change in
+      which the cell passes, and any other code set needs a ruling of its
+      own. The entry covers no other code, cell or column and no cell of a
+      later scenario set.
+  - cell: codex:official/S40/primary/raw
+    observed_under: {}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column:
+      whether this cell may be entered under records R04 and R05, the two
+      findings on the official Codex route that the release owner accepted
+      as known gaps on 2026-11-21, although that answer was given when the
+      column ran the starter set and names no cell of pack A. Decided, 3 of
+      3: yes, for this cell and this code and nothing else. The owner ruled
+      on the findings, not on this cell; that the cell shows them and no
+      other deviation is the panel's finding. Beside the two column-wide
+      codes of R04 the cell fails with this one code, under the declared
+      values recorded here, on a turn of several model responses; the code
+      goes and no other code moves when the last-response usage field is
+      read as the turn so far (the test the record of R05 names plays the
+      raw cell of this scenario under both readings and is required by
+      name). R05 is unconfirmed. A change that alters the codes of this cell
+      does not edit this entry to fit: the entry is deleted in the change in
+      which the cell passes, and any other code set needs a ruling of its
+      own. The entry covers no other code, cell or column and no cell of a
+      later scenario set.
+  # The dispatch-budget denial and the HTTP policy rejection on the same
+  # column, each under a record of its own (R09, R14) with the ruling of a
+  # decision panel on that cell and not an answer of the release owner in
+  # person; each text says so, and each covers its cell and nothing else
+  # that the column shows. The entry of the denial lists the cost flag code:
+  # the token flag code of the cell is the column-wide one of R04. On the
+  # rejection the two column-wide codes of R04 are not owed, by two rows of
+  # the inventory.
+  - cell: codex:official/S12/primary/raw
+    observed_under: {}
+    codes:
+      "flag:cost_complete=False": R09
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red because the result this route
+      returns when a workflow's tool-dispatch budget denies a call flags its
+      cost and its token usage incomplete and reports no usage for responses
+      the provider billed (the worker of this route publishes usage only
+      when a turn ends, and the turn was cancelled); and whether the
+      scenario owes those flags where a vendor tool owns the tool loop.
+      Decided, 3 of 3: the scenario owes the flags on every kind, and
+      nothing was waived. The cell is accepted as a known gap of the
+      reference for this observation and no other: this cell; its whole code
+      set, which is the cost flag code this entry lists and the token flag
+      code the column-wide entry of the kind carries; no governing declared
+      value; a result built by the denial branch of the attempt controller
+      with no result of the cancelled attempt; the terminal flagged
+      complete; the seam canary passing and every other cell of the column
+      as its entries state in the same run; no further request reaching the
+      provider in that run. If the column-wide entry for the token flag is
+      deleted while this entry stands, that code is written into this entry
+      in the same change, under this ruling. This entry does not say that
+      the route stops the vendor tool at the denial: the cancellation came
+      before the tool bridge had answered the denied call. The fix is a
+      change of its own, made after the change that entered this entry: a
+      denied call is not answered before the tool is stopped, the route
+      reports the usage of a turn it cancelled where the tool settled it and
+      flags that complete, and it never invents usage. When the cost is
+      flagged complete here, the column-wide pricing code of the kind is
+      owed on this cell as on every other. That change deletes this entry in
+      the change in which this cell passes, and not while the cell is
+      answered from frames that were only constructed. The acceptance covers
+      no other code, cell, scenario, column or reference gap, and no request
+      after the denied call.
+  - cell: codex:official/S23c/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=content_rejected": R14
+      "retriable:True": R14
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after pack A first ran on this column: what
+      to do with this cell, which is red on two codes: a turn the provider
+      failed for its usage policy ends as a transport error where the
+      scenario asks for rejected content, and the error is flagged retriable
+      where the scenario asks for a result that is not retried. Decided, 3
+      of 3: accepted as a known gap of the official route for this
+      observation and no other: this cell, these two codes and no third (the
+      two column-wide codes of the route are not owed on it), no governing
+      declared value, a retry budget of one, one provider request, nothing
+      billed, the error built from the worker's report of a failed turn by
+      the type of its error and typed by the classifier's default, the seam
+      canary of the column passing, its plain text cells showing nothing
+      beyond the column-wide gaps of the route, and the same cell of the
+      app-server column passing in the same run. The same typed result
+      answers every failed turn of the route, whatever error kind the
+      notification names; from a retry budget of two the flag is cleared by
+      a rule on accounting, and the request is sent once at every budget.
+      The fix belongs to the Codex adapter, in two steps that may be two
+      changes. The flag: a turn the provider failed for its policy is not
+      flagged retriable at any retry budget, made where the worker's result
+      is read and not where the adapter types an exception it has no rule
+      for; that step is not held and takes the flag code off this entry. The
+      kind: the worker reports the closed error kind of a failed turn and
+      the adapter types a policy kind as rejected content, as the app-server
+      route does. The record closes on grade documented: this entry is
+      deleted in the change in which the cell passes on a reply of that
+      grade whose source states that the tool ends a turn the provider
+      refused for its policy as a failed turn of this kind. The acceptance
+      covers no other failed turn of the route, no other code, cell or
+      column, not the same code on another scenario, and not the typed error
+      of a missing sign-in, which is another record.
   - column_wide: {kind: "codex:official", code: "flag:token_usage_complete=False", gap: R04}
     ruling: >-
       Release owner in person, 2026-11-21. Asked: whether to accept the two
@@ -1096,12 +2830,28 @@ declared_differences:
       - codex:legacy/S03/primary/guarded
       - codex:legacy/S04/primary/raw
       - codex:legacy/S04/primary/guarded
+      - codex:legacy/S10a/primary/raw
+      - codex:legacy/S10a/primary/guarded
+      - codex:legacy/S11/primary/raw
+      - codex:legacy/S12/primary/raw
+      - codex:legacy/S13/primary/raw
+      - codex:legacy/S18/primary/raw
+      - codex:legacy/S23c/primary/raw
+      - codex:legacy/S40/primary/raw
       - codex:official/S01/primary/raw
       - codex:official/S01/primary/guarded
       - codex:official/S03/primary/raw
       - codex:official/S03/primary/guarded
       - codex:official/S04/primary/raw
       - codex:official/S04/primary/guarded
+      - codex:official/S10a/primary/raw
+      - codex:official/S10a/primary/guarded
+      - codex:official/S11/primary/raw
+      - codex:official/S12/primary/raw
+      - codex:official/S13/primary/raw
+      - codex:official/S18/primary/raw
+      - codex:official/S23c/primary/raw
+      - codex:official/S40/primary/raw
   - id: D-COST-BOUND-UNRANKED
     citation: >-
       crucible/backends/limits.py (_normalize_returned_result: a result under
@@ -1139,6 +2889,8 @@ declared_differences:
       - kimi/S01/primary/guarded
       - kimi/S03/primary/guarded
       - kimi/S04/primary/guarded
+      - kimi/S10a/primary/guarded
       - kimi/S01/secondary/guarded
       - kimi/S03/secondary/guarded
       - kimi/S04/secondary/guarded
+      - kimi/S10a/secondary/guarded

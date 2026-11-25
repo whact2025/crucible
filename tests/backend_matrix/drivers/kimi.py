@@ -69,8 +69,15 @@ from .. import declarations
 from .. import envelopes as envelope_files
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import launch
-from ..provider import CacheCounts, LoopbackProvider, Reply, SeenRequest, SentCall
-from ..script import Call, ProviderScript, Say, ServedAs, Step
+from ..provider import (
+    CacheCounts,
+    LoopbackProvider,
+    Reply,
+    SeenRequest,
+    SentCall,
+    answered_from,
+)
+from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from . import openai_compat as chat
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
@@ -183,7 +190,7 @@ class MoonshotChatDialect:
     def envelope_names(self) -> tuple[str, ...]:
         return tuple(
             f"{self.name}/{self.provider}.{behaviour}"
-            for behaviour in ("completion", _TOOL_CALL)
+            for behaviour in ("completion", _TOOL_CALL, *chat.REFUSALS.values())
         )
 
     def parse(
@@ -357,24 +364,34 @@ class MoonshotChatDialect:
                 # The wire carries the arguments as a JSON document in a string.
                 "tool_arguments": json.dumps(arguments, sort_keys=True),
             }
+        elif isinstance(step, Refuse):
+            behaviour, call, slots = chat.REFUSALS[step.form], None, {}
         else:
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
                 "the scenario that needs it adds the envelope with its liar"
             )
         envelope = envelope_files.load(f"{self.name}/{self.provider}.{behaviour}")
+        if envelope.status != 200:
+            # A request the service rejects is answered with its error object
+            # alone, no stream: nothing is billed and no model is named.
+            return Reply(envelope.status, envelope.fill(slots), envelope=envelope.name)
         usage = step.usage
         slots.update(
             response_id=f"chatcmpl-{call_id}",
             created=_CREATED,
             served_model=served,
-            reasoning_text=REASONING_TEXT,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.input_tokens + usage.output_tokens,
-            # Reasoning is part of the completion tokens the provider bills.
-            reasoning_tokens=usage.output_tokens // 2,
         )
+        if not isinstance(step, Refuse):
+            # A reply that answers or calls a tool reasons first; reasoning
+            # is part of the completion tokens the provider bills.
+            slots.update(
+                reasoning_text=REASONING_TEXT,
+                reasoning_tokens=usage.output_tokens // 2,
+            )
         chunks = envelope.fill(slots)
         return Reply(
             envelope.status,
@@ -578,6 +595,9 @@ class KimiDriver:
     @property
     def envelopes(self) -> tuple[str, ...]:
         return MoonshotChatDialect().envelope_names()
+
+    def answers(self, script: ProviderScript) -> tuple[str, ...]:
+        return answered_from(MoonshotChatDialect(), script)
 
     @property
     def interpreter(self) -> Path:

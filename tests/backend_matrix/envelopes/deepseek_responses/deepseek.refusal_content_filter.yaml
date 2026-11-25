@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed response that a content filter stopped: the events of one
+# response of the DeepSeek Responses route that ends with the terminal of an
+# incomplete response, whose reason names the filter. It is billed and holds
+# no output.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: deepseek_responses
+provider: deepseek
+behaviour: refusal_content_filter
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    the events openai.types.responses.ResponseCreatedEvent,
+    ResponseInProgressEvent and ResponseIncompleteEvent, the last with a
+    Response of status "incomplete" whose incomplete_details.reason is
+    "content_filter" (openai.types.responses.response.IncompleteDetails)
+  sdk_version: openai 2.53.0
+  notes: >-
+    The vendor's guide to its Responses route (primary source, read
+    2026-11-18) names response.incomplete among the terminals of a stream
+    and says that usage is null until the terminal event; it does not say
+    when the route sends that terminal, and no refusal was induced against
+    the route. That a filtered response ends with it, with the reason
+    "content_filter" and no output item, is the reading of the pinned SDK's
+    types: the reason is one of the two values the SDK types for an
+    incomplete response. The usage block and the remaining keys are those
+    of the completion envelope. So this envelope proves that such a stream
+    parses through the pinned SDK, not that the route sends it.
+
+status: 200
+body:
+  - type: response.created
+    sequence_number: 0
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.in_progress
+    sequence_number: 1
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.incomplete
+    sequence_number: 2
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: incomplete
+      model: {slot: served_model}
+      incomplete_details:
+        reason: content_filter
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage:
+        input_tokens: {slot: input_tokens}
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: {slot: output_tokens}
+        output_tokens_details:
+          reasoning_tokens: 0
+        total_tokens: {slot: total_tokens}

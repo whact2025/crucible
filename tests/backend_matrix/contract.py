@@ -824,17 +824,29 @@ def _cost_interval(obs: Observation, ref: Reference) -> list[Deviation]:
     return out
 
 
-def _unasked(obs: Observation) -> frozenset[str]:
-    """Checks a result's own flags switch off inside a clause that is evaluated.
+# The flags a scenario may waive: the two accounting flags (C6) and the
+# terminal flag (C4). The trace flag is waived by no scenario.
+_WAIVABLE_FLAGS = ("token_usage_complete", "cost_complete", "terminal_complete")
 
-    C6 requires pricing evidence of a result that flags its cost complete; a
-    result that flags it incomplete owes a lower bound and no evidence.
+
+def _unasked(obs: Observation, exp: Expectation) -> frozenset[str]:
+    """Checks that are switched off inside a clause that is evaluated.
+
+    Two ways. The scenario waives a flag (a refusal the provider never
+    billed carries no usage): the check that would report the flag false is
+    not asked, whatever the result says. And C6 requires pricing evidence of
+    a result that flags its cost complete; a result that flags it incomplete
+    owes a lower bound and no evidence. A column-wide known gap is not owed
+    where its check was not asked.
     """
 
     result = obs.result
-    if result is not None and not result.completeness.cost_complete:
-        return PRICING_CODES
-    return frozenset()
+    if result is None:
+        return frozenset()  # a raise: no result clause ran at all
+    waived = {f"flag:{name}=False" for name in _WAIVABLE_FLAGS if name not in exp.flags}
+    if not result.completeness.cost_complete:
+        return frozenset(waived) | PRICING_CODES
+    return frozenset(waived)
 
 
 _CALL_RAISE = re.compile(r"raise:\w+@(before|after)_request/[\w.]+")
@@ -849,10 +861,11 @@ _NOT_A_REWRITE = (
 def not_owed_given(code: str, cell_codes: Iterable[str]) -> bool:
     """Whether a cell's own expected codes show that the check of ``code`` did not run.
 
-    The same three rules by which :func:`evaluate` leaves a check out, read
+    Three of the rules by which :func:`evaluate` leaves a check out, read
     from the codes a cell is ledgered with instead of from an observation, so
     that the verifier can tell without playing the cell where a column-wide
-    code is owed:
+    code is owed. The fourth, a flag the scenario waives, shows in no code of
+    the cell: the inventory pins those cells, each with its reason.
 
     - a raise out of the call stands for the result clauses (a raise out of
       ``close()`` does not: the result was there);
@@ -1307,4 +1320,4 @@ def evaluate(
         outcomes[SCENARIO] = ClauseOutcome("stood_for", reason=raised.code)
     else:
         outcomes[SCENARIO] = ClauseOutcome("ok")
-    return Report(outcomes, tuple(obs.provider.seam_problems), _unasked(obs))
+    return Report(outcomes, tuple(obs.provider.seam_problems), _unasked(obs, exp))
