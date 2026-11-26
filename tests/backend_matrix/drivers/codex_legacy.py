@@ -61,8 +61,15 @@ from .. import envelopes as envelope_files
 from .. import netguard
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import codex_app_server as peer_program
-from ..provider import LoopbackProvider, Reply, SeenRequest, answered_from
-from ..script import Call, ProviderScript, Refuse, Say, Step
+from ..provider import (
+    LoopbackProvider,
+    Reply,
+    SeenRequest,
+    answered_from,
+    require_cut_in_body,
+    whole_and_partial,
+)
+from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
@@ -82,6 +89,9 @@ _TOOL_LABEL = "codex_cli_rs"
 # The word in the sign-in file of a cell. It is a fake; clause C9 looks for it
 # wherever it looks for the canary credential.
 LOGIN_WORD = "matrix-fake-session-word"
+# What the model is scripted to have thought in a response that writes no
+# message. It never reaches a result.
+REASONING_TEXT = "matrix reasoning that is never shown [canary-reasoning-2f9a]"
 
 _LAUNCHER = """#!{interpreter} -IS
 # Written by the backend matrix for one cell: the scripted Codex app-server peer.
@@ -142,6 +152,8 @@ class CodexAppServerDialect:
     provider = "app_server"
     behaviours: tuple[str, ...] = (
         "agent_message",
+        # A response that reasons and writes no message.
+        "reasoning",
         "tool_call_started",
         "tool_call_completed",
         "raw_response_completed",
@@ -306,7 +318,7 @@ class CodexAppServerDialect:
                 "response and no refusal part of a message, so the cell is pinned "
                 "not expressible in the inventory"
             )
-        if not isinstance(step, (Say, Call, Refuse)):
+        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__}: the "
                 "wire names no served model, and every other step lands with the "
@@ -355,6 +367,8 @@ class CodexAppServerDialect:
             # before any model response, and nothing is billed.
             frame("turn_failed_policy")
             return Reply(200, {"frames": frames, "call": None}, envelopes=tuple(used))
+        if isinstance(step, Drop):
+            require_cut_in_body(self.name, step)
         usage = step.usage
 
         def account() -> None:
@@ -409,8 +423,51 @@ class CodexAppServerDialect:
             return Reply(
                 200, body, usage, None, (step.slot, call_id, arguments), envelopes=tuple(used)
             )
-        frame("agent_message", created=now(), item_id=f"msg_{call_id}", text=step.text)
+        if isinstance(step, Reason):
+            # The response reasons and writes no message: the turn completes
+            # with a reasoning item and nothing a client could show.
+            frame(
+                "reasoning",
+                created=now(),
+                item_id=f"rs_{call_id}",
+                reasoning_text=REASONING_TEXT,
+            )
+        else:
+            frame("agent_message", created=now(), item_id=f"msg_{call_id}", text=step.text)
         account()
+        if isinstance(step, Drop):
+            # The tool goes away inside the model response. The wire is a
+            # stream of notifications, one line each, so it is cut as an
+            # HTTP stream is: the agent message, which carries the answer,
+            # travels whole and the client of the tool holds the text; the
+            # line of the notification after it ends in its middle without
+            # a line end, and the tool is killed. No usage notification
+            # arrives whole, so none is billed. The reply is answered from
+            # the notification that arrived and the one that was cut.
+            lines = [json.dumps(item).encode("utf-8") for item in frames]
+            whole, partial = whole_and_partial(lines, step.text)
+            return Reply(
+                200,
+                {
+                    "frames": frames[:whole],
+                    "call": None,
+                    "gone": {"partial": partial.decode("utf-8"), "killed": True},
+                },
+                envelopes=tuple(used[: whole + 1]),
+            )
+        if isinstance(step, Malformed):
+            # The stream of the tool ends without its terminal: the agent
+            # message and the usage notifications of the response arrive
+            # whole, then the tool ends its output and exits with status 0
+            # without the notification that ends the turn. The usage was
+            # stated, so the provider bills it.
+            return Reply(
+                200,
+                {"frames": frames, "call": None, "gone": {"partial": "", "killed": False}},
+                usage,
+                None,
+                envelopes=tuple(used),
+            )
         frame("turn_completed")
         return Reply(200, {"frames": frames, "call": None}, usage, None, envelopes=tuple(used))
 

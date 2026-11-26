@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed chat completion that reasons and ends cleanly without any visible
+# text, for a request of the K3 series for which nothing was read from the
+# cache: the output tokens the reply bills are all reasoning tokens.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: reasoning_only
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletionChunk objects: the chunks of the
+    completion envelope without the chunk whose delta holds the content
+  sdk_version: openai 2.14.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach for this reply:
+    every one of the four raw streams of the live observation of 2026-11-18
+    that the completion envelope cites held visible text after its
+    reasoning, and the vendor's chat reference and its guide to thinking
+    models (primary sources, read 2026-11-18) state the order of
+    reasoning_content and content in a stream and no stream that ends
+    without content. What is taken from those sources is what the
+    completion envelope takes: the delta keys, the finish chunk with its
+    repeated usage, the statistics chunk with empty choices, the keys of the
+    usage of a request that read nothing from the cache, and "[DONE]" last.
+    Constructed: that such a stream holds no chunk with a content delta at
+    all (and not one with an empty string), that the finish reason is
+    "stop", and that all completion tokens are reasoning tokens. The
+    reasoning text is a slot. The last entry is the closing message of the
+    stream, which is no JSON document.
+
+status: 200
+body:
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          role: assistant
+          reasoning_content: {slot: reasoning_text}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta: {}
+        finish_reason: stop
+        usage:
+          prompt_tokens: {slot: input_tokens}
+          completion_tokens: {slot: output_tokens}
+          total_tokens: {slot: total_tokens}
+          prompt_tokens_details:
+            cache_write_tokens: 0
+          completion_tokens_details:
+            reasoning_tokens: {slot: reasoning_tokens}
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices: []
+    usage:
+      prompt_tokens: {slot: input_tokens}
+      completion_tokens: {slot: output_tokens}
+      total_tokens: {slot: total_tokens}
+      prompt_tokens_details:
+        cache_write_tokens: 0
+      completion_tokens_details:
+        reasoning_tokens: {slot: reasoning_tokens}
+  - "[DONE]"

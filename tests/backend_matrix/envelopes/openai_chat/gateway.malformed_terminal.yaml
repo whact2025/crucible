@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A reply that is no terminal of the chat-completions wire: an HTTP 200 whose
+# chat-completion object holds no choice, in the hosted gateway's dialect.
+# The wire carries one document per reply, so a reply without its terminal
+# is a complete document without a turn.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: gateway
+behaviour: malformed_terminal
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletion with an empty list of choices: the five
+    fields of the type that have no default (id, choices, created, model,
+    object), where choices is typed as a list and the empty list is a value
+    of it
+  sdk_version: openai 2.44.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach: no source
+    states that the gateway answers a request with a 200 whose list of
+    choices is empty, and none was induced. The SDK does not validate a
+    reply against its type, so the document parses and its list of choices
+    is simply empty; a client that reads the first choice finds none. The
+    usage field of the type is optional and is left out: the reply states
+    no usage, so the scripted provider bills none for it. The model is the
+    one the request named. So this envelope shows what a client makes of
+    such a reply, not that the gateway sends it.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices: []

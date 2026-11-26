@@ -45,8 +45,10 @@
 #   A `column_wide` entry is one clause code that shows on every cell of a
 #   kind where its clause was evaluated and its check was asked (C6 asks for
 #   pricing evidence only of a result that flags its cost complete, and a
-#   flag that the scenario of a cell waives is not asked of its result). It
-#   is owed there and tolerated nowhere else.
+#   flag that the scenario of a cell waives or expects false is not asked
+#   of its result; where the cost flag is expected false, outright or
+#   because the provider billed nothing for the call, no evidence is asked
+#   either). It is owed there and tolerated nowhere else.
 # declared_differences: differences no feature field expresses. Each has a
 #   product citation, an owner, a date and the alternative contract asserted
 #   instead; a cell passes only if the alternative holds. Either a variant of
@@ -107,7 +109,7 @@ schema_version: crucible.backend-matrix.ledger.v1
 ceilings:
   max_known_gaps:
     pack_a: 84
-    pack_b: 0
+    pack_b: 24
   frozen: [pack_a]
   max_declared_differences: 4
 
@@ -379,6 +381,19 @@ registry:
         observed_under: {}
         closes_under: {}
         predicted: ["digest.mismatch:tool_authority"]
+      # The scenarios of a write that succeeds: three more tool cells.
+      - cell: deepseek/S41/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S44/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["digest.mismatch:tool_authority"]
+      - cell: deepseek/S45/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["digest.mismatch:tool_authority"]
 
   G28:
     title: The gateway adapter records one request event per completion, which the limit guard rejects
@@ -628,6 +643,17 @@ registry:
       # as incomplete is an exit without a limit too. Its stop_reason is
       # error and its terminal event is named response.incomplete.
       - cell: deepseek/S23a/primary/raw
+        observed_under: {}
+        closes_under: {}
+      # The scenarios of a write that succeeds end without a limit as well,
+      # the one whose last response holds a reasoning item alone included.
+      - cell: deepseek/S41/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: deepseek/S44/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: deepseek/S45/primary/raw
         observed_under: {}
         closes_under: {}
 
@@ -951,6 +977,107 @@ registry:
         observed_under: {}
         closes_under: {}
 
+  G09:
+    title: Kimi returns a billed final turn without visible text as a transport error
+    origin: gap list
+    severity: medium
+    closes_on_grade: documented
+    # Predicted for the scenario of an empty final turn after a write. At
+    # its first run the cell shows the kind alone: the worker returns a
+    # valid terminal for a reply that reasons and shows no text, and the
+    # adapter turns it into a transport error because the visible message is
+    # empty, whatever the provider billed for the turn (30 output tokens
+    # here). After a write the error is not retriable; the result keeps
+    # stop_reason end_turn, its usage, its served model and its terminal
+    # flag, and the write is on disk. The scenario asks for a success: a
+    # completion is taken for stalled only where no output token was
+    # produced. The reply is constructed: no source states a stream of the
+    # provider that reasons and ends without content, so the record closes
+    # on a reply of the grade documented. The same sentence of the contract
+    # fails on a reference route by another mechanism, under record R16 (the
+    # app-server Codex route); no cell is shared, and the fix of this record
+    # is held to the scenario and not to what that route returns.
+    cells:
+      - cell: kimi/S44/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  G31:
+    title: The gateway adapter runs write tools in the process of the workflow
+    origin: gap list
+    severity: medium
+    # Predicted. The adapter builds no process for the writes of a call: the
+    # write of the scenario is dispatched by the ToolSet object in the
+    # process of the workflow, where the fixture's recorder sees it, and no
+    # host is built. So nothing stands between a write handler that blocks
+    # and the deadline of the invocation, and close() has nothing to stop.
+    # The call itself is a clean success with the write on disk.
+    cells:
+      - cell: openai_compat:hosted/S41/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S41/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  G36:
+    title: The gateway adapter changes what a writer is offered and told after a third of its turns
+    origin: gap list
+    severity: medium
+    # Predicted. From the turn at a third of max_turns on, a call that
+    # attached write tools is offered the write tools only, and the adapter
+    # appends a user message of its own to the conversation that says so.
+    # Neither is in the prompt of the workflow or in the ToolSet it
+    # attached. The scenario plays every turn of its budget, thirteen
+    # requests in thirteen turns, and the cells show three codes: the
+    # requests from the sixth on advertise three of the seven attached
+    # tools; they carry a user message after the first turn of the model;
+    # and the three reads the model asks for after that point are answered
+    # without a dispatch, with a text of the adapter's own in the place of
+    # a result. The call still ends as a clean success with every write on
+    # disk and the usage of all thirteen responses.
+    # Two things the adapter does to a writer are not reached by these
+    # cells, because the first write of the script succeeds before that
+    # turn: a request that forces a tool call, and the adapter's other
+    # messages to the model (after a reply that calls no write tool, after
+    # a write that failed, after a reply cut by the output limit). The
+    # cells speak for the change at a third of the turns and for nothing
+    # else of this record.
+    cells:
+      - cell: openai_compat:hosted/S45/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S45/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  # -- broken terminals (S26, S27) ------------------------------------------
+  G34:
+    title: The gateway adapter lets an unknown exception leave the call on a reply without a choice
+    origin: gap list
+    severity: medium
+    closes_on_grade: documented
+    # A 200 whose list of choices is empty, on both kinds: the adapter reads
+    # the first choice, the IndexError is no exception its classifier knows,
+    # and it leaves the call after the request, so the workflow gets no
+    # result at all. Predicted with this code. The reply without a choice is
+    # constructed from the type of the SDK, which allows the empty list: no
+    # source in reach says that a gateway or a local server sends one, so
+    # the two cells cannot close on that envelope (`closes_on_grade`), and
+    # such a reply cannot be induced for a recording. Whether the type of
+    # the SDK is ground enough for a fix of this raise to close them is a
+    # ruling that is owed before that fix is scheduled. The other clause the
+    # gap list has under this id, the terminal flag that the adapter writes
+    # true on every path, is no fact about what a provider sends and is a
+    # record of its own, M15.
+    cells:
+      - cell: openai_compat:hosted/S26/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S26/primary/raw
+        observed_under: {}
+        closes_under: {}
+
   M10:
     title: Kimi does not read the refusal field of a reply, which ends as a retriable transport error
     origin: matrix
@@ -1035,6 +1162,20 @@ registry:
       - cell: kimi/S40/secondary/raw
         observed_under: {}
         closes_under: {}
+      # A stream that ends without its terminal and a stream that is cut
+      # inside the turn (first run of the two scenarios, primary column).
+      # Both calls end in an exception the worker's classifier turns into
+      # the outcome it reports. The chunks that arrived named the model and
+      # stated no usage, and the result names no served model: the one code
+      # of this record that these cells can show. Their scenarios expect the
+      # terminal flag false and do not owe the cost flag, so neither the
+      # terminal code nor the interval code is asked there.
+      - cell: kimi/S26/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: kimi/S27/primary/raw
+        observed_under: {}
+        closes_under: {}
 
   M12:
     title: A Kimi route under its cost policy reports a cost above the matrix rate card when one response overruns the budget (no fix is owed)
@@ -1092,6 +1233,21 @@ registry:
       - cell: deepseek/S23c/primary/raw
         observed_under: {}
         closes_under: {}
+      # A stream that ends without its terminal and a stream that is cut
+      # inside the turn (first run of the two scenarios). The adapter builds
+      # both results in its branch for a qualification failure of the
+      # worker: the error and the terminal event of the trace name that
+      # failure and not what the worker made of the stream. The events
+      # that arrived named the model and stated no usage; the result names
+      # no served model and flags its trace incomplete. The two accounting
+      # codes of this record are not asked there: the scenarios do not owe
+      # those flags.
+      - cell: deepseek/S26/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: deepseek/S27/primary/raw
+        observed_under: {}
+        closes_under: {}
 
   M14:
     title: The DeepSeek adapter ends the call at a tool result over the byte budget instead of truncating it
@@ -1113,6 +1269,33 @@ registry:
     # of the release owner, who may overrule it.
     cells:
       - cell: deepseek/S18/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  M15:
+    title: The gateway adapter flags the terminal of every result complete
+    origin: matrix
+    severity: medium
+    # Seen at the first run of the reply that is cut inside the turn, on
+    # both kinds, and stated from the result builder of the adapter before
+    # that run. The connection goes away inside the reply; the SDK's
+    # connection error is typed as a transport error with both accounting
+    # flags false, and the result flags its terminal complete although no
+    # terminal ever arrived: the builder writes that flag true on every
+    # path. The same code is predicted for a call that ends at its deadline.
+    # The behaviour was known before the matrix was built: the gap list
+    # carries it as the last clause of G34. It is a record of its own
+    # because G34 is a gap about what a provider sends and names the grade
+    # of reply its cells close on, and this is none: the flag is written
+    # whatever the reply was. Under G34 a cell of this code that is answered
+    # from a constructed reply, as every cell of the local kind is, could
+    # not close on a fix of that one line. This record names no grade, so
+    # its cells close when they stop showing the code.
+    cells:
+      - cell: openai_compat:hosted/S27/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: openai_compat:local/S27/primary/raw
         observed_under: {}
         closes_under: {}
 
@@ -1188,13 +1371,13 @@ registry:
     # 2026-11-21: asked whether to accept the two findings on the official
     # Codex route as known gaps and keep the real worker, the owner accepted
     # both. That ruling is the `ruling` of the entries of the starter set
-    # that name this record. The entries of pack A that name it carry the
-    # ruling of a decision panel instead: the owner ruled on the finding,
-    # and that the cells of pack A show it and nothing else is the panel's
-    # finding. Here it is restated and is not a field of the record: a
-    # ruling on a registry record is leave to withdraw the record's cells
-    # (H03 then accepts a cell that is pinned not expressible or no longer
-    # generated), which was not ruled.
+    # that name this record. The entries of pack A and of the writer
+    # scenarios of pack B that name it carry the ruling of a decision panel
+    # instead: the owner ruled on the finding, and that those cells show it
+    # and nothing else is the panel's finding. Here it is restated and is
+    # not a field of the record: a ruling on a registry record is leave to
+    # withdraw the record's cells (H03 then accepts a cell that is pinned
+    # not expressible or no longer generated), which was not ruled.
     # It rests on the reading of the last-response usage field. The worker
     # reports `last` of the turn's usage
     # (crucible/backends/codex_worker/src/crucible_codex_worker/__main__.py).
@@ -1259,6 +1442,18 @@ registry:
         observed_under: {}
         closes_under: {}
       - cell: codex:official/S40/primary/raw
+        observed_under: {}
+        closes_under: {}
+      # Observed at the first run of the writer scenarios of pack B; the
+      # test named above plays both readings of `last` on the raw cell of
+      # each.
+      - cell: codex:official/S41/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: codex:official/S44/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: codex:official/S45/primary/raw
         observed_under: {}
         closes_under: {}
 
@@ -1620,7 +1815,9 @@ registry:
     # known-gap entry that names this record. It is not a field of the
     # record: a ruling on a registry record is leave to withdraw the
     # record's cells (H03 then accepts a cell that is pinned not expressible
-    # or no longer generated), which was not ruled.
+    # or no longer generated), which was not ruled. From 2026-11-25 the
+    # record also lists write cells of pack B, each entered by the ruling of
+    # a decision panel that names the cell.
     # For one invocation the adapter replaces the attached ToolSet by the
     # wrapper that routes the mutators to their isolated process, and the
     # per-attempt function hashes that (crucible/backends/claude.py:
@@ -1657,6 +1854,15 @@ registry:
         observed_under: {}
         closes_under: {}
       - cell: claude/S40/secondary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S41/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S44/primary/raw
+        observed_under: {}
+        closes_under: {}
+      - cell: claude/S45/primary/raw
         observed_under: {}
         closes_under: {}
 
@@ -1710,6 +1916,137 @@ registry:
     # column rests on it too.
     cells:
       - cell: codex:official/S23c/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R15:
+    title: The Claude adapter returns the text of a turn whose terminal never arrived as the final message of its transport error
+    origin: reference
+    severity: medium
+    # First run of the scenario with the frame of the model turn arriving
+    # whole; predicted by reading before that play. A known gap of the
+    # reference by the ruling of a decision panel, not an answer of the
+    # release owner in person. That ruling is the `ruling` of the known-gap
+    # entry that names this record. It is not a field of the record: a
+    # ruling on a registry record is leave to withdraw the record's cells
+    # (H03 then accepts a cell that is pinned not expressible or no longer
+    # generated), which was not ruled.
+    # The adapter sets its final message from every assistant frame it
+    # admits, as the frame arrives, and two exits of the per-attempt
+    # function return it where no terminal frame arrived
+    # (crucible/backends/claude.py, _invoke_once): the handler of an
+    # exception that ends the stream loop, which this cell plays, and the
+    # ordinary end of a stream without its terminal frame. The same adapter
+    # empties it where an API error invalidates the attempt, where the
+    # served model is unproven, and in the results its attempt controller
+    # builds for a deadline or a cancellation. Both Codex routes return an
+    # empty final message on the same play.
+    # The scenario holds that the text of a reply whose terminal never
+    # arrived is not the final message of the result, whatever the kind of
+    # the result. It does not hold that an error result carries no text:
+    # where a reply ended and a limit was judged after it, the result
+    # carries the answer beside its error and claims its terminal, and that
+    # is no gap of this record.
+    # The text of its turn stands in the error result of a stream that ends
+    # in order without its terminal frame (S26, the ordinary end), by run.
+    # No check of that scenario reads the final message, so that cell passes
+    # and is not entered.
+    # Who reads it: no workflow that was read takes the final message of an
+    # error result for an answer. The planning wrapper of the Architect
+    # workflow keeps the final message of a planner result whose accounting
+    # is incomplete as a diagnostic candidate, without looking at the error.
+    # The fix empties the final message on both exits where no terminal
+    # frame arrived, whatever the kind of the error, and pins both in the
+    # product tests. On the handler it reaches every failure which that
+    # handler ends with the stop reason `error`, as on this cell: a
+    # transport error here, rejected content where the exception names a
+    # refusal. It leaves the causes to which the handler gives a stop reason
+    # of their own (an exhausted dispatch budget, an indeterminate mutation,
+    # a terminal tool dispatch), which return what they return today. On the
+    # ordinary end it reaches every result built without a terminal frame,
+    # also where a spending limit judged afterwards replaces the transport
+    # error. It changes no result whose terminal arrived, and it may keep
+    # the text in the transcript, of which the scenario asserts nothing. It
+    # is the adapter's own change with the gap fixes and deletes the entry.
+    # No grade holds the record: the substance is what the adapter does with
+    # a frame it holds.
+    # The severity is the panel's: medium. The result carries more than an
+    # error result promises; nothing is billed or claimed wrongly.
+    # The record lists this cell and this code. The same handler ends an
+    # exhausted dispatch budget and a terminal tool dispatch under stop
+    # reasons of their own, with whatever text had arrived where no ToolSet
+    # with writers is attached; a later cell that shows the code from it is
+    # not covered by this ruling. Text that another adapter takes into the
+    # final message from a terminal other than the completed one is another
+    # gap with another fix, and no cell of this record.
+    cells:
+      - cell: claude/S27/primary/raw
+        observed_under: {}
+        closes_under: {}
+
+  R16:
+    title: On the app-server Codex route a billed final turn that shows no message ends as a transport error (unconfirmed, reference emulated)
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # First run of the scenario of an empty final turn after a write; not
+    # predicted. A known gap of the reference by the ruling of a decision
+    # panel, which is the `ruling` of the entry and not a field of the
+    # record: nothing is withdrawn.
+    # The turn writes, then its last model response reasons and shows no
+    # message; the provider billed output tokens for it. The adapter waits
+    # for the turn with the buffered call of the client library of the
+    # route (a third party's library, pinned; not the vendor's client).
+    # That call raises a protocol error, "turn completed but no final
+    # assistant message could be resolved", for a completed turn in which
+    # it finds no agent message with text, alike when no agent message
+    # completed and when one completed with an empty text. The adapter
+    # types every protocol error of that library a transport error that is
+    # not retried and builds the result in the exception branch of the
+    # attempt, with the usage of every billed response, all four
+    # completeness flags true and the write on disk. Its own
+    # empty-completion guard is not what fires: it is gated on zero output
+    # tokens and on a call without tools.
+    # The scenario asks for a success with an empty final message: a
+    # completion is taken for stalled only where no output token was
+    # produced. The cell is not pinned: the wire carried the turn, the
+    # streaming call of the same library returns it, and the official-SDK
+    # route returns the success on the same scripted reply. It is the
+    # contract sentence of G09 (Kimi) by another mechanism, on another
+    # adapter and with another code set; no cell is shared.
+    # The two codes of the cell do not say that the error is not retriable,
+    # what its text is, or where the result is built: a protocol error of
+    # another text and a retriable error in the same place give the same two
+    # codes.
+    # test_a_billed_turn_that_shows_no_message_ends_in_the_protocol_error_of_the_client_and_is_not_retried
+    # in the app-server module holds the first two on the raw cell, with
+    # lying counterparts beside it, and is required by name by the verifier.
+    # Where the result is built was printed by a play when the entry was
+    # made and is held by no test. The entry does not cover the same two
+    # codes from another error, and a change of the library's pinned release
+    # plays the cell and that test before it lands.
+    # The reply is constructed. Whether the vendor's tool ends a turn whose
+    # last model response holds no message as a completed turn is not
+    # observed, and no source in reach states it of the tool's
+    # notifications. (The vendor's own SDK, which the official route uses,
+    # types the final response of a run as optional and raises only for a
+    # failed turn; that is a fact about a client and grades no frame.) So
+    # the record closes on a reply of the grade documented. The grade is
+    # read from four frames: the start of a tool call, the usage
+    # notification, the reasoning item and the completed turn; three of
+    # them are the general frames of the route. What releases the record
+    # is a vendor source stating that the tool completes a turn whose last
+    # model response holds no message of the agent, and in which shape; a
+    # regrade of the frames for another record's reason releases nothing.
+    # If the cell stops deviating while its frames are constructed, or no
+    # such source is in hand when the fix is designed, a decision panel is
+    # asked to take the grade off by a ruling; nothing is regraded, edited
+    # or pinned to make room before it.
+    # Severity: medium while unconfirmed. The result fails closed (an
+    # error, the accounting complete, not retried), and a finished, billed
+    # turn is discarded after a write that stays on disk.
+    cells:
+      - cell: codex:legacy/S44/primary/raw
         observed_under: {}
         closes_under: {}
 
@@ -2745,6 +3082,51 @@ known_gaps:
       covers no other failed turn of the route, no other code, cell or
       column, not the same code on another scenario, and not the typed error
       of a missing sign-in, which is another record.
+  # Writes that succeed (S41, S44, S45), first run on the open-weight
+  # columns. The Kimi column owes only its two column-wide codes on S41 and
+  # S45 and has no entry there; both gateway kinds pass S44, where the final
+  # turn follows a write inside the tool loop. The three DeepSeek cells end
+  # in a clean success and show what every clean tool cell of the column
+  # shows.
+  - cell: kimi/S44/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=none": G09
+  - cell: openai_compat:hosted/S41/primary/raw
+    observed_under: {}
+    codes:
+      "mutation:in_process": G31
+  - cell: openai_compat:local/S41/primary/raw
+    observed_under: {}
+    codes:
+      "mutation:in_process": G31
+  - cell: openai_compat:hosted/S45/primary/raw
+    observed_under: {}
+    codes:
+      "request.content:tools": G36
+      "request.content:messages": G36
+      "dispatch.missing:read_a": G36
+  - cell: openai_compat:local/S45/primary/raw
+    observed_under: {}
+    codes:
+      "request.content:tools": G36
+      "request.content:messages": G36
+      "dispatch.missing:read_a": G36
+  - cell: deepseek/S41/primary/raw
+    observed_under: {}
+    codes:
+      "event.terminal:response.completed!=end_turn": M05
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S44/primary/raw
+    observed_under: {}
+    codes:
+      "event.terminal:response.completed!=end_turn": M05
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S45/primary/raw
+    observed_under: {}
+    codes:
+      "event.terminal:response.completed!=end_turn": M05
+      "digest.mismatch:tool_authority": G24
   - column_wide: {kind: "codex:official", code: "flag:token_usage_complete=False", gap: R04}
     ruling: >-
       Release owner in person, 2026-11-21. Asked: whether to accept the two
@@ -2755,6 +3137,303 @@ known_gaps:
       Release owner in person, 2026-11-21. Asked: whether to accept the two
       findings on the official Codex route (records R04 and R05) as known
       gaps and keep the real worker. Decided: yes, both are accepted.
+
+  # Broken terminals, first run of S26 and S27 on the primary columns: the
+  # open-weight cells. The gateway adapter raises on a reply without a
+  # choice (G34) and flags the terminal of a cut reply complete (M15).
+  # The DeepSeek result of both scenarios is built from a failure of the
+  # worker (M13) and the Kimi result from an outcome of the worker's
+  # exception classifier (M11): each names no served model although the
+  # frames that arrived named one, and the DeepSeek result flags its trace
+  # incomplete.
+  - cell: openai_compat:hosted/S26/primary/raw
+    observed_under: {}
+    codes:
+      "raise:IndexError@after_request/crucible.backends.openai_compat": G34
+  - cell: openai_compat:hosted/S27/primary/raw
+    observed_under: {}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:local/S26/primary/raw
+    observed_under: {}
+    codes:
+      "raise:IndexError@after_request/crucible.backends.openai_compat": G34
+  - cell: openai_compat:local/S27/primary/raw
+    observed_under: {}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: deepseek/S26/primary/raw
+    observed_under: {}
+    codes:
+      "digest.missing:served_model": M13
+      "flag:trace_complete=False": M13
+  - cell: deepseek/S27/primary/raw
+    observed_under: {}
+    codes:
+      "digest.missing:served_model": M13
+      "flag:trace_complete=False": M13
+  - cell: kimi/S26/primary/raw
+    observed_under: {}
+    codes:
+      "digest.missing:served_model": M11
+  - cell: kimi/S27/primary/raw
+    observed_under: {}
+    codes:
+      "digest.missing:served_model": M11
+
+  - cell: claude/S27/primary/raw
+    observed_under: {}
+    codes:
+      "text:mismatch": R15
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the scenario first ran with the frame
+      of the model turn arriving whole: what to do with this cell of the
+      reference, which is red only because the final message of its
+      transport error is the text of the turn that had arrived when the
+      tool was killed before its terminal frame. Decided, 3 of 3: the
+      assertion stands as it was stated before the first play of the
+      scenario (the text of a reply whose terminal never arrived is not the
+      final message of the result, whatever the kind of the result), and
+      the cell is accepted as a known gap of the reference for this
+      observation and no other: this cell, this one code alone, no
+      governing declared value, a typed transport error that claims neither
+      its token usage, its cost nor its terminal. Both Codex routes return
+      an empty final message on the same play. No check is changed: the
+      scripted answer is asserted on a result without error only, as
+      before, and the check of this scenario holds an absence on every
+      result. Nothing is ruled of a result whose reply ended before a limit
+      was judged. The fix belongs to the Claude adapter and is a change of
+      its own with the gap fixes. Where the stream did not reach its
+      terminal, the result carries no final message, whatever the kind of
+      its error: on the handler this cell plays, for every failure that
+      handler ends with the stop reason "error" and for no cause to which
+      it gives another stop reason; on the ordinary end of a stream without
+      its terminal, also where a spending limit judged afterwards replaces
+      the transport error. That change deletes this entry. The acceptance
+      covers no other code, cell, column or reference gap, not the text of
+      the turn on the cell of the malformed terminal, which no check reads,
+      not a gap of another adapter, and not the same code on a later cell
+      that leaves by the same handler. Reopened by a decision of the owner
+      or a statement of the protocol that an error result may carry the
+      text of a turn that did not reach its terminal, by a product reader
+      shown to need that text in the final message, or by any other code
+      set on the cell, among them no code where the adapter was not fixed.
+
+  # Writes that succeed (S41, S44, S45), first run on the reference columns:
+  # seven cells, each entered with the ruling of a decision panel on that
+  # cell and not an answer of the release owner in person; each text says
+  # so, and each covers its cell and nothing else. The three Claude cells
+  # show the digest code of R13 alone, the three cells of the official
+  # Codex route the usage code of R05 beside the two column-wide codes of
+  # R04, and the cell of the app-server route its two codes under a record
+  # of its own (R16).
+  - cell: claude/S41/primary/raw
+    observed_under: {}
+    codes:
+      "digest.mismatch:tool_authority": R13
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the writer scenarios of pack B first
+      ran on this column: what to do with this write cell of the reference,
+      which is red only because the tool-authority digest in its trace is not
+      the digest of the attached ToolSet. Decided, 3 of 3 as to this cell:
+      accepted as a known gap of the reference for this observation and no
+      other: this cell, this one code alone, no governing declared value, a
+      result without an error whose write is on disk, returned on the trace of
+      the result the attempt built, the digest in the trace being the one the
+      adapter hashes from the wrapper that routes the mutators to their
+      isolated process (equal to the shared digest of the same tools with no
+      path scope stated), the proof the verifier requires for this cell
+      passing in both halves, and the starter tool cells of the column passing
+      in the same run. What the session may write is enforced from the
+      attached ToolSet and is not affected. The fix belongs to the Claude
+      adapter and is a change of its own, made after the change that entered
+      this entry: on every path that hosts mutators the trace binds the digest
+      of the attached ToolSet with every path scope it carries, as read for
+      that invocation, and that change deletes this entry. The acceptance
+      covers no other code, cell, column or reference gap, no trace without a
+      digest, no result with an error, and not the same code on another cell.
+  - cell: claude/S44/primary/raw
+    observed_under: {}
+    codes:
+      "digest.mismatch:tool_authority": R13
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the writer scenarios of pack B first
+      ran on this column: what to do with this write cell of the reference,
+      which is red only because the tool-authority digest in its trace is not
+      the digest of the attached ToolSet. Decided, 3 of 3 as to this cell:
+      accepted as a known gap of the reference for this observation and no
+      other: this cell, this one code alone, no governing declared value, a
+      result without an error whose final message is empty and whose write is
+      on disk, returned on the trace of the result the attempt built, the
+      digest in the trace being the one the adapter hashes from the wrapper
+      that routes the mutators to their isolated process (equal to the shared
+      digest of the same tools with no path scope stated), the proof the
+      verifier requires for this cell passing in both halves, and the starter
+      tool cells of the column passing in the same run. The reply this
+      scenario plays is a constructed one; the record names no closing grade,
+      because the digest is computed before any frame of the vendor tool is
+      read. What the session may write is enforced from the attached ToolSet
+      and is not affected. The fix belongs to the Claude adapter and is a
+      change of its own, made after the change that entered this entry: on
+      every path that hosts mutators the trace binds the digest of the
+      attached ToolSet with every path scope it carries, as read for that
+      invocation, and that change deletes this entry. The acceptance covers no
+      other code, cell, column or reference gap, no trace without a digest, no
+      result with an error, and not the same code on another cell.
+  - cell: claude/S45/primary/raw
+    observed_under: {}
+    codes:
+      "digest.mismatch:tool_authority": R13
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the writer scenarios of pack B first
+      ran on this column: what to do with this write cell of the reference,
+      which is red only because the tool-authority digest in its trace is not
+      the digest of the attached ToolSet. Decided, 3 of 3 as to this cell:
+      accepted as a known gap of the reference for this observation and no
+      other: this cell, this one code alone, no governing declared value, a
+      result without an error whose six writes are on disk, returned on the
+      trace of the result the attempt built, the digest in the trace being the
+      one the adapter hashes from the wrapper that routes the mutators to
+      their isolated process (equal to the shared digest of the same tools
+      with no path scope stated), the proof the verifier requires for this
+      cell passing in both halves, and the starter tool cells of the column
+      passing in the same run. What the session may write is enforced from the
+      attached ToolSet and is not affected. The fix belongs to the Claude
+      adapter and is a change of its own, made after the change that entered
+      this entry: on every path that hosts mutators the trace binds the digest
+      of the attached ToolSet with every path scope it carries, as read for
+      that invocation, and that change deletes this entry. The acceptance
+      covers no other code, cell, column or reference gap, no trace without a
+      digest, no result with an error, and not the same code on another cell.
+  - cell: codex:official/S41/primary/raw
+    observed_under: {}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the writer scenarios of pack B first
+      ran on this column: whether this cell may be entered under record R05,
+      the finding on the usage of a turn of several model responses that the
+      release owner accepted as a known gap of the route on 2026-11-21,
+      although that answer names no cell of pack B. Decided, 3 of 3 as to this
+      cell: yes, for this cell and this code and nothing else. The owner ruled
+      on the finding, not on this cell; that the cell shows it and no other
+      deviation is the panel's finding. Beside the two column-wide codes of
+      R04 the cell fails with this one code, under the declared values
+      recorded here and with all four completeness flags owed, on a turn of
+      several model responses that ends as the scenario asks; the result is
+      the one the adapter built from the terminal the worker reported for the
+      turn, in one attempt; the code goes and no other code moves when the
+      last-response usage field is read as the turn so far (the test the
+      record of R05 names plays the raw cell of this scenario under both
+      readings and is required by name). R05 is unconfirmed. A change that
+      alters the codes of this cell does not edit this entry to fit: the entry
+      is deleted in the change in which the cell passes, and any other code
+      set needs a ruling of its own. The entry covers no other code, cell,
+      lens or column, and no cell of a later batch.
+  - cell: codex:official/S44/primary/raw
+    observed_under: {}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the writer scenarios of pack B first
+      ran on this column: whether this cell may be entered under record R05,
+      the finding on the usage of a turn of several model responses that the
+      release owner accepted as a known gap of the route on 2026-11-21,
+      although that answer names no cell of pack B. Decided, 3 of 3 as to this
+      cell: yes, for this cell and this code and nothing else. The owner ruled
+      on the finding, not on this cell; that the cell shows it and no other
+      deviation is the panel's finding. Beside the two column-wide codes of
+      R04 the cell fails with this one code, under the declared values
+      recorded here and with all four completeness flags owed, on a turn of
+      several model responses that ends as the scenario asks; the result is
+      the one the adapter built from the terminal the worker reported for the
+      turn, in one attempt; the code goes and no other code moves when the
+      last-response usage field is read as the turn so far (the test the
+      record of R05 names plays the raw cell of this scenario under both
+      readings and is required by name). R05 is unconfirmed. A change that
+      alters the codes of this cell does not edit this entry to fit: the entry
+      is deleted in the change in which the cell passes, and any other code
+      set needs a ruling of its own. The entry covers no other code, cell,
+      lens or column, and no cell of a later batch.
+  - cell: codex:official/S45/primary/raw
+    observed_under: {}
+    codes:
+      "usage.cost_usd:lt": R05
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the writer scenarios of pack B first
+      ran on this column: whether this cell may be entered under record R05,
+      the finding on the usage of a turn of several model responses that the
+      release owner accepted as a known gap of the route on 2026-11-21,
+      although that answer names no cell of pack B. Decided, 3 of 3 as to this
+      cell: yes, for this cell and this code and nothing else. The owner ruled
+      on the finding, not on this cell; that the cell shows it and no other
+      deviation is the panel's finding. Beside the two column-wide codes of
+      R04 the cell fails with this one code, under the declared values
+      recorded here and with all four completeness flags owed, on a turn of
+      several model responses that ends as the scenario asks; the result is
+      the one the adapter built from the terminal the worker reported for the
+      turn, in one attempt; the code goes and no other code moves when the
+      last-response usage field is read as the turn so far (the test the
+      record of R05 names plays the raw cell of this scenario under both
+      readings and is required by name). R05 is unconfirmed. A change that
+      alters the codes of this cell does not edit this entry to fit: the entry
+      is deleted in the change in which the cell passes, and any other code
+      set needs a ruling of its own. The entry covers no other code, cell,
+      lens or column, and no cell of a later batch.
+  - cell: codex:legacy/S44/primary/raw
+    observed_under: {}
+    codes:
+      "kind:transport!=none": R16
+      "stop:error!=end_turn": R16
+    ruling: >-
+      Decision panel, 2026-11-25, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, after the writer scenarios of pack B first
+      ran on this column, where this cell was predicted to pass: what to do
+      with this cell, which is red because a turn whose last model response
+      reasons, shows no message and was billed output tokens ends as a
+      transport error on the app-server route, where the scenario asks for a
+      success with an empty final message. Decided, 3 of 3: the scenario
+      stands on every kind; nothing is waived and nothing is pinned, because
+      the route carried the turn and the client library of the route can
+      return it. The cell is accepted as a known gap of the reference for this
+      observation and no other: this cell, exactly these two codes, no
+      governing declared value, one attempt, a transport error that is not
+      retriable and carries the protocol error the client library raises for a
+      turn that completed without a final assistant message, first built in
+      the exception branch of the attempt, with the usage of every billed
+      response reported, all four completeness flags true and the write on
+      disk, and with the seam canary and the two other writer cells of the
+      column passing in the same run. The adapter's own empty-completion guard
+      is not what fires. The test the record names holds that the error is not
+      retriable and carries that sentence, and is required by name; where the
+      result is first built was shown by a play printed when this entry was
+      made and is held by no test. The acceptance does not cover the same two
+      codes from an error of another text or from one that is retriable. The
+      reply is constructed: whether the vendor's tool ends such a turn as
+      completed is not observed, so the record closes on a documented reply,
+      and this entry is not deleted while the cell is answered from a weaker
+      one unless a decision panel has taken the grade off the record. The fix
+      is a change of its own, made after the change that entered this entry: a
+      completed turn that was billed output tokens and shows no message is
+      returned as a success, and a turn that produced nothing stays an error.
+      A change that alters the codes of this cell does not edit this entry to
+      fit, and any other code set needs a ruling of its own. The entry covers
+      no other code, cell, scenario, lens, column or reference gap.
 
 declared_differences:
   - id: D-STRUCT-UNQUALIFIED
@@ -2844,6 +3523,11 @@ declared_differences:
       - codex:legacy/S18/primary/raw
       - codex:legacy/S23c/primary/raw
       - codex:legacy/S40/primary/raw
+      - codex:legacy/S26/primary/raw
+      - codex:legacy/S27/primary/raw
+      - codex:legacy/S41/primary/raw
+      - codex:legacy/S44/primary/raw
+      - codex:legacy/S45/primary/raw
       - codex:official/S01/primary/raw
       - codex:official/S01/primary/guarded
       - codex:official/S03/primary/raw
@@ -2858,6 +3542,11 @@ declared_differences:
       - codex:official/S18/primary/raw
       - codex:official/S23c/primary/raw
       - codex:official/S40/primary/raw
+      - codex:official/S26/primary/raw
+      - codex:official/S27/primary/raw
+      - codex:official/S41/primary/raw
+      - codex:official/S44/primary/raw
+      - codex:official/S45/primary/raw
   - id: D-COST-BOUND-UNRANKED
     citation: >-
       crucible/backends/limits.py (_normalize_returned_result: a result under

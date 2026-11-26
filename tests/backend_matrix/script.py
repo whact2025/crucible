@@ -80,9 +80,22 @@ class HttpError:
 
 @dataclass(frozen=True)
 class Drop:
-    """The connection goes away after part of the reply."""
+    """The connection or the peer goes away after part of the reply.
 
+    The reply is the one the dialect has for a final answer of ``text``.
+    Only a leading part of it travels: it ends inside the turn, before
+    anything that ends the turn, and then the other side is gone. On a
+    wire of one document per reply the document is cut inside the text, so
+    no document arrives. On a stream of frames the frame that carries the
+    text travels whole and the frame after it is cut, so the client holds
+    the text. ``usage`` is what the provider bills where a frame that
+    travels whole states the usage of the turn; a dialect whose usage
+    travels after the text states none and bills none.
+    """
+
+    text: str
     after: Literal["headers", "partial_body"] = "partial_body"
+    usage: TokenUsage = DEFAULT_USAGE
 
 
 @dataclass(frozen=True)
@@ -94,7 +107,18 @@ class Stall:
 
 @dataclass(frozen=True)
 class Malformed:
-    """A reply that is not a valid terminal of the dialect."""
+    """A reply that is not a valid terminal of the dialect.
+
+    Either a complete reply that holds no turn at all, or the frames of a
+    final answer of ``text`` without the frame that ends the turn, after
+    which the stream ends in order. Which of the two a wire can carry is
+    its dialect's to say. ``usage`` is what the provider bills where the
+    frames that do travel state the usage of the turn; a dialect whose
+    usage travels with the terminal states none and bills none.
+    """
+
+    text: str
+    usage: TokenUsage = DEFAULT_USAGE
 
 
 @dataclass(frozen=True)

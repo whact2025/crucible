@@ -48,8 +48,11 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from .drivers.base import MatrixSetupError
 from .script import (
     Call,
+    Drop,
     Loop,
+    Malformed,
     ProviderScript,
+    Reason,
     Refuse,
     Say,
     ServedAs,
@@ -146,6 +149,11 @@ class ProviderLedger:
     # call (:class:`TurnControlDialect`). Where it has none, a request
     # without a turn control says nothing about the adapter.
     turn_control_field: bool = False
+    # What the dialect of a wire that carries the conversation says of the
+    # messages of the scripted requests that are neither the workflow's
+    # prompt, a turn of the model nor a tool result
+    # (:class:`ConversationDialect`); empty where the dialect has no such rule.
+    foreign_messages: list[str] = field(default_factory=list)
 
     @property
     def request_count(self) -> int:
@@ -176,6 +184,10 @@ class Reply:
     # the bytes were rendered from.
     raw: bytes | None = None
     content_type: str = "application/json"
+    # Where the connection goes away: the headers announce the whole reply,
+    # this many bytes of it are sent, and the socket is closed. ``None`` for
+    # a reply that travels whole.
+    cut: int | None = None
 
 
 class Dialect(Protocol):
@@ -250,6 +262,83 @@ class TurnControlDialect(Protocol):
     turn_control_field: bool
 
 
+@runtime_checkable
+class ConversationDialect(Protocol):
+    """A dialect of a wire on which every request carries its conversation.
+
+    Such a dialect can say what each message of a request is. A request of a
+    call holds the workflow's prompt (the opening), the turns of the model
+    and the results of the tools it called; a message of any other kind is
+    the adapter's own word to the model, which the workflow never sees. The
+    provider asks when the scripted exchange ends and the ledger keeps the
+    answer (:attr:`ProviderLedger.foreign_messages`), for the scenario that
+    is about it. A wire that keeps the conversation itself has no such rule.
+    """
+
+    def foreign_messages(self, requests: Sequence[SeenRequest]) -> list[str]:
+        """The messages of the matched requests that are none of the three kinds."""
+
+
+def require_cut_in_body(dialect: str, step: Drop) -> None:
+    """A dialect cuts a reply inside its body, after part of the answer."""
+
+    if step.after != "partial_body":
+        raise MatrixSetupError(
+            f"the {dialect} dialect drops a reply inside its body only; the "
+            "scenario that drops one earlier adds the rendering with its liar"
+        )
+
+
+def cut_inside(payload: bytes, text: str) -> int:
+    """Where a reply that carries ``text`` is cut: in the middle of that text.
+
+    The offset of the middle of the first place the text stands in the bytes
+    of the reply, so that what travels ends inside the answer.
+    """
+
+    words = text.encode("utf-8")
+    if len(words) < 2 or words not in payload:
+        raise MatrixSetupError(
+            "a reply can be cut inside its answer text only where it carries "
+            f"that text, of two bytes or more: {text!r}"
+        )
+    return payload.index(words) + len(words) // 2
+
+
+def cut_after(frames: Sequence[bytes], text: str) -> int:
+    """Where a stream that carries ``text`` is cut: inside the frame after it.
+
+    The frames up to the first one that carries the text travel whole, so the
+    client holds the text; the connection goes away in the middle of the
+    frame that follows, before anything that ends the turn.
+    """
+
+    whole, partial = whole_and_partial(frames, text)
+    return sum(len(frame) for frame in frames[:whole]) + len(partial)
+
+
+def whole_and_partial(frames: Sequence[bytes], text: str) -> tuple[int, bytes]:
+    """What travels of a stream that is cut after its answer text.
+
+    How many frames travel whole, the first that carries ``text`` being the
+    last of them, and the leading half of the frame that follows it: what
+    the other side had written of that frame when it went away. The one
+    statement of where a stream of frames is cut, for a wire whose frames
+    are parts of an HTTP body and for one whose frames are lines of a tool's
+    output.
+    """
+
+    words = text.encode("utf-8")
+    carrying = next((index for index, frame in enumerate(frames) if words in frame), None)
+    if not words or carrying is None or carrying + 1 >= len(frames):
+        raise MatrixSetupError(
+            "a stream can be cut after its answer text only where a frame "
+            f"carries that text and another follows it: {text!r}"
+        )
+    following = frames[carrying + 1]
+    return carrying + 1, following[: len(following) // 2]
+
+
 def answered_from(dialect: Dialect, script: ProviderScript) -> tuple[str, ...]:
     """The envelopes ``dialect`` renders the steps of ``script`` from, in order.
 
@@ -311,12 +400,13 @@ class ToyDialect:
             budget_control=payload.get("budget_usd"),
             schema_field="response_schema" in payload,
             host=headers.get("Host", ""),
-            # The calls a request names as answered by earlier requests.
-            evidence=(
-                {"answered": [str(item) for item in payload["answered"]]}
-                if isinstance(payload.get("answered"), list)
-                else {}
-            ),
+            # The calls a request names as answered by earlier requests, and
+            # what the adapter says to the model in words of its own.
+            evidence={
+                name: [str(item) for item in payload[name]]
+                for name in ("answered", "notes")
+                if isinstance(payload.get(name), list)
+            },
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -359,15 +449,57 @@ class ToyDialect:
                 )
         return problems
 
+    def foreign_messages(self, requests: Sequence[SeenRequest]) -> list[str]:
+        """The notes of the adapter's own that the matched requests carry.
+
+        The toy wire carries the workflow's prompt in two fields, the results
+        of the last calls and the names of the earlier ones. Anything the
+        adapter says to the model beside them travels as a note.
+        """
+
+        return [
+            f"request {index + 1} carries {len(notes)} note(s) of the adapter's own"
+            for index, request in enumerate(requests)
+            for notes in (request.evidence.get("notes") or (),)
+            if request.matched and notes
+        ]
+
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
         served = seen.model
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
+        if isinstance(step, Malformed):
+            # A 200 whose document holds no turn: no type, no finish and no
+            # usage. Nothing is billed for it.
+            return Reply(200, {"model": served}, served_model=served)
+        if isinstance(step, Drop):
+            require_cut_in_body(self.name, step)
+            # The document of a plain answer, of which the wire carries the
+            # part that ends inside the text. No document arrives, so nothing
+            # is billed and no model is named.
+            whole = {"model": served, "type": "message", "text": step.text, "finish": "stop"}
+            payload = json.dumps(whole).encode("utf-8")
+            return Reply(200, whole, raw=payload, cut=cut_inside(payload, step.text))
         usage = {
             "input_tokens": getattr(step, "usage", TokenUsage(0, 0)).input_tokens,
             "output_tokens": getattr(step, "usage", TokenUsage(0, 0)).output_tokens,
         }
+        if isinstance(step, Reason):
+            # A clean stop with reasoning and no visible text.
+            return Reply(
+                200,
+                {
+                    "model": served,
+                    "type": "message",
+                    "text": "",
+                    "reasoning": "toy reasoning that is never shown",
+                    "finish": "stop",
+                    "usage": usage,
+                },
+                step.usage,
+                served,
+            )
         if isinstance(step, Say):
             return Reply(
                 200,
@@ -476,9 +608,11 @@ class LoopbackProvider:
         # dropped connection inside the server's.
         blank = self._dialect.parse("POST", self._dialect.path, {}, b"{}", credential="")
         for step in (*script.steps, *((script.tail,) if script.tail else ())):
-            self._stated(
-                self._dialect.render(step.step if isinstance(step, Loop) else step, blank, "")
+            rendered = self._dialect.render(
+                step.step if isinstance(step, Loop) else step, blank, ""
             )
+            self._stated(rendered)
+            self._require_cut_inside(rendered)
         provider = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -501,7 +635,13 @@ class LoopbackProvider:
                 self.send_header("Content-Length", str(len(payload)))
                 self.send_header("Connection", "close")
                 self.end_headers()
-                if self.command != "HEAD":
+                if reply.cut is not None:
+                    # The connection goes away: the headers announced the
+                    # whole reply, a leading part is sent, the socket closes.
+                    self.wfile.write(payload[: reply.cut])
+                    self.wfile.flush()
+                    self.close_connection = True
+                elif self.command != "HEAD":
                     self.wfile.write(payload)
 
             # Every method reaches the ledger: a request that is not the scripted
@@ -530,6 +670,20 @@ class LoopbackProvider:
         return f"http://127.0.0.1:{self.port}"
 
     # -- replay ----------------------------------------------------------
+
+    @staticmethod
+    def _require_cut_inside(reply: Reply) -> None:
+        """A reply that is cut has bytes of its own, and loses at least one of them."""
+
+        if reply.cut is None:
+            return
+        whole = len(json.dumps(reply.body).encode("utf-8") if reply.raw is None else reply.raw)
+        if not 0 < reply.cut < whole:
+            raise MatrixSetupError(
+                f"a reply of {whole} byte(s) cannot be cut after {reply.cut}: the "
+                "connection goes away inside the reply, after its first byte and "
+                "before its last"
+            )
 
     def _stated(self, reply: Reply) -> CacheCounts | None:
         """What a billed reply says of the cache, where the dialect reads it back."""
@@ -658,6 +812,10 @@ class LoopbackProvider:
                             self._ledger.requests, self._ledger.sent_calls
                         )
                     )
+                if isinstance(self._dialect, ConversationDialect):
+                    self._ledger.foreign_messages = list(
+                        self._dialect.foreign_messages(self._ledger.requests)
+                    )
                 self._frozen = replace(
                     self._ledger,
                     requests=list(self._ledger.requests),
@@ -672,6 +830,7 @@ class LoopbackProvider:
                     envelopes=list(self._ledger.envelopes),
                     seam_problems=list(self._ledger.seam_problems),
                     replay_problems=list(self._ledger.replay_problems),
+                    foreign_messages=list(self._ledger.foreign_messages),
                 )
             return self._frozen
 

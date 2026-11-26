@@ -41,6 +41,12 @@ FLAGS = (
     "terminal_complete",
     "trace_complete",
 )
+# The flags a scenario may waive, and may expect false: the two accounting
+# flags (C6) and the terminal flag (C4). The trace flag is waived by no
+# scenario and expected false by none.
+EXPECTED_FALSE_FLAGS = ("token_usage_complete", "cost_complete", "terminal_complete")
+# The two of them that are about what the provider billed (C6).
+ACCOUNTING_FLAGS = ("token_usage_complete", "cost_complete")
 CLAUSES = ("C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10")
 RESULT_CLAUSES = ("C2", "C3", "C4", "C6", "C7")
 SCENARIO = "S"
@@ -48,6 +54,14 @@ SCENARIO = "S"
 # (crucible/backends/limits.py: _attempt_evidence_result,
 # _incomplete_limit_evidence_result).
 GUARD_STOP_REASONS = frozenset({"limit_contract_violated", "limit_evidence_incomplete"})
+# The stop reasons a workflow reads as an outcome of their own (clause C3):
+# an error that carried one of them would be booked as that outcome.
+READ_STOP_REASONS = (
+    "end_turn",
+    "max_turns",
+    "budget_exhausted",
+    "tool_mutation_indeterminate",
+)
 MAX_ERROR_TEXT = 2000
 # What C6 asks only of a result that flags its cost complete.
 PRICING_CODES = frozenset({"pricing:none", "pricing:unreconciled"})
@@ -98,6 +112,7 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"request\.content:\w+", SCENARIO),
     (r"context:over_budget", SCENARIO),
     (r"progress:write_not_credited", SCENARIO),
+    (r"mutation:(in_process|host_alive|left_behind|deadline_unbound)", SCENARIO),
     (r"admission:\w+:\w+!=\w+", SCENARIO),
     (r"decl\.(changed|over|under|mismatch):\w+", "D"),
     (r"static:\w+", "static"),
@@ -172,6 +187,41 @@ class Settlement:
 
 
 @dataclass(frozen=True)
+class WriteHost:
+    """One process a backend ran writes in, as its host object showed it.
+
+    Read in the test process from the object the backend built for the
+    purpose: the deadline it was built with (on the monotonic clock), the pid
+    it showed once it was started, the writes it had recorded as started
+    when ``invoke`` returned, and whether that process still existed then.
+    ``left_behind`` are the other processes it left: those that were below
+    it when it was stopped and those whose parent, process group or session
+    it is, as far as they still existed when ``invoke`` had returned.
+    """
+
+    pid: int | None
+    deadline: float
+    started_writes: tuple[str, ...]
+    alive_at_return: bool
+    left_behind: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class Mutation:
+    """Where the writes of a cell ran: every host the cell saw, and the call's times.
+
+    ``invoked_at`` and ``returned_at`` are the monotonic clock around
+    ``invoke``; ``timeout_seconds`` is the policy's, so the invocation's own
+    deadline is ``invoked_at + timeout_seconds``.
+    """
+
+    hosts: tuple[WriteHost, ...]
+    invoked_at: float
+    returned_at: float
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class Observation:
     """Everything a cell may assert on."""
 
@@ -189,6 +239,14 @@ class Observation:
     settlement: Settlement
     wall_seconds: float
     debug_dump_text: str
+    # What the cell saw of the processes its writes ran in; ``None`` where
+    # the cell attaches no ToolSet with write names, or returned no result.
+    mutation: Mutation | None = None
+    # Every call the attached ToolSet object answered in the test process,
+    # with the text it handed to the adapter: what the innermost ToolSet
+    # returned and whatever a wrapper of the workflow added to it. A write
+    # that ran in a host is not in it.
+    toolset_returned: tuple[Dispatch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -219,6 +277,9 @@ class Reference:
     # interval to. Never the matrix rate card, which stays the reference of
     # the reported cost on every route. ``None`` where no row is shipped.
     bound_pricing: ModelPricing | None = None
+    # The names of the tools the cell attached, as the ToolSet lists them;
+    # empty where it attaches none.
+    attached_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -231,11 +292,51 @@ class Expectation:
     stop: tuple[str, ...] = ("end_turn",)
     stop_not: tuple[str, ...] = ()
     retriable: bool | None = None
+    # The flags the result owes true. A flag that is neither here nor in
+    # ``flags_false`` is waived: its check is not asked of the result.
     flags: tuple[str, ...] = FLAGS
     events: tuple[str, ...] = ()
     final_text: str | None = None
     dispatch: tuple[str, ...] = ()
     dispatch_optional: tuple[str, ...] = ()
+    # The flags the result is expected to flag false: the turn never reached
+    # its terminal, or no usage record ever arrived. A result that flags one
+    # of them complete deviates (``flag:<name>=True``). Only a flag that a
+    # scenario may waive can be expected false, never the trace flag.
+    flags_false: tuple[str, ...] = ()
+    # The accounting flags that go by what the provider billed for the call.
+    # Where it billed nothing, no frame that travelled stated a usage: the
+    # flag is expected false, as one of ``flags_false`` is, because zero
+    # tokens flagged complete would be a complete account of a usage record
+    # that never arrived. Where it billed something, the frames stated the
+    # usage: the flag is waived, and a result may report that usage and
+    # claim it. Read from the provider ledger of the cell, never from the
+    # kind of the column or from what the adapter returned.
+    flags_false_if_unbilled: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        unknown = sorted(set(self.flags) - set(FLAGS))
+        misplaced = sorted(
+            (set(self.flags_false) - set(EXPECTED_FALSE_FLAGS))
+            | (set(self.flags_false_if_unbilled) - set(ACCOUNTING_FLAGS))
+        )
+        named = [*self.flags, *self.flags_false, *self.flags_false_if_unbilled]
+        both = sorted({name for name in named if named.count(name) > 1})
+        if unknown or misplaced or both:
+            raise ValueError(
+                f"an expectation names the flags {unknown} that no result has, "
+                f"expects {misplaced} false although only "
+                f"{list(EXPECTED_FALSE_FLAGS)} can be (and only "
+                f"{list(ACCOUNTING_FLAGS)} by what was billed), or names "
+                f"{both} in more than one of its lists"
+            )
+
+    def expected_false(self, *, billed: bool) -> frozenset[str]:
+        """The flags the result is expected to flag false, given the provider's bill."""
+
+        return frozenset(self.flags_false) | (
+            frozenset() if billed else frozenset(self.flags_false_if_unbilled)
+        )
 
     @property
     def stop_label(self) -> str:
@@ -469,6 +570,14 @@ def _c4(result: InvocationResult, exp: Expectation) -> list[Deviation]:
         out.append(
             Deviation("flag:terminal_complete=False", "the result disowns its terminal")
         )
+    if "terminal_complete" in exp.flags_false and flags.terminal_complete:
+        out.append(
+            Deviation(
+                "flag:terminal_complete=True",
+                "the turn never reached its terminal and the result flags its "
+                "terminal complete",
+            )
+        )
     if not flags.trace_complete:
         out.append(
             Deviation(
@@ -615,7 +724,8 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
     out: list[Deviation] = []
     usage, flags = obs.result.usage, obs.result.completeness
     billed = obs.provider.billed_total()
-    for name in ("token_usage_complete", "cost_complete"):
+    expected_false = exp.expected_false(billed=bool(obs.provider.billed))
+    for name in ACCOUNTING_FLAGS:
         if name in exp.flags and not getattr(flags, name):
             out.append(
                 Deviation(
@@ -623,13 +733,32 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
                     "the provider reported usage for every response",
                 )
             )
+        if name in expected_false and getattr(flags, name):
+            out.append(
+                Deviation(
+                    f"flag:{name}=True",
+                    "the turn never reached its terminal and the result flags this "
+                    "part of its accounting complete"
+                    if name in exp.flags_false
+                    else "no usage record arrived for the turn, the provider billed "
+                    "nothing for it, and the result flags this part of its "
+                    "accounting complete",
+                )
+            )
+    # Where the scenario expects an accounting flag false, outright or
+    # because the provider billed nothing for the call, the clause judges
+    # its second arm whatever the result flags: what the result reports is
+    # held as a lower bound, never above what was billed, and the claim of
+    # completeness is the one deviation. No pricing evidence is asked of it.
+    tokens_claimed = flags.token_usage_complete and "token_usage_complete" not in expected_false
+    cost_claimed = flags.cost_complete and "cost_complete" not in expected_false
     # A route whose results are cost intervals flags its accounting incomplete
     # even where every response is accounted for: the flags then excuse
     # nothing, and where the scenario owes them the numbers are owed exactly.
     exact_tokens = ref.cost_bounded and "token_usage_complete" in exp.flags
     for field_name in ("input_tokens", "output_tokens"):
         got, want = getattr(usage, field_name), getattr(billed, field_name)
-        lower_bound = not flags.token_usage_complete and got < want and not exact_tokens
+        lower_bound = not tokens_claimed and got < want and not exact_tokens
         if got == want or lower_bound:
             continue  # exact, or an honest lower bound
         out.append(
@@ -647,7 +776,7 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
     )
     cost = float(usage.cost_usd)
     exact = math.isclose(cost, priced, rel_tol=1e-9, abs_tol=1e-12)
-    if not exact and (flags.cost_complete or cost > priced):
+    if not exact and (cost_claimed or cost > priced):
         out.append(
             Deviation(
                 f"usage.cost_usd:{'lt' if cost < priced else 'gt'}",
@@ -655,7 +784,7 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
                 f"usage at {priced:.9f} USD (cost_complete={flags.cost_complete})",
             )
         )
-    if flags.cost_complete:
+    if cost_claimed:
         evidence = obs.result.pricing_evidence
         if evidence is None:
             out.append(
@@ -824,27 +953,32 @@ def _cost_interval(obs: Observation, ref: Reference) -> list[Deviation]:
     return out
 
 
-# The flags a scenario may waive: the two accounting flags (C6) and the
-# terminal flag (C4). The trace flag is waived by no scenario.
-_WAIVABLE_FLAGS = ("token_usage_complete", "cost_complete", "terminal_complete")
+# The flags a scenario may waive or expect false: the two accounting flags
+# (C6) and the terminal flag (C4). The trace flag is waived by no scenario.
+_WAIVABLE_FLAGS = EXPECTED_FALSE_FLAGS
 
 
 def _unasked(obs: Observation, exp: Expectation) -> frozenset[str]:
     """Checks that are switched off inside a clause that is evaluated.
 
-    Two ways. The scenario waives a flag (a refusal the provider never
-    billed carries no usage): the check that would report the flag false is
-    not asked, whatever the result says. And C6 requires pricing evidence of
-    a result that flags its cost complete; a result that flags it incomplete
-    owes a lower bound and no evidence. A column-wide known gap is not owed
-    where its check was not asked.
+    Three ways. The scenario waives a flag (a refusal the provider never
+    billed carries no usage) or expects it false (a turn that never reached
+    its terminal): the check that would report the flag false is not asked,
+    whatever the result says. C6 requires pricing evidence of a result that
+    flags its cost complete; a result that flags it incomplete owes a lower
+    bound and no evidence. And where the scenario expects the cost flag
+    false, outright or because the provider billed nothing for the call, no
+    evidence is asked whatever the result flags: the claim itself is the
+    deviation. A column-wide known gap is not owed where its check was not
+    asked.
     """
 
     result = obs.result
     if result is None:
         return frozenset()  # a raise: no result clause ran at all
     waived = {f"flag:{name}=False" for name in _WAIVABLE_FLAGS if name not in exp.flags}
-    if not result.completeness.cost_complete:
+    expected_false = exp.expected_false(billed=bool(obs.provider.billed))
+    if not result.completeness.cost_complete or "cost_complete" in expected_false:
         return frozenset(waived) | PRICING_CODES
     return frozenset(waived)
 
@@ -864,8 +998,9 @@ def not_owed_given(code: str, cell_codes: Iterable[str]) -> bool:
     Three of the rules by which :func:`evaluate` leaves a check out, read
     from the codes a cell is ledgered with instead of from an observation, so
     that the verifier can tell without playing the cell where a column-wide
-    code is owed. The fourth, a flag the scenario waives, shows in no code of
-    the cell: the inventory pins those cells, each with its reason.
+    code is owed. The fourth, a flag the scenario waives or expects false,
+    shows in no code of an honest cell: the inventory pins those cells, each
+    with its reason.
 
     - a raise out of the call stands for the result clauses (a raise out of
       ``close()`` does not: the result was there);

@@ -52,11 +52,19 @@ from .. import columns as matrix_columns
 from .. import envelopes as envelope_files
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import launch
-from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall, answered_from
-from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
+from ..provider import (
+    LoopbackProvider,
+    Reply,
+    SeenRequest,
+    SentCall,
+    answered_from,
+    cut_after,
+    require_cut_in_body,
+)
+from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
-from .openai_compat import REFUSALS
+from .openai_compat import MALFORMED, REASONING_ONLY, REFUSALS
 
 _SDK = "openai"
 _WORKER_PROJECT = launch.REPOSITORY / "backends" / "deepseek_worker"
@@ -125,7 +133,13 @@ class DeepSeekResponsesDialect:
     def envelope_names(self) -> tuple[str, ...]:
         return tuple(
             f"{self.name}/{self.provider}.{behaviour}"
-            for behaviour in ("completion", _TOOL_CALL, *REFUSALS.values())
+            for behaviour in (
+                "completion",
+                _TOOL_CALL,
+                REASONING_ONLY,
+                *REFUSALS.values(),
+                MALFORMED,
+            )
         )
 
     def parse(
@@ -188,7 +202,12 @@ class DeepSeekResponsesDialect:
                 "stream": payload.get("stream"),
                 # The shape of the replayed history: kinds and call ids, no text.
                 "input": [
-                    {"kind": _kind(item), "call_id": item.get("call_id")} for item in items
+                    {
+                        "kind": _kind(item),
+                        "call_id": item.get("call_id"),
+                        "role": item.get("role"),
+                    }
+                    for item in items
                 ],
                 "launches": [] if self._journal is None else self._journal.launches(),
             },
@@ -258,14 +277,51 @@ class DeepSeekResponsesDialect:
 
         return replay_problems(requests, calls)
 
+    def foreign_messages(self, requests: Sequence[SeenRequest]) -> list[str]:
+        """What the requests of a call carry beside prompt, model turns and tool results."""
+
+        return foreign_messages(requests)
+
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
         served = seen.model
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
-        if isinstance(step, Say):
+        if isinstance(step, Malformed):
+            # A stream that ends without its terminal: every event of a plain
+            # answer arrives but the terminal, then the body ends in order.
+            # The usage is null until the terminal, so none is billed.
+            envelope = envelope_files.load(f"{self.name}/{self.provider}.{MALFORMED}")
+            events = envelope.fill(
+                {
+                    "response_id": f"resp-{call_id}",
+                    "created": _CREATED,
+                    "served_model": served,
+                    "item_id": f"msg-{call_id}",
+                    "text": step.text,
+                }
+            )
+            return Reply(
+                envelope.status,
+                events,
+                None,
+                served,
+                None,
+                envelope.name,
+                raw=server_sent_events(events),
+                content_type="text/event-stream",
+            )
+        if isinstance(step, (Say, Drop)):
             behaviour, call = "completion", None
             slots: dict[str, Any] = {"text": step.text, "item_id": f"msg-{call_id}"}
+        elif isinstance(step, Reason):
+            behaviour, call = REASONING_ONLY, None
+            slots = {
+                "reasoning_item_id": f"rs-{call_id}",
+                "reasoning_text": REASONING_TEXT,
+                # Every output token of such a response is a reasoning token.
+                "reasoning_tokens": step.usage.output_tokens,
+            }
         elif isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
@@ -295,6 +351,33 @@ class DeepSeekResponsesDialect:
             # A request the service rejects is answered with its error object
             # alone, no stream: nothing is billed and no model is named.
             return Reply(envelope.status, envelope.fill(slots), envelope=envelope.name)
+        if isinstance(step, Drop):
+            # The stream of a plain answer, cut after its text delta. The
+            # events that arrive whole name the model; the usage is null
+            # until the terminal, which never arrives, so none is billed and
+            # the counters of that event are fillers.
+            slots.update(
+                response_id=f"resp-{call_id}",
+                created=_CREATED,
+                served_model=served,
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+            )
+            require_cut_in_body(self.name, step)
+            events = envelope.fill(slots)
+            frames = [server_sent_events([event]) for event in events]
+            return Reply(
+                envelope.status,
+                events,
+                None,
+                served,
+                None,
+                envelope.name,
+                raw=b"".join(frames),
+                content_type="text/event-stream",
+                cut=cut_after(frames, step.text),
+            )
         usage = step.usage
         slots.update(
             response_id=f"resp-{call_id}",
@@ -338,6 +421,73 @@ def replayed_turn(envelope: str) -> tuple[str, ...]:
 
     terminal = envelope_files.load(envelope).body[-1]
     return tuple(str(item["type"]) for item in terminal["response"]["output"])
+
+
+_PROMPT_KINDS = ("system", "user")
+# The items of a turn of the model, and the item that answers a call of it.
+_MODEL_KINDS = ("reasoning", "function_call")
+_RESULT_KIND = "function_call_output"
+
+
+def _is_of_the_model(item: Mapping[str, Any]) -> bool:
+    kind = item.get("kind")
+    return kind in _MODEL_KINDS or (kind == "message" and item.get("role") == "assistant")
+
+
+def foreign_messages(requests: Sequence[SeenRequest]) -> list[str]:
+    """The input items of a call that are neither its prompt, a model turn nor a tool result.
+
+    Every request of the route carries the conversation as input items. It
+    opens with the workflow's prompt: at most one system and one user
+    message, the same in every request of the call. After the first item of
+    the model come only items of the model (its reasoning, its function
+    calls, a message of the assistant) and the outputs of the calls. Any
+    other item there, or an opening that is not the first request's, is the
+    client's own word to the model.
+
+    A request that matched no scripted step is not judged: it is an extra
+    request, which clause C0 reports.
+    """
+
+    problems: list[str] = []
+    opening: list[str] | None = None
+    for index, request in enumerate(requests):
+        if not request.matched:
+            continue
+        items = [item for item in request.evidence.get("input") or () if isinstance(item, dict)]
+        first_turn = next(
+            (
+                place
+                for place, item in enumerate(items)
+                if _is_of_the_model(item) or item.get("kind") == _RESULT_KIND
+            ),
+            len(items),
+        )
+        head = [str(item.get("kind")) for item in items[:first_turn]]
+        why: list[str] = []
+        if opening is None:
+            opening = head
+            if any(kind not in _PROMPT_KINDS or head.count(kind) > 1 for kind in head):
+                why.append(
+                    f"it opens with {head}: more than the one system and the one "
+                    "user message of a workflow's prompt"
+                )
+        elif head != opening:
+            why.append(f"it opens with {head}, the first request of the call with {opening}")
+        other = [
+            str(item.get("kind"))
+            for item in items[first_turn:]
+            if not _is_of_the_model(item) and item.get("kind") != _RESULT_KIND
+        ]
+        if other:
+            why.append(
+                f"{len(other)} item(s) of the kind(s) {sorted(set(other))} follow the "
+                "first item of the model"
+            )
+        if why:
+            kinds = [str(item.get("kind")) for item in items]
+            problems.append(f"request {index + 1} carries {kinds}: " + "; ".join(why))
+    return problems
 
 
 def replay_problems(

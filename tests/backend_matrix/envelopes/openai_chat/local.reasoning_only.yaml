@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A chat completion that ends cleanly after reasoning and shows no text, as a
+# local server with a reasoning parser may answer: the visible content is
+# empty, and the output tokens the reply counts are all reasoning tokens.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: local
+behaviour: reasoning_only
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletion whose message has an empty content and
+    whose usage carries openai.types.CompletionUsage with
+    completion_tokens_details.reasoning_tokens; reasoning_content is no field
+    of the message type and travels as an extra field, which the type admits
+  sdk_version: openai 2.44.0
+  notes: >-
+    No local server was run. The serving stacks the model cards of the
+    open-weight models name move the reasoning of a reply into
+    message.reasoning_content when their reasoning parser is on (vendor
+    model cards and serving recipes, read 2026-11-18); none of them states a
+    reply that holds reasoning and no visible text. Choices of this
+    envelope: the content is the empty string and not null; the finish
+    reason is "stop"; all output tokens are reasoning tokens.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices:
+    - index: 0
+      message:
+        role: assistant
+        content: ""
+        reasoning_content: {slot: reasoning_text}
+      finish_reason: stop
+  usage:
+    prompt_tokens: {slot: input_tokens}
+    completion_tokens: {slot: output_tokens}
+    total_tokens: {slot: total_tokens}
+    completion_tokens_details:
+      reasoning_tokens: {slot: reasoning_tokens}

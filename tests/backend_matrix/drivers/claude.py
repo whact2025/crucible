@@ -59,8 +59,15 @@ from .. import envelopes as envelope_files
 from .. import netguard
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..peers import claude_cli as peer_program
-from ..provider import LoopbackProvider, Reply, SeenRequest, answered_from
-from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
+from ..provider import (
+    LoopbackProvider,
+    Reply,
+    SeenRequest,
+    answered_from,
+    require_cut_in_body,
+    whole_and_partial,
+)
+from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
@@ -85,6 +92,9 @@ _MAX_INTERPRETER_LINE = 250
 # the structured output of that frame and nowhere else, so that a cell can
 # tell an adapter that reads it from one that reads either text.
 SCHEMA_SESSION_TEXT = "The answer is in the structured output of the result."
+# What the model is scripted to have thought in a turn that shows no text.
+# It never reaches a result.
+REASONING_TEXT = "matrix reasoning that is never shown [canary-reasoning-b47e]"
 
 _LAUNCHER = """#!{interpreter} -IS
 # Written by the backend matrix for one cell: the scripted Claude CLI peer.
@@ -136,6 +146,8 @@ class ClaudeCliDialect:
     behaviours: tuple[str, ...] = (
         "init",
         "assistant_text",
+        # A model turn that thinks and writes no text.
+        "assistant_thinking",
         "assistant_tool_use",
         "tool_result",
         "result",
@@ -289,11 +301,13 @@ class ClaudeCliDialect:
                 f"{step.form!r}: a message the tool relays has no refusal part, so "
                 "the cell is pinned not expressible in the inventory"
             )
-        if not isinstance(step, (Say, Call, Refuse)):
+        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
                 "the scenario that needs it adds the envelope with its liar"
             )
+        if isinstance(step, Drop):
+            require_cut_in_body(self.name, step)
         evidence = seen.evidence
         session_id = str(evidence.get("session_id", ""))
         turn = int(evidence.get("turn", 1))
@@ -356,6 +370,20 @@ class ClaudeCliDialect:
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
         }
+        if isinstance(step, Malformed):
+            # The stream of the tool ends without its terminal: the frame of
+            # the model turn arrives whole, then the tool ends its output and
+            # exits with status 0 without a terminal frame. The turn frame
+            # names the model and states the usage of the turn, which the
+            # provider therefore bills.
+            frame("assistant_text", **turn_slots, text=step.text)
+            return Reply(
+                200,
+                {"frames": frames, "call": None, "gone": {"partial": "", "killed": False}},
+                usage,
+                served,
+                envelopes=tuple(used),
+            )
         if isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
@@ -433,7 +461,7 @@ class ClaudeCliDialect:
         answer: Any = None
         if seen.schema_field:
             try:
-                answer = json.loads(step.text)
+                answer = None if isinstance(step, Reason) else json.loads(step.text)
             except json.JSONDecodeError:
                 answer = None
             if not isinstance(answer, dict):
@@ -449,8 +477,14 @@ class ClaudeCliDialect:
                 )
         # In a schema session the answer travels in the structured output of
         # the terminal frame only; both texts carry the tool's note instead.
-        text = SCHEMA_SESSION_TEXT if seen.schema_field else step.text
-        frame("assistant_text", **turn_slots, text=text)
+        if isinstance(step, Reason):
+            # The turn thinks and writes nothing: the frame holds a thinking
+            # block, and the result text of the terminal frame is empty.
+            text = ""
+            frame("assistant_thinking", **turn_slots, reasoning_text=REASONING_TEXT)
+        else:
+            text = SCHEMA_SESSION_TEXT if seen.schema_field else step.text
+            frame("assistant_text", **turn_slots, text=text)
         total_in = int(spent.get("input_tokens", 0)) + usage.input_tokens
         total_out = int(spent.get("output_tokens", 0)) + usage.output_tokens
         totals = {
@@ -467,6 +501,28 @@ class ClaudeCliDialect:
             frame("result_structured", **totals, structured_output=answer)
         else:
             frame("result", **totals)
+        if isinstance(step, Drop):
+            # The tool goes away inside the turn. The wire is a stream of
+            # frames, one line each, so it is cut as an HTTP stream is: the
+            # frame that carries the answer travels whole and the client of
+            # the tool holds the text; the line of the frame after it, the
+            # terminal of the session, ends in its middle without a line
+            # end, and the tool is killed. The turn frame that arrived names
+            # the model and states the usage of the turn, which the provider
+            # therefore bills.
+            lines = [json.dumps(item).encode("utf-8") for item in frames]
+            whole, partial = whole_and_partial(lines, step.text)
+            return Reply(
+                200,
+                {
+                    "frames": frames[:whole],
+                    "call": None,
+                    "gone": {"partial": partial.decode("utf-8"), "killed": True},
+                },
+                usage,
+                served,
+                envelopes=tuple(used[: whole + 1]),
+            )
         return Reply(
             200, {"frames": frames, "call": None, "exit": 0}, usage, served, envelopes=tuple(used)
         )

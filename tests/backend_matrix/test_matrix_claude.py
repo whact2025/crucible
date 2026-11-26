@@ -36,7 +36,9 @@ import importlib.metadata
 import json
 import logging
 import os
+import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -81,6 +83,8 @@ from .script import (
     READ_B,
     Call,
     Cut,
+    Drop,
+    Malformed,
     ProviderScript,
     Refuse,
     Say,
@@ -1297,9 +1301,11 @@ def test_every_frame_of_a_cell_counts_towards_its_grade(tmp_path: Path) -> None:
         "constructed"
     }
     # The starter cells use the frames of a session that ends on an answer;
-    # the turn terminal of the tool and the frames of the two refusals are
-    # used by the limit and refusal cells alone.
+    # the turn terminal of the tool, the frames of the two refusals and the
+    # frame of a turn that thinks and writes no text are used by other cells
+    # alone.
     assert set(claude_driver.ClaudeDriver().envelopes) - set().union(*used.values()) == named(
+        "assistant_thinking",
         "result_max_turns",
         "assistant_refusal",
         "result_refusal",
@@ -1424,16 +1430,16 @@ WRITE_DIGEST_GAP = "R13"
 PROOF_MODULE = cells.MODULE_BY_KIND[CLAUDE_KIND]
 
 
-def _write_cell(column: Column) -> Cell:
-    """The cell of a Claude column on which the proof of the write digest plays."""
+# The first write cell of the kind: the one the lying counterparts play.
+WRITE_CELL = cells.WRITES_ON_THE_CLAUDE_COLUMNS[0]
 
-    (listed,) = (
-        item
-        for item in cells.WRITES_ON_THE_CLAUDE_COLUMNS
-        if ledger.parse_cell_id(item)[2] == column.role
-    )
-    _kind, scenario, _role, lens = ledger.parse_cell_id(listed)
-    return Cell(column, scenario, lens)
+
+def _write_cell(listed: str = WRITE_CELL) -> Cell:
+    """A cell of the Claude kind on which the proof of the write digest plays."""
+
+    assert listed in cells.WRITES_ON_THE_CLAUDE_COLUMNS
+    _kind, scenario, role, lens = ledger.parse_cell_id(listed)
+    return Cell(_column(role), scenario, lens)
 
 
 def _trace_digest(execution: runner.Execution) -> str | None:
@@ -1509,9 +1515,9 @@ def _statuses(execution: runner.Execution) -> dict[str, str]:
     return {name: str(item.status) for name, item in execution.report.outcomes.items()}
 
 
-@pytest.mark.parametrize("column", COLUMNS, ids=lambda column: column.id)
+@pytest.mark.parametrize("listed", cells.WRITES_ON_THE_CLAUDE_COLUMNS)
 def test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope(
-    column: Column, tmp_path: Path, request: pytest.FixtureRequest
+    listed: str, tmp_path: Path, request: pytest.FixtureRequest
 ) -> None:
     """A known gap of the reference, held to its one cause from both sides.
 
@@ -1526,11 +1532,12 @@ def test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_
     gap (R13) on the cells this test plays and on no other.
     """
 
-    # The verifier requires this test by name on each column: the entries of
+    # The verifier requires this test by name on each cell: the entries of
     # the record lean on it, and a run without it is refused. No entry
     # attributes a code to that record on a cell this test does not play.
     assert request.node.name in cells.REQUIRED_PROOFS[PROOF_MODULE]
-    cell = _write_cell(column)
+    cell = _write_cell(listed)
+    column = cell.column
     attributed = {
         entry.cell for entry in LEDGER.entries if WRITE_DIGEST_GAP in entry.codes.values()
     }
@@ -1602,8 +1609,8 @@ def test_the_first_half_of_the_write_proof_fails_on_a_digest_that_is_wrong_for_a
     # known gap; the first half does not. (Another capability cannot be
     # played on a write: the shared function refuses a writer under every
     # capability but the one of the cell.)
-    column = _column()
-    cell = _write_cell(column)
+    cell = _write_cell()
+    column = cell.column
     digest = ClaudeBackend._tool_authority_digest
 
     def another_budget(self: Any, toolset: Any, context_budget: int | None) -> str:
@@ -1641,8 +1648,8 @@ def test_the_second_half_of_the_write_proof_fails_on_a_write_that_keeps_a_second
     # the same code from a second cause: the hash is bound to the ToolSet that
     # was attached and to another context budget. One never met the cause:
     # the hash was handed the attached ToolSet all along.
-    column = _column()
-    cell = _write_cell(column)
+    cell = _write_cell()
+    column = cell.column
     honest = _played(column, cell.scenario, tmp_path / "honest", cell.lens)
     attach, digest = ClaudeBackend.attach_toolset, ClaudeBackend._tool_authority_digest
 
@@ -1677,6 +1684,143 @@ def test_the_second_half_of_the_write_proof_fails_on_a_write_that_keeps_a_second
     # A play of a cell whose ToolSet the adapter does not wrap says nothing
     # about the cause: the hash was handed what was attached.
     assert _more_than_the_one_cause(honest, removed, []) != []
+
+
+# -- broken terminals: a stream without its terminal, a tool that is gone ------------
+
+_GO_AWAY = """
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("peer_under_test", sys.argv[1])
+peer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(peer)
+sys.stdout.buffer.write(b"a whole line\\n")
+status = peer.go_away(peer._Gone(sys.argv[2], sys.argv[3] == "killed"), sys.stdout.buffer)
+sys.stdout.buffer.write(b"written after the tool went away")
+raise SystemExit(status)
+"""
+
+
+def test_a_peer_that_goes_away_ends_its_output_in_order_or_is_killed_inside_a_line() -> None:
+    def gone(partial: str, how: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [sys.executable, "-I", "-c", _GO_AWAY, peer_program.__file__, partial, how],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+    # A tool that is cut off: what it had written of the line arrives without
+    # a line end, and the process is killed where it stands. Nothing of it
+    # runs after that, and its status is that of the signal.
+    cut = gone('{"type": "assistant", "text": "an answ', "killed")
+    assert cut.stdout == b'a whole line\n{"type": "assistant", "text": "an answ'
+    assert cut.returncode == -signal.SIGKILL
+    # A tool whose stream ends without its terminal leaves in order: no line
+    # is cut, and the status it hands back is 0.
+    ended = gone("", "in order")
+    assert ended.stdout.startswith(b"a whole line\n") and ended.returncode == 0
+    assert b'"an answ' not in ended.stdout
+
+
+def test_a_stream_without_its_terminal_and_a_cut_turn_are_what_the_tool_sends() -> None:
+    dialect = claude_driver.ClaudeCliDialect()
+    asked = dialect.parse("POST", dialect.path, {}, b"{}", credential="")
+    text = "an answer that is cut off"
+    usage = TokenUsage(7, 3)
+
+    unended = dialect.render(Malformed(text, usage), asked, "call-1")
+    cut = dialect.render(Drop(text, usage=usage), asked, "call-2")
+
+    # A stream that ends without its terminal: the opening frame and the
+    # frame of the model turn, whole, and then the tool leaves in order
+    # without a terminal frame. The turn frame states the usage of the turn,
+    # so the provider bills it, and names the model.
+    frames = [parse_message(frame) for frame in unended.body["frames"]]
+    assert [type(frame) for frame in frames] == [
+        sdk_types.SystemMessage,
+        sdk_types.AssistantMessage,
+    ]
+    assert unended.envelopes == ("claude_cli/cli.init", "claude_cli/cli.assistant_text")
+    assert unended.body["gone"] == {"partial": "", "killed": False}
+    assert (unended.usage, unended.body["call"]) == (usage, None)
+    # A turn that is cut: the wire is a stream of frames, so the frame that
+    # carries the answer travels whole, as the chunk that carries it does on
+    # an HTTP stream, and the client of the tool holds the text. That frame
+    # names the model and states the usage of the turn, which the provider
+    # bills. The line of the terminal frame after it ends in its middle,
+    # and the tool is killed.
+    arrived = [parse_message(frame) for frame in cut.body["frames"]]
+    assert [type(frame) for frame in arrived] == [
+        sdk_types.SystemMessage,
+        sdk_types.AssistantMessage,
+    ]
+    assert arrived[-1].content == frames[-1].content == [sdk_types.TextBlock(text=text)]
+    assert cut.envelopes == (*unended.envelopes, "claude_cli/cli.result")
+    assert (cut.usage, cut.served_model, cut.body["call"]) == (usage, unended.served_model, None)
+    partial = cut.body["gone"]["partial"]
+    assert cut.body["gone"]["killed"] is True
+    assert partial.startswith('{"type": "result"') and "\n" not in partial
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(partial)
+    # What is cut is the terminal frame of a plain turn, in its middle.
+    whole = dialect.render(Say(text, usage), asked, "call-2").body["frames"]
+    assert isinstance(parse_message(whole[-1]), sdk_types.ResultMessage)
+    assert len(partial) == len(json.dumps(whole[-1])) // 2
+    with pytest.raises(MatrixSetupError, match="inside its body only"):
+        dialect.render(Drop(text, after="headers"), asked, "call-3")
+
+
+class _AnswersWhole(claude_driver.ClaudeCliDialect):
+    """Renders a broken terminal as a plain turn: the session ends on its terminal."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, (Malformed, Drop)):
+            step = Say(step.text)
+        return super().render(step, seen, call_id)
+
+
+@pytest.mark.parametrize("scenario", ["S26", "S27"])
+def test_a_session_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
+    scenario: str, tmp_path: Path
+) -> None:
+    cell = Cell(_column(), scenario, "raw")
+    honest = _played(_column(), scenario, tmp_path / "honest")
+    provider, result = honest.observation.provider, honest.observation.result
+    (step,) = honest.plan.script.steps
+    assert isinstance(step, (Malformed, Drop))
+
+    # What the play guarantees whatever the verdict of the cell, which is
+    # the cell's own item to give: one request for a model turn. In both
+    # scenarios the frame of the turn arrived whole, with the answer, the
+    # model and the usage of the turn, which the provider billed. A stream
+    # that ends without its terminal is answered from that frame alone; of
+    # a turn that is cut the terminal frame was on its way when the tool
+    # was killed. The result is a typed transport error whose terminal it
+    # does not claim.
+    entry = LEDGER.entry(cell.id)
+    assert honest.report.seam_problems == () and (entry is None) is (scenario == "S26")
+    assert (provider.request_count, provider.extra, provider.unconsumed) == (1, 0, 0)
+    turn = ["claude_cli/cli.init", "claude_cli/cli.assistant_text"]
+    assert provider.envelopes == (turn if scenario == "S26" else [*turn, "claude_cli/cli.result"])
+    assert provider.billed == [step.usage] and provider.served_models == [honest.reference.model]
+    assert result is not None and result.error is not None
+    assert (str(result.error.kind), result.completeness.terminal_complete) == ("transport", False)
+    # The lying counterpart: a session that ends on its terminal frame is a
+    # clean finish where the scenario expects that error, and the cell fails:
+    # as an unexpected deviation where it has no entry, and as a different
+    # one where its entry is strict on another code set.
+    verdict = "unexpected deviation" if entry is None else "different deviation"
+    with pytest.raises(ledger.LedgerMismatch, match=verdict) as refused:
+        runner.run_cell(
+            cell,
+            tmp_path / "lying",
+            preflight={CLAUDE_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_AnswersWhole),
+        )
+    assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
 
 
 # -- the module ends with the canary check --------------------------------------------

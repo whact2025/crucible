@@ -43,8 +43,16 @@ from .. import columns as matrix_columns
 from .. import envelopes as envelope_files
 from .. import netguard, tap
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
-from ..provider import LoopbackProvider, Reply, SeenRequest, SentCall, answered_from
-from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
+from ..provider import (
+    LoopbackProvider,
+    Reply,
+    SeenRequest,
+    SentCall,
+    answered_from,
+    cut_inside,
+    require_cut_in_body,
+)
+from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
@@ -56,6 +64,12 @@ REFUSALS = {
     "refusal_part": "refusal_part",
     "http_policy": "refusal_http_policy",
 }
+# The behaviour class of a reply that reasons and shows no text, and what
+# the model is scripted to have thought in it. It never reaches a result.
+REASONING_ONLY = "reasoning_only"
+REASONING_TEXT = "matrix reasoning that is never shown [canary-reasoning-5c1d]"
+# The behaviour class of a reply that is no terminal of its wire.
+MALFORMED = "malformed_terminal"
 
 
 def _text(content: Any) -> str:
@@ -112,7 +126,13 @@ class OpenAIChatDialect:
     def envelope_names(self) -> tuple[str, ...]:
         return tuple(
             f"{self.name}/{self._provider}.{behaviour}"
-            for behaviour in ("completion", "tool_call", *REFUSALS.values())
+            for behaviour in (
+                "completion",
+                "tool_call",
+                REASONING_ONLY,
+                *REFUSALS.values(),
+                MALFORMED,
+            )
         )
 
     def parse(
@@ -221,14 +241,39 @@ class OpenAIChatDialect:
 
         return replay_problems(requests, calls)
 
+    def foreign_messages(self, requests: Sequence[SeenRequest]) -> list[str]:
+        """What the requests of a call carry beside prompt, model turns and tool results."""
+
+        return foreign_messages(requests)
+
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
         served = seen.model
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
-        if isinstance(step, Say):
+        if isinstance(step, Malformed):
+            # The wire carries one document per reply, so a reply that is no
+            # terminal is a complete document without a turn: a 200 whose
+            # list of choices is empty. It states no usage, so none is billed.
+            envelope = envelope_files.load(f"{self.name}/{self._provider}.{MALFORMED}")
+            body = envelope.fill(
+                {
+                    "response_id": f"chatcmpl-{call_id}",
+                    "created": _CREATED,
+                    "served_model": served,
+                }
+            )
+            return Reply(envelope.status, body, None, served, None, envelope.name)
+        if isinstance(step, (Say, Drop)):
             behaviour, call = "completion", None
             slots: dict[str, Any] = {"text": step.text}
+        elif isinstance(step, Reason):
+            behaviour, call = REASONING_ONLY, None
+            # Every output token of such a reply is a reasoning token.
+            slots = {
+                "reasoning_text": REASONING_TEXT,
+                "reasoning_tokens": step.usage.output_tokens,
+            }
         elif isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
@@ -251,6 +296,8 @@ class OpenAIChatDialect:
             # A request the service rejects is answered with its error object
             # alone: nothing is billed and no model is named.
             return Reply(envelope.status, envelope.fill(slots), envelope=envelope.name)
+        if isinstance(step, Drop):
+            return self._dropped(step, envelope, slots, served, call_id)
         usage = step.usage
         slots.update(
             response_id=f"chatcmpl-{call_id}",
@@ -262,6 +309,41 @@ class OpenAIChatDialect:
         )
         return Reply(
             envelope.status, envelope.fill(slots), usage, served, call, envelope.name
+        )
+
+    def _dropped(
+        self,
+        step: Drop,
+        envelope: envelope_files.Envelope,
+        slots: dict[str, Any],
+        served: str,
+        call_id: str,
+    ) -> Reply:
+        """The document of a plain completion, cut inside its answer text.
+
+        The headers announce the whole document and the connection goes away
+        in the middle of the text. No document arrives, so the reply names
+        no model and states no usage: the counters of the part that never
+        travels are fillers.
+        """
+
+        require_cut_in_body(self.name, step)
+        slots.update(
+            response_id=f"chatcmpl-{call_id}",
+            created=_CREATED,
+            served_model=served,
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+        )
+        body = envelope.fill(slots)
+        payload = json.dumps(body).encode("utf-8")
+        return Reply(
+            envelope.status,
+            body,
+            envelope=envelope.name,
+            raw=payload,
+            cut=cut_inside(payload, step.text),
         )
 
 
@@ -278,6 +360,59 @@ def conversation(seen: SeenRequest) -> list[str]:
         ids = [message["answers"]] if message["role"] == "tool" else message["asks"]
         words.append(message["role"] + (f"[{', '.join(ids)}]" if ids else ""))
     return words
+
+
+_PROMPT_ROLES = ("system", "user")
+_TURN_ROLES = ("assistant", "tool")
+
+
+def foreign_messages(requests: Sequence[SeenRequest]) -> list[str]:
+    """The messages of a call that are neither its prompt, a model turn nor a tool result.
+
+    Every request of the wire carries the conversation. It opens with the
+    workflow's prompt: at most one system and one user message, the same in
+    every request of the call. After the first turn of the model come only
+    turns of the model (``assistant``) and results of the tools it called
+    (``tool``). A message of another role there, or an opening that is not
+    the first request's, is the client's own word to the model: the wire
+    takes it (see :func:`replay_problems`), and the workflow never sees it.
+
+    A request that matched no scripted step is not judged: it is an extra
+    request, which clause C0 reports.
+    """
+
+    problems: list[str] = []
+    opening: list[str] | None = None
+    for index, request in enumerate(requests):
+        if not request.matched:
+            continue
+        roles = [str(message["role"]) for message in request.evidence.get("messages") or ()]
+        first_turn = next(
+            (place for place, role in enumerate(roles) if role in _TURN_ROLES), len(roles)
+        )
+        head, rest = roles[:first_turn], roles[first_turn:]
+        why: list[str] = []
+        if opening is None:
+            opening = head
+            if any(role not in _PROMPT_ROLES or head.count(role) > 1 for role in head):
+                why.append(
+                    f"it opens with {head}: more than the one system and the one "
+                    "user message of a workflow's prompt"
+                )
+        elif head != opening:
+            why.append(f"it opens with {head}, the first request of the call with {opening}")
+        other = [role for role in rest if role not in _TURN_ROLES]
+        if other:
+            why.append(
+                f"{len(other)} message(s) of the role(s) {sorted(set(other))} follow "
+                "the first turn of the model"
+            )
+        if why:
+            problems.append(
+                f"request {index + 1} carries {', '.join(conversation(request))}: "
+                + "; ".join(why)
+            )
+    return problems
 
 
 def replay_problems(

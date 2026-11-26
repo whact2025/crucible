@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The frame of a model turn that ends cleanly and holds a thinking block and
+# no text block: a turn the provider billed output tokens for and that shows
+# nothing.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: assistant_thinking
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.AssistantMessage whose content is one
+    claude_agent_sdk.types.ThinkingBlock, as
+    claude_agent_sdk._internal.message_parser.parse_message reads the frame;
+    the message is an anthropic.types.Message whose content is one
+    anthropic.types.ThinkingBlock
+  sdk_version: claude-agent-sdk 0.2.121, anthropic 0.112.0
+  reason: >-
+    No frame of the vendor's tool was recorded, and no source in reach states
+    what the tool emits for a turn that thinks and writes no text. The frame
+    is the one of a text turn with the text block replaced by the thinking
+    block of the SDK's types, whose two fields are the thinking text and a
+    signature; the signature here is a fixed word, since nothing reads it.
+
+status: 200
+body:
+  type: assistant
+  message:
+    id: {slot: response_id}
+    type: message
+    role: assistant
+    model: {slot: served_model}
+    content:
+      - type: thinking
+        thinking: {slot: reasoning_text}
+        signature: matrix-thinking-signature
+    stop_reason: end_turn
+    stop_sequence: null
+    usage:
+      input_tokens: {slot: input_tokens}
+      output_tokens: {slot: output_tokens}
+      cache_creation_input_tokens: 0
+      cache_read_input_tokens: 0
+  parent_tool_use_id: null
+  session_id: {slot: session_id}
+  uuid: {slot: frame_id}

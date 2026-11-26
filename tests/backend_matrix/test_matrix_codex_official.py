@@ -68,8 +68,8 @@ from .peers import codex_app_server as peer_program
 from .peers import codex_worker as stage
 from .peers import launch, worker_harness
 from .scenarios import D_CDX_SERVED, SCENARIOS, SYSTEM, USER
-from .script import READ_A, READ_B, Call, ProviderScript, Refuse, Say
-from .test_matrix_codex import LastAsTheTurnSoFar, presenting_a_served_model
+from .script import READ_A, READ_B, Call, Malformed, ProviderScript, Reason, Refuse, Say
+from .test_matrix_codex import AnswersWhole, LastAsTheTurnSoFar, presenting_a_served_model
 
 pytestmark = pytest.mark.matrix_worker
 
@@ -895,6 +895,8 @@ def test_the_notifications_validate_against_the_vendor_types_in_the_locked_inter
     replies = (
         dialect.render(Call(READ_A), seen, "call-2"),
         dialect.render(Say("x"), seen, "c"),
+        # A response that reasons and writes no message.
+        dialect.render(Reason(), seen, "c"),
         # The terminal of a turn the provider refused for its policy.
         dialect.render(Refuse("http_policy"), seen, "c"),
     )
@@ -949,6 +951,55 @@ def test_a_missing_worker_environment_is_an_error_that_names_the_install_command
     monkeypatch.setenv("CRUCIBLE_CODEX_WORKER_PYTHON", str(absent))
     assert runner.preflight_all()[CODEX_OFFICIAL_KIND] is None
     assert os.environ["CRUCIBLE_CODEX_WORKER_PYTHON"] == str(absent)
+
+
+# -- broken terminals: a stream without its terminal, a tool that is gone --------
+
+
+class _EndsItsTurns(codex_official.CodexOfficialDriver):
+    """Its dialect renders a broken terminal as a plain answer."""
+
+    def _dialect(self, journal: launch.Journal, launcher: Path) -> Any:
+        return AnswersWhole(super()._dialect(journal, launcher))
+
+
+@pytest.mark.parametrize("scenario", ["S26", "S27"])
+def test_a_turn_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
+    scenario: str, tmp_path: Path
+) -> None:
+    cell = Cell(COLUMN, scenario, "raw")
+    honest = runner.run_cell(cell, tmp_path / "honest", preflight={KINDS[0]: None}, known=LEDGER)
+    provider, result = honest.observation.provider, honest.observation.result
+
+    # The cell passes with no entry: the official SDK in the locked worker
+    # asked for one model response, the peer went away before the turn
+    # ended, and the adapter returns a typed transport error whose terminal
+    # the result does not claim.
+    assert honest.report.codes == frozenset() and LEDGER.entry(cell.id) is None
+    assert (provider.request_count, provider.extra, provider.unconsumed) == (1, 0, 0)
+    # In both scenarios the agent message arrived whole, with the answer.
+    # The client of this route asks for no raw events, so the notification
+    # after it is the usage of the thread: whole in a stream that ends
+    # without its terminal, where the provider bills it, and cut where the
+    # tool is killed, where nothing is billed.
+    assert provider.envelopes == [
+        "codex_app_server/app_server.agent_message",
+        "codex_app_server/app_server.token_usage_updated",
+    ]
+    assert provider.billed == ([Malformed("").usage] if scenario == "S26" else [])
+    assert result is not None and result.error is not None
+    assert (str(result.error.kind), result.completeness.terminal_complete) == ("transport", False)
+    # The lying counterpart: a turn that ends on its terminal notification is
+    # a clean finish where the scenario expects that error, and the cell fails.
+    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation") as refused:
+        runner.run_cell(
+            cell,
+            tmp_path / "lying",
+            preflight={KINDS[0]: None},
+            known=LEDGER,
+            driver=_EndsItsTurns(),
+        )
+    assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
 
 
 # -- the module ends with the canary check ----------------------------------------

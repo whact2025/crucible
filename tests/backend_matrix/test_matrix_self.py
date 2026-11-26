@@ -22,14 +22,17 @@ import logging
 import math
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, Mapping
 
+import psutil
 import pytest
 import yaml  # type: ignore[import-untyped]
 
@@ -51,7 +54,9 @@ from crucible.backends.config import BackendRouting, RoleConfig, load_routing
 from crucible.backends.features import FeatureAdmissionError
 from crucible.backends.pricing import ModelPricing
 
-from . import cells, contract, declarations, ledger, netguard, runner
+from . import cells, contract, declarations, ledger, mutation, netguard, runner, toolsets
+from . import report as matrix_report
+from . import write_host as host_program
 from . import columns as matrix_columns
 from . import envelopes as matrix_envelopes
 from . import verify as matrix_verify
@@ -78,6 +83,9 @@ from .provider import (
     StatelessDialect,
     ToyDialect,
     TurnControlDialect,
+    cut_after,
+    cut_inside,
+    whole_and_partial,
 )
 from .scenarios import (
     BUDGET_USD,
@@ -85,6 +93,7 @@ from .scenarios import (
     D_COST_BOUND_UNRANKED,
     D_OAI_SCHEMA_FINAL,
     D_STRUCT_UNQUALIFIED,
+    DEADLINE_SLACK_SECONDS,
     GUARDED,
     PACK_A,
     PACK_B,
@@ -102,8 +111,21 @@ from .scenarios import (
     tool_events_paired,
     turn_count_in_request,
 )
-from .script import READ_A, Call, Loop, ProviderScript, Refuse, Say, ServedAs, Step
-from .toolsets import BINDINGS
+from .script import (
+    READ_A,
+    WRITE,
+    Call,
+    Drop,
+    Loop,
+    Malformed,
+    ProviderScript,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+    TokenUsage,
+)
+from .toolsets import BINDINGS, WRITER
 
 LEDGER = ledger.load()
 TOY_CELLS = cells.cells_of((TOY_KIND,))
@@ -1009,6 +1031,270 @@ def test_a_flag_the_scenario_waives_is_not_asked_of_the_result(tmp_path: Path) -
         )
 
 
+def test_a_flag_the_scenario_expects_false_deviates_when_the_result_claims_it(
+    tmp_path: Path,
+) -> None:
+    """A turn that never reached its terminal: what its result cannot claim.
+
+    The scenario of a reply that is cut inside the turn expects the token,
+    the cost and the terminal flag false. A result that flags one of them
+    complete deviates with the code of that flag and no other: on such a
+    cell clause C6 judges its second arm whatever the result flags, a lower
+    bound that is never above what was billed, and asks no pricing evidence.
+    """
+
+    dropped = _honest(tmp_path / "dropped", "S27")
+    result, _trace = _result_and_trace(dropped)
+    flags, expect = result.completeness, dropped.plan.expect
+    false = contract.EXPECTED_FALSE_FLAGS
+
+    assert set(expect.flags_false) == set(false) and expect.flags == ("trace_complete",)
+    assert [getattr(flags, name) for name in contract.FLAGS] == [False, False, False, True]
+    # One code for each flag a result claims, and nothing else.
+    for name in false:
+        claimed = dataclasses.replace(flags, **{name: True})
+        assert _judge(dropped, completeness=claimed) == {f"flag:{name}=True"}
+    every = dataclasses.replace(flags, **{name: True for name in false})
+    assert _judge(dropped, completeness=every) == {f"flag:{name}=True" for name in false}
+    # The trace flag is owed as on every cell.
+    untraced = dataclasses.replace(flags, trace_complete=False)
+    assert "flag:trace_complete=False" in _judge(
+        dropped, completeness=untraced, execution_trace=None, checks=()
+    )
+    # The second arm of C6. Where the provider billed something, a result
+    # that reports less is a lower bound whatever it flags; one that reports
+    # more than was billed is above the bill whatever it flags.
+    accounting = dataclasses.replace(flags, token_usage_complete=True, cost_complete=True)
+    claims = {"flag:token_usage_complete=True", "flag:cost_complete=True"}
+    billed = dataclasses.replace(dropped.observation.provider, billed=[TokenUsage(120, 30)])
+    assert _judge(dropped, provider=billed) == frozenset()
+    assert _judge(dropped, provider=billed, completeness=accounting) == claims
+    more = dataclasses.replace(result.usage, input_tokens=1)
+    assert _judge(dropped, usage=more) == {"usage.input_tokens:gt"}
+    assert _judge(dropped, usage=more, completeness=accounting) == claims | {
+        "usage.input_tokens:gt"
+    }
+    costlier = dataclasses.replace(result.usage, cost_usd=0.5)
+    assert _judge(dropped, usage=costlier) == {"usage.cost_usd:gt"}
+    # No pricing evidence is asked of a claim the scenario excludes ...
+    costed = dataclasses.replace(flags, cost_complete=True)
+    assert _judge(dropped, completeness=costed, pricing_evidence=None) == {
+        "flag:cost_complete=True"
+    }
+    # ... where a scenario that only waives the flags judges the claim in the
+    # first arm of the clause: evidence, and the numbers exactly.
+    waiving = dataclasses.replace(expect, flags_false=("terminal_complete",))
+    assert _judge(
+        dropped, expect=waiving, completeness=costed, pricing_evidence=None
+    ) == {"pricing:none"}
+    counted = dataclasses.replace(flags, token_usage_complete=True)
+    assert _judge(dropped, expect=waiving, provider=billed, completeness=counted) == {
+        "usage.input_tokens:lt",
+        "usage.output_tokens:lt",
+    }
+    assert _judge(dropped, expect=waiving, completeness=every) == {
+        "flag:terminal_complete=True",
+        "pricing:unreconciled",
+    }
+
+    # The form. Only a flag that a scenario may waive can be expected false,
+    # only an accounting flag can go by what the provider billed, and a flag
+    # is in one list: owed, expected false, or expected false where nothing
+    # was billed.
+    for wrong in (
+        {"flags_false": ("trace_complete",)},
+        {"flags": ("terminal_complete",), "flags_false": ("terminal_complete",)},
+        {"flags": ("usage_complete",)},
+        {"flags": (), "flags_false_if_unbilled": ("terminal_complete",)},
+        {"flags_false_if_unbilled": ("cost_complete",)},
+        {
+            "flags": (),
+            "flags_false": ("cost_complete",),
+            "flags_false_if_unbilled": ("cost_complete",),
+        },
+    ):
+        with pytest.raises(ValueError, match="an expectation names the flags"):
+            Expectation(**wrong)  # type: ignore[arg-type]
+    assert Expectation().flags_false == () == Expectation().flags_false_if_unbilled
+    # No scenario of the starter set or of pack A expects a flag false in
+    # either way: the form changes what none of their cells asserts.
+    for scenario in SCENARIOS.values():
+        if scenario.set in (STARTER, PACK_A):
+            expected = scenario.plan().expect
+            assert expected.flags_false == () == expected.flags_false_if_unbilled, scenario.id
+
+    # What is not asked on such a cell: the checks that would report the
+    # three flags false, and pricing evidence whatever the result flags. So a
+    # column-wide accounting code of a kind is not owed there, and a result
+    # that claims its cost is one unexpected code, never "gap fixed".
+    unasked = {f"flag:{name}=False" for name in false} | contract.PRICING_CODES
+    assert dropped.report.unasked == unasked
+    kind = dropped.cell.column.kind
+    wide = ("flag:token_usage_complete=False", "flag:cost_complete=False", "pricing:none")
+    known = dataclasses.replace(
+        LEDGER,
+        registry={
+            **LEDGER.registry,
+            "G99": ledger.GapRecord(
+                "G99", "synthetic", "matrix", "low", column_wide=tuple((kind, c) for c in wide)
+            ),
+        },
+        column_wide=tuple(ledger.ColumnWide(kind, code, "G99") for code in wide),
+    )
+
+    def verdict(report: Report) -> None:
+        ledger.compare(
+            known,
+            dropped.cell.id,
+            report.codes,
+            current=dropped.current,
+            evaluated=report.evaluated(),
+            unasked=report.unasked,
+        )
+
+    verdict(dropped.report)  # nothing is owed: the cell passes
+    claimed = contract.evaluate(
+        dataclasses.replace(
+            dropped.observation,
+            result=dataclasses.replace(result, completeness=costed, pricing_evidence=None),
+        ),
+        expect,
+        dropped.reference,
+        lens="raw",
+        toolset=False,
+        checks=dropped.plan.checks,
+    )
+    assert claimed.unasked == unasked
+    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation") as refused:
+        verdict(claimed)
+    assert "flag:cost_complete=True" in str(refused.value).splitlines()[0]
+    # The same kind owes the same codes on a cell whose scenario owes the flags.
+    owing = _honest(tmp_path / "owing", "S01")
+    with pytest.raises(ledger.LedgerMismatch, match="gap fixed: column-wide"):
+        ledger.compare(
+            known,
+            owing.cell.id,
+            owing.report.codes,
+            current=owing.current,
+            evaluated=owing.report.evaluated(),
+            unasked=owing.report.unasked,
+        )
+
+    # A reply that is no terminal of its wire: the terminal flag is expected
+    # false, and the two accounting flags go by what the provider billed.
+    unended = _honest(tmp_path / "unended", "S26")
+    plain = unended.plan.expect
+    assert plain.flags_false == ("terminal_complete",) and plain.flags == ("trace_complete",)
+    assert plain.flags_false_if_unbilled == contract.ACCOUNTING_FLAGS
+    told = unended.observation.result
+    assert told is not None and not told.completeness.terminal_complete
+    ended = dataclasses.replace(told.completeness, terminal_complete=True)
+    assert _judge(unended, completeness=ended) == {"flag:terminal_complete=True"}
+    # Nothing was billed for the reply of this wire: its usage would have
+    # travelled with the terminal that never came. A result that flags a
+    # part of its accounting complete then deviates with the code of that
+    # flag and no other, as on a reply that is cut, and no evidence is asked.
+    assert unended.observation.provider.billed == [] and unended.report.unasked == unasked
+    assert _judge(unended, completeness=counted) == {"flag:token_usage_complete=True"}
+    assert _judge(unended, completeness=costed, pricing_evidence=None) == {
+        "flag:cost_complete=True"
+    }
+    # The claim that clause C6 alone has nothing to hold against: zero
+    # tokens and zero cost are what was billed, and complete evidence of no
+    # response reconciles them. An expectation that only waives the two
+    # flags lets it pass; this one does not.
+    nothing = UsagePricingEvidence((), complete=True)
+    assert nothing.reconciles(told.usage)
+    assert _judge(unended, completeness=accounting, pricing_evidence=nothing) == claims
+    only_waived = dataclasses.replace(plain, flags_false_if_unbilled=())
+    assert (
+        _judge(unended, expect=only_waived, completeness=accounting, pricing_evidence=nothing)
+        == frozenset()
+    )
+    # Where the frames that travelled stated the usage, the provider billed
+    # it: the flags are not asked and the clause judges both arms. A result
+    # that reports what was billed and claims it, with evidence, passes; so
+    # does one that reports less and flags it incomplete; a claim over less
+    # than was billed is short, and a claim of the cost without evidence is
+    # asked for it. Only the provider ledger differs between the two halves.
+    paid = owing.observation.result
+    assert paid is not None and paid.completeness.cost_complete
+    stated = dataclasses.replace(
+        unended.observation.provider, billed=owing.observation.provider.billed
+    )
+    assert stated.billed == [TokenUsage(120, 30)]
+    assert _judge(unended, provider=stated) == frozenset()
+    assert (
+        _judge(
+            unended,
+            provider=stated,
+            completeness=accounting,
+            usage=paid.usage,
+            pricing_evidence=paid.pricing_evidence,
+        )
+        == frozenset()
+    )
+    assert _judge(unended, provider=stated, completeness=counted) == {
+        "usage.input_tokens:lt",
+        "usage.output_tokens:lt",
+    }
+    assert _judge(
+        unended, provider=stated, completeness=accounting, usage=paid.usage, pricing_evidence=None
+    ) == {"pricing:none"}
+    # What is not asked follows the bill as well: with nothing billed no
+    # evidence is asked whatever the result flags, and with a bill it is
+    # asked of a result that flags its cost complete.
+    for bill, cost_claimed, pricing_asked in (
+        ([], False, False),
+        ([], True, False),
+        (stated.billed, False, False),
+        (stated.billed, True, True),
+    ):
+        report = contract.evaluate(
+            dataclasses.replace(
+                unended.observation,
+                provider=dataclasses.replace(unended.observation.provider, billed=bill),
+                result=dataclasses.replace(
+                    told, completeness=accounting if cost_claimed else told.completeness
+                ),
+            ),
+            plain,
+            unended.reference,
+            lens="raw",
+            toolset=False,
+            checks=unended.plan.checks,
+        )
+        assert (contract.PRICING_CODES <= report.unasked) is not pricing_asked
+        assert {f"flag:{name}=False" for name in false} <= report.unasked
+
+
+def test_the_text_of_a_reply_that_was_cut_off_is_no_final_message(tmp_path: Path) -> None:
+    dropped = _honest(tmp_path, "S27")
+    result, trace = _result_and_trace(dropped)
+    (step,) = dropped.plan.script.steps
+
+    assert isinstance(step, Drop) and result.final_message == ""
+    assert result.error is not None and str(result.error.kind) == "transport"
+    # Nothing of the reply was billed and no document named a model.
+    provider = dropped.observation.provider
+    assert (provider.billed, provider.served_models, provider.request_count) == ([], [], 1)
+    # A leading part of the scripted answer in the final message is the text
+    # that had arrived, whatever the kind of the result; other words are not.
+    arrived = step.text[: len(step.text) // 2]
+    assert _judge(dropped, final_message=arrived) == {"text:mismatch"}
+    assert _judge(dropped, final_message=f"the provider said: {step.text}") == {"text:mismatch"}
+    assert _judge(dropped, final_message="the connection went away") == frozenset()
+    # A stop reason that a workflow reads as an outcome of its own is refused.
+    for stop in contract.READ_STOP_REASONS:
+        named = dataclasses.replace(
+            trace,
+            events=(*trace.events[:-1], dataclasses.replace(trace.events[-1], name=stop)),
+        )
+        assert _judge(dropped, stop_reason=stop, execution_trace=named) == {
+            f"stop:{stop}!=other"
+        }
+
+
 def test_c8_c9_and_c10_report_what_the_cell_left_and_dispatched(tmp_path: Path) -> None:
     execution = _honest(tmp_path, "S03")
     log = execution.observation.toolset_log
@@ -1605,6 +1891,82 @@ def test_a_reply_travels_as_the_bytes_and_the_content_type_its_dialect_gives() -
     # What the ledger keeps is the reply's, whatever its bytes are.
     assert (seen.request_count, seen.unconsumed, seen.extra) == (1, 0, 0)
     assert seen.billed == [Say("one").usage]
+
+
+class _CutsOutsideItsReply(ToyDialect):
+    """Cuts a reply after its last byte: nothing of it would be missing."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        reply = super().render(step, seen, call_id)
+        return dataclasses.replace(reply, cut=len(reply.raw or b""))
+
+
+def test_a_reply_that_is_cut_ends_short_of_what_its_headers_announce() -> None:
+    text = "an answer that is cut off"
+
+    def asked(provider: LoopbackProvider) -> tuple[int, int, bytes, bool]:
+        connection = http.client.HTTPConnection("127.0.0.1", provider.port, timeout=5)
+        try:
+            connection.request("POST", ToyDialect.path, body=b"{}")
+            response = connection.getresponse()
+            announced = int(response.getheader("Content-Length") or 0)
+            try:
+                return response.status, announced, response.read(), False
+            except http.client.IncompleteRead as cut:
+                return response.status, announced, bytes(cut.partial), True
+        finally:
+            connection.close()
+
+    # The headers announce the whole reply, the body ends inside the answer
+    # text, and the socket is closed: the client is told that the reply is
+    # incomplete, and holds no document.
+    with LoopbackProvider(ProviderScript((Drop(text),)), credential="c") as provider:
+        status, announced, arrived, short = asked(provider)
+        seen = provider.freeze()
+    assert (status, short) == (200, True) and 0 < len(arrived) < announced
+    assert arrived.endswith(text[: len(text) // 2].encode()) and text.encode() not in arrived
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(arrived)
+    # The step is consumed; nothing is billed for it and no model is named.
+    assert (seen.request_count, seen.unconsumed, seen.extra) == (1, 0, 0)
+    assert (seen.billed, seen.served_models) == ([], [])
+    # A reply that is not cut arrives whole, as before.
+    with LoopbackProvider(ProviderScript((Say(text),)), credential="c") as provider:
+        status, announced, arrived, short = asked(provider)
+    assert (status, short, len(arrived)) == (200, False, announced)
+    # A reply without a turn: a whole document, no bill, the model named.
+    with LoopbackProvider(ProviderScript((Malformed(text),)), credential="c") as provider:
+        status, body = _ask(provider, {"model": "asked"})
+        seen = provider.freeze()
+    assert (status, body) == (200, {"model": "asked"})
+    assert (seen.billed, seen.served_models, seen.unconsumed) == ([], ["asked"], 0)
+
+    # Where a reply is cut: inside its answer text, or inside the frame that
+    # follows the frame which carries the text.
+    assert cut_inside(b'{"text": "abcd"}', "abcd") == 12
+    frames = [b"first ", b"the text here ", b"then more"]
+    assert cut_after(frames, "text") == len(frames[0]) + len(frames[1]) + len(frames[2]) // 2
+    # The same cut as frames: the frame that carries the text is the last
+    # that travels whole, and half of the next one follows it. A wire whose
+    # frames are lines of a tool's output is cut by this.
+    assert whole_and_partial(frames, "text") == (2, b"then")
+    for wrong in (
+        lambda: cut_inside(b"no such words", "text"),
+        lambda: cut_inside(b"x", "x"),
+        lambda: cut_after(frames, "missing"),
+        lambda: cut_after(frames[:2], "text"),
+        lambda: whole_and_partial(frames[:2], "text"),
+    ):
+        with pytest.raises(MatrixSetupError, match="can be cut"):
+            wrong()
+    # A dialect drops a reply inside its body only, and a cut that leaves the
+    # whole reply is no cut: both are setup errors where the provider is built.
+    with pytest.raises(MatrixSetupError, match="inside its body only"):
+        LoopbackProvider(ProviderScript((Drop(text, after="headers"),)), credential="c")
+    with pytest.raises(MatrixSetupError, match="cannot be cut after"):
+        LoopbackProvider(
+            ProviderScript((Drop(text),)), credential="c", dialect=_CutsOutsideItsReply()
+        )
 
 
 class _TwoFrames(ToyDialect):
@@ -2639,6 +3001,8 @@ def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
         "R12",
         "R13",
         "R14",
+        "R15",
+        "R16",
     }
     # With a cell of the record withdrawn the ruling is what H03 asks for.
     # Either the cell is pinned not expressible ...
@@ -2961,8 +3325,10 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
     # open-weight records that are on it; nothing else holds the field of a
     # record of origin ``reference`` or of the matrix.
     counted = {
+        "G09": 1,
         "G10": 2,
         "G18": 3,
+        "G34": 2,
         "G35": 9,
         "M10": 2,
         "R07": 2,
@@ -2971,11 +3337,12 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
         "R10": 2,
         "R11": 2,
         "R14": 1,
+        "R16": 1,
     }
     assert graded == set(counted)
     assert {gap: len(LEDGER.registry[gap].cells) for gap in counted} == counted
     references = {gap for gap in graded if LEDGER.registry[gap].origin == "reference"}
-    assert references == {"R07", "R08", "R09", "R10", "R11", "R14"}
+    assert references == {"R07", "R08", "R09", "R10", "R11", "R14", "R16"}
     # What the record of each says its cells are answered from today. A
     # cell of a reference may be answered from several frames; its grade is
     # that of the weakest, and each of these is constructed. A change that
@@ -3000,6 +3367,11 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
             "claude_cli/cli.result_api_error",
         },
         "R14": {"codex_app_server/app_server.turn_failed_policy"},
+        "R16": tool_call
+        | {
+            "codex_app_server/app_server.reasoning",
+            "codex_app_server/app_server.turn_completed",
+        },
     }
     assert set(answered) == references
     for gap, frames in answered.items():
@@ -3025,6 +3397,33 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
     # answered from: a record without the field is not held.
     assert LEDGER.registry["G17"].closes_on_grade is None
     assert _problem_codes(_without_the_codes_of("G17")) == set()
+    # The terminal flag that the gateway adapter writes true on every path
+    # is no provider fact either, and has a record of its own for that
+    # reason: its cells close when they stop showing the code, whatever
+    # they are answered from.
+    assert LEDGER.registry["M15"].closes_on_grade is None
+    assert _problem_codes(_without_the_codes_of("M15"), grade=_constructed) == set()
+    # The lying counterpart: the same cells listed in the record of the
+    # raise of the same adapter, with a grade on that record, as a gap
+    # about a reply no provider is known to send names one. The grade is
+    # written here and not read from the shipped record, so the test says
+    # the same whatever grade that record names. The fix of the flag
+    # deletes the same codes, and the deletion is refused on every cell
+    # that a constructed reply answers, for a reason that is none of the
+    # flag's: no edit of the ledger lands that fix.
+    rebooked = _without_the_codes_of("M15")
+    moved = rebooked["registry"].pop("M15")["cells"]
+    rebooked["registry"]["G34"]["closes_on_grade"] = "documented"
+    rebooked["registry"]["G34"]["cells"].extend(moved)
+    assert _problem_codes(rebooked, grade=_constructed) == {
+        "static:registry_closed_below_grade"
+    }
+    refused = _closed_below_grade(
+        rebooked, dataclasses.replace(cells.world(), grade=_constructed)
+    )
+    assert len(refused) == len(moved) and all(
+        any(item["cell"] in detail for detail in refused) for item in moved
+    )
 
 
 def test_h03_holds_a_gap_open_while_its_record_waits_for_a_ruling() -> None:
@@ -3361,7 +3760,7 @@ def test_h03_refuses_an_entry_that_outlives_a_proof_it_leans_on() -> None:
     # A proof holds what the codes of an entry do not say. The records whose
     # entries lean on one are named here, so that a row of the table cannot
     # go with its proof while an entry still names the record.
-    assert set(cells.RECORD_PROOFS) == {"R04", "R05", "R08", "R09", "R13"}
+    assert set(cells.RECORD_PROOFS) == {"R04", "R05", "R08", "R09", "R13", "R16"}
     assert set(cells.RECORD_PROOFS) <= set(LEDGER.registry)
     # Each of them is named by an entry today, and every proof those entries
     # lean on is one the verifier requires by name.
@@ -4474,6 +4873,357 @@ def test_inventory_is_exactly_what_this_module_collected(
         + len(matrix_columns.REAL_KINDS)
         + 2 * len(cells.toy_columns())
     )
+
+
+# -- where a write ran, and what a writer is offered and told -------------------
+
+
+def test_where_a_write_ran_is_judged_on_the_recorder_and_on_the_hosts(tmp_path: Path) -> None:
+    honest = _honest(tmp_path, "S41")
+    observation = honest.observation
+    seen = observation.mutation
+    name = BINDINGS[WRITE].name
+    assert seen is not None and observation.write_applied is True
+    (host,) = seen.hosts
+
+    # The honest toy: the write is on disk and the recorder of this process
+    # never saw it; a process other than this one recorded it as started, was
+    # gone when the call had returned, and was bound to the call's deadline.
+    assert all(item.name != name for item in observation.toolset_log)
+    assert host.pid not in (None, os.getpid()) and host.started_writes == (name,)
+    assert not host.alive_at_return and host.left_behind == ()
+    own = seen.invoked_at + seen.timeout_seconds
+    assert 0 <= host.deadline - own <= DEADLINE_SLACK_SECONDS
+    # One fact changed at a time, each with its code and no other.
+    here = (*observation.toolset_log, toolsets.Dispatch(name, {}, "OK"))
+    assert _judge(honest, toolset_log=here) == {"mutation:in_process"}
+    left = dataclasses.replace(seen, hosts=(dataclasses.replace(host, alive_at_return=True),))
+    assert _judge(honest, mutation=left) == {"mutation:host_alive"}
+    # The deadline of the host is the invocation's: the moment of the call
+    # plus the policy's timeout, give or take the slack between two readings
+    # of the clock. A host that is built into the call with a whole timeout
+    # of its own is beyond it, however soon the call returned afterwards.
+    def bound_to(deadline: float) -> frozenset[str]:
+        hosts = (dataclasses.replace(host, deadline=deadline),)
+        return _judge(honest, mutation=dataclasses.replace(seen, hosts=hosts))
+
+    assert bound_to(own + DEADLINE_SLACK_SECONDS - 0.01) == frozenset()
+    assert bound_to(own + DEADLINE_SLACK_SECONDS + 0.01) == {"mutation:deadline_unbound"}
+    assert bound_to(own - 5.0) == frozenset()
+    # The next case states its own times, a call of ten seconds whose host
+    # was built two seconds into it; how long the honest call took on this
+    # machine is no part of it.
+    assert DEADLINE_SLACK_SECONDS < 2.0
+    late_call = dataclasses.replace(seen, returned_at=seen.invoked_at + 10.0)
+    fresh = dataclasses.replace(host, deadline=seen.invoked_at + 2.0 + seen.timeout_seconds)
+    assert _judge(honest, mutation=dataclasses.replace(late_call, hosts=(fresh,))) == {
+        "mutation:deadline_unbound"
+    }
+    # A host that is gone and left a process behind.
+    orphaned = dataclasses.replace(seen, hosts=(dataclasses.replace(host, left_behind=(4242,)),))
+    assert _judge(honest, mutation=orphaned) == {"mutation:left_behind"}
+    # A host that ran no write of the call counts as well: left running, or
+    # gone with something left behind.
+    idle = dataclasses.replace(host, started_writes=(), alive_at_return=True)
+    both = dataclasses.replace(seen, hosts=(host, idle))
+    assert _judge(honest, mutation=both) == {"mutation:host_alive"}
+    littering = dataclasses.replace(host, started_writes=(), left_behind=(4242, 4243))
+    assert _judge(honest, mutation=dataclasses.replace(seen, hosts=(host, littering))) == {
+        "mutation:left_behind"
+    }
+    # A write that is on disk and that nothing saw cannot be judged: that is
+    # an error of the matrix, never a deviation and never a pass.
+    nowhere = dataclasses.replace(seen, hosts=())
+    silent = dataclasses.replace(seen, hosts=(dataclasses.replace(host, started_writes=()),))
+    for unseen in (None, nowhere, silent):
+        with pytest.raises(MatrixSetupError, match="cannot say where it ran"):
+            _judge(honest, mutation=unseen)
+    # A write that is not on disk is the missing dispatch of the clause about
+    # tools, and nothing is said of its host.
+    assert _judge(honest, write_applied=False, mutation=None) == {f"dispatch.missing:{WRITE}"}
+    # A cell that attaches no write tool watches nothing.
+    assert _honest(tmp_path / "read", "S03").observation.mutation is None
+
+
+def test_the_watch_holds_every_host_built_in_the_process_and_changes_none(
+    tmp_path: Path,
+) -> None:
+    classes = mutation.host_classes()
+    product, own = classes
+    name, arguments = BINDINGS[WRITE].name, dict(BINDINGS[WRITE].arguments)
+    fixture = toolsets.build(WRITER(2), tmp_path / toolsets.WORKSPACE)
+    before = {item: (item.__init__, item.start, item.stop) for item in classes}
+
+    # The two classes: the product's shared host, a private name the module
+    # lists, and the toy's own.
+    assert own is toy.WriteHost
+    assert (f"{product.__module__}.{product.__qualname__}",) == mutation.PRIVATE_SEAMS
+    with mutation.watch() as seen:
+        assert all(
+            wrapped is not original
+            for item in classes
+            for wrapped, original in zip(
+                (item.__init__, item.start, item.stop), before[item], strict=True
+            )
+        )
+        host = toy.WriteHost(fixture.workspace, invocation_deadline=time.monotonic() + 30.0)
+        # Built and not started: no process, nothing recorded.
+        (built,) = seen.at_return()
+        assert built.pid is None and not built.alive_at_return and built.started_writes == ()
+        host.start()
+        try:
+            assert host.dispatch(name, arguments).startswith("OK")
+            # Still running after the grace: reported as alive, with what it
+            # recorded and the pid of a process that is not this one.
+            (running,) = seen.at_return()
+            assert running.alive_at_return and running.started_writes == (name,)
+            assert running.pid == host.pid and running.pid not in (None, os.getpid())
+        finally:
+            host.stop()
+        (stopped,) = seen.at_return()
+        assert not stopped.alive_at_return and stopped.pid == running.pid
+        assert running.left_behind == stopped.left_behind == ()
+        # A host that is not built with the keyword of its deadline cannot be
+        # held to one: an error of the matrix.
+        with pytest.raises(MatrixSetupError, match="invocation_deadline"):
+            seen.built(host, None)
+    # The write ran through the real tool, in no process of the test.
+    assert fixture.write_applied() and fixture.log == []
+    # Outside the block the classes are as they were, and nothing is held.
+    assert {item: (item.__init__, item.start, item.stop) for item in classes} == before
+    with mutation.watch() as later:
+        assert later.at_return() == ()
+
+
+def _gone(pid: int, seconds: float = 10.0) -> bool:
+    until = time.monotonic() + seconds
+    while mutation._exists(pid) and time.monotonic() < until:
+        time.sleep(0.02)
+    return not mutation._exists(pid)
+
+
+def test_the_watch_sees_what_a_stopped_host_left_behind(tmp_path: Path) -> None:
+    fixture = toolsets.build(WRITER(2), tmp_path / toolsets.WORKSPACE)
+    sleeper = [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"]
+    with mutation.watch() as seen:
+        # Below the host when it was stopped. The lying host of the toy
+        # starts a process in a session of its own; the kill of the host
+        # does not reach it, and once the host is gone nothing names the
+        # host as its parent, its process group or its session.
+        host = toy.WriteHost(
+            fixture.workspace,
+            invocation_deadline=time.monotonic() + 30.0,
+            leaves_a_process=True,
+        )
+        host.start()
+        below = host.left
+        try:
+            assert below is not None and mutation._exists(below)
+            assert os.getsid(below) == below != os.getsid(host.pid or 0)
+            (running,) = seen.at_return()
+            # While the host lives, what it started is its child.
+            assert running.alive_at_return and running.left_behind == (below,)
+            host.stop()
+            (stopped,) = seen.at_return()
+            assert not stopped.alive_at_return and stopped.left_behind == (below,)
+            assert psutil.Process(below).ppid() != stopped.pid
+        finally:
+            host.stop()
+            if below is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(below, signal.SIGKILL)
+        assert below is not None and _gone(below)
+        (cleared,) = seen.at_return()
+        assert cleared.left_behind == ()
+
+        # Of the host's process group and session. A host that is ended
+        # otherwise than through its ``stop`` leaves no reading of what was
+        # below it; what is still in the group and the session it led is
+        # found by its pid. The stand-in is no host class: the watch is told
+        # of it as the wrapped constructor and ``start`` tell it.
+        leader = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                "import subprocess, sys, time\n"
+                f"member = subprocess.Popen({sleeper!r})\n"
+                "print(member.pid, flush=True)\n"
+                "time.sleep(30)\n",
+            ],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            assert leader.stdout is not None
+            member = int(leader.stdout.readline())
+            standin = SimpleNamespace(pid=leader.pid, started_write_names=())
+            seen.built(standin, time.monotonic() + 30.0)
+            seen.started(standin)
+            leader.kill()
+            leader.wait(timeout=10)
+            _first, ended = seen.at_return()
+            assert not ended.alive_at_return and ended.left_behind == (member,)
+            assert os.getpgid(member) == os.getsid(member) == leader.pid
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(leader.pid, signal.SIGKILL)
+            leader.wait(timeout=10)
+            if leader.stdout is not None:
+                leader.stdout.close()
+        assert _gone(member)
+        assert [item.left_behind for item in seen.at_return()] == [(), ()]
+
+
+def test_the_write_host_of_the_toy_runs_under_the_network_guard(tmp_path: Path) -> None:
+    fixture = toolsets.build(WRITER(2), tmp_path / toolsets.WORKSPACE)
+    command = [sys.executable, "-B", "-m", host_program.__name__, str(fixture.workspace)]
+
+    # The process says that it is ready, and that the guard is installed in
+    # it, before it takes a call; the toy's host requires both.
+    process = subprocess.run(
+        [*command, host_program.SCOPED], input=b"", capture_output=True, timeout=60, check=False
+    )
+    (line,) = process.stdout.decode("utf-8").splitlines()
+    assert process.returncode == 0, process.stderr.decode("utf-8", "replace")
+    assert json.loads(line) == {
+        host_program.READY: {host_program.GUARDED: True, host_program.LEFT: None}
+    }
+    # The guard of that process is the matrix's, and a reach beyond loopback
+    # ends the process whoever swallows the exception: the toy's dispatch
+    # then finds its host gone, which is an error of the matrix.
+    reach = (
+        "import importlib, socket\n"
+        f"host = importlib.import_module({host_program.__name__!r})\n"
+        "host.guard()\n"
+        "try:\n"
+        "    socket.create_connection(('192.0.2.1', 9), timeout=1)\n"
+        "except BaseException:\n"
+        "    pass\n"
+        "print('still here')\n"
+    )
+    reached = subprocess.run(
+        [sys.executable, "-B", "-c", reach], capture_output=True, timeout=60, check=False
+    )
+    assert reached.returncode == host_program.GUARD_EXIT
+    assert reached.stdout == b"" and b"192.0.2.1" in reached.stderr
+    # A host that does not say so is refused before it is handed a write.
+    silent = toy.WriteHost(fixture.workspace, invocation_deadline=time.monotonic() + 30.0)
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(host_program, "GUARDED", "not said")
+        with pytest.raises(MatrixSetupError, match="under the network guard"):
+            silent.start()
+    assert silent.pid is not None and _gone(silent.pid)
+
+
+def test_the_cell_report_names_the_private_name_the_watch_wraps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The report of a process says, per kind, which private names of the
+    # product were wrapped while its cells played: none for a kind of which
+    # only cells without write tools played, the product's host class once a
+    # cell that attaches write tools did.
+    monkeypatch.setattr(matrix_report, "_CELLS", {})
+    monkeypatch.setattr(matrix_report, "_WATCHED", set())
+    column = cells.toy_columns()[0]
+
+    reading = runner.execute(Cell(column, "S03", "raw"), tmp_path / "read")
+    matrix_report.note_cell(reading, LEDGER)
+    assert not reading.watched
+    assert matrix_report.document()["kinds"][TOY_KIND]["watch_seams"] == []
+    writing = runner.execute(Cell(column, "S41", "raw"), tmp_path / "write")
+    matrix_report.note_cell(writing, LEDGER)
+    assert writing.watched
+    described = matrix_report.document()["kinds"][TOY_KIND]
+    assert described["watch_seams"] == list(mutation.PRIVATE_SEAMS) == [mutation.PRODUCT_HOST]
+    assert described["private_seams"] == []
+    matrix_report.reset()
+    assert matrix_report.describe_kind(TOY_KIND)["watch_seams"] == []
+
+
+def test_a_write_is_judged_by_the_last_text_its_script_puts_on_disk(tmp_path: Path) -> None:
+    honest = _honest(tmp_path, "S45")
+    observation = honest.observation
+    writes = [call for call in observation.provider.sent_calls if call.slot == WRITE]
+    texts = [str(call.arguments["content"]) for call in writes]
+
+    # Six writes, each a longer text than the one before, the last on disk.
+    assert len(texts) == 6 and all(b.startswith(a) and a != b for a, b in zip(texts, texts[1:]))
+    assert observation.write_applied is True
+    assert (tmp_path / toolsets.WORKSPACE / toolsets.WRITE_FILE).read_text(encoding="utf-8") == (
+        texts[-1]
+    )
+    # A script that states no text writes the one of the write slot.
+    assert runner._last_written(ProviderLedger()) == toolsets.WRITE_CONTENT
+    assert runner._last_written(observation.provider) == texts[-1]
+    # A file that holds another text than the last write's: the dispatch of
+    # the writes is missing, whatever earlier write is still on disk.
+    assert _judge(honest, write_applied=False) == {f"dispatch.missing:{WRITE}"}
+    # The toy wire names what the adapter says to the model on its own.
+    dialect = ToyDialect()
+    blank = dialect.parse("POST", dialect.path, {}, b"{}", credential="")
+    noted = dataclasses.replace(blank, matched=True, evidence={"notes": ["a word"]})
+    assert dialect.foreign_messages([dataclasses.replace(blank, matched=True)]) == []
+    assert dialect.foreign_messages([dataclasses.replace(noted, matched=False)]) == []
+    (problem,) = dialect.foreign_messages([dataclasses.replace(blank, matched=True), noted])
+    assert problem.startswith("request 2 carries 1 note(s)")
+    # The scenario's two assertions, each on one changed fact.
+    told = dataclasses.replace(observation.provider, foreign_messages=[problem])
+    assert _judge(honest, provider=told) == {"request.content:messages"}
+    fewer = dataclasses.replace(
+        honest.reference, attached_tools=honest.reference.attached_tools[1:]
+    )
+    assert _judge(honest, reference=fewer) == {"request.content:tools"}
+    # The scenario plays every turn of its budget: as many requests as turns.
+    assert honest.plan.max_turns == observation.provider.request_count == 13
+
+    # What a message says, beyond which kind it is. The system and the user
+    # text of every scripted request are those of the first.
+    def with_request(index: int, **changed: Any) -> frozenset[str]:
+        requests = list(observation.provider.requests)
+        requests[index] = dataclasses.replace(requests[index], **changed)
+        return _judge(honest, provider=dataclasses.replace(observation.provider, requests=requests))
+
+    last = observation.provider.requests[-1]
+    assert with_request(12, system=last.system + " One more word.") == {
+        "request.content:messages"
+    }
+    assert with_request(12, user=last.user + " One more word.") == {"request.content:messages"}
+    assert with_request(0, system="Another prompt.") == {"request.content:messages"}
+    # A request that matched no scripted step is clause C0's and is not read.
+    assert with_request(12, system="Another prompt.", matched=False) == frozenset()
+    # The result a request carries for a call is a text the attached ToolSet
+    # handed back for that tool: the six reads of the script, each answered
+    # in this process.
+    read = BINDINGS[READ_A].name
+    returned = observation.toolset_returned
+    assert [item.name for item in returned] == [read] * 6
+    assert [item.result for item in returned] == [item.result for item in observation.toolset_log]
+    second = observation.provider.requests[1]
+    ((call_id, text),) = second.tool_results
+    assert text == returned[0].result
+    assert with_request(1, tool_results=((call_id, text + "\n\nOne more word."),)) == {
+        "request.content:messages"
+    }
+    assert with_request(1, tool_results=((call_id, "ERROR the tool is not offered now"),)) == {
+        "request.content:messages"
+    }
+    # What a wrapper of the workflow adds to a result is the ToolSet's: the
+    # reference is what the attached object handed back, not the innermost.
+    warned = text + "\n\n[a word of the workflow's wrapper]"
+    handed = (dataclasses.replace(returned[0], result=warned), *returned[1:])
+    requests = list(observation.provider.requests)
+    requests[1] = dataclasses.replace(second, tool_results=((call_id, warned),))
+    carried = dataclasses.replace(observation.provider, requests=requests)
+    assert _judge(honest, provider=carried, toolset_returned=handed) == frozenset()
+    assert _judge(honest, provider=carried) == {"request.content:messages"}
+    # The result of a write that ran in a host was handed back by no ToolSet
+    # object of this process, and nothing is said of it.
+    third = observation.provider.requests[2]
+    ((write_id, written),) = third.tool_results
+    assert written.startswith("OK") and all(item.name != BINDINGS[WRITE].name for item in returned)
+    assert with_request(2, tool_results=((write_id, written + " And a word."),)) == frozenset()
 
 
 # -- the module ends with the canary check --------------------------------------

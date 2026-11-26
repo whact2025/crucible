@@ -602,11 +602,16 @@ def test_the_cell_report_says_what_a_behaviour_cell_showed(tmp_path: Path) -> No
     # What the driver of the kind bypasses is said once per kind.
     assert kind["fidelity"] == "wire" and kind["dialect"] == "openai_chat"
     assert any("DNS and TLS" in layer for layer in kind["bypassed_layers"])
-    # Two envelopes of the tool loop and one for each form of refusal. The
-    # driver replaces no private name of the product, and no required proof
-    # of the kind's module does.
-    assert kind["private_seams"] == [] and len(kind["envelopes"]) == 5
+    # Two envelopes of the tool loop, one for a reply that reasons and shows
+    # no text, one for each form of refusal and one for a reply that is no
+    # terminal of the wire. The driver replaces no private name of the
+    # product, and no required proof of the kind's module does.
+    assert kind["private_seams"] == [] and len(kind["envelopes"]) == 7
     assert kind["proof_seams"] == []
+    # None of the four scenarios attaches write tools, so no cell of the run
+    # played under the watch of write hosts and the report names nothing
+    # that it wrapped.
+    assert kind["watch_seams"] == []
 
 
 def test_the_verifier_runs_as_the_ci_step_runs_it(tmp_path: Path) -> None:
