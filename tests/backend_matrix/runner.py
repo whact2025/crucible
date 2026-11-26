@@ -37,7 +37,7 @@ from crucible.backends.tool_authority import (
 
 from . import cells as matrix_cells
 from . import columns as matrix_columns
-from . import contract, declarations, drivers, envelopes, ledger, netguard, toolsets
+from . import contract, declarations, drivers, envelopes, ledger, mutation, netguard, toolsets
 from . import report as matrix_report
 from . import verify as matrix_verify
 from .cells import Cell
@@ -47,6 +47,7 @@ from .contract import (
     RETAINED,
     Admitted,
     Deviation,
+    Mutation,
     Observation,
     Raised,
     Reference,
@@ -78,6 +79,9 @@ class Execution:
     # The budget the cell passed because its route asks for one, where the
     # scenario sets none of its own (``None``: the route asks for none).
     route_budget: float | None = None
+    # Whether the cell played under the watch of write hosts: it attaches
+    # write tools.
+    watched: bool = False
 
 
 class _LogCapture(logging.Handler):
@@ -131,6 +135,20 @@ def shared_tool_authority_digest(
 
 def _required_steps(script: ProviderScript) -> int:
     return sum(1 for step in script.steps if not isinstance(step, Loop) or step.at_least)
+
+
+def _last_written(provider: ProviderLedger) -> str:
+    """The text the last write the provider asked for puts into the scripted file.
+
+    A write is judged by its effect, and a script may write more than once:
+    what is on disk afterwards is the text of its last write. A script that
+    states no text of its own writes the one of the write slot.
+    """
+
+    for call in reversed(provider.sent_calls):
+        if call.slot == WRITE and "content" in call.arguments:
+            return str(call.arguments["content"])
+    return toolsets.WRITE_CONTENT
 
 
 def _hears_routing() -> bool:
@@ -265,7 +283,7 @@ def execute(
     fixture = (
         None
         if scenario.toolset is None
-        else toolsets.build(scenario.toolset, tmp_path / "workspace")
+        else toolsets.build(scenario.toolset, tmp_path / toolsets.WORKSPACE)
     )
     # A route may ask a budget of every invocation (a closed extra of its
     # routing file). The cell is then called as the route asks, unless the
@@ -298,12 +316,16 @@ def execute(
     baseline = contract.settlement_baseline()
     started = time.monotonic()
     result = raised = terminal = second = declared = None
+    hosted: Mutation | None = None
     endpoint: str | None = None
     name = model = ""
     log_dirs: tuple[Path, ...] = ()
     secrets: tuple[str, ...] = ()
     provider_ledger = ProviderLedger(unconsumed=_required_steps(plan.script))
     settlement = contract.Settlement()
+    # A cell that attaches write tools holds every process a write of it is
+    # hosted in, from before the backend is built.
+    watched = fixture is not None and bool(getattr(fixture.toolset, "write_names", None))
     # The handler alone sees nothing below the root logger's level, which is
     # WARNING under pytest. A workflow run sets it to INFO and keeps every
     # record in its stderr log, so the cell reads every level while it plays.
@@ -314,6 +336,7 @@ def execute(
     try:
         with contextlib.ExitStack() as stack:
             bound = None
+            hosts = stack.enter_context(mutation.watch()) if watched else None
             try:
                 bound = stack.enter_context(
                     played_by.open(
@@ -332,7 +355,18 @@ def execute(
                     backend.attach_toolset(
                         fixture.toolset, context_budget=plan.context_budget
                     )
+                invoked_at = time.monotonic()
                 result = backend.invoke(invocation)
+                returned_at = time.monotonic()
+                if hosts is not None:
+                    # Read before close(): what is left of a host once the
+                    # call has returned.
+                    hosted = Mutation(
+                        hosts=hosts.at_return(),
+                        invoked_at=invoked_at,
+                        returned_at=returned_at,
+                        timeout_seconds=float(scenario.policy.timeout_seconds or 0.0),
+                    )
             except (netguard.NetworkGuardViolation, drivers.MatrixSetupError):
                 raise  # the matrix's own failures are not observations
             except Exception as exc:  # noqa: BLE001 - every raise is an observation
@@ -375,7 +409,11 @@ def execute(
         provider=provider_ledger,
         toolset_log=() if fixture is None else tuple(fixture.log),
         wrapper_snapshot=None if fixture is None else fixture.progress(),
-        write_applied=None if fixture is None else fixture.write_applied(),
+        write_applied=(
+            None
+            if fixture is None
+            else fixture.write_applied(_last_written(provider_ledger))
+        ),
         declarations=declared,
         backend_name=name,
         backend_model=model,
@@ -384,6 +422,8 @@ def execute(
         settlement=settlement,
         wall_seconds=time.monotonic() - started,
         debug_dump_text=_debug_text(log_dirs, capture),
+        mutation=hosted,
+        toolset_returned=() if fixture is None else tuple(fixture.returned),
     )
     reference = Reference(
         routed=routed,
@@ -406,6 +446,11 @@ def execute(
         cost_bounded=cost_bounded,
         cost_policy=cost_policy,
         bound_pricing=bound_pricing,
+        attached_tools=(
+            ()
+            if fixture is None
+            else tuple(str(item["name"]) for item in fixture.toolset.to_anthropic_tools())
+        ),
     )
     report = contract.evaluate(
         observation,
@@ -427,6 +472,7 @@ def execute(
         differences=tuple(differences),
         grade=envelopes.weakest(provider_ledger.envelopes),
         route_budget=route_budget if plan.budget_usd is None else None,
+        watched=watched,
     )
 
 

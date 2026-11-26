@@ -44,7 +44,17 @@ from .drivers import deepseek as driver
 from .peers import launch
 from .provider import LoopbackProvider, Reply, SeenRequest, SentCall
 from .scenarios import SCENARIOS, TEXT, history_replayed
-from .script import READ_A, Call, ProviderScript, Refuse, Say, ServedAs, Step
+from .script import (
+    READ_A,
+    Call,
+    Drop,
+    Malformed,
+    ProviderScript,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+)
 
 # Every test here runs the locked worker: a missing environment is an error.
 pytestmark = pytest.mark.matrix_worker
@@ -927,7 +937,9 @@ def test_every_cell_of_the_column_is_graded_by_the_envelopes_it_used(
     text, tools = played("S01"), played("S04")
 
     loop = {"deepseek_responses/deepseek.completion", "deepseek_responses/deepseek.tool_call"}
-    refusals = set(DRIVER.envelopes) - loop
+    reasoning = {"deepseek_responses/deepseek.reasoning_only"}
+    unended = f"deepseek_responses/deepseek.{driver.MALFORMED}"
+    refusals = set(DRIVER.envelopes) - loop - reasoning - {unended}
     assert set(text.observation.provider.envelopes) == {"deepseek_responses/deepseek.completion"}
     assert set(tools.observation.provider.envelopes) == loop
     assert set(DRIVER.envelopes) == {
@@ -943,12 +955,181 @@ def test_every_cell_of_the_column_is_graded_by_the_envelopes_it_used(
     assert len(refusals) == 3
     assert {envelopes.load(name).grade for name in refusals} == {"constructed"}
     assert played("S23a").grade == "constructed"
+    # Nor was a response that reasons and holds no message: no reply of the
+    # route was recorded.
+    assert {envelopes.load(name).grade for name in reasoning} == {"constructed"}
+    # That a stream of the route ends in order before its terminal is stated
+    # by no source either: the envelope of that reply is constructed.
+    assert envelopes.load(unended).grade == "constructed"
     # The schema answer of the planner shape travels in the prompt, once, and
     # in no provider field: what the route declares.
     assert SCENARIOS["S04"].governing == ("structured_output",)
     assert tools.current == {"structured_output": "prompt_only"}
     assert not any(request.schema_field for request in _matched(tools))
     assert not {code for code in tools.report.codes if code.startswith("request.content")}
+
+
+# -- what a request carries beside prompt, model turns and tool results ----------------
+
+
+def _input(*items: tuple[str, str | None], matched: bool = True) -> SeenRequest:
+    """A request whose input items are ``(kind, role)``, as the dialect reads them."""
+
+    dialect = driver.DeepSeekResponsesDialect()
+    blank = dialect.parse("POST", dialect.path, {}, b"{}", credential="")
+    evidence = {"input": [{"kind": kind, "call_id": None, "role": role} for kind, role in items]}
+    return dataclasses.replace(blank, evidence=evidence, matched=matched)
+
+
+def test_an_input_item_that_is_not_the_workflows_is_named() -> None:
+    opening = [("system", "system"), ("user", "user")]
+    round_ = [("reasoning", None), ("function_call", None), ("function_call_output", None)]
+    said = ("message", "assistant")
+    word = ("user", "user")
+    first = _input(*opening)
+
+    def named(*items: tuple[str, str | None], **more: Any) -> list[str]:
+        return driver.foreign_messages([first, _input(*items, **more)])
+
+    # The prompt, then items of the model and outputs of its calls: nothing.
+    assert named(*opening, *round_, *round_) == []
+    assert named(*opening, *round_, said) == []
+    # A word of the client's own after a round, as a plain message or as a
+    # typed one, and another opening than the first request's: each is named.
+    for told in (
+        [*opening, *round_, word],
+        [*opening, *round_, ("message", "user")],
+        [*opening, *round_, ("message", "developer")],
+        [*opening, word, *round_],
+        [opening[0], *round_],
+    ):
+        (problem,) = named(*told)
+        assert problem.startswith("request 2 carries ")
+    (wide,) = driver.foreign_messages([_input(*opening, word)])
+    assert "more than the one system and the one user message" in wide
+    # A request that matched no scripted step is not judged.
+    assert named(*opening, *round_, word, matched=False) == []
+    # The dialect reads the role of an item off the wire, beside its kind.
+    dialect = driver.DeepSeekResponsesDialect()
+    body = {"input": [{"role": "user", "content": "x"}, {"type": "message", "role": "assistant"}]}
+    seen = dialect.parse("POST", dialect.path, {}, json.dumps(body).encode(), credential="x")
+    assert [(item["kind"], item["role"]) for item in seen.evidence["input"]] == [
+        ("user", "user"),
+        ("message", "assistant"),
+    ]
+    assert dialect.foreign_messages([first]) == []
+
+
+# -- broken terminals: a stream without its terminal, a stream that is cut ----------
+
+
+def test_a_stream_without_its_terminal_and_a_cut_stream_are_what_the_wire_carries() -> None:
+    dialect = driver.DeepSeekResponsesDialect()
+    asked = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
+    text = "an answer that is cut off"
+
+    unended = dialect.render(Malformed(text), asked, "call-1")
+    cut = dialect.render(Drop(text), asked, "call-2")
+    whole = dialect.render(Say(text), asked, "call-2")
+
+    # A stream that ends without its terminal: every event of a plain answer
+    # but the terminal, and the body ends in order. The usage is null until
+    # the terminal, so none is billed; the first events name the model.
+    kinds = [event["type"] for event in unended.body]
+    assert kinds == [event["type"] for event in whole.body][:-1]
+    assert not set(kinds) & set(adapter._TERMINAL_TYPES)
+    assert unended.envelope == f"deepseek_responses/deepseek.{driver.MALFORMED}"
+    assert (unended.status, unended.usage, unended.served_model, unended.cut) == (
+        200,
+        None,
+        "asked",
+        None,
+    )
+    assert all(event.get("response", {}).get("usage") is None for event in unended.body)
+    assert unended.raw == driver.server_sent_events(unended.body)
+    # A stream that is cut: the bytes of a plain answer, of which the events
+    # up to the text delta arrive whole and the event after it is cut. The
+    # terminal never arrives: nothing is billed, the model is named.
+    assert cut.envelope == "deepseek_responses/deepseek.completion"
+    assert (cut.status, cut.usage, cut.served_model) == (200, None, "asked")
+    assert cut.raw is not None and cut.cut is not None and 0 < cut.cut < len(cut.raw)
+    arrived = cut.raw[: cut.cut].split(b"\n\n")
+    events = [json.loads(frame.split(b"data: ", 1)[1]) for frame in arrived[:-1]]
+    assert events[-1]["type"] == "response.output_text.delta" and events[-1]["delta"] == text
+    assert not {event["type"] for event in events} & set(adapter._TERMINAL_TYPES)
+    assert arrived[-1].startswith(b"event: ") and b"response.completed" not in cut.raw[: cut.cut]
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(arrived[-1].split(b"data: ", 1)[1])
+    with pytest.raises(MatrixSetupError, match="inside its body only"):
+        dialect.render(Drop(text, after="headers"), asked, "call-3")
+
+
+class _AnswersWhole(driver.DeepSeekResponsesDialect):
+    """Renders a broken terminal as a plain answer: the stream ends on its terminal."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, (Malformed, Drop)):
+            step = Say(step.text)
+        return super().render(step, seen, call_id)
+
+
+@pytest.mark.parametrize("scenario", ["S26", "S27"])
+def test_a_stream_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
+    scenario: str, tmp_path: Path, played: Callable[[str], runner.Execution]
+) -> None:
+    cell = Cell(COLUMN, scenario, "raw")
+    entry = LEDGER.entry(cell.id)
+    wide = {scope.code for scope in LEDGER.column_wide if scope.kind == DEEPSEEK_KIND}
+    honest = played(scenario)
+    provider, result = honest.observation.provider, honest.observation.result
+
+    # The honest cell shows what the ledger expects of it, its entry or
+    # nothing, beside what the column owes on every cell, ...
+    assert honest.report.seam_problems == ()
+    assert honest.report.codes == (set() if entry is None else set(entry.codes)) | wide
+    # ... from one request, answered with the stream the scenario scripts:
+    # the events of a plain answer before the terminal, or the stream of a
+    # plain answer that is cut. The events that arrived named the model and
+    # stated no usage ...
+    assert (provider.request_count, provider.extra, provider.unconsumed) == (1, 0, 0)
+    behaviour = driver.MALFORMED if scenario == "S26" else "completion"
+    assert provider.envelopes == [f"deepseek_responses/deepseek.{behaviour}"]
+    assert (provider.billed, provider.served_models) == ([], [honest.reference.model])
+    # ... and for the cause the scenario scripts, as far as a result can
+    # show one. The codes of an entry here are those of any result the
+    # adapter builds from a failure of its worker, whatever failed. Of this
+    # one the adapter says, in the error and in the terminal of the trace,
+    # that the worker failed the qualification of what it read. It does not
+    # say why, so the stream the one request was answered with is what
+    # tells the two cells apart, and a call that ended in another branch of
+    # the adapter fails here by name.
+    assert result is not None and result.error is not None
+    assert type(result.error).__name__ == "TransportError" and not result.error.retriable
+    assert (
+        str(result.error.message)
+        == "DeepSeek worker qualification failed with DeepSeekSDKQualificationError"
+    )
+    trace = result.execution_trace
+    assert trace is not None
+    assert [(event.kind, event.name) for event in trace.events][-1] == (
+        "terminal",
+        "worker_qualification_error",
+    )
+
+    # The lying counterpart. The entry of the cell is strict: a provider
+    # side whose stream ends on its terminal yields a clean finish where the
+    # scenario expects the transport error of a turn without its terminal,
+    # and the cell fails as a different deviation instead of staying an
+    # expected failure.
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation") as refused:
+        runner.run_cell(
+            cell,
+            tmp_path,
+            preflight={DEEPSEEK_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_AnswersWhole),
+        )
+    assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
 
 
 # -- the module ends with the canary check --------------------------------------------

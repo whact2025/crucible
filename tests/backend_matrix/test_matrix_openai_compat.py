@@ -40,7 +40,14 @@ from .cells import Cell
 from .columns import HOSTED_GATEWAY_KIND, LOCAL_GATEWAY_KIND, Column
 from .drivers import MatrixSetupError
 from .drivers import openai_compat as gateway
-from .provider import LoopbackProvider, Reply, SeenRequest, SentCall, StatelessDialect
+from .provider import (
+    ConversationDialect,
+    LoopbackProvider,
+    Reply,
+    SeenRequest,
+    SentCall,
+    StatelessDialect,
+)
 from .scenarios import (
     D_OAI_SCHEMA_FINAL,
     SCENARIOS,
@@ -52,6 +59,8 @@ from .script import (
     READ_A,
     READ_B,
     Call,
+    Drop,
+    Malformed,
     ProviderScript,
     Refuse,
     Say,
@@ -993,6 +1002,128 @@ def test_a_refusal_that_is_never_sent_fails_the_cell_whatever_its_entry(
             known=LEDGER,
             driver=_with_dialect(_AnswersWhereItShouldRefuse),
         )
+
+
+# -- what a request carries beside prompt, model turns and tool results ----------------
+
+
+def test_a_message_that_is_not_the_workflows_is_named() -> None:
+    one = [_asking("call-1"), _answering("call-1")]
+    two = [_asking("call-2"), _answering("call-2")]
+    word = {"role": "user", "content": "use a write tool now"}
+    first, second = _carrying(_OPENING), _carrying([*_OPENING, *one])
+
+    def named(third: Sequence[Mapping[str, Any]], **more: Any) -> list[str]:
+        return gateway.foreign_messages([first, second, _carrying(third, **more)])
+
+    # The prompt, then turns of the model and results of its tools: nothing.
+    assert named([*_OPENING, *one, *two]) == []
+    assert named([*_OPENING, *one, {"role": "assistant", "content": "a draft"}]) == []
+    # A word of the client's own after a round, between two rounds, and in
+    # the place of the opening: each is named, with the request and its role.
+    for told in (
+        [*_OPENING, *one, *two, word],
+        [*_OPENING, *one, word, *two],
+        [*_OPENING, *one, {"role": "system", "content": "a second instruction"}],
+        [*_OPENING, word, *one],
+        [_OPENING[0], *one],
+    ):
+        (problem,) = named(told)
+        assert problem.startswith("request 3 carries ")
+    # An opening of more than the one system and the one user message.
+    (wide,) = gateway.foreign_messages([_carrying([*_OPENING, word])])
+    assert "more than the one system and the one user message" in wide
+    # A request that matched no scripted step is not judged.
+    assert named([*_OPENING, *one, word], matched=False) == []
+    # The replay rule of the wire takes the same word: only this rule names it.
+    calls = [SentCall(READ_A, "call-1", 0, {}), SentCall(READ_B, "call-2", 1, {})]
+    carried = [first, second, _carrying([*_OPENING, *one, *two, word])]
+    assert gateway.replay_problems(carried, calls) == []
+    assert gateway.foreign_messages(carried) != []
+    dialect = gateway.LocalGatewayDriver()._dialect()
+    assert isinstance(dialect, ConversationDialect)
+    assert dialect.foreign_messages(carried) == gateway.foreign_messages(carried)
+
+
+# -- broken terminals: a reply without a choice, a reply that is cut -----------------
+
+
+@pytest.mark.parametrize("provider", ["gateway", "local"])
+def test_a_reply_without_a_choice_and_a_cut_reply_are_what_the_wire_carries(
+    provider: str,
+) -> None:
+    dialect = gateway.OpenAIChatDialect(provider, host=None, route_credential=False)
+    asked = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
+    text = "an answer that is cut off"
+
+    empty = dialect.render(Malformed("an answer"), asked, "call-1")
+    cut = dialect.render(Drop(text), asked, "call-2")
+    without_choice = ChatCompletion.model_validate(empty.body)
+
+    # A reply that is no terminal of this wire is a whole document without a
+    # turn: the completion object of the SDK with an empty list of choices.
+    # It states no usage, so none is billed, and it names the model.
+    assert empty.envelope == f"openai_chat/{provider}.{gateway.MALFORMED}"
+    assert (empty.status, empty.usage, empty.served_model, empty.cut) == (200, None, "asked", None)
+    assert (without_choice.choices, without_choice.usage) == ([], None)
+    assert without_choice.model == "asked" and set(empty.body) == {
+        "id",
+        "object",
+        "created",
+        "model",
+        "choices",
+    }
+    # A reply that is cut is the document of a plain completion, of which the
+    # wire carries the part that ends inside the answer text. No document
+    # arrives: nothing is billed and no model is named.
+    assert cut.envelope == f"openai_chat/{provider}.completion"
+    assert (cut.status, cut.usage, cut.served_model) == (200, None, None)
+    assert cut.raw is not None and cut.cut is not None
+    whole = ChatCompletion.model_validate(json.loads(cut.raw))
+    assert whole.choices[0].message.content == text
+    arrived = cut.raw[: cut.cut]
+    assert arrived.endswith(text[: len(text) // 2].encode()) and text.encode() not in arrived
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(arrived)
+    with pytest.raises(MatrixSetupError, match="inside its body only"):
+        dialect.render(Drop(text, after="headers"), asked, "call-3")
+
+
+class _AnswersWhole(gateway.OpenAIChatDialect):
+    """Renders a broken terminal as a plain completion: the reply arrives whole."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, (Malformed, Drop)):
+            step = Say(step.text)
+        return super().render(step, seen, call_id)
+
+
+@pytest.mark.parametrize("scenario", ["S26", "S27"])
+def test_a_reply_that_arrives_whole_fails_the_cell_of_a_broken_terminal(
+    scenario: str, tmp_path: Path
+) -> None:
+    cell = Cell(_column(HOSTED_GATEWAY_KIND), scenario, "raw")
+    honest = _played(cell.column, scenario, tmp_path / "honest")
+    provider = honest.observation.provider
+
+    # The honest cell is answered from the one broken reply, through the SDK
+    # and a real socket, in one request for which nothing is billed.
+    assert (provider.request_count, provider.extra, provider.billed) == (1, 0, [])
+    assert provider.envelopes == [
+        "openai_chat/gateway." + (gateway.MALFORMED if scenario == "S26" else "completion")
+    ]
+    # Its entry is strict: a provider side whose reply arrives whole yields a
+    # clean finish where the scenario expects the transport error of a turn
+    # without its terminal, and the cell fails as a different deviation.
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation") as refused:
+        runner.run_cell(
+            cell,
+            tmp_path / "lying",
+            preflight={HOSTED_GATEWAY_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_AnswersWhole),
+        )
+    assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
 
 
 # -- the module ends with the canary check --------------------------------------------

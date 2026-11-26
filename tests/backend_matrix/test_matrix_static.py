@@ -17,11 +17,13 @@ import contextlib
 import functools
 import importlib
 import importlib.metadata
+import inspect
 import re
 import sys
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import AbstractSet, Any, Iterator, Mapping, Sequence
 
 import pytest
@@ -31,8 +33,9 @@ import assay
 from assay import BackendFeatureSet
 from crucible.backends import BACKEND_NAMES
 
-from . import cells, contract, declarations, drivers, envelopes, ledger, runner
+from . import cells, contract, declarations, drivers, envelopes, ledger, mutation, runner
 from . import columns as matrix_columns
+from . import conftest as matrix_conftest
 from . import report as matrix_report
 from .columns import REAL_KINDS, TOY_KIND, WORKER_KINDS, Column
 from .contract import Deviation
@@ -1226,6 +1229,9 @@ def test_the_private_names_a_required_proof_replaces_are_listed_beside_the_proof
             cells.PROOF_SEAMS.get(cells.module_of(kind), ())
         )
         assert described["private_seams"] == list(drivers.get(kind).private_seams)
+        # A third list: what the watch of write hosts wraps, named for a
+        # kind once a cell of it that attaches write tools has played.
+        assert set(described["watch_seams"]) <= set(mutation.PRIVATE_SEAMS)
     assert matrix_report.describe_kind(matrix_columns.CLAUDE_KIND)["proof_seams"]
     # The rule sees what it is there for: a proof that replaces private names
     # nobody listed, on a class and through a module alias. A public name and
@@ -1475,6 +1481,43 @@ def test_every_driven_kind_names_its_test_module() -> None:
     assert {test for test, _parametrised in cells.STATIC_TESTS.values()} <= defined
 
 
+def test_the_watch_of_write_hosts_wraps_one_private_name_and_lists_it() -> None:
+    # Beside the drivers and the required proofs, one module of the package
+    # touches a private name of the product: the watch that holds the
+    # processes a cell's writes run in. It imports that one name, lists it,
+    # wraps the constructor, the start and the stop of the class and reads
+    # nothing of a host but two public properties; the host of the toy
+    # carries all of them too. The toy's wire and adapter stay free of it.
+    tree = _tree("mutation.py")
+    private = [
+        f"{node.module}.{alias.name}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and not node.level
+        for alias in node.names
+        if (node.module or "").startswith("crucible")
+    ]
+    product, own = mutation.host_classes()
+
+    assert private == list(mutation.PRIVATE_SEAMS) == [mutation.PRODUCT_HOST]
+    assert f"{product.__module__}.{product.__qualname__}" == mutation.PRODUCT_HOST
+    assert own is toy.WriteHost
+    for host_class in (product, own):
+        deadline = inspect.signature(host_class.__init__).parameters["invocation_deadline"]
+        assert deadline.kind is inspect.Parameter.KEYWORD_ONLY
+        for name in ("pid", "started_write_names"):
+            assert isinstance(inspect.getattr_static(host_class, name), property), name
+        for name in ("start", "stop"):
+            assert inspect.isfunction(inspect.getattr_static(host_class, name)), name
+    # No rule module reaches the watch: the contract holds its data types.
+    for module in _RULE_MODULES:
+        assert "mutation" not in {
+            alias.name
+            for node in ast.walk(_tree(module))
+            if isinstance(node, ast.ImportFrom) and node.level
+            for alias in node.names
+        }, module
+
+
 def test_toy_driver_touches_no_private_product_name() -> None:
     tree = _tree("drivers/toy.py")
     crucible_imports = [
@@ -1578,14 +1621,122 @@ def test_difference_tables_are_total_and_cite_their_fallbacks() -> None:
 
 
 def test_every_scenario_passes_the_complete_base_policy() -> None:
+    # The scenarios that pass another policy, each with the one field it
+    # changes and why. The scenario of the stable writer catalogue is
+    # thirteen provider requests long; a backend that starts a worker for
+    # every request needs most of the base policy's minute for them, and
+    # three times as long where the test shares one hardware thread with
+    # another busy process. The scenario is not about a deadline, so its
+    # deadline is several times the longer figure.
+    exceptions = {"S45": ("timeout_seconds", 600)}
     for scenario in SCENARIOS.values():
         policy = scenario.policy
-        assert (
-            policy.retry_budget,
-            policy.timeout_seconds,
-            policy.on_cancellation,
-            policy.on_max_turns,
-        ) == (1, 60, "convert_to_backend_error", "raise"), scenario.id
+        expected = {
+            "retry_budget": 1,
+            "timeout_seconds": 60,
+            "on_cancellation": "convert_to_backend_error",
+            "on_max_turns": "raise",
+        }
+        if scenario.id in exceptions:
+            name, value = exceptions[scenario.id]
+            assert expected[name] != value
+            expected[name] = value
+        assert {name: getattr(policy, name) for name in expected} == expected, scenario.id
+    assert set(exceptions) <= set(SCENARIOS)
+
+
+class _CollectedItem:
+    """What the collection hook of the package reads and writes of a test item."""
+
+    def __init__(self, module: str, name: str) -> None:
+        self.path = PACKAGE / f"{module}.py"
+        self.name = name
+        self.nodeid = f"{self.path.name}::{name}"
+        self.limits: list[float] = []
+
+    def get_closest_marker(self, _name: str) -> None:
+        return None
+
+    def add_marker(self, marker: Any) -> None:
+        assert marker.name == "timeout" and not marker.kwargs
+        (seconds,) = marker.args
+        self.limits.append(seconds)
+
+
+def test_the_item_of_a_cell_with_a_long_deadline_has_a_limit_above_it(
+    request: pytest.FixtureRequest,
+) -> None:
+    # The suite ends a test after a fixed time. A cell whose scenario passes
+    # an invocation deadline that is not below that time could never be
+    # ended by its deadline: the suite would end the item first, a plain
+    # failure that the verifier refuses for a cell the ledger expects to
+    # fail. The item of such a cell gets a limit of its own at collection,
+    # the deadline and a margin; today those are the cells of the one
+    # scenario that passes another deadline than the base policy's.
+    options = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["pytest"]
+    configured = float(options["ini_options"]["timeout"])
+    long = {
+        name: scenario.policy.timeout_seconds
+        for name, scenario in SCENARIOS.items()
+        if (scenario.policy.timeout_seconds or 0) >= configured
+    }
+
+    def limits(limit: float | None, hook: bool = False) -> dict[str, list[float]]:
+        items = [_CollectedItem(item.module, item.name) for item in cells.expected_items()]
+        items.append(_CollectedItem(cells.STATIC_MODULE, "test_cell[toy/S45/none/raw]"))
+        if hook:
+            matrix_conftest.pytest_collection_modifyitems(request.config, items)
+        else:
+            cells.limit_long_cells(items, PACKAGE, limit)
+        return {item.name: item.limits for item in items if item.limits}
+
+    expected = {
+        f"{cells.BEHAVIOUR_TEST}[{cell.id}]": [long[cell.scenario] + cells.LIMIT_MARGIN_SECONDS]
+        for cell in cells.behaviour_cells()
+        if cell.scenario in long
+    }
+    assert long == {"S45": 600} and cells.LIMIT_MARGIN_SECONDS >= configured
+    assert len(expected) == len(REAL_KINDS) + len(cells.toy_columns())
+    assert limits(configured) == expected
+    # A deadline below the limit can end its call, and without a limit there
+    # is nothing to exceed: no item is touched. Nor is an item that judges
+    # no cell, or one outside the package.
+    assert limits(600.5) == limits(None) == limits(0.0) == {}
+    outside = _CollectedItem("test_matrix_claude", "test_cell[claude/S45/primary/raw]")
+    outside.path = REPOSITORY / "tests" / outside.path.name
+    cells.limit_long_cells([outside], PACKAGE, configured)
+    assert outside.limits == []
+    # Under a suite limit of a minute the base policy's deadline is not
+    # below it either: then every cell is such a cell, each with its own
+    # deadline and the margin.
+    minute = limits(60.0)
+    assert set(minute) == {f"{cells.BEHAVIOUR_TEST}[{cell.id}]" for cell in cells.behaviour_cells()}
+    assert {name: value for name, value in minute.items() if name in expected} == expected
+    assert {tuple(value) for name, value in minute.items() if name not in expected} == {
+        (60 + cells.LIMIT_MARGIN_SECONDS,)
+    }
+    # The hook of the package applies it with the limit this run is under.
+    assert limits(None, hook=True) == limits(cells.suite_limit(request.config))
+    # The limit is read as the timeout plug-in reads it: the command line,
+    # then the environment, then the configuration file; zero is no limit.
+
+    def configured_with(option: Any, ini: Any) -> SimpleNamespace:
+        def getini(_name: str) -> Any:
+            if isinstance(ini, Exception):
+                raise ini
+            return ini
+
+        return SimpleNamespace(getoption=lambda _name, _default=None: option, getini=getini)
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.delenv("PYTEST_TIMEOUT", raising=False)
+        assert cells.suite_limit(configured_with(300, "120")) == 300.0
+        assert cells.suite_limit(configured_with(None, "120")) == 120.0
+        assert cells.suite_limit(configured_with(0, "120")) is None
+        assert cells.suite_limit(configured_with(None, "")) is None
+        assert cells.suite_limit(configured_with(None, ValueError("unknown"))) is None
+        patched.setenv("PYTEST_TIMEOUT", "45")
+        assert cells.suite_limit(configured_with(None, "120")) == 45.0
 
 
 def test_every_recorded_code_is_in_the_closed_vocabulary() -> None:

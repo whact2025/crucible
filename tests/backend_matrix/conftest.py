@@ -8,6 +8,8 @@
 - every test gets the scripted route environment, the matrix rate card and a
   private home directory;
 - an item with a skip or xfail marker is refused at collection;
+- the test item of a cell whose scenario passes an invocation deadline that is
+  not below the suite's limit for a test gets a limit above that deadline;
 - an expected failure is a failure unless the item is the test item of a
   cell the ledger expects to fail (an entry of its own, or a column-wide gap
   it owes), so a self-test cannot pass by reaching the comparator's verdict;
@@ -53,6 +55,7 @@ def matrix_preflight() -> dict[str, str | None]:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[Any]) -> None:
     cells.refuse_skip_markers(items, _PACKAGE)
+    cells.limit_long_cells(items, _PACKAGE, cells.suite_limit(config))
 
 
 @pytest.hookimpl(hookwrapper=True)

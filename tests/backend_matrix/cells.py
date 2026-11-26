@@ -25,6 +25,7 @@ worker environment.
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
@@ -124,6 +125,9 @@ SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE: tuple[str, ...] = (
     "S10a",
     "S18",
     "S40",
+    "S41",
+    "S44",
+    "S45",
 )
 # Those of them that run in the guarded lens too: where the limit guard
 # replaces the result (known gap R04) of a turn that shows R05.
@@ -142,11 +146,23 @@ DISPATCH_DENIAL_ON_THE_OFFICIAL_CODEX_ROUTE = ledger.cell_id(
 DISPATCH_DENIAL_ON_THE_APP_SERVER_CODEX_ROUTE = ledger.cell_id(
     matrix_columns.CODEX_LEGACY_KIND, "S12", "primary", "raw"
 )
+# The cell of the app-server Codex column whose billed final turn shows no
+# message: where known gap R16 shows.
+EMPTY_FINAL_TURN_ON_THE_APP_SERVER_CODEX_ROUTE = ledger.cell_id(
+    matrix_columns.CODEX_LEGACY_KIND, "S44", "primary", "raw"
+)
 # The cells of the Claude kind that attach a ToolSet with write names and end
-# in a result of the attempt: where known gap R13 shows.
-WRITES_ON_THE_CLAUDE_COLUMNS: tuple[str, ...] = tuple(
-    ledger.cell_id(matrix_columns.CLAUDE_KIND, "S40", role, "raw")
-    for role in ("primary", "secondary")
+# in a result of the attempt: where known gap R13 shows. A scenario of the
+# set that runs on the primary column only has its one cell here.
+WRITES_ON_THE_CLAUDE_COLUMNS: tuple[str, ...] = (
+    *(
+        ledger.cell_id(matrix_columns.CLAUDE_KIND, "S40", role, "raw")
+        for role in ("primary", "secondary")
+    ),
+    *(
+        ledger.cell_id(matrix_columns.CLAUDE_KIND, scenario, "primary", "raw")
+        for scenario in ("S41", "S44", "S45")
+    ),
 )
 # Proofs a module holds beside its cells, which the verifier requires by name:
 # product behaviour that no clause states, so no cell's verdict shows when it
@@ -185,16 +201,22 @@ WRITES_ON_THE_CLAUDE_COLUMNS: tuple[str, ...] = tuple(
 # billed. While its entry stands no clause compares what it reports either,
 # and a result that had lost its usage would show the same two codes: only a
 # proof holds the numbers.
+# On the same route a billed turn whose last model response shows no message
+# ends as a transport error (known gap R16). The two codes of its cell are
+# those of any error that ends the turn after its accounting, a protocol
+# error of another text and a retriable error among them: only a proof
+# shows that the error is not retriable and carries the sentence the client
+# library of the route raises for a turn without a final assistant message.
 # On a write the trace of the Claude adapter binds a tool-authority digest
 # that is not the shared one (known gap R13). The one code of its cells says
-# that the digest differs, not why: only the proof that plays the write of
-# each Claude column shows that the value is the digest of the same tools
+# that the digest differs, not why: only the proof that plays every write
+# cell of the kind shows that the value is the digest of the same tools
 # without a path scope, and that nothing else stands behind the code.
 REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]: tuple(
         "test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope"
-        f"[{kind}/{role}]"
-        for kind, _scenario, role, _lens in map(ledger.parse_cell_id, WRITES_ON_THE_CLAUDE_COLUMNS)
+        f"[{cell}]"
+        for cell in WRITES_ON_THE_CLAUDE_COLUMNS
     ),
     MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND]: (
         "test_the_probe_and_the_request_launch_run_under_the_harness",
@@ -208,6 +230,8 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     ),
     MODULE_BY_KIND[matrix_columns.CODEX_LEGACY_KIND]: (
         "test_the_result_of_a_dispatch_budget_denial_reports_every_response_the_provider_billed",
+        "test_a_billed_turn_that_shows_no_message_ends_in_the_protocol_error_of_the_client"
+        "_and_is_not_retried",
     ),
     MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]: (
         "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
@@ -242,8 +266,9 @@ class RecordProof:
     module: str
     test: str
     # How an item of the test names the cell it plays: one item whatever the
-    # cell (""), one for every scenario, or one for every column.
-    per: Literal["", "scenario", "column"] = ""
+    # cell (""), one for every scenario, one for every column, or one for
+    # every cell.
+    per: Literal["", "scenario", "column", "cell"] = ""
     # The lens of the entries that lean on it; every lens where none is named.
     lens: str | None = None
 
@@ -263,6 +288,8 @@ class RecordProof:
             return f"{self.test}[{scenario}]"
         if self.per == "column":
             return f"{self.test}[{kind}/{role}]"
+        if self.per == "cell":
+            return f"{self.test}[{cell}]"
         return self.test
 
 
@@ -283,7 +310,9 @@ class RecordProof:
 # its twin. The result of a dispatch-budget denial is compared by no clause
 # on either Codex route while its entry stands (R08, R09). The digest code
 # of a write on the Claude columns says that the digest differs, not why
-# (R13).
+# (R13). The two codes of a billed turn without a message on the app-server
+# route say neither that its error is not retriable nor what its text is
+# (R16).
 _CLAUDE_MODULE = MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]
 _APP_SERVER_MODULE = MODULE_BY_KIND[matrix_columns.CODEX_LEGACY_KIND]
 _OFFICIAL_MODULE = MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]
@@ -323,7 +352,14 @@ RECORD_PROOFS: Mapping[str, tuple[RecordProof, ...]] = {
         RecordProof(
             _CLAUDE_MODULE,
             "test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope",
-            per="column",
+            per="cell",
+        ),
+    ),
+    "R16": (
+        RecordProof(
+            _APP_SERVER_MODULE,
+            "test_a_billed_turn_that_shows_no_message_ends_in_the_protocol_error_of_the_client"
+            "_and_is_not_retried",
         ),
     ),
 }
@@ -814,6 +850,57 @@ def refuse_skip_markers(items: Sequence[Any], root: Path) -> None:
             "cannot run is an error and a known gap is a ledger entry:\n  "
             + "\n  ".join(offenders)
         )
+
+
+# How much longer than the invocation deadline of its scenario the test item
+# of a cell may run, where that deadline is not below the suite's limit.
+LIMIT_MARGIN_SECONDS = 120
+
+
+def suite_limit(config: Any) -> float | None:
+    """The time after which the suite ends a test, as the timeout plug-in reads it.
+
+    The command line, then the environment, then the configuration file;
+    ``None`` where none of them states a limit or the plug-in is not loaded.
+    """
+
+    sources = (
+        lambda: config.getoption("timeout", None),
+        lambda: os.environ.get("PYTEST_TIMEOUT"),
+        lambda: config.getini("timeout"),
+    )
+    for read in sources:
+        try:
+            value = read()
+        except ValueError:
+            continue  # the option is not registered: no plug-in, no limit
+        if value not in (None, ""):
+            return float(value) or None
+    return None
+
+
+def limit_long_cells(items: Sequence[Any], root: Path, limit: float | None) -> None:
+    """Give the test item of a cell with a long invocation deadline a limit above it.
+
+    The suite ends every test after ``limit`` seconds. A cell whose scenario
+    passes an invocation deadline that is not below that limit could never be
+    ended by its own deadline: the suite would end the item first, as a
+    plain failure, and the verifier refuses a plain failure of a cell the
+    ledger expects to fail. The item of such a cell is marked with the
+    deadline plus :data:`LIMIT_MARGIN_SECONDS`. No other item is touched.
+    """
+
+    if not limit:
+        return
+    for item in items:
+        path = Path(str(item.path))
+        if root not in path.parents:
+            continue
+        cell = cell_of_item(path.stem, str(item.name))
+        scenario = None if cell is None else SCENARIOS.get(ledger.parse_cell_id(cell)[1])
+        deadline = None if scenario is None else scenario.policy.timeout_seconds
+        if deadline and deadline >= limit:
+            item.add_marker(pytest.mark.timeout(deadline + LIMIT_MARGIN_SECONDS))
 
 
 def world() -> ledger.World:

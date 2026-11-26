@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed chat completion that ends without its terminal, in the dialect
+# of the Moonshot route: the reasoning and the answer arrive, and then the
+# body ends in order, before the finish chunk, the statistics chunk and the
+# closing message of the stream.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: malformed_terminal
+
+provenance:
+  grade: constructed
+  reason: >-
+    The two chunks are the first two of the completion envelope of this
+    dialect, whose shape was observed live and is documented by the vendor
+    (the chunk kinds and their order, the delta keys, the requested model
+    name on every chunk; the usage only in the finish chunk and in the
+    statistics chunk that follow). What is constructed is that the stream
+    ends here: no source read for the route states that it ends a stream
+    in order without a finish reason, without its usage and without the
+    closing message, and none was observed to. No chunk of this envelope
+    states a usage, so the scripted provider bills none for the reply. So
+    this envelope shows what a client makes of a stream that ends before
+    its terminal, not that the route sends one.
+
+status: 200
+body:
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          role: assistant
+          reasoning_content: {slot: reasoning_text}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          content: {slot: text}
+        finish_reason: null

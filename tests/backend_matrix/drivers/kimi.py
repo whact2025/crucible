@@ -76,8 +76,10 @@ from ..provider import (
     SeenRequest,
     SentCall,
     answered_from,
+    cut_after,
+    require_cut_in_body,
 )
-from ..script import Call, ProviderScript, Refuse, Say, ServedAs, Step
+from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
 from ..toolsets import BINDINGS
 from . import openai_compat as chat
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
@@ -190,7 +192,13 @@ class MoonshotChatDialect:
     def envelope_names(self) -> tuple[str, ...]:
         return tuple(
             f"{self.name}/{self.provider}.{behaviour}"
-            for behaviour in ("completion", _TOOL_CALL, *chat.REFUSALS.values())
+            for behaviour in (
+                "completion",
+                _TOOL_CALL,
+                chat.REASONING_ONLY,
+                *chat.REFUSALS.values(),
+                chat.MALFORMED,
+            )
         )
 
     def parse(
@@ -335,6 +343,55 @@ class MoonshotChatDialect:
 
         return replay_problems(requests, calls)
 
+    def foreign_messages(self, requests: Sequence[SeenRequest]) -> list[str]:
+        """What the requests of a call carry beside prompt, model turns and tool results.
+
+        The rule of any chat-completions wire
+        (:func:`.openai_compat.foreign_messages`).
+        """
+
+        return chat.foreign_messages(requests)
+
+    def _dropped(
+        self,
+        step: Drop,
+        envelope: envelope_files.Envelope,
+        slots: dict[str, Any],
+        served: str,
+        call_id: str,
+    ) -> Reply:
+        """The stream of a plain completion, cut after its answer text.
+
+        The chunks that arrive whole name the model, so the reply names it.
+        The usage travels in the chunks that never arrive: none is billed,
+        and the counters of those chunks are fillers.
+        """
+
+        slots.update(
+            response_id=f"chatcmpl-{call_id}",
+            created=_CREATED,
+            served_model=served,
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            reasoning_text=REASONING_TEXT,
+            reasoning_tokens=0,
+        )
+        require_cut_in_body(self.name, step)
+        chunks = envelope.fill(slots)
+        frames = [server_sent_events([chunk]) for chunk in chunks]
+        return Reply(
+            envelope.status,
+            chunks,
+            None,
+            served,
+            None,
+            envelope.name,
+            raw=b"".join(frames),
+            content_type="text/event-stream",
+            cut=cut_after(frames, step.text),
+        )
+
     def cache_counts(self, reply: Reply) -> CacheCounts:
         """The cache counts a reply states, for the provider ledger of a cell.
 
@@ -351,9 +408,36 @@ class MoonshotChatDialect:
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
-        if isinstance(step, Say):
+        if isinstance(step, Malformed):
+            # A stream that ends without its terminal: the reasoning and the
+            # answer arrive, then the body ends in order, before the finish
+            # chunk, the statistics and the closing message. The usage
+            # travels in the chunks that never come, so none is billed.
+            envelope = envelope_files.load(f"{self.name}/{self.provider}.{chat.MALFORMED}")
+            chunks = envelope.fill(
+                {
+                    "response_id": f"chatcmpl-{call_id}",
+                    "created": _CREATED,
+                    "served_model": served,
+                    "reasoning_text": REASONING_TEXT,
+                    "text": step.text,
+                }
+            )
+            return Reply(
+                envelope.status,
+                chunks,
+                None,
+                served,
+                None,
+                envelope.name,
+                raw=server_sent_events(chunks),
+                content_type="text/event-stream",
+            )
+        if isinstance(step, (Say, Drop)):
             behaviour, call = "completion", None
             slots: dict[str, Any] = {"text": step.text}
+        elif isinstance(step, Reason):
+            behaviour, call, slots = chat.REASONING_ONLY, None, {}
         elif isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
@@ -376,6 +460,8 @@ class MoonshotChatDialect:
             # A request the service rejects is answered with its error object
             # alone, no stream: nothing is billed and no model is named.
             return Reply(envelope.status, envelope.fill(slots), envelope=envelope.name)
+        if isinstance(step, Drop):
+            return self._dropped(step, envelope, slots, served, call_id)
         usage = step.usage
         slots.update(
             response_id=f"chatcmpl-{call_id}",
@@ -388,9 +474,14 @@ class MoonshotChatDialect:
         if not isinstance(step, Refuse):
             # A reply that answers or calls a tool reasons first; reasoning
             # is part of the completion tokens the provider bills.
+            # Where the reply shows no text, every one of them is reasoning.
             slots.update(
                 reasoning_text=REASONING_TEXT,
-                reasoning_tokens=usage.output_tokens // 2,
+                reasoning_tokens=(
+                    usage.output_tokens
+                    if isinstance(step, Reason)
+                    else usage.output_tokens // 2
+                ),
             )
         chunks = envelope.fill(slots)
         return Reply(

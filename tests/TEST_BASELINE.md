@@ -115,6 +115,112 @@ carries no code of the gap, whatever the cell shows: the change that enters
 the ruling makes the scenario assert it and takes the field off the record.
 The record of the DeepSeek turn ceiling waits for one.
 
+A cell that attaches write tools holds every process its writes run in.
+For as long as it plays, [a watch](backend_matrix/mutation.py) wraps the
+constructor, the start and the stop of the two classes whose objects host
+writes: the product's shared mutation host, which is a private name of the
+product that the module lists and the cell report names for the kind, and
+the host of the toy adapter. It changes nothing of what a host does and is
+told nothing by an adapter. When `invoke` has returned, and before
+`close()`, the cell reads what each host recorded as started, whether its
+process is still there, and what else it left: the processes that were below
+it when it was stopped and the processes whose parent, process group or
+session it is. That a write ran in the process of the workflow is seen by
+the fixture's recorder, which shadows the dispatch of the innermost ToolSet
+object in the test process. The scenario of a write in a killable host
+asserts on both: the write did not run here, no host outlived the call or
+left a process behind, and the host of the write was built with the deadline
+of the invocation, the moment of the call plus the policy's timeout, within
+half a second for the two readings of the clock. A host that is given a
+timeout of its own from the moment it is built is not bound to it. A write
+that is on disk, that the recorder did not see and that no host recorded is
+an error of the matrix, never a deviation. The sweep does not see a process
+that had left a host's tree, its process group and its session before the
+host was stopped; the children of the test process are the settlement
+clause's, on every cell. The honest toy starts
+[a process of its own](backend_matrix/write_host.py) for the writes of an
+invocation and stops it before the call returns. That process installs the
+network guard before it imports anything of the product and says so before
+it takes a call; a reach beyond loopback ends it.
+
+A write is judged by its effect: by the text the last write of the script
+puts on disk. A scenario that writes more than once replaces the file with a
+longer text each time, with the hash of the text before it, so that every
+write succeeds.
+
+What a writer is offered and told is asserted on every request of one
+scenario: the advertised tools are those of the attached ToolSet, and every
+message is the workflow's prompt, a turn of the model or a tool result. The
+scenario plays every turn of its budget, thirteen requests in thirteen
+turns, so that a change at any point of the budget is seen. Which kind a
+message is, is the wire's to say. The dialect of a wire on which every
+request carries its conversation (the chat-completions wires, the Responses
+wire, the toy wire) names a message of any other kind; a wire that keeps the
+conversation itself (the three session wires) has no such rule, and there
+the tools are what the tool server listed for the session. What a message
+says is read on every wire: the system and the user text of every request
+are those of the first request, and the result a request carries for a call
+is a text the attached ToolSet handed back for that tool. The fixture
+records what the attached object returns as well as what reaches the
+innermost one, because a wrapper of the workflow may add words to a result
+and those are the ToolSet's. The result of a write that ran in a host is
+not read, and neither is the text of a turn of the model that a request
+replays. That scenario
+passes a longer invocation deadline than the base policy, ten minutes, the
+one field a static test admits for it: its thirteen requests take a backend
+that starts a worker for every request most of a minute, and three times as
+long where the test shares one hardware thread with another busy process.
+The scenario is not about a deadline, so the value is several times the
+longer figure and ends only a call that hangs. A deadline that is not below
+the suite's limit for a test could never end its call, because the suite
+would end the test first: the test item of a cell with such a deadline gets
+a limit of its own at collection, the deadline and 120 seconds, and a static
+test holds that rule.
+
+Two scenarios of pack B hold a turn that never reached its terminal. `S26`
+is a reply that is no terminal of its wire. On a wire of one document per
+reply (both gateway kinds) it is an HTTP 200 whose list of choices is empty.
+On a stream it is the frames of a plain answer without the frame that ends
+the turn, after which the stream ends in order: the chunks of the Kimi route
+before the finish chunk, the events of the DeepSeek route before the
+terminal event, the frames of the Claude tool without its terminal frame and
+the notifications of the Codex app-server without the one that ends the
+turn, where the scripted peer then exits with status 0. `S27` is a reply
+that is cut inside the turn, after part of the answer. Whether the text of
+that answer reaches a client is a property of the wire. On a wire of one
+document per reply (both gateway kinds) the scripted provider announces the
+whole document, sends it up to the middle of the answer text and closes the
+socket: no document arrives, and a client that reads documents holds no
+text. On a stream of frames the frame that carries the answer travels whole,
+so the client holds the text, and the frame after it is cut: on the Kimi and
+the DeepSeek route the provider closes the socket inside the next chunk or
+event, and on the two session wires the peer writes the frame of the model
+turn (Claude) or the agent message (Codex), then half of the line that
+follows it, and is killed. The turn frame of the Claude wire states the
+usage of the turn, which the provider therefore bills; on every other wire
+nothing is billed for a reply that is cut. Both scenarios expect a typed
+transport error whose stop reason is none of those a workflow reads as an
+outcome of its own. A scenario can expect a flag false (`flags_false` of its
+expectation): both expect the terminal flag false, `S27` the token and the
+cost flag as well, and a result that flags one of them complete deviates
+with `flag:<name>=True`. In `S26` the two accounting flags go by what the
+provider billed (`flags_false_if_unbilled`), read from the provider ledger
+of the cell and never from the kind. Where no frame that travelled stated a
+usage (the four HTTP columns) nothing was billed and both flags are expected
+false, so a result that flags zero tokens and zero cost complete deviates.
+Where the frames stated the usage (the three reference columns) the flags
+are not asked, and clause C6 judges a claim against the bill. Where an
+accounting flag is expected false, clause C6 holds what the result reports
+as a lower bound that is never above what the provider billed, and asks no
+pricing evidence of it. `S27` also holds that the text which had arrived is
+not the final message of the result, whatever the kind of the result: a
+check that has text to find on the five kinds whose wire is a stream of
+frames and none on the two gateway kinds. The cut is an act of the scripted
+provider or of the peer and no reply shape, so an `S27` cell has the grade
+of the plain completion of its dialect; the envelopes of `S26` on the four
+HTTP columns are `constructed`, because no source states that a provider
+sends such a reply.
+
 Two static cells run on the toy columns only: `P01` (the protocol surface)
 and `P02` (the profile binding). So on a real column no cell asserts that the
 backend instance declares the profile routing computes for its route, or that
@@ -192,10 +298,13 @@ adapter in the two forms the frames of the tool can carry: a model turn whose
 stop reason is the refusal, and the error terminal of a request the provider
 rejected with an HTTP status, with the accounting the tests of the product
 state for that terminal. Every cell that rests on one of these frames
-rests on an emulation of the reference. What the peer does not emulate (the
-budget terminal between two turns) ends the cell as a setup error, never as an
-observation. A known gap on a reference column needs the owner's ruling in its
-ledger entry. A ruling that keeps a gap is always written in the entries of
+rests on an emulation of the reference. Where the script says so the peer
+goes away: it ends its output in order and exits with status 0 without a
+terminal frame, or it is killed inside a line of its output, after the
+frames that had travelled whole. What the peer does not emulate (the budget
+terminal between two turns) ends the cell as a setup error, never as an
+observation. A known gap on a reference column needs the owner's ruling in
+its ledger entry. A ruling that keeps a gap is always written in the entries of
 the gap: on a registry record a ruling is the licence to withdraw a cell of
 that record, and static cell `H03` refuses one that withdraws none. A ruling
 may be a decision panel's under the owner's standing instruction; its text
@@ -213,7 +322,10 @@ reviewed, and the sign-in file is a fake one in a home directory of the cell,
 which the driver makes `HOME` while the backend is open. The peer speaks the
 app-server's JSON-RPC, takes each model response from the scripted provider
 and reaches the ToolSet through the loopback tool server its command line
-names. Its notifications are built to the generated types of the vendor's
+names. A client that reads the thread back, as the pinned client does after
+a turn that completed without a message of the agent, is answered with the
+items of the notifications the peer relayed and with nothing of its own.
+Its notifications are built to the generated types of the vendor's
 official SDK, with one exception that says so: the exact usage of a response,
 which no installed vendor type states and on which the complete accounting of
 the column rests. The usage counters of the thread are emulated, and the type
@@ -303,12 +415,12 @@ lies inside the worker's own environment, because such a program opens its
 sockets where the network guard does not see them: without the stage the
 bundled runtime never starts, and the attempt is a violation.
 
-Four known gaps of the reference columns lean on a proof that the verifier
+Five known gaps of the reference columns lean on a proof that the verifier
 requires by name, because the codes of their cells do not say what the gap
 is, or what its record says of the result. On a write the trace of the
 Claude adapter binds a tool-authority digest
-that is not the shared one: the proof plays the write of both Claude columns
-and shows that the value is the shared digest of the same tools with no path
+that is not the shared one: the proof plays every write cell of the Claude
+kind and shows that the value is the shared digest of the same tools with no path
 scope stated, and that the cell shows no code once the adapter's hash is
 bound to the ToolSet that was attached. The result of a dispatch-budget
 denial on the official Codex route flags its accounting incomplete, which
@@ -317,7 +429,12 @@ usage for responses the provider billed. On the app-server route the result
 of the same denial flags its accounting incomplete too, and reports every
 billed response; a result that had lost its usage would show the same two
 codes, so the proof judges the result as one that claims its accounting
-complete and finds no code about the size of its usage. Where the limit
+complete and finds no code about the size of its usage. On the app-server
+Codex route a billed turn whose last response shows no message ends as a
+transport error; the two codes of its cell are those of any error after the
+accounting, so the proof shows that the error is not retriable and carries
+the sentence the client library of the route raises for a turn without a
+final assistant message. Where the limit
 guard replaces a result of the official route, its two codes do not say what
 the guard missed: a twin of the test that plays both readings of `last`
 shows that the guard misses the token flag alone and that nothing but the
@@ -389,7 +506,9 @@ from: `recorded` from the provider, `documented` by the vendor or a live
 observation, or `constructed` to satisfy the SDK's types. The weakest envelope
 a cell used is its grade. The envelopes of a refusal are `constructed` on
 every dialect: no refusal of a provider was observed or is documented in
-reach, so a gap that a refusal cell shows cannot be closed on them. The
+reach, so a gap that a refusal cell shows cannot be closed on them. So are
+the envelopes of a reply that reasons and shows no text: reasoning content
+was observed beside visible text only. The
 registry record of a gap that is about what a provider sends names the grade
 its cells close on (`closes_on_grade`), and so does, on a reference column,
 the record of a gap that is about what the vendor's tool relays of such a
@@ -490,13 +609,17 @@ its code, except the seam canary, a cell whose own entry shows that the check
 did not run (a raise, a guard rewrite, the cost flagged incomplete) and a
 cell the inventory pins under `column_wide_not_owed` with its reason: a cell
 whose scenario waives the flag that asks for the check (a refusal that is an
-HTTP rejection bills nothing, so it owes no accounting flag), where the cell
-itself does not ask it either. A run
+HTTP rejection bills nothing, so it owes no accounting flag) or expects that
+flag false (a reply that is cut inside the turn, or one that is no terminal
+of its wire and was billed nothing), where the cell itself does not ask it
+either. A run
 that writes a JUnit file also writes
 `matrix-report-<n>.json` beside it: the codes, gaps, declared values, clause
 outcomes and grade of every cell the process judged, and for each kind what
-its driver bypasses and the private names of the product that the driver and
-the required proofs of the kind's module replace. The names a required proof
+its driver bypasses, the private names of the product that the driver and
+the required proofs of the kind's module replace, and the private names
+that the watch of write hosts wrapped where a cell of the kind that attaches
+write tools played. The names a required proof
 replaces are listed beside the proofs (`PROOF_SEAMS`), and a static test
 holds that list to what the proofs replace.
 

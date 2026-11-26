@@ -19,11 +19,15 @@ none. The peer is a program of its own: its journal keeps no value of the
 environment it was started in, and the network guard of the package runs
 inside it.
 
-One test is held by name for the verifier, because no code of its cell shows
-what it holds: the result of a dispatch-budget denial reports every response
-the provider billed. That result flags its accounting incomplete, which the
-ledger carries as a known gap, and while it does no clause compares what it
-reports. The lying counterparts of that test are beside it.
+Two tests are held by name for the verifier, because no code of their cells
+shows what they hold. The result of a dispatch-budget denial reports every
+response the provider billed: that result flags its accounting incomplete,
+which the ledger carries as a known gap, and while it does no clause compares
+what it reports. And a billed final turn that shows no message ends in the
+protocol error the client library of the route raises for it, which the
+adapter types not retriable: its cell shows the two codes of any error that
+ends a turn after its accounting, which the ledger carries as a known gap of
+its own. The lying counterparts of each test are beside it.
 
 Two lying counterparts are shared with the module of the official-SDK column,
 which plays them on its own driver: :class:`LastAsTheTurnSoFar` and
@@ -44,6 +48,7 @@ import dataclasses
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -67,12 +72,25 @@ from .peers import codex_worker as stage
 from .peers import launch, worker_harness
 from .provider import LoopbackProvider, Reply, SeenRequest
 from .scenarios import D_CDX_SERVED, SCENARIOS, SYSTEM, USER
-from .script import READ_A, READ_B, Call, ProviderScript, Refuse, Say, ServedAs, Step
+from .script import (
+    READ_A,
+    READ_B,
+    Call,
+    Drop,
+    Malformed,
+    ProviderScript,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+    TokenUsage,
+)
 
 LEDGER = ledger.load()
 KINDS = (CODEX_LEGACY_KIND,)
 # The envelope of the one refusal the notifications of the app-server carry.
 _REFUSED_TURN = "codex_app_server/app_server.turn_failed_policy"
+_REASONING_ITEM = "codex_app_server/app_server.reasoning"
 CELLS = cells.cells_of(KINDS)
 (COLUMN,) = (column for column in matrix_columns.real_columns() if column.kind in KINDS)
 # The product's loopback tool server logs under its module name.
@@ -444,10 +462,11 @@ def test_tool_calls_travel_to_the_tool_server_of_the_route(tmp_path: Path) -> No
     assert len({request.evidence["turn_id"] for request in requests}) == 1
     assert execution.observation.result is not None
     # Every notification of the cell was rendered from an envelope: all of
-    # them but the terminal of a turn the provider refused.
+    # them but the terminal of a turn the provider refused and the item of a
+    # response that reasons and writes no message.
     assert set(execution.observation.provider.envelopes) == set(
         codex_driver.CodexLegacyDriver().envelopes
-    ) - {_REFUSED_TURN}
+    ) - {_REFUSED_TURN, _REASONING_ITEM}
     assert execution.grade == "constructed"
 
 
@@ -908,6 +927,213 @@ def test_the_proof_of_the_billed_denial_fails_on_a_result_that_lost_its_usage(
     more = dataclasses.replace(usage, input_tokens=usage.input_tokens + 1)
     assert _judged(honest) == honest.report.codes
     assert _judged(honest, usage=more) == honest.report.codes | {"usage.input_tokens:gt"}
+
+
+EMPTY_TURN = cells.EMPTY_FINAL_TURN_ON_THE_APP_SERVER_CODEX_ROUTE
+# The record of the ledger whose cell the proof below plays.
+EMPTY_TURN_GAP = "R16"
+# What the buffered call of the client library of the route raises for a
+# completed turn in which it finds no agent message with text.
+NO_FINAL_MESSAGE = "turn completed but no final assistant message could be resolved"
+# What the proof below holds of a play, by the name it reports for each.
+NOT_RETRIED, SENTENCE, FOUR_FLAGS = "not retriable", "the sentence", "four flags"
+BILLED_USAGE, TWO_REQUESTS, WRITE_ON_DISK = "the usage", "two requests", "the write"
+
+
+def _not_the_billed_turn_without_a_message(execution: runner.Execution) -> list[str]:
+    """What a play lacks of a billed final turn that the client library refused for its text.
+
+    Read from the play alone: the result the call returned, what the provider
+    saw and billed, and the state of the write. Where the adapter first built
+    the result is not in a play and is not read here.
+    """
+
+    observation = execution.observation
+    result = observation.result
+    if result is None or result.error is None:
+        return ["no result with an error"]
+    error, provider = result.error, observation.provider
+    lacking: list[str] = []
+    if error.kind != "transport" or error.retriable is not False:
+        lacking.append(NOT_RETRIED)
+    if NO_FINAL_MESSAGE not in error.message:
+        lacking.append(SENTENCE)
+    if not all(getattr(result.completeness, name) for name in contract.FLAGS):
+        lacking.append(FOUR_FLAGS)
+    billed, total = provider.billed, provider.billed_total()
+    if (
+        len(billed) != 2
+        or not all(item.input_tokens and item.output_tokens for item in billed)
+        or (result.usage.input_tokens, result.usage.output_tokens)
+        != (total.input_tokens, total.output_tokens)
+    ):
+        lacking.append(BILLED_USAGE)
+    if provider.request_count != 2 or provider.extra or provider.unconsumed:
+        lacking.append(TWO_REQUESTS)
+    if observation.write_applied is not True:
+        lacking.append(WRITE_ON_DISK)
+    return lacking
+
+
+def test_a_billed_turn_that_shows_no_message_ends_in_the_protocol_error_of_the_client_and_is_not_retried(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because the two codes of the cell do not show it.
+
+    The turn writes, then its last model response reasons and shows no
+    message, and the provider billed output tokens for it. The adapter waits
+    for the turn with the buffered call of the client library of the route,
+    which raises a protocol error for a completed turn in which it finds no
+    agent message with text; the adapter types that error of the client
+    library a transport error that is not retriable. The scenario asks for a
+    success with an empty final message, so the cell shows two codes: a
+    transport error where none is expected, and the stop reason of an error
+    (known gap R16). Those are the codes of any error that ends the turn
+    after its accounting: a protocol error of another text, and an error
+    the adapter types retriable, show the same two. This test holds what
+    they do not say, from the play alone and with nothing of the product
+    replaced: the error is typed a transport error that is not retriable and
+    carries the sentence of the client library; all four completeness flags
+    are true; the provider billed two responses, each for something, and
+    the result reports their tokens; two requests, none extra and none left
+    unasked; the write is on disk. Of retrying it holds the typing alone:
+    the base policy of the scenarios allows one attempt whatever an error
+    is typed, so an error typed retriable ends after the same two requests
+    and the count of requests does not tell the two apart. Where the
+    adapter first builds that result is in no play, and this test does not
+    hold it. This test and its lying counterparts go with the entry of the
+    cell, and a change of the pinned release of the client library plays
+    the cell and this test before it lands.
+    """
+
+    # The verifier requires this test by name: the entry of the record leans
+    # on it, and a run without it is refused. No entry attributes a code to
+    # that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_LEGACY_KIND]]
+    kind, scenario, role, lens = ledger.parse_cell_id(EMPTY_TURN)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+    attributed = {
+        entry.cell for entry in LEDGER.entries if EMPTY_TURN_GAP in entry.codes.values()
+    }
+    assert attributed <= {EMPTY_TURN}
+
+    execution = _played(scenario, tmp_path, lens)
+
+    assert execution.report.seam_problems == ()
+    assert _not_the_billed_turn_without_a_message(execution) == []
+
+
+def test_the_proof_of_the_billed_turn_without_a_message_fails_on_another_error_and_on_a_lost_fact(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the proof above. Two are plays: the same
+    # turn, with another failure where the client library raises for a turn
+    # without a final assistant message. In one the read-back of the thread
+    # is refused, a protocol error of another text; in the other the
+    # library fails with an error of a class the adapter has no rule for,
+    # which it types retriable. The cell does not see either: both end as a
+    # transport error with the stop reason of an error, after the same two
+    # billed responses and the same write, so the comparator is handed the
+    # same for all three plays and says of the lying ones what it says of
+    # the honest one. The others are the honest play with one thing made up,
+    # for each thing the proof holds: the same error typed retriable; the
+    # text of another protocol error; a flag false; a token, or a response,
+    # more or less on the bill than the result reports; a request more than
+    # scripted, or a step never asked; the write not on disk.
+    from codex_app_server_sdk import (  # noqa: PLC0415 - preflight reports its absence
+        CodexClient,
+        CodexProtocolError,
+    )
+
+    kind, scenario, role, lens = ledger.parse_cell_id(EMPTY_TURN)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+
+    async def refused(self: Any, *, thread_id: str, turn_id: Any) -> Any:
+        raise CodexProtocolError("thread not found", code=-32000)
+
+    async def unknown(self: Any, *, thread_id: str, turn_id: Any) -> Any:
+        raise NotImplementedError("a failure of another kind")
+
+    honest = _played(scenario, tmp_path / "honest", lens)
+    plays: dict[str, runner.Execution] = {}
+    for name, read_back in (("refused", refused), ("unknown", unknown)):
+        with pytest.MonkeyPatch.context() as patched:
+            # A private method of the client library, in this counterpart
+            # only; the proof itself replaces nothing.
+            patched.setattr(CodexClient, "_read_turn_agent_message", read_back)
+            plays[name] = _played(scenario, tmp_path / name, lens)
+    result = honest.observation.result
+    assert result is not None and result.error is not None
+
+    assert honest.report.seam_problems == ()
+    assert honest.report.codes == {"kind:transport!=none", "stop:error!=end_turn"}
+    assert _not_the_billed_turn_without_a_message(honest) == []
+    # The two plays: the cell shows the same, and the proof names each.
+    for lying in plays.values():
+        assert lying.report.seam_problems == () and lying.observation.result is not None
+        assert _handed_to_the_comparator(lying) == _handed_to_the_comparator(honest)
+        assert lying.observation.provider.billed == honest.observation.provider.billed
+    assert _not_the_billed_turn_without_a_message(plays["refused"]) == [SENTENCE]
+    assert _not_the_billed_turn_without_a_message(plays["unknown"]) == [NOT_RETRIED, SENTENCE]
+
+    def with_result(**changed: Any) -> runner.Execution:
+        observation = dataclasses.replace(
+            honest.observation, result=dataclasses.replace(result, **changed)
+        )
+        return dataclasses.replace(honest, observation=observation)
+
+    def with_provider(**changed: Any) -> runner.Execution:
+        provider = dataclasses.replace(honest.observation.provider, **changed)
+        return dataclasses.replace(
+            honest, observation=dataclasses.replace(honest.observation, provider=provider)
+        )
+
+    def lacking(execution: runner.Execution) -> list[str]:
+        return _not_the_billed_turn_without_a_message(execution)
+
+    # The same error typed retriable, or as rejected content; the text of
+    # another protocol error.
+    error = result.error
+    assert lacking(with_result(error=dataclasses.replace(error, retriable=True))) == [NOT_RETRIED]
+    assert lacking(with_result(error=dataclasses.replace(error, kind="content_rejected"))) == [
+        NOT_RETRIED
+    ]
+    other = dataclasses.replace(error, message="CodexProtocolError (code=-32000): thread not found")
+    assert lacking(with_result(error=other)) == [SENTENCE]
+    assert lacking(with_result(error=None)) == ["no result with an error"]
+    # A flag false, each of the four. A result that flags its token usage or
+    # its cost incomplete carries no complete pricing evidence.
+    for name in contract.FLAGS:
+        flags = dataclasses.replace(result.completeness, **{name: False})
+        accounting = name in contract.ACCOUNTING_FLAGS
+        changed = with_result(
+            completeness=flags, **({"pricing_evidence": None} if accounting else {})
+        )
+        assert lacking(changed) == [FOUR_FLAGS], name
+    # The usage: a token short of the bill in the result, or more than the
+    # bill; a response more on the provider's bill, or one response only.
+    usage, billed = result.usage, list(honest.observation.provider.billed)
+    for name in ("input_tokens", "output_tokens"):
+        for step in (-1, 1):
+            off = dataclasses.replace(usage, **{name: getattr(usage, name) + step})
+            assert lacking(with_result(usage=off, pricing_evidence=None)) == [BILLED_USAGE], name
+    assert len(billed) == 2
+    assert lacking(with_provider(billed=[*billed, billed[-1]])) == [BILLED_USAGE]
+    assert lacking(with_provider(billed=billed[:1])) == [BILLED_USAGE]
+    # The requests: one more than scripted, one fewer seen, a step never
+    # asked. The count holds the play to its script. It does not tell an
+    # error that is retriable from one that is not: the base policy allows
+    # one attempt whatever an error is typed, and the play above that ends
+    # in an error typed retriable has the same two requests.
+    requests = list(honest.observation.provider.requests)
+    assert lacking(with_provider(extra=1)) == [TWO_REQUESTS]
+    assert lacking(with_provider(unconsumed=1)) == [TWO_REQUESTS]
+    assert lacking(with_provider(requests=requests[:1])) == [TWO_REQUESTS]
+    assert lacking(with_provider(requests=[*requests, requests[-1]])) == [TWO_REQUESTS]
+    # The write: not on disk, or not judged.
+    for state in (False, None):
+        unwritten = dataclasses.replace(honest.observation, write_applied=state)
+        assert lacking(dataclasses.replace(honest, observation=unwritten)) == [WRITE_ON_DISK], state
 
 
 def presenting_a_served_model(driver: type[Any]) -> Any:
@@ -1584,6 +1810,166 @@ def test_a_locked_interpreter_started_through_asyncio_is_wrapped_and_nothing_els
             assert module.asyncio.matrix_real is asyncio
         assert module.asyncio is view
     assert module.asyncio is asyncio
+
+
+# -- broken terminals: a stream without its terminal, a tool that is gone --------
+
+_GO_AWAY = """
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("peer_under_test", sys.argv[1])
+peer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(peer)
+sys.stdout.buffer.write(b"a whole line\\n")
+status = peer.go_away(peer._Gone(sys.argv[2], sys.argv[3] == "killed"), sys.stdout.buffer)
+sys.stdout.buffer.write(b"written after the tool went away")
+raise SystemExit(status)
+"""
+
+
+def test_a_peer_that_goes_away_ends_its_output_in_order_or_is_killed_inside_a_line() -> None:
+    def gone(partial: str, how: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [sys.executable, "-I", "-c", _GO_AWAY, peer_program.__file__, partial, how],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+    # A tool that is cut off: what it had written of the line arrives without
+    # a line end, and the process is killed where it stands. Nothing of it
+    # runs after that, and its status is that of the signal.
+    cut = gone('{"type": "assistant", "text": "an answ', "killed")
+    assert cut.stdout == b'a whole line\n{"type": "assistant", "text": "an answ'
+    assert cut.returncode == -signal.SIGKILL
+    # A tool whose stream ends without its terminal leaves in order: no line
+    # is cut, and the status it hands back is 0.
+    ended = gone("", "in order")
+    assert ended.stdout.startswith(b"a whole line\n") and ended.returncode == 0
+    assert b'"an answ' not in ended.stdout
+
+
+def test_a_stream_without_its_terminal_and_a_cut_response_are_what_the_tool_sends() -> None:
+    dialect = codex_driver.LegacyDialect(client="a-client/0")
+    asked = dialect.parse("POST", dialect.path, {}, b'{"raw_events": true}', credential="")
+    text = "an answer that is cut off"
+    usage = TokenUsage(7, 3)
+
+    unended = dialect.render(Malformed(text, usage), asked, "call-1")
+    cut = dialect.render(Drop(text), asked, "call-2")
+
+    # A stream that ends without its terminal: the agent message and the
+    # usage notifications of the response, whole, and no notification that
+    # ends the turn; then the tool leaves in order. The usage was stated, so
+    # the provider bills it. The wire names no served model.
+    assert [frame["method"] for frame in unended.body["frames"]] == [
+        "item/completed",
+        RAW_USAGE,
+        THREAD_USAGE,
+    ]
+    assert unended.envelopes == (
+        "codex_app_server/app_server.agent_message",
+        "codex_app_server/app_server.raw_response_completed",
+        "codex_app_server/app_server.token_usage_updated",
+    )
+    assert unended.body["gone"] == {"partial": "", "killed": False}
+    assert (unended.usage, unended.served_model, unended.body["call"]) == (usage, None, None)
+    # A response that is cut: the wire is a stream of notifications, so the
+    # agent message, which carries the answer, travels whole, as the chunk
+    # that carries it does on an HTTP stream, and the client of the tool
+    # holds the text. The line of the notification after it ends in its
+    # middle, and the tool is killed. No usage notification arrives whole,
+    # so nothing is billed.
+    (message,) = cut.body["frames"]
+    assert message["method"] == "item/completed"
+    assert message["params"]["item"] == unended.body["frames"][0]["params"]["item"] | {
+        "id": "msg_call-2"
+    }
+    assert message["params"]["item"]["text"] == text
+    assert cut.body["gone"]["killed"] is True
+    # The reply is answered from the notification that arrives and from the
+    # one that is cut, and from nothing that was never on its way.
+    assert cut.envelopes == unended.envelopes[:2]
+    assert (cut.usage, cut.served_model, cut.body["call"]) == (None, None, None)
+    partial = cut.body["gone"]["partial"]
+    assert partial.startswith(f'{{"method": "{RAW_USAGE}"') and "\n" not in partial
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(partial)
+    # What is cut is the notification that follows the agent message of a
+    # plain answer, in its middle: on a client that asked for no raw events,
+    # the usage notification of the thread.
+    whole = dialect.render(Say(text), asked, "call-2").body["frames"]
+    assert [frame["method"] for frame in whole[:2]] == ["item/completed", RAW_USAGE]
+    assert len(partial) == len(json.dumps(whole[1])) // 2
+    plain = dialect.parse("POST", dialect.path, {}, b"{}", credential="")
+    assert dialect.render(Drop(text), plain, "call-2").body["gone"]["partial"].startswith(
+        f'{{"method": "{THREAD_USAGE}"'
+    )
+    with pytest.raises(MatrixSetupError, match="inside its body only"):
+        dialect.render(Drop(text, after="headers"), asked, "call-3")
+
+
+class AnswersWhole:
+    """A dialect of the app-server that renders a broken terminal as a plain answer.
+
+    It wraps the dialect of a Codex column, so both columns can play the
+    lying counterpart of their broken terminals: the turn ends on the
+    notification that ends it.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, (Malformed, Drop)):
+            step = Say(step.text)
+        return self._inner.render(step, seen, call_id)
+
+
+class _EndsItsTurns(codex_driver.CodexLegacyDriver):
+    def _dialect(self) -> Any:
+        return AnswersWhole(super()._dialect())
+
+
+@pytest.mark.parametrize("scenario", ["S26", "S27"])
+def test_a_turn_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
+    scenario: str, tmp_path: Path
+) -> None:
+    cell = Cell(COLUMN, scenario, "raw")
+    honest = runner.run_cell(cell, tmp_path / "honest", preflight={KINDS[0]: None}, known=LEDGER)
+    provider, result = honest.observation.provider, honest.observation.result
+
+    # The cell passes with no entry: one request for a model response, and a
+    # typed transport error whose terminal the result does not claim. In
+    # both scenarios the agent message arrived whole, with the answer. A
+    # stream that ends without its terminal stated the usage of the
+    # response, which the provider billed; of a response that is cut the
+    # notification after the agent message was on its way when the tool was
+    # killed, and nothing is billed.
+    assert honest.report.codes == frozenset() and LEDGER.entry(cell.id) is None
+    assert (provider.request_count, provider.extra, provider.unconsumed) == (1, 0, 0)
+    message = "codex_app_server/app_server.agent_message"
+    raw = "codex_app_server/app_server.raw_response_completed"
+    usage = "codex_app_server/app_server.token_usage_updated"
+    assert provider.envelopes == ([message, raw, usage] if scenario == "S26" else [message, raw])
+    assert provider.billed == ([Malformed("").usage] if scenario == "S26" else [])
+    assert result is not None and result.error is not None
+    assert (str(result.error.kind), result.completeness.terminal_complete) == ("transport", False)
+    # The lying counterpart: a turn that ends on its terminal notification is
+    # a clean finish where the scenario expects that error, and the cell fails.
+    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation") as refused:
+        runner.run_cell(
+            cell,
+            tmp_path / "lying",
+            preflight={KINDS[0]: None},
+            known=LEDGER,
+            driver=_EndsItsTurns(),
+        )
+    assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
 
 
 # -- the module ends with the canary check ----------------------------------------

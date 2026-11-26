@@ -9,7 +9,8 @@ the variant each governing declared value selected, the declared differences
 in force, the outcome of every clause that applies, the grade of the weakest
 envelope the provider answered from, and what the driver of the kind bypasses,
 with the private names of the product that it and the required proofs of the
-kind's module replace.
+kind's module replace, and the private names that the watch of write hosts
+wraps while a cell of the kind that attaches write tools plays.
 
 One file per pytest process, written beside the JUnit file when the run has
 one (``test-results-3.xml`` gives ``matrix-report-3.json``). JUnit properties
@@ -23,7 +24,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from . import cells, declarations, drivers, ledger
+from . import cells, declarations, drivers, ledger, mutation
 from .contract import Deviation
 from .scenarios import SCENARIOS
 
@@ -37,10 +38,13 @@ NOT_JUDGED = "not_judged"
 
 # What this process has seen, by cell id.
 _CELLS: dict[str, dict[str, Any]] = {}
+# The kinds of which a cell played under the watch of write hosts.
+_WATCHED: set[str] = set()
 
 
 def reset() -> None:
     _CELLS.clear()
+    _WATCHED.clear()
 
 
 def _gaps(known: ledger.Ledger, cell: str, codes: Sequence[str]) -> list[str]:
@@ -62,6 +66,8 @@ def note_cell(execution: Execution, known: ledger.Ledger) -> None:
     """Record what a played behaviour cell showed."""
 
     cell, report = execution.cell, execution.report
+    if execution.watched:
+        _WATCHED.add(cell.column.kind)
     if _CELLS.get(cell.id, {}).get("outcome", NOT_JUDGED) != NOT_JUDGED:
         return  # the cell's own test item was judged; a later replay is not it
     scenario = SCENARIOS[cell.scenario]
@@ -130,7 +136,12 @@ def path_beside(junit: str | Path) -> Path:
 
 
 def describe_kind(kind: str) -> dict[str, Any]:
-    """What the evidence of a driven kind leans on, said once per kind."""
+    """What the evidence of a driven kind leans on, said once per kind.
+
+    ``watch_seams`` are the private names of the product that the watch of
+    write hosts wrapped in the test process: named where a cell of the kind
+    that this process played attaches write tools, and empty otherwise.
+    """
 
     driver = drivers.get(kind)
     return {
@@ -139,6 +150,7 @@ def describe_kind(kind: str) -> dict[str, Any]:
         "bypassed_layers": list(driver.bypassed_layers),
         "private_seams": list(driver.private_seams),
         "proof_seams": list(cells.PROOF_SEAMS.get(cells.module_of(kind), ())),
+        "watch_seams": list(mutation.PRIVATE_SEAMS) if kind in _WATCHED else [],
         "envelopes": list(driver.envelopes),
     }
 

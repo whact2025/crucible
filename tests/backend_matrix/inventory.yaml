@@ -38,15 +38,14 @@
 # column_wide_not_owed: (cell, code) pairs on which a column-wide known gap of
 #   the ledger is not owed for a reason of the cell's definition that the
 #   cell's own entry cannot show: its variant expects no result, or its
-#   scenario waives the flag that asks for the check. Each row states the
-#   reason. The verifier requires the column-wide gap on every other behaviour
-#   cell of the kind whose definition has the clause of its code (lens,
-#   ToolSet), the seam canary excepted, and refuses it on a pinned cell; a
-#   cell whose own entry shows that the check did not run (a raise, a guard
-#   rewrite, the cost flagged incomplete) needs no row. Static cell H03
-#   rejects a row that is listed twice or names a cell that could not owe the
-#   gap. The rows today are all on the refusal that is an HTTP rejection:
-#   nothing is billed there, so the scenario waives the accounting flags.
+#   scenario waives the flag that asks for the check or expects that flag
+#   false. Each row states the reason. The verifier requires the column-wide
+#   gap on every other behaviour cell of the kind whose definition has the
+#   clause of its code (lens, ToolSet), the seam canary excepted, and
+#   refuses it on a pinned cell; a cell whose own entry shows that the check
+#   did not run (a raise, a guard rewrite, the cost flagged incomplete)
+#   needs no row. Static cell H03 rejects a row that is listed twice or
+#   names a cell that could not owe the gap.
 # admission: for each admission cell (S51) of a real column, what the cell
 #   must see today: the word the profile catalogs of both products have for
 #   the column (availability), and for each capability a workflow can ask
@@ -80,28 +79,30 @@
 schema_version: crucible.backend-matrix.inventory.v1
 
 cell_counts:
-  # The starter set and pack A (17 cells) and S51 on each toy column.
-  toy: 72
+  # The starter set and pack A (17 cells) and, of pack B, S26, S27, S41, S44,
+  # S45 and S51 on each toy column.
+  toy: 92
   # Starter set (S00, and S01, S03, S04 in both lenses: 7 cells) and pack A
-  # without the refusal part (9 cells), on each of the two columns; S51 on
-  # the primary column.
-  claude: 33
+  # without the refusal part (9 cells), on each of the two columns; S26, S27,
+  # S41, S44, S45 and S51 on the primary column.
+  claude: 38
   # Starter set (7 cells), pack A with one form of refusal, the policy
-  # error (8 cells), and S51, on the one column.
-  "codex:legacy": 16
+  # error (8 cells), and S26, S27, S41, S44, S45 and S51, on the one column.
+  "codex:legacy": 21
   # Starter set (7 cells), pack A with one form of refusal, the policy
-  # error (8 cells), and S51, on the one column.
-  "codex:official": 16
-  # Starter set (7 cells), pack A (10 cells) and S51 on the one column.
-  deepseek: 18
-  # Starter set and pack A on the two diagnostic columns (17 each) and S51
-  # on the primary one; S00, S01 in both lenses and S51 on the blocked
-  # column.
-  kimi: 39
-  # Starter set (7 cells) and pack A (10 cells) on each column; S51 on the
-  # primary column of each kind.
-  "openai_compat:hosted": 35
-  "openai_compat:local": 18
+  # error (8 cells), and S26, S27, S41, S44, S45 and S51, on the one column.
+  "codex:official": 21
+  # Starter set (7 cells), pack A (10 cells) and S26, S27, S41, S44, S45 and
+  # S51 on the one column.
+  deepseek: 23
+  # Starter set and pack A on the two diagnostic columns (17 each) and S26,
+  # S27, S41, S44, S45 and S51 on the primary one; S00, S01 in both lenses
+  # and S51 on the blocked column.
+  kimi: 44
+  # Starter set (7 cells) and pack A (10 cells) on each column; S26, S27,
+  # S41, S44, S45 and S51 on the primary column of each kind.
+  "openai_compat:hosted": 40
+  "openai_compat:local": 23
 
 not_evaluated:
   - scenario: S00
@@ -231,6 +232,72 @@ column_wide_not_owed:
       so it waives the cost flag, and the adapter flags the cost of the error
       result incomplete: pricing evidence is asked only of a result that
       flags its cost complete.
+  # The two broken terminals (S26, S27) on the kinds that carry a
+  # column-wide accounting code.
+  - cell: kimi/S26/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a reply that is no terminal of its wire. It owes
+      neither accounting flag: where the provider billed nothing for the
+      reply, as on this wire, it expects both false. The check that reports
+      this code is not asked of its result.
+  - cell: kimi/S26/primary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The scenario is a reply that is no terminal of its wire. It owes
+      neither accounting flag: where the provider billed nothing for the
+      reply, as on this wire, it expects both false. The check that reports
+      this code is not asked of its result.
+  - cell: kimi/S27/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a reply that is cut inside the turn, so it expects
+      both accounting flags false: the check that reports this code is not
+      asked of its result.
+  - cell: kimi/S27/primary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The scenario is a reply that is cut inside the turn, so it expects
+      both accounting flags false: the check that reports this code is not
+      asked of its result.
+  - cell: codex:official/S26/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a reply that is no terminal of its wire. It owes
+      neither accounting flag: where the frames that travelled stated the
+      usage, as on this wire, it asks neither. The check that reports this
+      code is not asked of its result.
+  - cell: codex:official/S26/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The scenario is a reply that is no terminal of its wire and does
+      not ask the cost flag, and the adapter flags the cost of the error
+      result incomplete: pricing evidence is asked only of a result that
+      flags its cost complete.
+  - cell: codex:official/S27/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a reply that is cut inside the turn, so it expects
+      both accounting flags false: the check that reports this code is not
+      asked of its result.
+  - cell: codex:official/S27/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The scenario is a reply that is cut inside the turn, so it expects
+      the cost flag false: pricing evidence is asked only of a result that
+      may flag its cost complete.
+  - cell: openai_compat:hosted/S27/primary/raw
+    code: "pricing:none"
+    reason: >-
+      The scenario is a reply that is cut inside the turn, so it expects
+      the cost flag false: pricing evidence is asked only of a result that
+      may flag its cost complete.
+  - cell: openai_compat:local/S27/primary/raw
+    code: "pricing:none"
+    reason: >-
+      The scenario is a reply that is cut inside the turn, so it expects
+      the cost flag false: pricing evidence is asked only of a result that
+      may flag its cost complete.
 
 worker_skip_files: {}
 

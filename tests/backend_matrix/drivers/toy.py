@@ -9,7 +9,9 @@ real loopback socket in a dialect of its own, runs its own tool loop against
 the attached ToolSet, prices usage through pricing discovery and builds its
 results from public assay types. It behaves as its declared profile says, so
 every variant a real column selects has an honest pass before a real driver
-exists.
+exists. A write it does not run itself: it hands each one to a process of its
+own (:class:`WriteHost`), which it starts for the invocation, binds to the
+invocation's deadline and stops before the call returns.
 
 A *liar* is ``HonestBackend`` with one named fault (two faults are the
 driver's: it binds the limit guard to another profile, or builds the adapter
@@ -29,9 +31,13 @@ import http.client
 import json
 import logging
 import math
+import os
+import select
+import signal
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping
@@ -65,10 +71,12 @@ from crucible.backends.tool_authority import (
 from crucible.tools import ToolDispatchBudgetExceeded
 
 from .. import columns as matrix_columns
+from .. import write_host as host_program
 from ..columns import CANARY_CREDENTIAL, TOY_ADAPTER, TOY_KIND, Column
 from ..provider import POLICY_ERROR_CODE, LoopbackProvider, ToyDialect
 from ..scenarios import D_OAI_SCHEMA_FINAL, SCHEMA_KEY
 from ..script import READ_A, READ_B, ProviderScript
+from ..toolsets import WORKSPACE
 from .base import Lens, MatrixSetupError, bind_as_routing, register
 
 # Declared values the toy has a behaviour for. A snapshot value outside this
@@ -168,6 +176,53 @@ BUILT_FOR_OTHER_MODEL = "built_for_other_model"
 REFUSE_WRITER = "refuse_writer"
 REQUEST_AT_BUILD = "request_at_build"
 RETAIN_REJECTED_ROUTE = "retain_rejected_route"
+# Faults on a turn that never reached its terminal (a reply without a turn,
+# a reply that was cut off). One per flag: the result claims the tokens, the
+# cost or the terminal of such a turn. The adapter reads the first turn of a
+# reply that holds none. It names the stop of such a turn a clean finish, or
+# returns the reply without a turn as an empty answer. It puts the text that
+# had arrived before the connection went away into the final message of its
+# error result, or returns that text as the answer. Or it accounts for
+# nothing: a reply that stated no usage is returned with both accounting
+# flags true, zero tokens, zero cost and complete pricing evidence of no
+# response at all, which reconciles that zero.
+CLAIM_TOKENS_OF_A_BROKEN_TURN = "claim_tokens_of_a_broken_turn"
+CLAIM_COST_OF_A_BROKEN_TURN = "claim_cost_of_a_broken_turn"
+CLAIM_TERMINAL_OF_A_BROKEN_TURN = "claim_terminal_of_a_broken_turn"
+READ_FIRST_TURN_OF_NONE = "read_first_turn_of_none"
+BROKEN_TURN_ENDS_END_TURN = "broken_turn_ends_end_turn"
+REPLY_WITHOUT_A_TURN_IS_AN_ANSWER = "reply_without_a_turn_is_an_answer"
+PARTIAL_TEXT_IN_FINAL_MESSAGE = "partial_text_in_final_message"
+PARTIAL_TEXT_IS_THE_ANSWER = "partial_text_is_the_answer"
+ACCOUNT_FOR_NOTHING = "account_for_nothing"
+# Faults of a writer. The write is dispatched in the process of the adapter;
+# the process that hosts the writes is left running when the call returns
+# (and stopped by close()); it is stopped and leaves a process of its own
+# behind; it is built with a deadline far beyond the invocation's; or the
+# adapter takes its time and then gives the host the policy's whole timeout,
+# counted from the moment it builds it. A final turn without visible text is
+# returned as a failure although the provider billed output tokens for it.
+# Only the write tools are advertised: after a third of the turns, after two
+# thirds of them, or on the last turn alone. Or the adapter says something of
+# its own to the model between two rounds: as a note, in the system prompt,
+# or at the end of a tool result.
+WRITE_IN_PROCESS = "write_in_process"
+HOST_OUTLIVES_CALL = "host_outlives_call"
+HOST_LEAVES_A_PROCESS = "host_leaves_a_process"
+HOST_WITHOUT_DEADLINE = "host_without_deadline"
+HOST_WITH_OWN_TIMEOUT = "host_with_own_timeout"
+EMPTY_FINAL_IS_FAILURE = "empty_final_is_failure"
+DROP_READ_TOOLS = "drop_read_tools"
+DROP_READ_TOOLS_LATE = "drop_read_tools_late"
+DROP_READ_TOOLS_ON_LAST_TURN = "drop_read_tools_on_last_turn"
+NOTE_TO_MODEL = "note_to_model"
+NOTE_IN_SYSTEM_PROMPT = "note_in_system_prompt"
+NOTE_IN_TOOL_RESULT = "note_in_tool_result"
+_FAR_BEYOND = 86_400.0
+# How long the adapter of the fault above takes before it builds its host.
+_TAKES_ITS_TIME = 0.8
+# The adapter's own word to the model, wherever a fault puts it.
+_OWN_WORD = "Use one of the write tools now."
 
 
 @dataclass
@@ -184,6 +239,112 @@ class _Run:
     # The calls whose results earlier requests of this invocation carried:
     # the toy wire keeps no conversation, so every request names them again.
     answered: list[str] = field(default_factory=list)
+    # The deadline of the invocation, on the monotonic clock.
+    deadline: float = 0.0
+
+
+class WriteHost:
+    """The toy's own process for the writes of one invocation.
+
+    Built with the deadline of the invocation, started once, handed each
+    write, and stopped by a kill. It keeps the names of the writes it has
+    started. The process runs :mod:`..write_host`, which installs the
+    network guard of the matrix, builds the writer profile of the cell's
+    workspace and says that it is ready; a host that does not say so under
+    the guard is an error of the matrix. ``leaves_a_process`` is the fault of
+    a liar: the process starts another, in a session of its own, which the
+    kill of the host does not reach (:attr:`left` names it for the driver's
+    last resort).
+    """
+
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        invocation_deadline: float,
+        leaves_a_process: bool = False,
+    ) -> None:
+        self._workspace = workspace
+        self._deadline = float(invocation_deadline)
+        self._leaves_a_process = leaves_a_process
+        self._process: subprocess.Popen[bytes] | None = None
+        self._pid: int | None = None
+        self._started: list[str] = []
+        self.left: int | None = None
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
+
+    @property
+    def started_write_names(self) -> tuple[str, ...]:
+        return tuple(self._started)
+
+    def start(self) -> None:
+        self._process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                host_program.__name__,
+                str(self._workspace),
+                host_program.SCOPED,
+                *((host_program.LEAVES_A_PROCESS,) if self._leaves_a_process else ()),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        self._pid = self._process.pid
+        ready = self._answer().get(host_program.READY)
+        said = ready if isinstance(ready, dict) else {}
+        left = said.get(host_program.LEFT)
+        self.left = left if isinstance(left, int) else None
+        if said.get(host_program.GUARDED) is not True:
+            self.stop()
+            raise MatrixSetupError(
+                "the toy's write host did not say that it runs under the network "
+                f"guard of the matrix: it said {ready!r}"
+            )
+
+    def _answer(self) -> dict[str, Any]:
+        """The next line of the host, read before the deadline of the invocation."""
+
+        process = self._process
+        if process is None or process.stdout is None:
+            raise MatrixSetupError("the toy's write host was not started")
+        remaining = max(0.0, self._deadline - time.monotonic())
+        ready, _, _ = select.select([process.stdout], [], [], remaining)
+        line = process.stdout.readline() if ready else b""
+        if not line:
+            self.stop()
+            raise MatrixSetupError(
+                "the toy's write host did not answer before the deadline of its "
+                "invocation, or it ended: the scenario that needs either adds "
+                "the behaviour with its liar"
+            )
+        answer = json.loads(line)
+        return answer if isinstance(answer, dict) else {}
+
+    def dispatch(self, name: str, arguments: Mapping[str, Any]) -> str:
+        process = self._process
+        if process is None or process.stdin is None:
+            raise MatrixSetupError("the toy's write host was not started")
+        self._started.append(name)
+        call = {"name": name, "arguments": dict(arguments)}
+        process.stdin.write(json.dumps(call).encode("utf-8") + b"\n")
+        process.stdin.flush()
+        return str(self._answer()["result"])
+
+    def stop(self) -> None:
+        process, self._process = self._process, None
+        if process is None:
+            return
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                stream.close()
 
 
 class HonestBackend:
@@ -202,6 +363,7 @@ class HonestBackend:
         capability: str,
         log_dir: Path,
         faults: frozenset[str] = frozenset(),
+        workspace: Path | None = None,
     ) -> None:
         self.model = model
         self.capability = capability
@@ -215,6 +377,12 @@ class HonestBackend:
         self._context_budget: int | None = None
         self._children: list[subprocess.Popen[bytes]] = []
         self._listeners: list[socket.socket] = []
+        # Where the fixture of the cell lives, and the process that runs the
+        # writes of the invocation in flight.
+        self._workspace = workspace
+        self._host: WriteHost | None = None
+        # What a stopped host left running (the fault of a liar), for reap().
+        self._left: list[int] = []
         self._calls = 0
         self._closes = 0
         self._closed = False
@@ -251,6 +419,11 @@ class HonestBackend:
     def reap(self) -> None:
         """Stop and close whatever this backend started (the driver's last resort)."""
 
+        self._stop_host()
+        for pid in self._left:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        self._left.clear()
         for child in self._children:
             if child.poll() is None:
                 child.kill()
@@ -262,10 +435,24 @@ class HonestBackend:
 
     # -- wire -----------------------------------------------------------------
 
-    def _tool_names(self) -> list[str]:
+    def _tool_names(self, run: _Run | None = None) -> list[str]:
         if self._toolset is None:
             return []
-        return [str(item["name"]) for item in self._toolset.to_anthropic_tools()]
+        names = [str(item["name"]) for item in self._toolset.to_anthropic_tools()]
+        if run is not None:
+            # ``rounds`` counts the requests already sent: the index of the turn.
+            # From a third of the turns on, from two thirds of them on, or on
+            # the last turn alone, the model is offered the writers only.
+            turns = run.invocation.max_turns
+            writers_only = (
+                (DROP_READ_TOOLS in self._faults and run.rounds >= max(1, (turns + 2) // 3))
+                or (DROP_READ_TOOLS_LATE in self._faults and run.rounds >= (2 * turns) // 3)
+                or (DROP_READ_TOOLS_ON_LAST_TURN in self._faults and run.rounds == turns - 1)
+            )
+            if writers_only:
+                writes = getattr(self._toolset, "write_names", ())
+                names = [name for name in names if name in writes]
+        return names
 
     def _body(
         self,
@@ -316,7 +503,19 @@ class HonestBackend:
         if EMPTY_TOOL_RESULTS in self._faults:
             results = [{"id": item["id"], "text": ""} for item in results]
         answered = [] if FORGET_EARLIER_ROUNDS in self._faults else list(run.answered)
+        # A word of the adapter's own to the model, which no workflow sees:
+        # as a note, at the end of the system prompt, or at the end of every
+        # tool result.
+        if NOTE_IN_SYSTEM_PROMPT in self._faults and run.rounds >= 2:
+            system += "\n\n" + _OWN_WORD
+        if NOTE_IN_TOOL_RESULT in self._faults and run.rounds >= 2:
+            results = [
+                {"id": item["id"], "text": item["text"] + "\n\n" + _OWN_WORD}
+                for item in results
+            ]
         body.update(system=system, tools=tools, tool_results=results, answered=answered)
+        if NOTE_TO_MODEL in self._faults and run.rounds >= 2:
+            body["notes"] = [_OWN_WORD]
         return body
 
     def _post(self, body: Mapping[str, Any], timeout: float) -> tuple[int, dict[str, Any]]:
@@ -357,6 +556,21 @@ class HonestBackend:
     # -- the call -------------------------------------------------------------
 
     def invoke(self, invocation: Invocation) -> InvocationResult:
+        try:
+            return self._invoke(invocation)
+        finally:
+            # The process that ran the writes of the call ends with the call.
+            if HOST_OUTLIVES_CALL not in self._faults:
+                self._stop_host()
+
+    def _stop_host(self) -> None:
+        host, self._host = self._host, None
+        if host is not None:
+            host.stop()
+            if host.left is not None:
+                self._left.append(host.left)
+
+    def _invoke(self, invocation: Invocation) -> InvocationResult:
         if self._closed:
             raise RuntimeError("the toy backend is closed")
         policy = invocation.policy
@@ -402,11 +616,12 @@ class HonestBackend:
             return self._result(run, final="canned answer", stop="end_turn", error=None)
 
         timeout = float(policy.timeout_seconds or 60.0)
+        run.deadline = time.monotonic() + timeout
         results: list[dict[str, str]] = []
         turn = 0
         while True:
             turn += 1
-            reply = self._exchange(run, turn, results, self._tool_names(), timeout)
+            reply = self._exchange(run, turn, results, self._tool_names(run), timeout)
             if isinstance(reply, InvocationResult):
                 return reply
             if reply["type"] != "tool_calls":
@@ -468,6 +683,9 @@ class HonestBackend:
             if GET_BEFORE_TURN in self._faults:
                 self._send("GET", "/toy/v1/models", None, timeout)
             status, reply = self._post(body, timeout)
+        except (http.client.HTTPException, ConnectionError) as exc:
+            # The connection went away inside the reply.
+            return self._dropped(run, bytes(getattr(exc, "partial", b"")))
         except OSError as exc:
             run.usage_known = False
             return self._result(
@@ -511,6 +729,14 @@ class HonestBackend:
                 ),
             )
         run.served_model = str(reply.get("model", "")) or None
+        if "type" not in reply:
+            # A 200 whose document holds no turn.
+            if READ_FIRST_TURN_OF_NONE in self._faults:
+                turns: list[dict[str, Any]] = []
+                return turns[0]
+            if REPLY_WITHOUT_A_TURN_IS_AN_ANSWER in self._faults:
+                return self._result(run, final="", stop="end_turn", error=None)
+            return self._broken(run, "the reply of the provider holds no turn")
         usage = reply.get("usage", {})
         tokens_in, tokens_out = int(usage["input_tokens"]), int(usage["output_tokens"])
         cost = pricing_for_model(self.model).compute_cost(
@@ -524,6 +750,33 @@ class HonestBackend:
         if reply["type"] == "message" and reply.get("finish") == "content_filter":
             return self._refusal(run, "content_filter")
         return reply
+
+    def _broken(self, run: _Run, message: str, *, final: str = "") -> InvocationResult:
+        """The typed result of a turn that never reached its terminal.
+
+        No usage record arrived for it and no terminal: the result says so.
+        """
+
+        run.usage_known = False
+        return self._result(
+            run,
+            final=final,
+            stop="end_turn" if BROKEN_TURN_ENDS_END_TURN in self._faults else "error",
+            error=TransportError(message=message, retriable=False),
+            ended=False,
+        )
+
+    def _dropped(self, run: _Run, arrived: bytes) -> InvocationResult:
+        """The connection went away inside the reply; ``arrived`` is what came of it."""
+
+        # What had arrived of the answer: no document, a leading part of one.
+        text = arrived.decode("utf-8", errors="ignore").partition('"text": "')[2]
+        if PARTIAL_TEXT_IS_THE_ANSWER in self._faults:
+            return self._result(run, final=text, stop="end_turn", error=None)
+        kept = text if PARTIAL_TEXT_IN_FINAL_MESSAGE in self._faults else ""
+        return self._broken(
+            run, "the connection went away inside the reply of the provider", final=kept
+        )
 
     def _refusal(self, run: _Run, stop: str) -> InvocationResult:
         if REFUSAL_AS_TRANSPORT in self._faults:
@@ -545,6 +798,15 @@ class HonestBackend:
         invocation = run.invocation
         if DISPATCH_UNATTACHED in self._faults and self._toolset is not None:
             self._toolset.dispatch(_UNATTACHED_TOOL, {})
+        if EMPTY_FINAL_IS_FAILURE in self._faults and not text:
+            # Whatever the provider billed for the turn: no visible text is
+            # taken for a stalled completion.
+            return self._result(
+                run,
+                final="",
+                stop="error",
+                error=TransportError(message="empty completion", retriable=True),
+            )
         if ALTER_TEXT in self._faults:
             text = text.upper()
         if SCHEMA_ANSWER_INVALID in self._faults and invocation.response_schema is not None:
@@ -579,7 +841,7 @@ class HonestBackend:
         partial: str = "",
     ) -> InvocationResult:
         if EXTRA_TOOL_REQUEST in self._faults:
-            self._post(self._body(run, turn + 1, results, self._tool_names()), timeout)
+            self._post(self._body(run, turn + 1, results, self._tool_names(run)), timeout)
         if NO_LIMIT_EVENT not in self._faults:
             run.events.append(("limit", "max_turns"))
         if SUCCESS_AT_TURN_LIMIT in self._faults:
@@ -605,11 +867,13 @@ class HonestBackend:
         )
         if events:
             run.events.append(("tool_call", name))
+        hosted = (
+            name in getattr(self._toolset, "write_names", ())
+            and WRITE_IN_PROCESS not in self._faults
+        )
         try:
-            if WRITE_AROUND_WRAPPER in self._faults and name in self._toolset.write_names:
-                text = self._toolset.isolated_mutation_inner_toolset().dispatch(
-                    name, arguments
-                )
+            if hosted:
+                text = self._hosted_write(run, name, arguments)
             else:
                 text = self._toolset.dispatch(name, arguments)
         except ToolDispatchBudgetExceeded as exc:
@@ -617,6 +881,37 @@ class HonestBackend:
         if events:
             run.events.append(("tool_result", name))
         return self._bounded(run, str(text))
+
+    def _hosted_write(self, run: _Run, name: str, arguments: Mapping[str, Any]) -> str:
+        """Run one write in the host of the invocation, and credit it as progress."""
+
+        if self._host is None:
+            if self._workspace is None:
+                raise MatrixSetupError("the toy backend was built without a workspace")
+            deadline = run.deadline
+            if HOST_WITHOUT_DEADLINE in self._faults:
+                deadline += _FAR_BEYOND
+            if HOST_WITH_OWN_TIMEOUT in self._faults:
+                # The adapter has spent part of the invocation, and the host
+                # gets the whole timeout again: a blocked write outlives the
+                # deadline of the call by what was spent.
+                time.sleep(_TAKES_ITS_TIME)
+                deadline = time.monotonic() + float(
+                    run.invocation.policy.timeout_seconds or 60.0
+                )
+            self._host = WriteHost(
+                self._workspace,
+                invocation_deadline=deadline,
+                leaves_a_process=HOST_LEAVES_A_PROCESS in self._faults,
+            )
+            self._host.start()
+        text = self._host.dispatch(name, arguments)
+        # The wrapper that bounds reads until a write did not see this one:
+        # it is told the result, as it is told of any write that ran elsewhere.
+        credit = getattr(self._toolset, "record_isolated_write_result", None)
+        if callable(credit) and WRITE_AROUND_WRAPPER not in self._faults:
+            credit(text)
+        return text
 
     def _dispatch_budget_stop(
         self, run: _Run, turn: int, exc: Exception
@@ -671,7 +966,7 @@ class HonestBackend:
     # -- result ---------------------------------------------------------------
 
     def _result(
-        self, run: _Run, *, final: str, stop: str, error: Any
+        self, run: _Run, *, final: str, stop: str, error: Any, ended: bool = True
     ) -> InvocationResult:
         faults = self._faults
         events = list(run.events)
@@ -696,6 +991,17 @@ class HonestBackend:
             accounted, evidence = False, None
         if RETRIABLE_ERROR in faults and error is not None:
             error = dataclasses.replace(error, retriable=True)
+        tokens_known = cost_known = accounted
+        if not ended:
+            # A turn that never reached its terminal: a liar claims one of
+            # the three things such a result cannot know.
+            tokens_known = tokens_known or CLAIM_TOKENS_OF_A_BROKEN_TURN in faults
+            cost_known = cost_known or CLAIM_COST_OF_A_BROKEN_TURN in faults
+            ended = CLAIM_TERMINAL_OF_A_BROKEN_TURN in faults
+            if ACCOUNT_FOR_NOTHING in faults:
+                # A complete account of the nothing that arrived.
+                tokens_known = cost_known = True
+                evidence = UsagePricingEvidence(tuple(run.segments), complete=True)
         toolset = self._toolset
         trace = BackendExecutionTrace(
             backend=self.name,
@@ -731,9 +1037,9 @@ class HonestBackend:
             stop_reason=stop,
             error=error,
             completeness=ExecutionCompleteness(
-                token_usage_complete=accounted,
-                cost_complete=accounted,
-                terminal_complete=True,
+                token_usage_complete=tokens_known,
+                cost_complete=cost_known,
+                terminal_complete=ended,
                 trace_complete=True,
             ),
             execution_trace=trace,
@@ -840,6 +1146,7 @@ class ToyDriver:
                 capability=capability,
                 log_dir=log_dir,
                 faults=self.faults,
+                workspace=tmp_path / WORKSPACE,
             )
             role = matrix_columns.ROLE_BY_CAPABILITY[capability]
             route = f"{TOY_KIND}/{column.model} for role {role!r}"
@@ -1209,6 +1516,113 @@ LIARS: tuple[Liar, ...] = (
         rehearses=("G03",),
         composite=True,
     ),
+    # A reply that holds no turn. The adapter reads the first turn of none
+    # and the exception leaves the call; it flags the terminal of the turn
+    # complete; it names the stop a clean finish; or it returns an empty
+    # answer.
+    _liar(
+        "S26",
+        READ_FIRST_TURN_OF_NONE,
+        (f"raise:IndexError{_RAISE}",),
+        ("C1",),
+        rehearses=("G34",),
+    ),
+    _liar("S26", CLAIM_TERMINAL_OF_A_BROKEN_TURN, ("flag:terminal_complete=True",), ("C4",)),
+    # The reply stated no usage and the provider billed nothing for it. One
+    # liar for each accounting flag: the flag returned true, and nothing
+    # else of the result changed. And one that accounts for nothing: both
+    # flags true over zero tokens and zero cost, with evidence that
+    # reconciles the zero, so that what the result reports is what was
+    # billed.
+    _liar(
+        "S26",
+        CLAIM_TOKENS_OF_A_BROKEN_TURN,
+        ("flag:token_usage_complete=True",),
+        ("C6",),
+    ),
+    _liar("S26", CLAIM_COST_OF_A_BROKEN_TURN, ("flag:cost_complete=True",), ("C6",)),
+    _liar(
+        "S26",
+        ACCOUNT_FOR_NOTHING,
+        ("flag:token_usage_complete=True", "flag:cost_complete=True"),
+        ("C6",),
+    ),
+    _liar("S26", BROKEN_TURN_ENDS_END_TURN, ("stop:end_turn!=other",), ("C3",)),
+    _liar(
+        "S26",
+        REPLY_WITHOUT_A_TURN_IS_AN_ANSWER,
+        (
+            "kind:none!=transport",
+            "stop:end_turn!=other",
+            "flag:token_usage_complete=True",
+            "flag:cost_complete=True",
+            "flag:terminal_complete=True",
+        ),
+        ("C2", "C3", "C4", "C6"),
+    ),
+    # A reply that was cut off. One liar for each flag the result is expected
+    # to flag false: the flag returned true, and nothing else of the result
+    # changed.
+    _liar(
+        "S27",
+        CLAIM_TOKENS_OF_A_BROKEN_TURN,
+        ("flag:token_usage_complete=True",),
+        ("C6",),
+    ),
+    _liar("S27", CLAIM_COST_OF_A_BROKEN_TURN, ("flag:cost_complete=True",), ("C6",)),
+    _liar(
+        "S27",
+        CLAIM_TERMINAL_OF_A_BROKEN_TURN,
+        ("flag:terminal_complete=True",),
+        ("C4",),
+        rehearses=("M15",),
+    ),
+    # The text that had arrived is no final message: neither of the error
+    # result, nor as an answer.
+    _liar(
+        "S27",
+        PARTIAL_TEXT_IN_FINAL_MESSAGE,
+        ("text:mismatch",),
+        ("S",),
+        rehearses=("G25",),
+    ),
+    _liar(
+        "S27",
+        PARTIAL_TEXT_IS_THE_ANSWER,
+        (
+            "kind:none!=transport",
+            "stop:end_turn!=other",
+            "flag:token_usage_complete=True",
+            "flag:cost_complete=True",
+            "flag:terminal_complete=True",
+            "text:mismatch",
+        ),
+        ("C2", "C3", "C4", "C6", "S"),
+    ),
+    # A writer: the write runs in the process of the adapter; the process
+    # that ran it is still there when the call has returned; it is gone and a
+    # process it started is not; or it is bound to no deadline of the
+    # invocation, or to a timeout that began when it was built.
+    _liar("S41", WRITE_IN_PROCESS, ("mutation:in_process",), ("S",)),
+    _liar("S41", HOST_OUTLIVES_CALL, ("mutation:host_alive",), ("S",)),
+    _liar("S41", HOST_LEAVES_A_PROCESS, ("mutation:left_behind",), ("S",)),
+    _liar("S41", HOST_WITHOUT_DEADLINE, ("mutation:deadline_unbound",), ("S",)),
+    _liar("S41", HOST_WITH_OWN_TIMEOUT, ("mutation:deadline_unbound",), ("S",)),
+    # A final turn that was billed and shows no text is a finished turn.
+    _liar(
+        "S44",
+        EMPTY_FINAL_IS_FAILURE,
+        ("kind:transport!=none", "stop:error!=end_turn"),
+        ("C2", "C3"),
+    ),
+    # What the model is offered, and what it is told, is the workflow's: at
+    # every turn of the budget, and in the text of every message.
+    _liar("S45", DROP_READ_TOOLS, ("request.content:tools",), ("S",)),
+    _liar("S45", DROP_READ_TOOLS_LATE, ("request.content:tools",), ("S",)),
+    _liar("S45", DROP_READ_TOOLS_ON_LAST_TURN, ("request.content:tools",), ("S",)),
+    _liar("S45", NOTE_TO_MODEL, ("request.content:messages",), ("S",)),
+    _liar("S45", NOTE_IN_SYSTEM_PROMPT, ("request.content:messages",), ("S",)),
+    _liar("S45", NOTE_IN_TOOL_RESULT, ("request.content:messages",), ("S",)),
     # Admission: a capability the column's pin admits is refused, a backend
     # that is only built asks its provider something, and a role is built
     # although the profile of its route does not meet what the role asks.

@@ -19,7 +19,8 @@ on the worker route. Whoever starts the tool then starts this program:
 
 What the peer does on its own is what an app-server owns: it answers the
 requests that open a session (``initialize``, ``thread/start``, a
-``thread/resume`` of the thread it holds, ``turn/start``), connects the tool
+``thread/resume`` of the thread it holds, ``turn/start``) and a
+``thread/read`` of that thread, connects the tool
 servers its command line configures (``mcp_servers.<name>.url``) over
 streamable HTTP, sends each tool call the
 model makes to the server that lists the tool, feeds the result into the next
@@ -30,7 +31,12 @@ of that notification, so what the notification says of one response is the
 provider's statement alone. It emits
 the exact per-response usage notification only to a client that asked for it,
 as the app-server does: ``experimentalApi`` in ``initialize`` and
-``experimentalRawEvents`` in ``thread/start``.
+``experimentalRawEvents`` in ``thread/start``. And it goes away where a reply
+says so (``gone``): after the notifications of the reply it writes the
+leading part of a line the reply names, without a line end, and then either
+ends its output and exits with status 0, as a tool whose stream ends without
+the notification that ends the turn, or kills itself, as a tool that is gone
+in the middle of a response.
 
 The answers that open a session are not envelopes. They are the response
 shapes of the app-server protocol as the vendor's generated types state them
@@ -41,6 +47,14 @@ fields and
 nothing else; the official SDK validates them against those types in every
 cell of its column. Every value in them is taken from the request, generated
 (ids, a timestamp) or a filler that no client reads (the provider label).
+
+The answer to ``thread/read`` is the same ``Thread`` (``ThreadReadResponse``),
+with the turns of the session when the client asks for them: each ``Turn``
+holds the items of the ``item/completed`` notifications the peer relayed in
+it and the status its ``turn/completed`` notification stated. So what a
+client reads back of a thread is what the provider's notifications said of
+it, and nothing the peer made up. A client asks for it after a turn that
+completed without a message of the agent.
 
 Every process appends one record to the journal of the cell: its role, its
 pids, its command line, the names of its environment and whether it saw a
@@ -110,6 +124,31 @@ class _InputClosed(Exception):
 
 class _Unsupported(Exception):
     """The peer was asked for something it does not play."""
+
+
+class _Gone(Exception):
+    """The tool goes away now: its output ends here, in order or cut off."""
+
+    def __init__(self, partial: str, killed: bool) -> None:
+        super().__init__("the scripted tool goes away")
+        self.partial = partial
+        self.killed = killed
+
+
+def go_away(gone: _Gone, stdout: BinaryIO) -> int:
+    """Write what is left of the output and leave; the status of a tool that is not killed.
+
+    A tool that is cut off has written part of a line and no line end, and
+    is killed where it stands: nothing of this process runs after that.
+    """
+
+    stdout.write(gone.partial.encode("utf-8"))
+    stdout.flush()
+    if gone.killed:
+        import signal  # noqa: PLC0415 - only a tool that is cut off needs it
+
+        os.kill(os.getpid(), signal.SIGKILL)
+    return 0
 
 
 def parse_command(argv: list[str]) -> dict[str, Any]:
@@ -366,6 +405,9 @@ class AppServer:
         self._experimental = False
         self._thread: dict[str, Any] | None = None
         self._turn_id = ""
+        # The turns of the thread, as a client reads them back: the items
+        # that were completed in each and the status it ended with.
+        self._turns: list[dict[str, Any]] = []
         self._responses = 0
         self._spent = {"input_tokens": 0, "output_tokens": 0}
 
@@ -473,9 +515,35 @@ class AppServer:
             raise _Unsupported("a turn on a thread this session did not start")
         self._turn_id = str(uuid.uuid4())
         self._responses = 0
+        self._turns.append(
+            {"id": self._turn_id, "items": [], "status": "inProgress", "error": None}
+        )
         return {
             "turn": {"id": self._turn_id, "items": [], "status": "inProgress", "error": None}
         }
+
+    def _read_thread(self, params: dict[str, Any]) -> dict[str, Any]:
+        """A client reads back the thread this session holds."""
+
+        if self._thread is None or params.get("threadId") != self._thread["id"]:
+            raise _Unsupported("the reading of a thread this session did not start")
+        turns = self._turns if params.get("includeTurns") is True else []
+        thread = dict(self._thread["described"]["thread"])
+        thread["turns"] = [{**turn, "items": list(turn["items"])} for turn in turns]
+        return {"thread": thread}
+
+    def _keep(self, frame: dict[str, Any]) -> None:
+        """Keep what a notification of the turn in flight says of the thread."""
+
+        if not self._turns:
+            return
+        params = frame.get("params")
+        params = params if isinstance(params, dict) else {}
+        if frame.get("method") == "item/completed" and isinstance(params.get("item"), dict):
+            self._turns[-1]["items"].append(params["item"])
+        elif frame.get("method") == "turn/completed" and isinstance(params.get("turn"), dict):
+            self._turns[-1]["status"] = params["turn"].get("status")
+            self._turns[-1]["error"] = params["turn"].get("error")
 
     # -- the model side --------------------------------------------------------
 
@@ -571,7 +639,11 @@ class AppServer:
                 raise _Unsupported(str(reply["unsupported"]))
             for frame in reply.get("frames", ()):
                 self._account(frame)
+                self._keep(frame)
                 self._emit(frame)
+            gone = reply.get("gone")
+            if isinstance(gone, dict):
+                raise _Gone(str(gone.get("partial", "")), bool(gone.get("killed")))
             call = reply.get("call")
             if call is None:
                 return
@@ -603,6 +675,8 @@ class AppServer:
                 elif method == "turn/start":
                     self._emit({"id": message["id"], "result": self._start_turn(params)})
                     self._play()
+                elif method == "thread/read":
+                    self._emit({"id": message["id"], "result": self._read_thread(params)})
                 else:
                     self._refuse(message["id"], method)
         except (_InputClosed, BrokenPipeError):
@@ -627,6 +701,8 @@ def main(argv: list[str], config: dict[str, Any]) -> int:
             raise _Unsupported(f"the command line {record['argv'][:3]} ...")
         append_journal(config, {**record, "role": "app_server", "login": login_state()})
         return AppServer(command, config, sys.stdin.buffer, sys.stdout.buffer).run()
+    except _Gone as gone:
+        return go_away(gone, sys.stdout.buffer)
     except _Unsupported as exc:
         append_journal(
             config, {"role": "unsupported", "pid": os.getpid(), "detail": str(exc)}

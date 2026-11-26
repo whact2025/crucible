@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed response that reasons and completes without an output message:
+# its one output item is the reasoning item, and the output tokens it bills
+# are all reasoning tokens.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: deepseek_responses
+provider: deepseek
+behaviour: reasoning_only
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    the events of the tool-call envelope up to the end of its reasoning item
+    (openai.types.responses ResponseCreatedEvent, ResponseInProgressEvent,
+    ResponseOutputItemAddedEvent, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ResponseOutputItemDoneEvent) and a
+    ResponseCompletedEvent whose response holds that one
+    ResponseReasoningItem as its output
+  sdk_version: openai 2.53.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach: no reply of the
+    Responses route was recorded, and the vendor's guide to that route
+    (primary source, read 2026-11-18) states that a response of a thinking
+    model carries a reasoning item before what follows it and states no
+    response that ends after the reasoning item. The reasoning events are
+    those of the tool-call envelope, with its grounds. Constructed: that a
+    response which shows no text holds no message item at all (and not one
+    with an empty text), that its status is "completed", and that all output
+    tokens are reasoning tokens. The reasoning text is a slot.
+
+status: 200
+body:
+  - type: response.created
+    sequence_number: 0
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.in_progress
+    sequence_number: 1
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.output_item.added
+    sequence_number: 2
+    output_index: 0
+    item:
+      id: {slot: reasoning_item_id}
+      type: reasoning
+      summary: []
+      content: []
+      status: in_progress
+  - type: response.reasoning_text.delta
+    sequence_number: 3
+    item_id: {slot: reasoning_item_id}
+    output_index: 0
+    content_index: 0
+    delta: {slot: reasoning_text}
+  - type: response.reasoning_text.done
+    sequence_number: 4
+    item_id: {slot: reasoning_item_id}
+    output_index: 0
+    content_index: 0
+    text: {slot: reasoning_text}
+  - type: response.output_item.done
+    sequence_number: 5
+    output_index: 0
+    item:
+      id: {slot: reasoning_item_id}
+      type: reasoning
+      summary: []
+      content:
+        - type: reasoning_text
+          text: {slot: reasoning_text}
+      status: completed
+  - type: response.completed
+    sequence_number: 6
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: completed
+      model: {slot: served_model}
+      output:
+        - id: {slot: reasoning_item_id}
+          type: reasoning
+          summary: []
+          content:
+            - type: reasoning_text
+              text: {slot: reasoning_text}
+          status: completed
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage:
+        input_tokens: {slot: input_tokens}
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: {slot: output_tokens}
+        output_tokens_details:
+          reasoning_tokens: {slot: reasoning_tokens}
+        total_tokens: {slot: total_tokens}

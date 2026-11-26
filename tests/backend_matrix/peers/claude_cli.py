@@ -27,7 +27,11 @@ turn carries the frames of the tool's turn terminal, and the peer emits them
 after the tool call of that turn in the place of a further model turn, then
 exits with the status the reply names. It emulates no budget terminal: a
 reply that says ``unsupported`` ends the session with a journal entry, which
-fails the cell as a setup error.
+fails the cell as a setup error. And it goes away where a reply says so
+(``gone``): after the frames of the reply it writes the leading part of a
+line the reply names, without a line end, and then either ends its output and
+exits with status 0, as a tool whose stream ends without its terminal frame,
+or kills itself, as a tool that is gone in the middle of a turn.
 
 Every process appends one record to the journal of the cell: its role, its
 pids, its command line, the names of its environment and whether it saw a
@@ -91,6 +95,31 @@ class _InputClosed(Exception):
 
 class _Unsupported(Exception):
     """The peer was asked for something it does not play."""
+
+
+class _Gone(Exception):
+    """The tool goes away now: its output ends here, in order or cut off."""
+
+    def __init__(self, partial: str, killed: bool) -> None:
+        super().__init__("the scripted tool goes away")
+        self.partial = partial
+        self.killed = killed
+
+
+def go_away(gone: _Gone, stdout: BinaryIO) -> int:
+    """Write what is left of the output and leave; the status of a tool that is not killed.
+
+    A tool that is cut off has written part of a line and no line end, and
+    is killed where it stands: nothing of this process runs after that.
+    """
+
+    stdout.write(gone.partial.encode("utf-8"))
+    stdout.flush()
+    if gone.killed:
+        import signal  # noqa: PLC0415 - only a tool that is cut off needs it
+
+        os.kill(os.getpid(), signal.SIGKILL)
+    return 0
 
 
 def argument(argv: list[str], flag: str) -> str | None:
@@ -422,6 +451,9 @@ class Session:
             for frame in reply.get("frames", ()):
                 self._account(frame)
                 self._emit(frame)
+            gone = reply.get("gone")
+            if isinstance(gone, dict):
+                raise _Gone(str(gone.get("partial", "")), bool(gone.get("killed")))
             call = reply.get("call")
             if call is None:
                 return int(reply.get("exit", 0) or 0)
@@ -476,6 +508,8 @@ def main(argv: list[str], config: dict[str, Any]) -> int:
             raise _Unsupported(f"the command line {record['argv'][:3]} ...")
         append_journal(config, {**record, "role": "session"})
         return Session(argv, config, sys.stdin.buffer, sys.stdout.buffer).run()
+    except _Gone as gone:
+        return go_away(gone, sys.stdout.buffer)
     except _Unsupported as exc:
         append_journal(
             config, {"role": "unsupported", "pid": os.getpid(), "detail": str(exc)}

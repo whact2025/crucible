@@ -63,7 +63,17 @@ from .drivers.base import GUARD_POLICY
 from .peers import launch, worker_harness
 from .provider import CacheCounts, LoopbackProvider, Reply, SeenRequest, SentCall
 from .scenarios import D_COST_BOUND_UNRANKED, SCENARIOS, history_replayed
-from .script import READ_A, Call, ProviderScript, Refuse, Say, ServedAs, Step
+from .script import (
+    READ_A,
+    Call,
+    Drop,
+    Malformed,
+    ProviderScript,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+)
 
 # Every test here runs the locked worker: a missing environment is an error.
 pytestmark = pytest.mark.matrix_worker
@@ -1920,7 +1930,9 @@ def test_every_cell_of_the_columns_is_graded_by_the_envelopes_it_used(
     text, tools = played("S01"), played("S04")
 
     loop = {"moonshot_chat/moonshot.completion", "moonshot_chat/moonshot.tool_call"}
-    refusals = set(DRIVER.envelopes) - loop
+    reasoning = {"moonshot_chat/moonshot.reasoning_only"}
+    unended = f"moonshot_chat/moonshot.{chat.MALFORMED}"
+    refusals = set(DRIVER.envelopes) - loop - reasoning - {unended}
     assert set(text.observation.provider.envelopes) == {"moonshot_chat/moonshot.completion"}
     assert set(tools.observation.provider.envelopes) == loop
     assert set(DRIVER.envelopes) == {
@@ -1935,12 +1947,154 @@ def test_every_cell_of_the_columns_is_graded_by_the_envelopes_it_used(
     # three envelopes of a refusal are built to the types of the pinned SDK.
     assert len(refusals) == 3
     assert {envelopes.load(name).grade for name in refusals} == {"constructed"}
+    # Nor was a reply that reasons and shows no text: every stream of the
+    # live checks held text after its reasoning.
+    assert {envelopes.load(name).grade for name in reasoning} == {"constructed"}
+    # That a stream of the route ends in order before its terminal is stated
+    # by no source either: the envelope of that reply is constructed.
+    assert envelopes.load(unended).grade == "constructed"
     # The schema answer of the planner shape travels in the prompt, once, and
     # in no provider field: what the route declares.
     assert SCENARIOS["S04"].governing == ("structured_output",)
     assert tools.current == {"structured_output": "prompt_only"}
     assert not any(request.schema_field for request in _matched(tools))
     assert not {code for code in tools.report.codes if code.startswith("request.content")}
+
+
+# -- what a request carries beside prompt, model turns and tool results ----------------
+
+
+def test_the_route_names_a_message_of_the_clients_own_as_any_chat_wire_does() -> None:
+    opening = [("system", None, False), ("user", None, False)]
+    asked, answered = ("assistant", ("call-1",), True), ("tool", "call-1", False)
+    first = _request(opening)
+    dialect = driver.MoonshotChatDialect()
+
+    assert dialect.foreign_messages([first, _request([*opening, asked, answered])]) == []
+    told = [first, _request([*opening, asked, answered, ("user", None, False)])]
+    (problem,) = dialect.foreign_messages(told)
+    assert problem.startswith("request 2 carries ") and "['user']" in problem
+    assert dialect.foreign_messages([first, dataclasses.replace(told[1], matched=False)]) == []
+    # The replay rule of the route takes such a message: only this rule names it.
+    assert driver.replay_problems(told, [SentCall(READ_A, "call-1", 0, {})]) == []
+
+
+# -- broken terminals: a stream without its terminal, a stream that is cut ----------
+
+
+def test_a_stream_without_its_terminal_and_a_cut_stream_are_what_the_wire_carries() -> None:
+    dialect = driver.MoonshotChatDialect()
+    asked = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
+    text = "an answer that is cut off"
+
+    unended = dialect.render(Malformed(text), asked, "call-1")
+    cut = dialect.render(Drop(text), asked, "call-1")
+    whole = dialect.render(Say(text), asked, "call-1")
+
+    # A stream that ends without its terminal: the reasoning and the answer
+    # of a plain completion, and the body ends in order before the finish
+    # chunk, the statistics and the closing message. The usage travels in
+    # the chunks that never come, so none is billed; the chunks name the model.
+    assert unended.body == whole.body[:2]
+    assert unended.envelope == f"moonshot_chat/moonshot.{chat.MALFORMED}"
+    assert (unended.status, unended.usage, unended.served_model, unended.cut) == (
+        200,
+        None,
+        "asked",
+        None,
+    )
+    assert unended.raw == driver.server_sent_events(unended.body)
+    for chunk in unended.body:
+        assert "usage" not in chunk and chunk["choices"][0]["finish_reason"] is None
+    assert b"[DONE]" not in (unended.raw or b"")
+    # A stream that is cut: the bytes of a plain completion, of which the
+    # reasoning chunk and the content chunk arrive whole and the chunk after
+    # them is cut. Neither the finish reason nor a usage block arrives.
+    assert cut.envelope == "moonshot_chat/moonshot.completion"
+    assert (cut.status, cut.usage, cut.served_model) == (200, None, "asked")
+    assert cut.raw is not None and cut.cut is not None and 0 < cut.cut < len(cut.raw)
+    arrived = cut.raw[: cut.cut].split(b"\n\n")
+    chunks = [json.loads(frame.removeprefix(b"data: ")) for frame in arrived[:-1]]
+    assert chunks == whole.body[:2] and chunks[-1]["choices"][0]["delta"]["content"] == text
+    assert arrived[-1].startswith(b"data: ") and b"[DONE]" not in cut.raw[: cut.cut]
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(arrived[-1].removeprefix(b"data: "))
+    assert driver.stated_cache_counts(cut.raw[: cut.cut]) == CacheCounts(None, None)
+    with pytest.raises(MatrixSetupError, match="inside its body only"):
+        dialect.render(Drop(text, after="headers"), asked, "call-3")
+
+
+class _AnswersWhole(driver.MoonshotChatDialect):
+    """Renders a broken terminal as a plain answer: the stream ends on its terminal."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, (Malformed, Drop)):
+            step = Say(step.text)
+        return super().render(step, seen, call_id)
+
+
+# What the worker says of each broken stream, in the text of the error the
+# adapter returns: its own check names the closing message that never came,
+# and its HTTP stack names the body that ended short of what was announced.
+_BROKEN_STREAM = {
+    "S26": (chat.MALFORMED, "WorkerQualificationError", "code=missing_done", False),
+    "S27": (
+        "completion",
+        "ChatProviderError",
+        "peer closed connection without sending complete message body",
+        True,
+    ),
+}
+
+
+@pytest.mark.parametrize("scenario", ["S26", "S27"])
+def test_a_stream_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
+    scenario: str, tmp_path: Path, played: Callable[..., runner.Execution]
+) -> None:
+    cell = Cell(PRIMARY, scenario, "raw")
+    entry = LEDGER.entry(cell.id)
+    honest = played(scenario)
+    provider, result = honest.observation.provider, honest.observation.result
+    envelope, raised, cause, retriable = _BROKEN_STREAM[scenario]
+
+    # The honest cell shows what the ledger expects of it, its entry or
+    # nothing, ...
+    assert honest.report.seam_problems == ()
+    assert honest.report.codes == (frozenset() if entry is None else frozenset(entry.codes))
+    assert (provider.request_count, provider.extra, provider.unconsumed) == (1, 0, 0)
+    assert provider.envelopes == [f"moonshot_chat/moonshot.{envelope}"]
+    # ... the chunks that arrived named the model and stated no usage ...
+    assert (provider.billed, provider.served_models) == ([], [honest.reference.model])
+    # ... and it shows it for the cause the scenario scripts. The codes of
+    # an entry here are those of any call whose outcome the adapter builds
+    # from an exception, whatever raised it: an adapter that gave up on its
+    # worker for a reason of its own returns the same codes. The cause is in
+    # the text of the error: the worker read the scripted stream to where
+    # it broke.
+    assert result is not None and result.error is not None
+    assert type(result.error).__name__ == "TransportError"
+    text = str(result.error.message)
+    assert text.startswith(f"{raised}: ") and cause in text, text
+    assert result.error.retriable is retriable, text
+    if scenario == "S27":
+        # The body ended short of the length its headers announced.
+        short = re.search(r"received (\d+) bytes, expected (\d+)", text)
+        assert short is not None and 0 < int(short[1]) < int(short[2]), text
+
+    # The lying counterpart. The entry of the cell is strict: a provider
+    # side whose stream ends on its terminal yields a clean finish where the
+    # scenario expects the transport error of a turn without its terminal,
+    # and the cell fails as a different deviation instead of staying an
+    # expected failure.
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation") as refused:
+        runner.run_cell(
+            cell,
+            tmp_path,
+            preflight={KIMI_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_AnswersWhole),
+        )
+    assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
 
 
 # -- the module ends with the canary check --------------------------------------------

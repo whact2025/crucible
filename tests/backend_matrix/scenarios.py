@@ -28,6 +28,7 @@ Every scenario lands with a lying counterpart on the toy driver
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -35,11 +36,40 @@ from typing import Any, Callable, Mapping, Sequence
 
 from assay import BackendPolicy
 
-from .contract import Check, Deviation, Expectation, Observation, Reference
+from .contract import (
+    ACCOUNTING_FLAGS,
+    EXPECTED_FALSE_FLAGS,
+    READ_STOP_REASONS,
+    Check,
+    Deviation,
+    Expectation,
+    Observation,
+    Reference,
+)
 from .declarations import BASE, FALLBACK, Differences, Variant
 from .drivers.base import LENSES, MatrixSetupError
-from .script import READ_A, READ_B, WRITE, Call, Loop, ProviderScript, Refuse, Say, TokenUsage
-from .toolsets import READ, READ_BOUNDED, WRITER, ToolsetSpec, capability_of
+from .script import (
+    READ_A,
+    READ_B,
+    WRITE,
+    Call,
+    Drop,
+    Loop,
+    Malformed,
+    ProviderScript,
+    Reason,
+    Refuse,
+    Say,
+    TokenUsage,
+)
+from .toolsets import (
+    READ,
+    READ_BOUNDED,
+    WRITE_FILE,
+    WRITER,
+    ToolsetSpec,
+    capability_of,
+)
 
 GUARDED = "guarded"
 STARTER = "starter"
@@ -50,6 +80,10 @@ SETS = (STARTER, PACK_A, PACK_B)
 SYSTEM = "You are the matrix system prompt [canary-system-4f1c]."
 USER = "Answer the matrix user prompt [canary-user-9b2e]."
 TEXT = "matrix final answer"
+# The answer of a turn whose terminal never arrives, and the answer that is
+# on its way when the connection or the peer goes away.
+UNENDED_TEXT = "matrix answer of a turn without its terminal"
+DROPPED_TEXT = "matrix answer that was cut off on its way"
 SCHEMA_KEY = "matrix_answer"
 # The title occurs once in the schema, so it counts renderings of the schema.
 SCHEMA_TITLE = "matrix-schema-7c41"
@@ -69,6 +103,28 @@ CONTEXT_BUDGET = 64
 BUDGET_USD = 0.001
 # A prefix shorter than this inside a replayed result is coincidence, not payload.
 _PAYLOAD_FLOOR = 8
+# The turn count of the scenarios that write. One adapter changes what it
+# offers the model after a third of the turns: a scenario of a few rounds
+# stays below that.
+WRITER_TURNS = 24
+# How often the scenario about the offered tools reads and writes in turn.
+CATALOGUE_ROUNDS = 6
+# The turn count of that scenario: as many turns as its script holds
+# requests, the reads, the writes and the answer. So the scenario plays
+# every turn of its budget, the last one included, and an adapter that
+# changes what it offers or says at any point of the budget is seen.
+CATALOGUE_TURNS = 2 * CATALOGUE_ROUNDS + 1
+# The deadline of that scenario's invocation. Its thirteen requests take a
+# backend that starts a worker for every request most of the base policy's
+# minute, and three times as long where the test shares one hardware thread
+# with another busy process. The scenario is not about a deadline: the value
+# is several times the longer figure, so that it ends a call that hangs and
+# no other.
+CATALOGUE_TIMEOUT_SECONDS = 600
+# How much later than the deadline of the invocation the deadline of a write
+# host may be: the two clocks are read a moment apart. Every backend that
+# hosts writes is within a few milliseconds.
+DEADLINE_SLACK_SECONDS = 0.5
 
 # The base policy. No scenario relies on an adapter default: they differ.
 BASE_POLICY = BackendPolicy(
@@ -566,6 +622,207 @@ def write_is_progress(obs: Observation, _ref: Reference) -> list[Deviation]:
     ]
 
 
+def cut_off_text_withheld(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The text of a reply that was cut off is no final message.
+
+    Whatever the kind of the result: where the connection or the peer went
+    away inside the answer, what had arrived of it is not what the call
+    returns. A leading part of the scripted answer in the final message is
+    that text.
+    """
+
+    assert obs.result is not None
+    if DROPPED_TEXT[:_PAYLOAD_FLOOR] not in obs.result.final_message:
+        return []
+    return [
+        Deviation(
+            "text:mismatch",
+            "final_message carries text of the reply that was cut off before its "
+            "terminal",
+        )
+    ]
+
+
+def write_ran_in_a_host_that_is_gone(obs: Observation, ref: Reference) -> list[Deviation]:
+    """Where the write of the cell ran, and what became of that process.
+
+    A write that the fixture's recorder saw ran in the process of the
+    workflow: the recorder shadows the dispatch of the innermost ToolSet
+    object in this process and nowhere else. A write that it did not see ran
+    in a host, and the cell holds every host that was built while it played:
+    none may still be there once ``invoke`` has returned, none may have left
+    a process behind (one that was below it when it was stopped, or one of
+    its process group or session), and the one that recorded the write must
+    have been built with the deadline of the invocation: the moment of the
+    call plus the policy's timeout, give or take
+    :data:`DEADLINE_SLACK_SECONDS`. A host that is given a timeout of its
+    own, counted from the moment it is built, lets a blocked write outlive
+    the call by what the call had spent before. A write that is on disk, was
+    not seen here and is recorded by no host cannot be judged, which is an
+    error of the matrix and no deviation. A write that is not on disk is the
+    missing dispatch of the clause about tools; nothing is said of its host.
+    """
+
+    if not obs.write_applied:
+        return []
+    name = ref.bindings[ref.write_slot].name
+    if any(item.name == name for item in obs.toolset_log):
+        return [
+            Deviation(
+                "mutation:in_process",
+                f"{name} was dispatched in the process of the workflow: no process "
+                "of its own stands between a blocked write and the deadline of "
+                "the call",
+            )
+        ]
+    mutation = obs.mutation
+    hosts = () if mutation is None else mutation.hosts
+    ran = [host for host in hosts if name in host.started_writes]
+    if mutation is None or not ran:
+        raise MatrixSetupError(
+            f"{name} is on disk, did not run in the process of the workflow and "
+            "no host the matrix watches recorded it as started: the cell cannot "
+            "say where it ran"
+        )
+    out: list[Deviation] = []
+    left = sorted(str(host.pid) for host in hosts if host.alive_at_return)
+    if left:
+        out.append(
+            Deviation(
+                "mutation:host_alive",
+                f"the process(es) {', '.join(left)} that hosted writes of the call "
+                "were still there when invoke had returned",
+            )
+        )
+    behind = sorted({str(pid) for host in hosts for pid in host.left_behind})
+    if behind:
+        out.append(
+            Deviation(
+                "mutation:left_behind",
+                f"the process(es) {', '.join(behind)} that a host of the call had "
+                "started, or that are of its process group or session, were "
+                "still there when invoke had returned",
+            )
+        )
+    own = mutation.invoked_at + mutation.timeout_seconds
+    late = [
+        host.deadline - own
+        for host in ran
+        if host.deadline > own + DEADLINE_SLACK_SECONDS
+    ]
+    if late:
+        out.append(
+            Deviation(
+                "mutation:deadline_unbound",
+                f"the host of the write was built with a deadline {max(late):.1f} s "
+                f"later than the invocation's own ({mutation.timeout_seconds:g} s "
+                "from the call)",
+            )
+        )
+    return out
+
+
+def tools_are_the_attached_ones(obs: Observation, ref: Reference) -> list[Deviation]:
+    """Every scripted request advertises exactly the tools of the attached ToolSet."""
+
+    attached = set(ref.attached_tools)
+    other = [
+        (index + 1, sorted(set(request.tools) ^ attached))
+        for index, request in enumerate(obs.provider.requests)
+        if request.matched and set(request.tools) != attached
+    ]
+    if not other:
+        return []
+    first, differing = other[0]
+    return [
+        Deviation(
+            "request.content:tools",
+            f"{len(other)} of {len(_matched(obs))} request(s) advertise other tools "
+            f"than the attached ToolSet; the first is request {first}, which "
+            f"differs in {differing}",
+        )
+    ]
+
+
+def messages_are_the_workflows(obs: Observation, ref: Reference) -> list[Deviation]:
+    """Every message is the workflow's prompt, a turn of the model or a tool result.
+
+    Three things are read. What kind of message each one is, is the wire's
+    to say: the dialect of a wire that carries the conversation states it
+    and the provider ledger keeps what it found; a wire that keeps the
+    conversation itself has no such rule. The text of the prompt is read on
+    every wire: the system and the user text of every scripted request are
+    those of the first, so that an adapter says nothing of its own there in
+    the middle of a call. And the text of a tool result is read on every
+    wire: what a request carries as the result of a call is a text the
+    attached ToolSet handed back for that tool, with whatever a wrapper of
+    the workflow added and nothing else.
+
+    A write that ran in a host was answered by no ToolSet object of the test
+    process; of the result of a tool that the attached ToolSet never
+    answered here, nothing is said.
+    """
+
+    problems = list(obs.provider.foreign_messages)
+    requests = [
+        (index + 1, request)
+        for index, request in enumerate(obs.provider.requests)
+        if request.matched
+    ]
+    for part in ("system", "user"):
+        changed = [
+            number
+            for number, request in requests
+            if getattr(request, part) != getattr(requests[0][1], part)
+        ]
+        if changed:
+            problems.append(
+                f"the {part} text of {len(changed)} request(s) is not that of the "
+                f"first request of the call; the first is request {changed[0]}"
+            )
+    tool_of = {
+        call.call_id: ref.bindings[call.slot].name
+        for call in obs.provider.sent_calls
+        if call.slot in ref.bindings
+    }
+    handed_back: dict[str, set[str]] = {}
+    for item in obs.toolset_returned:
+        handed_back.setdefault(item.name, set()).add(item.result)
+    for number, request in requests:
+        for call_id, text in request.tool_results:
+            name = tool_of.get(call_id)
+            texts = None if name is None else handed_back.get(name)
+            if texts is not None and text not in texts:
+                problems.append(
+                    f"request {number} carries a result of {name} for {call_id} "
+                    "that is no text the attached ToolSet handed back"
+                )
+    if not problems:
+        return []
+    return [Deviation("request.content:messages", "; ".join(problems))]
+
+
+def _reads_and_writes_in_turn() -> ProviderScript:
+    """Read, write, and again: every write replaces the file with a longer text.
+
+    The write tool replaces an existing file only for the hash of what it
+    replaces, and never by the same text. So each write but the first names
+    the hash of the text before it, and every one of them succeeds.
+    """
+
+    steps: list[Call | Say] = []
+    text, before = "", None
+    for number in range(1, CATALOGUE_ROUNDS + 1):
+        steps.append(Call(READ_A))
+        text += f"line {number} of the matrix writer scenario\n"
+        arguments = {"file_path": WRITE_FILE, "content": text}
+        if before is not None:
+            arguments["expected_sha256"] = hashlib.sha256(before.encode("utf-8")).hexdigest()
+        steps.append(Call(WRITE, arguments))
+        before = text
+    return ProviderScript((*steps, Say(TEXT)))
+
+
 # -- variant transformations ------------------------------------------------
 
 
@@ -728,6 +985,20 @@ _REFUSAL = Expectation(
 )
 # A refusal the provider bills for keeps its usage ("usage kept if reported").
 _BILLED_REFUSAL = replace(_REFUSAL, flags=("token_usage_complete", "cost_complete"))
+
+
+# A turn that never reached its terminal ends as a transport error whose stop
+# reason is none of those a workflow reads as an outcome of its own, and the
+# result says that the terminal is missing: the terminal flag is expected
+# false. No event is asked beyond the one terminal event of a complete trace,
+# and no flag of the error is asserted.
+_BROKEN_TURN = Expectation(
+    kind="transport",
+    stop=(),
+    stop_not=READ_STOP_REASONS,
+    flags=("trace_complete",),
+    flags_false=("terminal_complete",),
+)
 
 
 def _refusal(form: str, letter: str, *, billed: bool) -> Scenario:
@@ -1020,8 +1291,94 @@ _ALL: tuple[Scenario, ...] = (
             expect=replace(CLEAN, dispatch=(READ_A, READ_B, WRITE, READ_A, READ_B)),
             # Six rounds stay below a third of max_turns, where one adapter
             # changes the advertised tools.
-            max_turns=24,
+            max_turns=WRITER_TURNS,
             checks=(write_is_progress, history_replayed),
+        ),
+    ),
+    # -- broken terminals ---------------------------------------------------
+    Scenario(
+        id="S26",
+        set=PACK_B,
+        title="Malformed terminal",
+        toolset=None,
+        lenses=("raw",),
+        # The reply is no terminal of its wire: a complete reply without a
+        # turn, or a stream that ends in order before the frame that ends
+        # the turn. The terminal flag is expected false on every wire. The
+        # two accounting flags go by what the provider billed. On a wire
+        # whose frames state the usage before the terminal it billed the
+        # turn: the flags are not asked and a result may report that usage
+        # and claim it. On a wire whose usage travels with the terminal it
+        # billed nothing: a result that flags either complete deviates.
+        plan=lambda: Plan(
+            ProviderScript((Malformed(UNENDED_TEXT),)),
+            expect=replace(_BROKEN_TURN, flags_false_if_unbilled=ACCOUNTING_FLAGS),
+        ),
+    ),
+    Scenario(
+        id="S27",
+        set=PACK_B,
+        title="Stream dropped mid-turn",
+        toolset=None,
+        lenses=("raw",),
+        # The connection or the peer goes away inside the answer. Nothing
+        # that arrived ends the turn, so the token, the cost and the
+        # terminal flag are each expected false, and the text that had
+        # arrived is no final message. On a stream of frames the frame that
+        # carries the text arrives whole and the client holds the text; on
+        # a wire of one document per reply no document arrives.
+        plan=lambda: Plan(
+            ProviderScript((Drop(DROPPED_TEXT),)),
+            expect=replace(_BROKEN_TURN, flags_false=EXPECTED_FALSE_FLAGS),
+            checks=(cut_off_text_withheld,),
+        ),
+    ),
+    Scenario(
+        id="S41",
+        set=PACK_B,
+        title="Writes run in a killable host",
+        # The fixture of S40; the count plays no part here.
+        toolset=WRITER(2),
+        lenses=("raw",),
+        plan=lambda: Plan(
+            ProviderScript((Call(WRITE), Say(TEXT))),
+            expect=replace(CLEAN, dispatch=(WRITE,)),
+            max_turns=WRITER_TURNS,
+            checks=(write_ran_in_a_host_that_is_gone, history_replayed),
+        ),
+    ),
+    Scenario(
+        id="S44",
+        set=PACK_B,
+        title="Empty final turn after a write",
+        toolset=WRITER(2),
+        lenses=("raw",),
+        plan=lambda: Plan(
+            # The last reply reasons and shows no text. The provider billed
+            # output tokens for it, so it is a finished turn: a completion is
+            # taken for stalled only where nothing was produced at all.
+            ProviderScript((Call(WRITE), Reason())),
+            expect=replace(CLEAN, final_text="", dispatch=(WRITE,)),
+            max_turns=WRITER_TURNS,
+            checks=(history_replayed,),
+        ),
+    ),
+    Scenario(
+        id="S45",
+        set=PACK_B,
+        title="Writer catalogue is stable",
+        # As many reads in a row as the script holds reads are admitted. That
+        # a write is credited as progress is another scenario's assertion;
+        # this one is about what the model is offered and told.
+        toolset=WRITER(CATALOGUE_ROUNDS),
+        lenses=("raw",),
+        policy=replace(BASE_POLICY, timeout_seconds=CATALOGUE_TIMEOUT_SECONDS),
+        plan=lambda: Plan(
+            _reads_and_writes_in_turn(),
+            expect=replace(CLEAN, dispatch=(READ_A, WRITE) * CATALOGUE_ROUNDS),
+            # Thirteen requests in thirteen turns: every turn of the budget.
+            max_turns=CATALOGUE_TURNS,
+            checks=(tools_are_the_attached_ones, messages_are_the_workflows, history_replayed),
         ),
     ),
     Scenario(

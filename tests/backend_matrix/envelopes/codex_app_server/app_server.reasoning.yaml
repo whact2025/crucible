@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The notification of a completed reasoning item: what a model response holds
+# that reasons and writes no message.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: reasoning
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai_codex.generated.v2_all.ItemCompletedNotification whose item is a
+    ReasoningThreadItem (id, summary, content); the pinned
+    codex-app-server-sdk reads the same notification as a step of the kind
+    "thinking"
+  sdk_version: openai-codex 0.144.4, codex-app-server-sdk 0.3.2
+  reason: >-
+    No notification of the vendor's tool was recorded, and no source in reach
+    states what the app-server emits for a response that reasons and writes
+    no message. The notification is the one of a completed agent message
+    with the item replaced by the reasoning item of the generated types,
+    whose summary holds the reasoning text and whose content is empty.
+
+status: 200
+body:
+  method: item/completed
+  params:
+    threadId: {slot: thread_id}
+    turnId: {slot: turn_id}
+    completedAtMs: {slot: created}
+    item:
+      type: reasoning
+      id: {slot: item_id}
+      summary:
+        - {slot: reasoning_text}
+      content: []
