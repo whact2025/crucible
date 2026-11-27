@@ -670,18 +670,25 @@ def write_login(home: Path) -> Path:
 
 
 @contextlib.contextmanager
-def private_home(tmp_path: Path) -> Iterator[Path]:
+def private_home(tmp_path: Path, *, signed_in: bool = True) -> Iterator[Path]:
     """Make a home directory of the cell ``HOME`` for the block, with its sign-in file.
 
     The adapters read the sign-in file from the home directory of the process.
     The driver never writes into the home it finds: it makes a directory of
     the cell the home for as long as a backend is open, and puts back what
     was there. No ambient tool home is in force meanwhile.
+
+    With ``signed_in`` false the home is that of a route without its
+    credential: the directory that should hold the sign-in file is made, and
+    nothing is written into it under the name of that file.
     """
 
     home = tmp_path / "codex-home"
     home.mkdir(parents=True, exist_ok=True)
-    write_login(home)
+    if signed_in:
+        write_login(home)
+    else:
+        (home / ".codex").mkdir(parents=True, exist_ok=True)
     previous = {name: os.environ.get(name) for name in ("HOME", "CODEX_HOME")}
     os.environ["HOME"] = str(home)
     os.environ.pop("CODEX_HOME", None)
@@ -737,6 +744,11 @@ def _native(launcher: Path) -> Iterator[None]:
         yield
     finally:
         adapter._is_native_codex_binary = original
+
+
+# How a routing file says that a route takes its credential from the
+# session of the vendor tool, whose record is the sign-in file.
+_SESSION = "chatgpt_session"
 
 
 @dataclass
@@ -832,6 +844,7 @@ class CodexLegacyDriver:
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
+        without_credential: bool = False,
     ) -> Iterator[_Bound]:
         if column.kind != self.kind:
             raise MatrixSetupError(f"column {column.id} is not of kind {self.kind}")
@@ -839,12 +852,22 @@ class CodexLegacyDriver:
         cwd.mkdir(parents=True, exist_ok=True)
         role = matrix_columns.ROLE_BY_CAPABILITY[capability]
         with contextlib.ExitStack() as stack:
-            stack.enter_context(private_home(tmp_path))
+            # The route takes its credential from the sign-in file of the
+            # vendor tool and reads it at the call. Without it the home of
+            # the cell has the directory of that file and no such file.
+            stack.enter_context(private_home(tmp_path, signed_in=not without_credential))
             dialect = self._dialect()
             provider = stack.enter_context(
                 LoopbackProvider(script, credential=CANARY_CREDENTIAL, dialect=dialect)
             )
             shipped = load_routing(config_path=column.routing_path(COLUMN_PRODUCT))
+            source = shipped.for_role(role).extra.get("credential_source")
+            if without_credential and source != _SESSION:
+                raise MatrixSetupError(
+                    f"column {column.id}: the route of role {role!r} does not name "
+                    "the session of the vendor tool as the source of its credential, "
+                    "so the home of the cell has no sign-in file to leave out"
+                )
             peer = write_peer(
                 tmp_path / "codex-peer",
                 provider=provider.url + dialect.path,

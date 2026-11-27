@@ -51,6 +51,7 @@ from assay import (
     ContentRejected,
     ConversationTransportOutcome,
     ExecutionCompleteness,
+    IncompleteEvidence,
     Invocation,
     InvocationResult,
     MaxTurnsExceeded,
@@ -73,13 +74,20 @@ from crucible.backends.tool_authority import (
 from crucible.tools import ToolDispatchBudgetExceeded
 
 from .. import columns as matrix_columns
+from .. import declarations
 from .. import write_host as host_program
 from ..columns import CANARY_CREDENTIAL, TOY_ADAPTER, TOY_KIND, Column
 from ..provider import POLICY_ERROR_CODE, LoopbackProvider, ToyDialect
-from ..scenarios import D_OAI_SCHEMA_FINAL, SCHEMA_KEY
+from ..scenarios import D_OAI_SCHEMA_FINAL, SCHEMA_KEY, SERVED_MODEL_FIELD
 from ..script import READ_A, READ_B, UNATTACHED, ProviderScript
 from ..toolsets import WORKSPACE
-from .base import Lens, MatrixSetupError, bind_as_routing, register
+from .base import (
+    Lens,
+    MatrixSetupError,
+    bind_as_routing,
+    refuse_the_scripted_credential,
+    register,
+)
 
 # Declared values the toy has a behaviour for. A snapshot value outside this
 # table cannot have an honest pass and is a collection error.
@@ -288,6 +296,24 @@ STALE_HANDLE_STARTS_FRESH = "stale_handle_starts_fresh"
 SERVE_CONVERSATION_UNDECLARED = "serve_conversation_undeclared"
 REFUSE_CONVERSATION_WITH_VALUE_ERROR = "refuse_conversation_with_value_error"
 REFUSE_CONVERSATION_AT_BUILD = "refuse_conversation_at_build"
+# Faults of an adapter whose reply came under another model than it asked
+# for. It observes only, whatever its route says: the call of the reply is
+# dispatched and the turn goes on. It refuses the reply although its route
+# admits a pin on the served model and leaves it out. It flags the cost of
+# the refused reply complete, or its token usage incomplete; or its error
+# names another field than the served model as what is missing.
+OBSERVE_ANOTHER_MODEL = "observe_another_model"
+REFUSE_ANOTHER_MODEL = "refuse_another_model"
+CLAIM_COST_OF_ANOTHER_MODEL = "claim_cost_of_another_model"
+DISOWN_TOKENS_OF_ANOTHER_MODEL = "disown_tokens_of_another_model"
+MISMATCH_NAMES_ANOTHER_FIELD = "mismatch_names_another_field"
+# Faults of an adapter that was built without a credential. It raises out of
+# the call; or it sends its request all the same, under a key of its own
+# that names no credential.
+RAISE_WITHOUT_CREDENTIAL = "raise_without_credential"
+SEND_PLACEHOLDER_KEY = "send_placeholder_key"
+# The key of the second fault: a word that is no credential of any route.
+_PLACEHOLDER_KEY = "no-key"
 _FAR_BEYOND = 86_400.0
 # How long the adapter of the fault above takes before it builds its host.
 _TAKES_ITS_TIME = 0.8
@@ -436,9 +462,14 @@ class HonestBackend:
         log_dir: Path,
         faults: frozenset[str] = frozenset(),
         workspace: Path | None = None,
+        observe_only: bool = False,
     ) -> None:
         self.model = model
         self.capability = capability
+        # Whether the route takes a reply under another model than it asked
+        # for: only a route that admits a pin on the served model and leaves
+        # it out does.
+        self._observe_only = observe_only
         self._profile = profile
         self._endpoint = endpoint
         self._credential = credential
@@ -620,7 +651,9 @@ class HonestBackend:
                 path,
                 body=None if body is None else json.dumps(body).encode("utf-8"),
                 headers={
-                    "Authorization": f"Bearer {self._credential}",
+                    # An adapter that was built without a credential and
+                    # sends a request all the same sends a key of its own.
+                    "Authorization": f"Bearer {self._credential or _PLACEHOLDER_KEY}",
                     "Content-Type": "application/json",
                     "User-Agent": agent,
                 },
@@ -680,6 +713,20 @@ class HonestBackend:
                 final="",
                 stop="error",
                 error=TransportError(message="the toy backend is gone", retriable=False),
+            )
+        if not self._credential and SEND_PLACEHOLDER_KEY not in self._faults:
+            # Built without a credential: the call sends nothing and says so.
+            if RAISE_WITHOUT_CREDENTIAL in self._faults:
+                raise RuntimeError("the toy route holds no credential")
+            run.usage_known = False
+            return self._result(
+                run,
+                final="",
+                stop="error",
+                error=TransportError(
+                    message="the toy route holds no credential", retriable=False
+                ),
+                ended=False,
             )
         if LEAVE_CHILD in self._faults:
             self._children.append(
@@ -889,6 +936,7 @@ class HonestBackend:
                 ),
             )
         run.served_model = str(reply.get("model", "")) or None
+        asked = str(body["model"])
         if "type" not in reply:
             # A 200 whose document holds no turn.
             if READ_FIRST_TURN_OF_NONE in self._faults:
@@ -906,6 +954,28 @@ class HonestBackend:
         if DROP_OUTPUT_TOKENS in self._faults:
             tokens_out = 0
         run.segments.append(UsagePricingSegment(tokens_in, tokens_out, 0, 0, cost))
+        observes = (
+            self._observe_only or OBSERVE_ANOTHER_MODEL in self._faults
+        ) and REFUSE_ANOTHER_MODEL not in self._faults
+        if run.served_model != asked and not observes:
+            # Another model answered than the one this request asked for: no
+            # result of the route. The reply is billed and reported; what it
+            # cost under the route's price is not what it cost.
+            named = "request_id" if MISMATCH_NAMES_ANOTHER_FIELD in self._faults else (
+                SERVED_MODEL_FIELD
+            )
+            if DISOWN_TOKENS_OF_ANOTHER_MODEL in self._faults:
+                run.usage_known = False
+            return self._result(
+                run,
+                final="",
+                stop="model_mismatch",
+                error=IncompleteEvidence(
+                    missing=(named,),
+                    message=f"the provider answered under {run.served_model!r}, not {asked!r}",
+                ),
+                priced=CLAIM_COST_OF_ANOTHER_MODEL in self._faults,
+            )
         if reply["type"] == "refusal":
             return self._refusal(run, "refusal")
         if reply["type"] == "message" and reply.get("finish") == "content_filter":
@@ -1261,6 +1331,7 @@ class HonestBackend:
         error: Any,
         ended: bool = True,
         conversation: ConversationTransportOutcome | None = None,
+        priced: bool = True,
     ) -> InvocationResult:
         faults = self._faults
         if LAST_RESPONSE_USAGE_ONLY in faults:
@@ -1280,7 +1351,7 @@ class HonestBackend:
         )
         accounted = run.usage_known
         evidence: UsagePricingEvidence | None = UsagePricingEvidence(
-            tuple(run.segments), complete=accounted
+            tuple(run.segments), complete=accounted and priced
         )
         if ZERO_COST_NO_EVIDENCE in faults:
             usage, evidence = dataclasses.replace(usage, cost_usd=0.0), None
@@ -1290,7 +1361,9 @@ class HonestBackend:
             accounted, evidence = False, None
         if RETRIABLE_ERROR in faults and error is not None:
             error = dataclasses.replace(error, retriable=True)
-        tokens_known = cost_known = accounted
+        tokens_known = accounted
+        # ``priced`` is false where the usage is known and its price is not.
+        cost_known = accounted and priced
         if not ended:
             # A turn that never reached its terminal: a liar claims one of
             # the three things such a result cannot know.
@@ -1413,6 +1486,17 @@ class ToyDriver:
             model for model in sorted(matrix_columns.rate_card()) if model != column.model
         )
 
+    def route_credential(self, without_credential: bool) -> str:
+        """The credential the toy backend is built with.
+
+        The toy has no routing file and no variable: its route takes its
+        credential from the argument the driver hands the backend when it
+        builds it, and reads it at no other moment. Without its credential
+        the backend is built with none.
+        """
+
+        return "" if without_credential else CANARY_CREDENTIAL
+
     @contextlib.contextmanager
     def open(
         self,
@@ -1422,6 +1506,7 @@ class ToyDriver:
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
+        without_credential: bool = False,
     ) -> Iterator[_Bound]:
         profile = column.features
         if profile is None:
@@ -1447,12 +1532,16 @@ class ToyDriver:
                 profile=profile,
                 model=self.built_model(column),
                 endpoint=provider.url,
-                credential=CANARY_CREDENTIAL,
+                credential=self.route_credential(without_credential),
                 session_token=TOY_SESSION_TOKEN,
                 capability=capability,
                 log_dir=log_dir,
                 faults=self.faults,
                 workspace=tmp_path / WORKSPACE,
+                # The toy has no routing file: its column states the state of
+                # the route extra that pins a served model.
+                observe_only=dict(column.route_states).get(declarations.SERVED_MODEL_EXTRA)
+                == declarations.ADMITTED_NOT_CARRIED,
             )
             role = matrix_columns.ROLE_BY_CAPABILITY[capability]
             route = f"{TOY_KIND}/{column.model} for role {role!r}"
@@ -1477,6 +1566,8 @@ class ToyDriver:
                 yield _Bound(backend, provider, log_dirs=(log_dir,))
             finally:
                 backend.reap()
+            if without_credential:
+                refuse_the_scripted_credential(column, provider)
 
 
 def _is_json(text: Any) -> bool:
@@ -2234,6 +2325,92 @@ LIARS: tuple[Liar, ...] = (
         (f"raise:NotImplementedError{_BEFORE}",),
         ("S",),
         needs=_NO_CONTINUITY,
+    ),
+    # A reply under another model. On a route that cannot state a pin on
+    # the served model the adapter observes only; on a route that admits the
+    # pin and leaves it out it refuses the reply. The first is the one that
+    # shows that such a route is held to the base contract.
+    _liar(
+        "S24",
+        OBSERVE_ANOTHER_MODEL,
+        (
+            "kind:transport!=incomplete_evidence",
+            "stop:error!=model_mismatch",
+            f"dispatch.extra:{READ_A}",
+            "request.extra",
+            "flag:token_usage_complete=False",
+        ),
+        ("C0", "C2", "C3", "C6", "C10"),
+        needs={declarations.SERVED_MODEL_EXTRA: declarations.NOT_ADMITTED},
+    ),
+    _liar(
+        "S24",
+        REFUSE_ANOTHER_MODEL,
+        (
+            "kind:incomplete_evidence!=none",
+            "stop:model_mismatch!=end_turn",
+            "flag:cost_complete=False",
+            f"dispatch.missing:{READ_A}",
+            "request.unconsumed",
+        ),
+        ("C0", "C2", "C3", "C6", "C10"),
+        needs={declarations.SERVED_MODEL_EXTRA: declarations.ADMITTED_NOT_CARRIED},
+    ),
+    # The flags of the refused reply, one fault each: the cost flagged
+    # complete; the token usage flagged incomplete after the billed reply;
+    # the tokens of the reply dropped by a result that claims them. The
+    # form asks nothing of the terminal flag, so it has no liar for it.
+    _liar(
+        "S24",
+        CLAIM_COST_OF_ANOTHER_MODEL,
+        ("flag:cost_complete=True",),
+        ("C6",),
+        needs={declarations.SERVED_MODEL_EXTRA: declarations.CARRIED},
+    ),
+    _liar(
+        "S24",
+        DISOWN_TOKENS_OF_ANOTHER_MODEL,
+        ("flag:token_usage_complete=False",),
+        ("C6",),
+        needs={declarations.SERVED_MODEL_EXTRA: declarations.CARRIED},
+        rehearses=("M28",),
+    ),
+    _liar(
+        "S24",
+        DROP_OUTPUT_TOKENS,
+        ("usage.output_tokens:lt",),
+        ("C6",),
+        needs={declarations.SERVED_MODEL_EXTRA: declarations.CARRIED},
+    ),
+    # The error is incomplete evidence and names another field as missing.
+    _liar(
+        "S24",
+        MISMATCH_NAMES_ANOTHER_FIELD,
+        (f"error.missing:{SERVED_MODEL_FIELD}",),
+        ("S",),
+        needs={declarations.SERVED_MODEL_EXTRA: declarations.CARRIED},
+    ),
+    # A route without its credential. The adapter raises out of the call; it
+    # flags its typed error retriable; or it sends its request under a key
+    # of its own. The last two together are what an adapter shows that has
+    # no check of a credential, where the provider answers the request with
+    # a status the adapter retries.
+    _liar(
+        "S28",
+        RAISE_WITHOUT_CREDENTIAL,
+        (f"raise:RuntimeError{_BEFORE}",),
+        ("S",),
+        rehearses=("G11", "G21"),
+    ),
+    _liar("S28", RETRIABLE_ERROR, ("retriable:True",), ("C2",)),
+    _liar("S28", SEND_PLACEHOLDER_KEY, ("request.extra",), ("C0",)),
+    Liar(
+        "S28",
+        frozenset({SEND_PLACEHOLDER_KEY, RETRIABLE_ERROR}),
+        frozenset({"request.extra", "retriable:True"}),
+        ("C0", "C2"),
+        rehearses=("G38",),
+        composite=True,
     ),
     # Admission: a capability the column's pin admits is refused, a backend
     # that is only built asks its provider something, and a role is built

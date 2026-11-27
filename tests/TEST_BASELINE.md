@@ -96,15 +96,20 @@ only, each scenario from the change that defines it. A blocked column runs
 its three scenarios. A form of refusal that the wire of a kind cannot carry
 is pinned not expressible in [the inventory](backend_matrix/inventory.yaml)
 and has no cell: the refusal part on the Claude columns, the content-filter
-stop and the refusal part on both Codex kinds. One other step is pinned, on
-the same three kinds: a tool call whose argument text is no JSON object
-(`S05`). The wire the matrix scripts for them is a session of the vendor's
-tool, on which a tool call travels to the adapter as a decoded object (the
-control channel of the Claude tool, the tool bridge of the Codex
-app-server). No such pin exists on an open-weight kind. A pin is a property
-of the scripted wire, not of what stands between that wire and the adapter:
-the Kimi worker reads the provider's chat stream, which carries the
-argument text of a call in a string, so the Kimi kind plays that scenario.
+stop and the refusal part on both Codex kinds. Two other steps are pinned.
+One, on the same three kinds, is a tool call whose argument text is no JSON
+object (`S05`). The wire the matrix scripts for them is a session of the
+vendor's tool, on which a tool call travels to the adapter as a decoded
+object (the control channel of the Claude tool, the tool bridge of the Codex
+app-server). The other, on both Codex kinds, is a reply under another model
+(`S24`, below). No such pin of a script step exists on an open-weight kind.
+Such a pin is a property of the scripted wire, not of what stands between
+that wire and the adapter: the Kimi worker reads the provider's chat stream,
+which carries the argument text of a call in a string, so the Kimi kind
+plays that scenario. One pin on an open-weight kind is of another ground:
+the missing-credential scenario (`S28`) on the hosted gateway, whose subject
+is a state of the route that no backend routing built for that kind can be
+in (below).
 
 The two turn cells hold a count. The turn limit asks every turn of the count
 of the provider, so a limit that is typed after fewer tool-bearing requests
@@ -364,6 +369,86 @@ it. The cell of the official Codex route is carried so, as an unconfirmed
 known gap (`R21`): red under the emulated code, and its entry goes only on
 an observed or documented answer of the tool.
 
+`S24` is a reply answered under another model than the route asked for: a
+call of a read tool, so that "nothing is dispatched" is an assertion. Such a
+reply is no result of the route. The scenario expects incomplete evidence
+that names the served-model field of the trace as what is missing, the stop
+reason `model_mismatch`, the id the provider named in the trace and nothing
+dispatched. It expects the cost flag false, because the price of the model
+that answered is not the route's, owes the token usage flag, because the one
+reply is billed and reported, and does not ask the terminal flag. Its
+difference table is the one table that no declared field keys. It is keyed
+by the state of the route extra that pins the served model, as routing
+states it for the route of the cell's role, read through routing's public
+validation of the routing file and never typed for a column that has such a
+file: `carried` (the route carries the pin, set to its own model) and
+`not_admitted` (routing refuses the extra on the route, which therefore can
+state no expected id and cannot leave one out) hold that contract, and
+`admitted_not_carried` (routing admits the pin and the route leaves it out)
+the fallback the product documents for such a route, a success with the
+observed id recorded. Both gateway kinds carry the pin; routing admits it on
+no route of the other kinds; no shipped route is in the third state, so the
+fallback is asserted on the toy only, where a column states its state
+itself, and a real column found in that state is an error of the matrix
+until a ruling names it. A test of every kind module reads the state of each
+of its routes from the routing files of both products. An entry on a cell of
+this scenario records the state under `observed_under` and a registry record
+under `closes_under` as well, so a route that changes state fails its cell
+with `decl.changed` and never with "gap fixed". The two Codex kinds have no
+cell: their notifications name no model of a response, so the step is
+pinned not expressible there. A result that flags its token usage incomplete
+is held to no number below the bill by the accounting clause on a route
+that owes no exact counts, so where the entry of an `S24` cell lists that
+flag (both gateway kinds, DeepSeek, Claude) a proof the verifier requires by
+name plays the cell and holds the tokens the result reports to the one reply
+the provider billed. The Kimi route owes exact counts, and its result
+reports no token of the billed reply: a known gap of its own, beside the
+typing of the error. On the Claude column the adapter refuses the reply at
+the frame of the model turn, while the tool it drives has the call of that
+turn to make, and the in-process tool bridge dispatches a call when it is
+handed the request, with no gate on what the adapter makes of the turn.
+Whether that call reaches the ToolSet follows from when the tool asks, so
+the scripted peer states the order (below), and a required proof plays the
+cell in both orders and holds the code set of each. In the order every cell
+plays the read is dispatched before the refusal and the result flags its
+fully reported tokens incomplete: the cell carries those two codes as a
+known gap of the reference, by the ruling of a decision panel in its entry,
+which leans on the item of the proof that plays that order.
+
+`S28` plays a route without its credential. The backend is built by routing
+from the shipped route, and the place the route takes its credential from
+holds none at the last moment at which the route reads it; the driver of
+the kind builds that state and says what the place is. Read at the call: the
+key variable of the kind on the DeepSeek route, absent for as long as the
+backend is open; the key variable the Kimi route names, which routing reads
+whenever it loads the file, so the driver takes it away at the last moment
+before the call; the sign-in record of the vendor tool on both Codex kinds,
+where the directory that should hold it is made and nothing is written into
+it under the name of the record; and the session of the vendor tool on the
+Claude columns, where the scripted peer answers the sign-in probe as a tool
+that is not signed in. Read when the adapter is built: on the local gateway,
+whose route names no key, neither of the two variables the adapter then
+looks at is set. The scenario scripts no reply, so any provider request is
+one too many, and it expects a typed transport error that is not retried,
+with a stop reason that is none of those a workflow reads as an outcome of
+its own. It owes the trace flag; the terminal flag and the two accounting
+flags are not asked, because no turn was started and no usage record can
+have arrived, and none is expected false. A play of the local gateway or of
+the toy whose request carried the scripted credential is an error of the
+matrix and no observation: there the route reads its credential when the
+backend is built, so such a request says that the state was not built. The
+hosted gateway has no cell: its routes name their key as a variable that
+routing binds while it loads the file and refuses when it is unset, and the
+adapter routing builds reads no key later. That row of
+[the inventory](backend_matrix/inventory.yaml) rests on those three
+statements, which a test of the gateway module holds on the shipped routing
+file of each product and the verifier requires by name; routing's refusal
+itself stays with the tests of the routing module. Both Codex cells carry a
+known gap of the reference, and a test of each Codex module, required by
+name as well, holds what their one code does not say: that the error names
+the sign-in record, that the directory which should hold it lists nothing
+under its name, and that nothing was sent or started for a model turn.
+
 Two static cells run on the toy columns only: `P01` (the protocol surface)
 and `P02` (the profile binding). So on a real column no cell asserts that the
 backend instance declares the profile routing computes for its route, or that
@@ -427,8 +512,15 @@ Claude session route keeps its shipped routing file and gets one overlay,
 [a scripted peer](backend_matrix/peers/claude_cli.py). The adapter's Agent SDK
 starts the peer as it starts the vendor tool. The peer takes each model turn
 from the scripted provider and sends each tool call through the SDK's control
-channel to the real dispatch bridge. Its canary fails unless the SDK started
-it: the two probes of the session route ran first, the environment was
+channel to the real dispatch bridge. The SDK handles a frame and a control
+request side by side, so the peer states how the request for a tool call
+follows the frame of the model turn that makes it: in every cell the two
+leave in one write (`joined`), the tool that asks at once, and the adapter
+has the request in hand when it reads the frame; the other order the peer
+can play (`held`) sends the request a stated time later unless the session
+has ended, and only the proof of the Claude module that plays both uses it.
+No source states the timing of the vendor tool. Its canary fails unless the
+SDK started it: the two probes of the session route ran first, the environment was
 sanitised, and the control handshake preceded the prompt. The peer's journal
 names the variables of its environment and keeps none of their values beyond
 the three the canary reads. Nothing was observed of the real tool, so every
@@ -562,7 +654,7 @@ lies inside the worker's own environment, because such a program opens its
 sockets where the network guard does not see them: without the stage the
 bundled runtime never starts, and the attempt is a violation.
 
-Eight known gaps of the reference columns lean on a proof that the verifier
+Ten known gaps of the reference columns lean on a proof that the verifier
 requires by name, because the codes of their cells do not say what the gap
 is, or what its record says of the result. On a write the trace of the
 Claude adapter binds a tool-authority digest
@@ -597,14 +689,19 @@ retriable and carries the sentence of the adapter's check of the item names.
 Where the limit guard replaces a result of the official route, its two codes
 do not say what the guard missed: a twin of the test that plays both
 readings of `last` shows that the guard misses the token flag alone and that
-nothing but the usage code moves with the reading. Each proof but one has
+nothing but the usage code moves with the reading. The proofs of a call
+without the sign-in record on the two Codex kinds and of a reply refused
+for the model that served it on the gateway kinds, DeepSeek and the Claude
+column are described with their scenarios above. Each proof but one has
 lying counterparts beside it that show it failing on what it is there to
 exclude: the test of the refused resume plays its cell under the other code
 itself. An entry must not outlive a proof it leans on: `RECORD_PROOFS` in
 `backend_matrix/cells.py` names, by registry record, the proofs its entries
 lean on, and static cell `H03` fails when an entry names such a record while
-the verifier does not require the proof that plays the entry's cell. One
-known gap of an open-weight column leans on a proof in the same way. Where
+the verifier does not require the proof that plays the entry's cell. Three
+known gaps of the open-weight columns lean on a proof in the same way: the
+two of a reply refused for the model that served it, on the gateway kinds
+and on DeepSeek (above), and one of the Kimi route. Where
 the Kimi route ends a call because of a tool call it will not run (a tool
 that is not attached, arguments that are no JSON object), the codes of the
 cell are those of any error of the worker after its first billed reply; the

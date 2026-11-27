@@ -112,6 +112,7 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"dispatch\.(extra|missing):\w+", "C10"),
     (r"event\.(missing|extra):\w+/[\w-]+", SCENARIO),
     (r"text:mismatch", SCENARIO),
+    (r"error\.missing:\w+", SCENARIO),
     (r"request\.content:\w+", SCENARIO),
     (r"context:over_budget", SCENARIO),
     (r"progress:write_not_credited", SCENARIO),
@@ -316,7 +317,8 @@ class Expectation:
     dispatch: tuple[str, ...] = ()
     dispatch_optional: tuple[str, ...] = ()
     # The flags the result is expected to flag false: the turn never reached
-    # its terminal, or no usage record ever arrived. A result that flags one
+    # its terminal, no usage record ever arrived, or the reply was answered
+    # under a model whose price is not the route's. A result that flags one
     # of them complete deviates (``flag:<name>=True``). Only a flag that a
     # scenario may waive can be expected false, never the trace flag.
     flags_false: tuple[str, ...] = ()
@@ -590,8 +592,8 @@ def _c4(result: InvocationResult, exp: Expectation) -> list[Deviation]:
         out.append(
             Deviation(
                 "flag:terminal_complete=True",
-                "the turn never reached its terminal and the result flags its "
-                "terminal complete",
+                "the scenario expects the terminal flagged missing and the result "
+                "flags its terminal complete",
             )
         )
     if not flags.trace_complete:
@@ -753,8 +755,8 @@ def _c6(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
             out.append(
                 Deviation(
                     f"flag:{name}=True",
-                    "the turn never reached its terminal and the result flags this "
-                    "part of its accounting complete"
+                    "the scenario expects this part of the accounting flagged "
+                    "incomplete and the result flags it complete"
                     if name in exp.flags_false
                     else "no usage record arrived for the turn, the provider billed "
                     "nothing for it, and the result flags this part of its "

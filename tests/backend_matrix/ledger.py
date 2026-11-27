@@ -9,7 +9,11 @@ A cell computes its deviation codes; ``ledger.yaml`` says what is expected.
   cell with an entry is an expected failure only when its codes are exactly the
   entry's, under the declared values the entry was observed under. It fails
   with ``decl.changed`` when the declaration moved, with "gap fixed" when it no
-  longer deviates and with "different deviation" for any other set.
+  longer deviates and with "different deviation" for any other set. A
+  governing value is a declared value, with one exception that the rules here
+  read as they read any other key: where the table of a scenario is keyed by
+  a route extra, the value is the state of that extra as routing states it
+  for the route of the cell's role.
 - The *gap registry* is permanent. It lists every cell of a gap with the
   declared values it was observed under and must close under, so a fix that
   deletes its entry leaves the passing cell pinned, and a declaration cannot
@@ -417,7 +421,9 @@ def compare(
 ) -> None:
     """Pass, report an expected failure, or fail: the three-way rule.
 
-    ``current`` holds the cell's governing declared values now; ``evaluated``
+    ``current`` holds the cell's governing values now (its declared values
+    and, where a route extra keys its table, the state of that extra on its
+    route); ``evaluated``
     the clauses the cell evaluated and ``unasked`` the codes whose check the
     result's own flags switched off there. A column-wide code is owed where
     its clause was evaluated and its check was asked, and nowhere else.

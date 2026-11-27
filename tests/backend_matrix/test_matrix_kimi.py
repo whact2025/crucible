@@ -59,7 +59,7 @@ from .contract import ADMITTED, SecondCall
 from .drivers import MatrixSetupError
 from .drivers import kimi as driver
 from .drivers import openai_compat as chat
-from .drivers.base import GUARD_POLICY
+from .drivers.base import GUARD_POLICY, at_the_call
 from .peers import launch, worker_harness
 from .provider import CacheCounts, LoopbackProvider, Reply, SeenRequest, SentCall
 from .scenarios import D_COST_BOUND_UNRANKED, SCENARIOS, history_replayed
@@ -2243,6 +2243,72 @@ def test_a_stream_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
             driver=_with_dialect(_AnswersWhole),
         )
     assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
+
+
+# -- a route without its credential ---------------------------------------------------
+
+
+def test_a_play_without_the_credential_keeps_the_key_variable_until_the_call(
+    tmp_path: Path,
+) -> None:
+    role = matrix_columns.ROLE_BY_CAPABILITY["text"]
+    path = PRIMARY.routing_path(matrix_columns.COLUMN_PRODUCT)
+    variable = declarations.credential_variable(path, role)
+
+    # The route names its key as a variable, which is one of the scripted
+    # environment: routing reads it whenever it loads the file.
+    assert variable is not None and variable in matrix_columns.SCRIPTED_ENV
+    assert variable not in matrix_columns.ENDPOINT_ENV.values()
+    with DRIVER.open(
+        PRIMARY,
+        capability="text",
+        lens="raw",
+        script=ProviderScript(()),
+        tmp_path=tmp_path,
+        without_credential=True,
+    ) as bound:
+        # The backend is built and the variable is still there: the runner
+        # asks routing for the route once more, which loads the file.
+        assert os.environ[variable] == matrix_columns.CANARY_CREDENTIAL
+        assert declarations.routed_endpoint(PRIMARY, role)
+        at_the_call(bound)
+        # From the call on it is gone. Routing would now refuse the file:
+        # that refusal is no state of the scenario, and no cell plays it.
+        assert variable not in os.environ
+        with pytest.raises(ValueError, match="unset"):
+            declarations.routed_endpoint(PRIMARY, role)
+    assert os.environ[variable] == matrix_columns.CANARY_CREDENTIAL
+    # A play with its credential leaves no such step.
+    with DRIVER.open(
+        PRIMARY,
+        capability="text",
+        lens="raw",
+        script=ProviderScript(()),
+        tmp_path=tmp_path / "with",
+    ) as bound:
+        assert bound.before_call is None
+        at_the_call(bound)
+        assert os.environ[variable] == matrix_columns.CANARY_CREDENTIAL
+
+
+# -- the state of the served-model pin on the routes of the kind ----------------------
+
+
+def test_the_state_of_the_served_model_pin_is_read_from_every_routing_file() -> None:
+    # A reply under another model is judged by the state of the route extra
+    # that pins the served model, as routing states it: read here from the
+    # shipped files, on every role a cell builds and on both products. A
+    # change of this state changes what that scenario asks of the column.
+    extra = declarations.SERVED_MODEL_EXTRA
+    states = {
+        (column.id, product, role): declarations.route_state(column, role, extra, product)
+        for column in COLUMNS.values()
+        for product, _path in column.routing
+        for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+    }
+
+    assert states and set(states.values()) == {declarations.NOT_ADMITTED}
+    assert len(states) == 18
 
 
 # -- the module ends with the canary check --------------------------------------------

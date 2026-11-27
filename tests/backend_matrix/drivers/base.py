@@ -72,7 +72,12 @@ class Driver(Protocol):
 
     @property
     def inexpressible(self) -> Mapping[str, str]:
-        """Script steps the kind's wire cannot carry: the inventory's rows."""
+        """What the inventory pins not expressible on the kind, by scenario and step.
+
+        The script steps the wire of the kind cannot carry and, where the
+        inventory has such a row, a state of the route that no backend
+        routing built for the kind can be in.
+        """
 
     @property
     def envelopes(self) -> tuple[str, ...]:
@@ -97,7 +102,17 @@ class Driver(Protocol):
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
-    ) -> ContextManager[Bound]: ...
+        without_credential: bool = False,
+    ) -> ContextManager[Bound]:
+        """Build the backend of ``column`` for one play.
+
+        ``without_credential`` asks for the route without its credential: the
+        backend is built by routing from the shipped route, and the place the
+        route takes its credential from holds none at the last moment at
+        which the route reads it. Where that moment is, and what the place
+        is, is the driver's to say; a driver that cannot build the state
+        raises ``MatrixSetupError``, which is no skip.
+        """
 
 
 @runtime_checkable
@@ -144,6 +159,42 @@ def get(kind: str) -> Driver:
             f"no driver is registered for kind {kind!r}; registered: "
             f"{sorted(_REGISTRY)}"
         ) from exc
+
+
+def refuse_the_scripted_credential(column: Column, provider: LoopbackProvider) -> None:
+    """A backend that was built without a credential sent the scripted one.
+
+    For a kind whose route reads its credential when the backend is built:
+    the state of a route without its credential is then shown, not assumed.
+    A request of such a play that carries the scripted credential says that
+    the backend was built with it, so the play is no play of that state. The
+    codes of a cell cannot tell a placeholder from the scripted credential;
+    this can, and it is the matrix's own failure, never a deviation.
+    """
+
+    carried = sum(request.scripted_credential for request in provider.freeze().requests)
+    if carried:
+        raise MatrixSetupError(
+            f"column {column.id}: {carried} request(s) of a play without the "
+            "credential of the route carried the scripted credential: the backend "
+            "was built with it, so the state the scenario asks for was not built"
+        )
+
+
+def at_the_call(bound: Bound) -> None:
+    """Let a driver do what it left for the last moment before ``invoke``.
+
+    A route that reads its credential at the call, and whose routing file
+    names it as a variable, is without its credential only from that moment
+    on: routing reads the same variable whenever it loads the file, and the
+    runner asks routing for the route once more after the backend is built.
+    A bound backend with such a step states it as ``before_call``; one
+    without has no such attribute, and nothing is done.
+    """
+
+    step = getattr(bound, "before_call", None)
+    if step is not None:
+        step()
 
 
 def bind_as_routing(

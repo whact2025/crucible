@@ -54,7 +54,7 @@ from .contract import (
     Report,
     SecondCall,
 )
-from .drivers.base import GUARD_POLICY, Bound, Driver
+from .drivers.base import GUARD_POLICY, Bound, Driver, at_the_call
 from .provider import ProviderLedger
 from .scenarios import BASE_POLICY, SCENARIOS, SYSTEM, USER, Plan, plan_for
 from .script import WRITE, Loop, ProviderScript, Say
@@ -277,8 +277,12 @@ def execute(
     # The route the cell runs through is the one of its capability's role.
     role = matrix_columns.ROLE_BY_CAPABILITY[scenario.capability]
     routed_model = declarations.routed_model(column, role)
+    # Where a route extra keys the table of the scenario, its state on the
+    # route of the cell's role: read from the routing file before the cell
+    # runs, beside the routed profile.
+    states = declarations.route_states(column, role, scenario.governing)
     plan = plan_for(
-        scenario, declarations.select(scenario.differences, routed), differences
+        scenario, declarations.select(scenario.differences, routed, states), differences
     )
     fixture = (
         None
@@ -355,6 +359,7 @@ def execute(
                         lens=cell.lens,  # type: ignore[arg-type]
                         script=plan.script,
                         tmp_path=tmp_path,
+                        without_credential=scenario.credential_unset,
                     )
                 )
                 backend = bound.backend
@@ -366,6 +371,7 @@ def execute(
                     backend.attach_toolset(
                         fixture.toolset, context_budget=plan.context_budget
                     )
+                at_the_call(bound)
                 invoked_at = time.monotonic()
                 calling = True
                 result = backend.invoke(invocation)
@@ -477,7 +483,7 @@ def execute(
         canary=scenario.canary,
         checks=plan.checks,
     )
-    current = declarations.governing_values(routed, scenario.governing)
+    current = declarations.governing_values(routed, scenario.governing, states)
     return Execution(
         cell,
         plan,
@@ -922,6 +928,69 @@ def preflight_all() -> dict[str, str | None]:
             except drivers.MatrixSetupError as exc:
                 failures[kind] = str(exc)
     return failures
+
+
+def judged_again(execution: Execution, **changed: Any) -> Execution:
+    """A play as the contract judges it with fields of its result changed.
+
+    For a proof and its lying counterparts: the same observation with a
+    result an adapter could have returned in its place, judged by the
+    contract itself and by nothing of the test that asks.
+    """
+
+    result = execution.observation.result
+    if result is None:
+        raise drivers.MatrixSetupError(
+            f"cell {execution.cell.id}: the play returned no result to judge again"
+        )
+    observation = replace(execution.observation, result=replace(result, **changed))
+    scenario = SCENARIOS[execution.cell.scenario]
+    report = contract.evaluate(
+        observation,
+        execution.plan.expect,
+        execution.reference,
+        lens=execution.cell.lens,
+        toolset=scenario.toolset is not None,
+        canary=scenario.canary,
+        checks=execution.plan.checks,
+    )
+    return replace(execution, observation=observation, report=report)
+
+
+def handed_to_the_comparator(execution: Execution) -> tuple[Any, ...]:
+    """Everything of a play that the comparator of the ledger decides its verdict by."""
+
+    report = execution.report
+    return report.codes, report.evaluated(), report.unasked, dict(execution.current)
+
+
+def not_the_tokens_of_the_one_billed_reply(execution: Execution) -> list[str]:
+    """Why a play is not a result that reports the tokens of the one reply the provider billed.
+
+    Clause C6 takes any number below the bill for honest on a result that
+    flags its token usage incomplete, down to none. Where the entry of a
+    cell lists that flag, no clause compares what the result reports while
+    the entry stands, and a proof holds the numbers with this: read from the
+    play alone, what the call returned against what the provider billed.
+    """
+
+    result = execution.observation.result
+    if result is None:
+        return ["the call returned no result"]
+    problems: list[str] = []
+    billed = execution.observation.provider.billed
+    if len(billed) != 1 or not (billed[0].input_tokens and billed[0].output_tokens):
+        problems.append(
+            f"the provider billed {len(billed)} replies, not one, or billed it for nothing"
+        )
+    total = execution.observation.provider.billed_total()
+    reported = (result.usage.input_tokens, result.usage.output_tokens)
+    if reported != (total.input_tokens, total.output_tokens):
+        problems.append(
+            f"the result reports {reported[0]} input and {reported[1]} output tokens of "
+            f"the {total.input_tokens} and {total.output_tokens} the provider billed"
+        )
+    return problems
 
 
 def canary_problems(outcomes: Mapping[str, str], cells: Sequence[Cell]) -> list[str]:

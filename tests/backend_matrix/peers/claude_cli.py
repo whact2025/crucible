@@ -43,6 +43,25 @@ the status is in this file: the peer asks the provider side for them, which
 renders them from an envelope that says what it rests on. Continuing a
 session that an earlier process of the cell did open is not played.
 
+How the request for a tool call follows the frame of the model turn that
+makes the call is stated, because the client of the tool handles the two side
+by side: the pinned SDK hands a control request to a task of its own while
+its consumer takes the frame from the message stream. Two writes with nothing
+stated between them leave it to the scheduler of the client which of the two
+it acts on first, and a client that ends the session at the frame then shows
+the call at its tool server in some plays and not in others. No source in
+reach says what time the vendor tool leaves between the two, so the order is
+the peer's own, one of two (``tool_request`` in the cell's configuration):
+
+- ``joined``, what every cell plays: the frame and the request leave in one
+  write, so the client has the request in hand when it reads the frame. This
+  is the tool that asks its tool server at once, and the order in which a
+  client that ends the session at the frame has not stopped the call.
+- ``held``: the request leaves :data:`HOLD_SECONDS` after the frame, unless
+  the client ends the session before, in which case it never leaves. The
+  time is far above what a client needs to end a session at a frame and is
+  not waited out where it does.
+
 Every process appends one record to the journal of the cell: its role, its
 pids, its command line, the names of its environment and whether it saw a
 value the cell forbids (the canary credential of the other routes). The
@@ -91,6 +110,12 @@ FABRICATED_RESULT = "a result the peer made up without asking the tool server"
 SKIP_ADDRESS_CHECK = "skip_address_check"
 SKIP_TURN_TERMINAL = "skip_turn_terminal"
 SKIP_BUDGET_TERMINAL = "skip_budget_terminal"
+# How the request for a tool call follows the frame of the model turn that
+# makes it (see the description of the module), and how long a held request
+# waits for a client that does not end the session.
+JOINED, HELD = "joined", "held"
+TOOL_REQUEST_FORMS = (JOINED, HELD)
+HOLD_SECONDS = 30.0
 # The only variables the journal keeps by value: how the SDK marks a tool it
 # starts, and the home directory the tool was given.
 JOURNALLED_ENV = ("CLAUDE_AGENT_SDK_VERSION", "CLAUDE_CODE_ENTRYPOINT", "HOME")
@@ -337,12 +362,50 @@ class Session:
         self._messages = 0
         self._turn = 0
         self._spent = {"input_tokens": 0, "output_tokens": 0}
+        self._tool_request = config.get("tool_request")
+        if self._tool_request not in TOOL_REQUEST_FORMS:
+            raise _Unsupported(
+                f"the configuration names the order {self._tool_request!r} for a tool "
+                f"request, not one of {TOOL_REQUEST_FORMS}"
+            )
+        # Lines that leave with the next write.
+        self._joined = b""
 
     # -- the standard streams ------------------------------------------------
 
-    def _emit(self, frame: dict[str, Any]) -> None:
-        self._stdout.write(json.dumps(frame).encode("utf-8") + b"\n")
-        self._stdout.flush()
+    def _emit(self, frame: dict[str, Any], *, with_next: bool = False) -> None:
+        """Write one frame as a line; ``with_next`` keeps it for the write of the next."""
+
+        self._joined += json.dumps(frame).encode("utf-8") + b"\n"
+        if not with_next:
+            self._release()
+
+    def _release(self) -> None:
+        """Write the lines that are kept, in one write."""
+
+        if self._joined:
+            lines, self._joined = self._joined, b""
+            self._stdout.write(lines)
+            self._stdout.flush()
+
+    def _hold(self) -> None:
+        """Wait before a held tool request, or until the client ends the session.
+
+        A frame the client writes meanwhile is read as at any other moment.
+        Its closed input ends the session, and the request never leaves.
+        """
+
+        import select  # noqa: PLC0415 - only a held request needs the two
+        import time  # noqa: PLC0415
+
+        until = time.monotonic() + HOLD_SECONDS
+        while (left := until - time.monotonic()) > 0:
+            if select.select([self._stdin], [], [], left)[0]:
+                frame = self._read()
+                if frame.get("type") == "control_request":
+                    self._serve(frame)
+                elif frame.get("type") != "control_response":
+                    self._backlog.append(frame)
 
     def _read(self) -> dict[str, Any]:
         while True:
@@ -456,6 +519,7 @@ class Session:
         if SKIP_BRIDGE in self._config.get("faults", ()):
             # A lying counterpart for the matrix's own tests: the tool server
             # is never asked.
+            self._release()
             return {
                 "tool_use_id": call["id"],
                 "content": FABRICATED_RESULT,
@@ -524,15 +588,22 @@ class Session:
             )
             if reply.get("unsupported"):
                 raise _Unsupported(str(reply["unsupported"]))
-            for frame in reply.get("frames", ()):
-                self._account(frame)
-                self._emit(frame)
+            frames = list(reply.get("frames", ()))
             gone = reply.get("gone")
+            call = None if isinstance(gone, dict) else reply.get("call")
+            # The last frame of a reply that makes a tool call is the frame
+            # of the model turn: joined, it leaves with the request for the
+            # call.
+            joined = call is not None and self._tool_request == JOINED
+            for index, frame in enumerate(frames):
+                self._account(frame)
+                self._emit(frame, with_next=joined and index == len(frames) - 1)
             if isinstance(gone, dict):
                 raise _Gone(str(gone.get("partial", "")), bool(gone.get("killed")))
-            call = reply.get("call")
             if call is None:
                 return int(reply.get("exit", 0) or 0)
+            if self._tool_request == HELD:
+                self._hold()
             results = [self._dispatch(call)]
             terminal = reply.get("turn_limit")
             # A lying counterpart for the matrix's own tests does not stop at

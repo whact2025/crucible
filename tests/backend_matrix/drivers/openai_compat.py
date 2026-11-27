@@ -32,6 +32,7 @@ import contextlib
 import importlib.metadata
 import importlib.util
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping, Sequence
@@ -40,8 +41,8 @@ from urllib.parse import urlsplit
 from crucible.backends.config import load_routing, resolve_for_role
 
 from .. import columns as matrix_columns
+from .. import declarations, netguard, tap
 from .. import envelopes as envelope_files
-from .. import netguard, tap
 from ..columns import CANARY_CREDENTIAL, COLUMN_PRODUCT, Column
 from ..provider import (
     LoopbackProvider,
@@ -67,7 +68,13 @@ from ..script import (
     Step,
 )
 from ..toolsets import BINDINGS
-from .base import GUARD_POLICY, Lens, MatrixSetupError, register
+from .base import (
+    GUARD_POLICY,
+    Lens,
+    MatrixSetupError,
+    refuse_the_scripted_credential,
+    register,
+)
 
 _SDK = "openai"
 _CREATED = 1_700_000_000
@@ -547,6 +554,13 @@ def replay_problems(
     return problems
 
 
+# Where the adapter takes its key from when it is built for a route that
+# names none, in its order: the key variable of a local endpoint, then the
+# variable of the hosted gateway. The module text of the adapter documents
+# both; they are public names of the environment, not names of the product.
+KEY_VARIABLES: tuple[str, ...] = ("CRUCIBLE_LOCAL_API_KEY", "INFER_AUTH_TOKEN")
+
+
 @dataclass
 class _Bound:
     backend: Any
@@ -579,7 +593,7 @@ class _GatewayDriver:
 
     @property
     def inexpressible(self) -> Mapping[str, str]:
-        """Script steps this kind's wire cannot carry: the inventory's rows only."""
+        """What the inventory pins not expressible on this kind: its rows only."""
 
         from .. import cells  # noqa: PLC0415 - cells imports the drivers
 
@@ -620,6 +634,20 @@ class _GatewayDriver:
     ) -> tap.TapRecord | None:
         return None
 
+    def _take_credential_away(self, column: Column, role: str) -> None:
+        """Leave the route of ``role`` without its credential, before routing builds it."""
+
+        raise MatrixSetupError(
+            f"column {column.id}: a route of this kind names its key as a variable "
+            "that routing binds while it loads the file and refuses when it is "
+            "unset, and the adapter routing builds reads no credential later: no "
+            "backend that routing built can be without its credential "
+            "(inventory.yaml pins the scenario not expressible on the kind)"
+        )
+
+    def _require_no_credential(self, column: Column) -> None:
+        """Refuse to build a backend that would hold a credential all the same."""
+
     @contextlib.contextmanager
     def open(
         self,
@@ -629,11 +657,13 @@ class _GatewayDriver:
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
+        without_credential: bool = False,
     ) -> Iterator[_Bound]:
         if column.kind != self.kind:
             raise MatrixSetupError(f"column {column.id} is not of kind {self.kind}")
         log_dir, cwd = tmp_path / "backend-logs", tmp_path / "backend-cwd"
         cwd.mkdir(parents=True, exist_ok=True)
+        role = matrix_columns.ROLE_BY_CAPABILITY[capability]
         with contextlib.ExitStack() as stack:
             provider = stack.enter_context(
                 LoopbackProvider(script, credential=CANARY_CREDENTIAL, dialect=self._dialect())
@@ -641,10 +671,15 @@ class _GatewayDriver:
             stack.enter_context(
                 matrix_columns.scripted_environment(**self._endpoint(provider))
             )
+            if without_credential:
+                # The scripted environment puts every variable back when the
+                # backend is closed.
+                self._take_credential_away(column, role)
+                self._require_no_credential(column)
             record = self._redirect(stack, provider)
             # The boundary of the matrix: exactly what a workflow calls.
             backend = resolve_for_role(
-                matrix_columns.ROLE_BY_CAPABILITY[capability],
+                role,
                 routing=load_routing(config_path=column.routing_path(COLUMN_PRODUCT)),
                 capability=capability,
                 native_shell=False,
@@ -664,6 +699,10 @@ class _GatewayDriver:
                         f"column {column.id}: a request left for another origin "
                         f"than the route's: {'; '.join(record.violations)}"
                     )
+            if without_credential:
+                # The route reads its credential when the backend is built,
+                # so the state is shown by what the backend then sent.
+                refuse_the_scripted_credential(column, provider)
 
 
 class HostedGatewayDriver(_GatewayDriver):
@@ -705,6 +744,36 @@ class LocalGatewayDriver(_GatewayDriver):
 
     def _endpoint(self, provider: LoopbackProvider) -> Mapping[str, str]:
         return {matrix_columns.ENDPOINT_ENV[self.kind]: f"{provider.url}/v1"}
+
+    def _take_credential_away(self, column: Column, role: str) -> None:
+        """Take away what the scripted environment set of the adapter's key variables.
+
+        The shipped route of the kind names no key. The adapter then takes
+        one when it is built: from the variables of :data:`KEY_VARIABLES`,
+        in that order, and failing both it holds a placeholder. That build
+        is the one moment the route reads a credential, so the variables are
+        taken away before routing builds the adapter.
+        """
+
+        path = column.routing_path(COLUMN_PRODUCT)
+        named = declarations.credential_variable(path, role)
+        if named is not None:
+            raise MatrixSetupError(
+                f"column {column.id}: the route of role {role!r} names the variable "
+                f"{named} for its key: its credential is not what the adapter finds "
+                "when it is built, and this driver cannot take it away"
+            )
+        for name in KEY_VARIABLES:
+            if name in matrix_columns.SCRIPTED_ENV:
+                os.environ.pop(name, None)
+
+    def _require_no_credential(self, column: Column) -> None:
+        held = [name for name in KEY_VARIABLES if os.environ.get(name, "").strip()]
+        if held:
+            raise MatrixSetupError(
+                f"column {column.id}: {held} would give the adapter a key when routing "
+                "builds it: the route is not without its credential"
+            )
 
 
 register(HostedGatewayDriver())

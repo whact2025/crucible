@@ -22,6 +22,8 @@ import dataclasses
 import http.server
 import importlib.metadata
 import json
+import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -33,6 +35,9 @@ import yaml  # type: ignore[import-untyped]
 from openai.resources.chat.completions import Completions
 from openai.types.chat import ChatCompletion
 from openai.types.shared import ErrorObject
+
+from assay import Invocation, Usage
+from crucible.backends.config import load_routing, resolve_for_role
 
 from . import cells, contract, declarations, envelopes, ledger, netguard, runner, tap
 from . import columns as matrix_columns
@@ -50,10 +55,13 @@ from .provider import (
     StatelessDialect,
 )
 from .scenarios import (
+    BASE_POLICY,
     D_OAI_SCHEMA_FINAL,
     SCENARIOS,
     SCHEMA_ANSWER,
     SCHEMA_FINAL_ANSWER,
+    SYSTEM,
+    USER,
     history_replayed,
 )
 from .script import (
@@ -1257,6 +1265,484 @@ def test_a_request_without_the_cap_of_the_route_fails_the_cell_of_the_cut(tmp_pa
             driver=_with_dialect(_SeesNoCap),
         )
     assert "'request.content:response_cap'" in str(refused.value).splitlines()[0]
+
+
+# -- a route without its credential --------------------------------------------------
+
+# The proof the row of the hosted kind for the missing-credential scenario
+# rests on, by the name the verifier requires it under: one item for the
+# routing file of each product.
+KEY_BOUND_AT_LOAD = "test_the_hosted_route_binds_its_key_while_routing_loads_the_file"
+_TEXT_ROLE = matrix_columns.ROLE_BY_CAPABILITY["text"]
+
+
+def _on(column: Column, path: Path) -> Column:
+    """``column`` as the routing file ``path`` routes it."""
+
+    return dataclasses.replace(column, routing=((matrix_columns.COLUMN_PRODUCT, path),))
+
+
+def _the_key_is_bound_while_routing_loads_the_file(
+    path: Path,
+    tmp_path: Path,
+    *,
+    absent_at_load: bool = True,
+    driver: Any = None,
+) -> None:
+    """The three statements the row of the hosted kind rests on, on one routing file.
+
+    (a) Every route of the file names its key as one variable reference, the
+    same one: read through routing's own validation of the file, which
+    resolves no reference. (b) With that variable absent, routing refuses
+    the file while it loads it, so no backend is built and the provider sees
+    no request. (c) A backend that routing built with the variable set
+    still sends the credential routing bound, after the variable is taken
+    away: read from the request the provider saw, never from the adapter.
+    Each failure names its part. ``absent_at_load`` and ``driver`` are what
+    a lying counterpart changes.
+    """
+
+    column = _on(_column(HOSTED_GATEWAY_KIND), path)
+    played_by = gateway.HostedGatewayDriver() if driver is None else driver
+    try:
+        named = declarations.credential_variables(path)
+    except (MatrixSetupError, ValueError) as exc:
+        raise AssertionError(f"(a) a route names no variable for its key: {exc}") from exc
+    variables = set(named.values())
+    assert None not in variables and len(variables) == 1, (
+        f"(a) the routes of the file name {named} for their key: not one variable on "
+        "every route"
+    )
+    (variable,) = (str(name) for name in variables)
+
+    built: list[Any] = []
+    with LoopbackProvider(
+        ProviderScript(()), credential=matrix_columns.CANARY_CREDENTIAL, dialect=_hosted_dialect()
+    ) as provider, matrix_columns.scripted_environment(), tap.redirect(PRODUCTION, provider.url):
+        if absent_at_load:
+            del os.environ[variable]
+        try:
+            built.append(
+                resolve_for_role(
+                    _TEXT_ROLE,
+                    routing=load_routing(config_path=path),
+                    capability="text",
+                    native_shell=False,
+                    allow_trusted_project_instructions=False,
+                    cwd=str(tmp_path),
+                    log_dir=tmp_path / "refused-logs",
+                )
+            )
+            refusal = None
+        except ValueError as exc:
+            refusal = str(exc)
+        finally:
+            for backend in built:
+                backend.close()
+        requests = provider.request_count
+    assert refusal is not None and f"${{{variable}}}" in refusal and "unset" in refusal, (
+        f"(b) routing did not refuse the file for the unset variable {variable}: "
+        f"{refusal or 'it loaded the file and built a backend'}"
+    )
+    assert not built and requests == 0, "(b) a backend was built, or the provider saw a request"
+
+    with played_by.open(
+        column,
+        capability="text",
+        lens="raw",
+        script=ProviderScript((Say("an answer under the bound key"),)),
+        tmp_path=tmp_path / "bound",
+    ) as bound:
+        # The scripted environment of the driver puts the variable back.
+        del os.environ[variable]
+        bound.backend.invoke(
+            Invocation(
+                system=SYSTEM,
+                user=USER,
+                tools=None,
+                max_turns=1,
+                budget_usd=None,
+                policy=BASE_POLICY,
+            )
+        )
+        seen = bound.provider.freeze().requests
+    assert [request.scripted_credential for request in seen] == [True], (
+        "(c) the request after the variable was taken away does not carry the credential "
+        f"routing bound ({len(seen)} request(s))"
+    )
+
+
+def _hosted_dialect() -> gateway.OpenAIChatDialect:
+    return gateway.HostedGatewayDriver()._dialect()
+
+
+@pytest.mark.parametrize("product", sorted(matrix_columns.PRODUCTS))
+def test_the_hosted_route_binds_its_key_while_routing_loads_the_file(
+    product: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name: the one row that takes a cell of this kind away rests on it.
+
+    The missing-credential scenario takes the credential of a route away at
+    the last moment at which the route reads it. The shipped routes of the
+    hosted gateway name their key as a variable; routing binds its value
+    while it loads the file and refuses the file when the variable is unset;
+    and the adapter that routing then builds reads no credential again. So
+    no backend that routing built from such a route can be in the state the
+    scenario asks for, and inventory.yaml pins the scenario not expressible
+    on the kind. This test holds those three statements on the shipped file
+    of each product. The third is a statement about what the adapter does,
+    and it is the one that sets this kind apart from a kind whose route is
+    written the same way and whose adapter reads the variable again at the
+    call: there the cell is generated. When any of the three stops being
+    true this test fails, and the row goes in that change. It plays nothing
+    in the form of the scenario and replaces nothing of the product; its
+    lying counterparts are the test below.
+    """
+
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[HOSTED_GATEWAY_KIND]]
+    column = _column(HOSTED_GATEWAY_KIND)
+
+    _the_key_is_bound_while_routing_loads_the_file(column.routing_path(product), tmp_path)
+
+
+def _copy_of_the_hosted_file(tmp_path: Path, change: Callable[[dict[str, Any]], None]) -> Path:
+    shipped = _column(HOSTED_GATEWAY_KIND).routing_path(matrix_columns.COLUMN_PRODUCT)
+    document = yaml.safe_load(shipped.read_text(encoding="utf-8"))
+    change(document)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    copy = tmp_path / shipped.name
+    copy.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return copy
+
+
+def _without_a_key_on_the_text_role(document: dict[str, Any]) -> None:
+    # A role inherits what it leaves out from the default route.
+    del document["default"]["api_key"]
+    del document["roles"][_TEXT_ROLE]["api_key"]
+
+
+def _with_a_literal_key_on_the_text_role(document: dict[str, Any]) -> None:
+    document["roles"][_TEXT_ROLE]["api_key"] = "a-key-written-into-the-file"
+
+
+class _ReadsItsKeyAtTheCall:
+    """The real adapter, built again at every call with the key of that moment."""
+
+    def __init__(self, inner: Any, route: Any) -> None:
+        self._inner, self._route = inner, route
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def invoke(self, invocation: Invocation) -> Any:
+        # No key is handed over: the adapter takes one from the environment
+        # as it stands now.
+        fresh = type(self._inner)(
+            model=self._route.model,
+            base_url=self._route.base_url,
+            expected_served_model=self._route.extra.get("expected_served_model"),
+        )
+        try:
+            return fresh.invoke(invocation)
+        finally:
+            fresh.close()
+
+
+class _KeyReadAtTheCall(gateway.HostedGatewayDriver):
+    """The hosted column, its adapter wrapped so that it reads its key at the call."""
+
+    @contextlib.contextmanager
+    def open(self, column: Column, *, capability: str, **named: Any) -> Iterator[Any]:
+        with super().open(column, capability=capability, **named) as bound:
+            route = load_routing(
+                config_path=column.routing_path(matrix_columns.COLUMN_PRODUCT)
+            ).for_role(matrix_columns.ROLE_BY_CAPABILITY[capability])
+            bound.backend = _ReadsItsKeyAtTheCall(bound.backend, route)
+            yield bound
+
+
+class _SendsNothing:
+    """An adapter that sends no request at a call: what one does that finds no key then."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def invoke(self, invocation: Invocation) -> Any:
+        return None
+
+
+class _NothingSentAtTheCall(gateway.HostedGatewayDriver):
+    """The hosted column, its adapter wrapped so that a call sends nothing."""
+
+    @contextlib.contextmanager
+    def open(self, column: Column, **named: Any) -> Iterator[Any]:
+        with super().open(column, **named) as bound:
+            bound.backend = _SendsNothing(bound.backend)
+            yield bound
+
+
+# What part (c) of the proof says of a backend whose one request left under
+# another bearer than the credential routing bound.
+_ONE_REQUEST_UNDER_ANOTHER_BEARER = r"^\(c\) .*\(1 request\(s\)\)"
+
+
+def test_the_proof_of_the_key_bound_at_load_fails_on_each_part_it_holds(tmp_path: Path) -> None:
+    # The lying counterparts of the proof above, one for each part of what
+    # it holds. (a) A copy of the shipped file whose text role has no key,
+    # and a copy where that key is written as a value. (b) The variable is
+    # present while routing loads the file, so routing loads it and builds
+    # a backend. (c) An adapter that takes its key from the environment at
+    # the call: a wrapper round the real adapter, which sends its one
+    # request under another bearer once the variable is gone. An adapter
+    # that sends nothing without a key fails that part as well, for the
+    # request that is not there, and is not what this counterpart shows.
+    shipped = _column(HOSTED_GATEWAY_KIND).routing_path(matrix_columns.COLUMN_PRODUCT)
+    body = _the_key_is_bound_while_routing_loads_the_file
+
+    for name, change in (
+        ("no-key", _without_a_key_on_the_text_role),
+        ("literal-key", _with_a_literal_key_on_the_text_role),
+    ):
+        with pytest.raises(AssertionError, match=r"^\(a\) "):
+            body(_copy_of_the_hosted_file(tmp_path / name, change), tmp_path / name)
+    with pytest.raises(AssertionError, match=r"^\(b\) "):
+        body(shipped, tmp_path / "present", absent_at_load=False)
+    with pytest.raises(AssertionError, match=_ONE_REQUEST_UNDER_ANOTHER_BEARER):
+        body(shipped, tmp_path / "at-the-call", driver=_KeyReadAtTheCall())
+    # The other way to fail part (c): nothing was sent at all. The proof
+    # refuses that too, in other words, and the counterpart above does not
+    # take it for an adapter that read its key at the call.
+    with pytest.raises(AssertionError) as silent:
+        body(shipped, tmp_path / "nothing-sent", driver=_NothingSentAtTheCall())
+    assert re.search(r"^\(c\) .*\(0 request\(s\)\)", str(silent.value))
+    assert not re.search(_ONE_REQUEST_UNDER_ANOTHER_BEARER, str(silent.value))
+
+
+def test_the_hosted_driver_refuses_to_play_a_route_without_its_credential(tmp_path: Path) -> None:
+    # No backend that routing built from a hosted route is without its
+    # credential, so the driver cannot build the state: an error of the
+    # matrix that names the pin, never a skip and never a cell.
+    with pytest.raises(MatrixSetupError, match="pins the scenario not expressible"):
+        with gateway.HostedGatewayDriver().open(
+            _column(HOSTED_GATEWAY_KIND),
+            capability="text",
+            lens="raw",
+            script=ProviderScript(()),
+            tmp_path=tmp_path,
+            without_credential=True,
+        ):
+            pass
+
+
+def test_the_local_route_without_its_credential_is_built_with_neither_key_variable_set(
+    tmp_path: Path,
+) -> None:
+    column = _column(LOCAL_GATEWAY_KIND)
+    hub = "INFER_AUTH_TOKEN"
+    before = os.environ[hub]
+
+    # The shipped route names no key, so the adapter takes one when it is
+    # built: from one of two variables, of which the scripted environment
+    # sets the second on every other cell.
+    assert gateway.KEY_VARIABLES == ("CRUCIBLE_LOCAL_API_KEY", hub)
+    assert declarations.credential_variable(
+        column.routing_path(matrix_columns.COLUMN_PRODUCT), _TEXT_ROLE
+    ) is None
+    assert matrix_columns.SCRIPTED_ENV[hub] == matrix_columns.CANARY_CREDENTIAL == before
+    with gateway.LocalGatewayDriver().open(
+        column,
+        capability="text",
+        lens="raw",
+        script=ProviderScript(()),
+        tmp_path=tmp_path / "built",
+        without_credential=True,
+    ) as bound:
+        # Routing has built the adapter: neither variable was set then, and
+        # the endpoint of the route is still the scripted provider.
+        assert not any(name in os.environ for name in gateway.KEY_VARIABLES)
+        assert bound.provider.url in os.environ[matrix_columns.ENDPOINT_ENV[LOCAL_GATEWAY_KIND]]
+    assert os.environ[hub] == before
+
+    execution = _played(column, "S28", tmp_path / "played")
+
+    # Nothing the cell sent carried the scripted credential. Whether it sent
+    # anything, and under what, is what the cell shows and its entry
+    # carries; this test holds the state the play was made in.
+    assert not any(
+        request.scripted_credential for request in execution.observation.provider.requests
+    )
+
+
+class _KeepsTheHubVariable(gateway.LocalGatewayDriver):
+    """The state is not built: the variable the scripted environment set stays."""
+
+    def _take_credential_away(self, column: Column, role: str) -> None:
+        return None
+
+
+class _KeepsItAndDoesNotLook(_KeepsTheHubVariable):
+    """And the driver does not look at what the adapter will find."""
+
+    def _require_no_credential(self, column: Column) -> None:
+        return None
+
+
+def test_a_local_play_whose_adapter_was_built_with_a_key_is_an_error_of_the_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = Cell(_column(LOCAL_GATEWAY_KIND), "S28", "raw")
+
+    # A driver that leaves the hub variable set is stopped before routing
+    # builds the adapter.
+    with pytest.raises(MatrixSetupError, match="would give the adapter a key"):
+        runner.execute(cell, tmp_path / "kept", driver=_KeepsTheHubVariable())
+    # One that does not look either is stopped by what the backend then
+    # sent: the codes of the cell would be the same with the scripted
+    # credential as with the adapter's placeholder.
+    with pytest.raises(MatrixSetupError, match="carried the scripted credential"):
+        runner.execute(cell, tmp_path / "unseen", driver=_KeepsItAndDoesNotLook())
+    # The key variable of a local endpoint is none the scripted environment
+    # sets, so the driver does not take it away: where a machine holds one,
+    # the state cannot be built here.
+    monkeypatch.setenv(gateway.KEY_VARIABLES[0], "a-key-of-this-machine")
+    with pytest.raises(MatrixSetupError, match="would give the adapter a key"):
+        runner.execute(cell, tmp_path / "ambient")
+
+
+# -- the state of the served-model pin on the routes of the kind ----------------------
+
+
+def test_the_state_of_the_served_model_pin_is_read_from_every_routing_file() -> None:
+    # A reply under another model is judged by the state of the route extra
+    # that pins the served model, as routing states it: read here from the
+    # shipped files, on every role a cell builds and on both products. A
+    # change of this state changes what that scenario asks of the column.
+    extra = declarations.SERVED_MODEL_EXTRA
+    states = {
+        (column.id, product, role): declarations.route_state(column, role, extra, product)
+        for column in COLUMNS
+        for product, _path in column.routing
+        for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+    }
+
+    assert states and set(states.values()) == {declarations.CARRIED}
+    assert len(states) == 18
+    # Carried is: set to the route's own model.
+    for column in COLUMNS:
+        for product, _path in column.routing:
+            for role in matrix_columns.ROLE_BY_CAPABILITY.values():
+                assert declarations.route_extra(column, role, extra, product) == (
+                    declarations.routed_model(column, role, product)
+                )
+
+
+# -- a reply under another model: what the entries of its cells do not show -----------
+
+# The record of the ledger whose cells the proof below plays, and its code.
+REFUSED_REPLY_GAP = "M28"
+_TOKENS_FLAGGED = "flag:token_usage_complete=False"
+_PRIMARY = tuple(column for column in COLUMNS if column.role == "primary")
+
+
+def _refused_reply(column: Column, tmp_path: Path) -> runner.Execution:
+    return _played(column, cells.SERVED_UNDER_ANOTHER_MODEL, tmp_path / column.kind.split(":")[-1])
+
+
+@pytest.mark.parametrize("column", _PRIMARY, ids=lambda column: column.id)
+def test_the_result_of_a_reply_refused_for_its_model_reports_the_tokens_the_provider_billed(
+    column: Column, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because no code of the cell shows it.
+
+    Both gateway routes pin the model that may serve them and refuse a reply
+    under another id, as the scenario asks. The result flags its token
+    usage incomplete, which is the one code of each cell (known gap M28).
+    Of a result that is flagged so, clause C6 takes any number below the
+    bill for honest, down to none: while the entry of the cell stands no
+    clause compares what the result reports, and a result that had lost the
+    usage of the billed reply would be the same expected failure. This test
+    compares it: the provider billed one reply, and the result reports its
+    tokens. A fix that flags the token usage of such a result by what was
+    accounted for lets the cell compare the numbers itself; this test holds
+    before and after it, and goes with its lying counterparts once no entry
+    lists the flag.
+    """
+
+    # The verifier requires this test by name on both kinds: the entries of
+    # the record lean on it, and a run without it is refused. No entry
+    # attributes a code to that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[column.kind]]
+    attributed = {
+        entry.cell for entry in LEDGER.entries if REFUSED_REPLY_GAP in entry.codes.values()
+    }
+    assert attributed <= {
+        Cell(item, cells.SERVED_UNDER_ANOTHER_MODEL, "raw").id for item in _PRIMARY
+    }
+
+    execution = _refused_reply(column, tmp_path)
+    result = execution.observation.result
+
+    # The play is the refusal the scenario asks for: the kind and the stop
+    # reason are the ones it names, nothing was dispatched, and the provider
+    # was asked once.
+    assert execution.report.seam_problems == () and result is not None
+    for clause in ("C0", "C2", "C3", "C7", "C10"):
+        assert execution.report.outcomes[clause].status == "ok", clause
+    assert result.error is not None
+    assert runner.not_the_tokens_of_the_one_billed_reply(execution) == []
+
+
+def test_the_proof_of_the_refused_reply_fails_on_a_result_that_lost_its_usage(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the proof above, on both kinds: the result
+    # of the cell with its usage made up. Dropped whole, halved, one token
+    # short: the result flags its token usage incomplete, so the contract
+    # judges each to the codes of the honest play and the comparator is
+    # handed the same, which makes the lying result the same expected
+    # failure; the proof names each. A provider that billed nothing, or two
+    # replies, is not the one billed reply the proof is about.
+    for column in _PRIMARY:
+        honest = _refused_reply(column, tmp_path)
+        result = honest.observation.result
+        assert result is not None and _TOKENS_FLAGGED in honest.report.codes, (
+            f"{column.id}: the result no longer flags its token usage incomplete, so the "
+            "cell compares the tokens itself: these counterparts go with the entry"
+        )
+        usage = result.usage
+        assert runner.not_the_tokens_of_the_one_billed_reply(honest) == []
+        for lost in (
+            Usage(),
+            dataclasses.replace(
+                usage,
+                input_tokens=usage.input_tokens // 2,
+                output_tokens=usage.output_tokens // 2,
+            ),
+            dataclasses.replace(usage, input_tokens=usage.input_tokens - 1),
+            dataclasses.replace(usage, output_tokens=usage.output_tokens - 1),
+        ):
+            lying = runner.judged_again(honest, usage=lost)
+            assert runner.handed_to_the_comparator(lying) == runner.handed_to_the_comparator(
+                honest
+            )
+            assert runner.not_the_tokens_of_the_one_billed_reply(lying) != []
+        (billed,) = honest.observation.provider.billed
+        for bill in ([], [billed, billed]):
+            provider = dataclasses.replace(honest.observation.provider, billed=bill)
+            other = dataclasses.replace(
+                honest, observation=dataclasses.replace(honest.observation, provider=provider)
+            )
+            assert runner.not_the_tokens_of_the_one_billed_reply(other) != []
+        # More than the bill is no lower bound: the cell itself names that,
+        # whatever the result flags.
+        more = runner.judged_again(
+            honest, usage=dataclasses.replace(usage, input_tokens=usage.input_tokens + 1)
+        )
+        assert more.report.codes == honest.report.codes | {"usage.input_tokens:gt"}
+        assert runner.not_the_tokens_of_the_one_billed_reply(more) != []
 
 
 # -- the module ends with the canary check --------------------------------------------

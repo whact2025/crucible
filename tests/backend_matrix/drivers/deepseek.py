@@ -704,6 +704,7 @@ class DeepSeekDriver:
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
+        without_credential: bool = False,
     ) -> Iterator[_Bound]:
         if column.kind != self.kind:
             raise MatrixSetupError(f"column {column.id} is not of kind {self.kind}")
@@ -728,7 +729,13 @@ class DeepSeekDriver:
             )
             interposer = launch.Interposer(lambda: journal, redirect=self._redirect(provider))
             stack.enter_context(launch.at_supervisor(adapter, interposer, _SEAM))
-            stack.enter_context(matrix_columns.adapter_credential(self.kind))
+            # The route names no key: the adapter reads the variable of the
+            # kind at each call. Without its credential the route is built as
+            # ever and that variable is absent for as long as the backend is
+            # open.
+            stack.enter_context(
+                matrix_columns.adapter_credential(self.kind, absent=without_credential)
+            )
             overlay = (
                 {}
                 if identity is None

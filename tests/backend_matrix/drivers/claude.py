@@ -653,8 +653,17 @@ def write_peer(
     organisation: Mapping[str, str],
     cli_version: str,
     faults: Sequence[str] = (),
+    signed_in: bool = True,
+    tool_request: str = peer_program.JOINED,
 ) -> Peer:
-    """Write the launcher and the configuration of a cell's peer."""
+    """Write the launcher and the configuration of a cell's peer.
+
+    With ``signed_in`` false the peer answers the sign-in probe of the
+    session route as a tool that is not signed in; the rest of its answer is
+    as on every other cell. ``tool_request`` is the order in which the peer
+    sends the request for a tool call after the frame of the model turn that
+    makes it, one of the two the peer states.
+    """
 
     directory.mkdir(parents=True, exist_ok=True)
     peer = Peer(directory / "claude", directory / "config.json", directory / "journal.jsonl")
@@ -665,7 +674,7 @@ def write_peer(
                 "journal": str(peer.journal),
                 # What the two probes of the session route are answered with.
                 "auth_status": {
-                    "loggedIn": True,
+                    "loggedIn": signed_in,
                     "authMethod": "claude.ai",
                     "apiProvider": "firstParty",
                     **organisation,
@@ -676,6 +685,7 @@ def write_peer(
                 # it and never writes it into its journal.
                 "forbidden": [CANARY_CREDENTIAL],
                 "faults": list(faults),
+                "tool_request": tool_request,
             },
             indent=2,
             sort_keys=True,
@@ -694,6 +704,11 @@ def write_peer(
     )
     peer.launcher.chmod(0o700)
     return peer
+
+
+# How a routing file says that a route takes its credential from the
+# session of the vendor tool.
+_SESSION = "claude_session"
 
 
 @dataclass
@@ -734,6 +749,13 @@ class ClaudeDriver:
         "CLAUDE_SESSION_REVIEWED_CLI_VERSIONS_BY_MODEL",
     )
     faults: tuple[str, ...] = ()
+    # How the peer of a cell sends the request for a tool call after the
+    # frame of the model turn that makes it. Every cell plays the tool that
+    # asks its tool server at once, frame and request in one write: the
+    # adapter then has the request in hand when it reads the frame, and a
+    # cell shows the same thing in every play. The timing is the peer's and
+    # is constructed: no source in reach states the vendor tool's.
+    tool_request: str = peer_program.JOINED
 
     @property
     def inexpressible(self) -> Mapping[str, str]:
@@ -786,6 +808,7 @@ class ClaudeDriver:
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
+        without_credential: bool = False,
     ) -> Iterator[_Bound]:
         if column.kind != self.kind:
             raise MatrixSetupError(f"column {column.id} is not of kind {self.kind}")
@@ -799,6 +822,12 @@ class ClaudeDriver:
             )
             shipped = load_routing(config_path=column.routing_path(COLUMN_PRODUCT))
             route = shipped.for_role(role)
+            if without_credential and route.extra.get("credential_source") != _SESSION:
+                raise MatrixSetupError(
+                    f"column {column.id}: the route of role {role!r} does not name "
+                    "the session of the vendor tool as the source of its credential, "
+                    "so the peer has no sign-in to take away"
+                )
             # The organisation of the session comes from the routing file.
             organisation = {
                 wire: str(route.extra[name])
@@ -811,6 +840,12 @@ class ClaudeDriver:
                 organisation=organisation,
                 cli_version=reviewed_cli_version(str(route.model)),
                 faults=self.faults,
+                # The route takes its credential from the session of the
+                # tool and reads it at the call, through the sign-in probe
+                # of the tool: without it the tool reports that it is not
+                # signed in.
+                signed_in=not without_credential,
+                tool_request=self.tool_request,
             )
             overlay = {name: str(peer.launcher) for name in self.overlay(column, {})}
             # The boundary of the matrix: exactly what a workflow calls.

@@ -250,6 +250,10 @@ class Column:
     # True on the view of a column whose routing file is read as shipped
     # (``as_shipped``): a driver adds no admission input to its routes there.
     shipped: bool = False
+    # What a column without a routing file states of the route extras that
+    # key a difference table: (extra, state) pairs. A column with a routing
+    # file states none; its states are read from the file.
+    route_states: tuple[tuple[str, str], ...] = ()
 
     @property
     def id(self) -> str:
@@ -386,7 +390,10 @@ def toy_columns(
 
     Computed from the declaration snapshot, never typed: each toy column takes
     the whole declared profile of the first snapshot row (in key order) that
-    shows its combination, and is named after the combination.
+    shows its combination, and is named after the combination. The state of a
+    route extra that keys a difference table is no declared value and the toy
+    has no routing file, so a toy column states it itself
+    (:func:`with_route_states`); the caller says which.
     """
 
     columns: dict[tuple[str, ...], Column] = {}
@@ -405,6 +412,32 @@ def toy_columns(
             features=profile,
         )
     return tuple(columns[values] for values in sorted(columns))
+
+
+def with_route_states(
+    columns: Sequence[Column], extras: Sequence[str], states: Sequence[str]
+) -> tuple[Column, ...]:
+    """The toy ``columns``, each stating one state of every keying extra.
+
+    The states are dealt out in turn over the columns in their order, so
+    that every state is stated by a column: with fewer columns than states a
+    state would have no honest pass, which is an error.
+    """
+
+    if not extras:
+        return tuple(columns)
+    if len(columns) < len(states):
+        raise MatrixSetupError(
+            f"{len(columns)} toy column(s) cannot state the {len(states)} states of "
+            f"{list(extras)}: a state would have no honest pass"
+        )
+    return tuple(
+        dataclasses.replace(
+            column,
+            route_states=tuple((extra, states[index % len(states)]) for extra in extras),
+        )
+        for index, column in enumerate(columns)
+    )
 
 
 def matrix_rate(model: str) -> ModelPricing:
@@ -489,12 +522,14 @@ def scripted_environment(**endpoints: str) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def adapter_credential(kind: str) -> Iterator[None]:
+def adapter_credential(kind: str, *, absent: bool = False) -> Iterator[None]:
     """Give the adapter of ``kind`` the canary credential for the block.
 
     For an adapter that reads its credential from the environment at each
     dispatch. The variable is restored afterwards: no test outside the block
-    sees it, and a real one on a developer machine is never used.
+    sees it, and a real one on a developer machine is never used. With
+    ``absent`` the variable is taken away for the block instead: the route
+    without its credential, at the moment the adapter reads it.
     """
 
     try:
@@ -504,7 +539,10 @@ def adapter_credential(kind: str) -> Iterator[None]:
             f"kind {kind} reads no credential from the environment itself"
         ) from exc
     previous = os.environ.get(name)
-    os.environ[name] = CANARY_CREDENTIAL
+    if absent:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = CANARY_CREDENTIAL
     try:
         yield
     finally:
