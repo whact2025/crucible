@@ -16,6 +16,13 @@ import pytest
 
 from crucible.workflows import _mutation_journal as journals
 
+from .test_mutation_journal_discovery_witness import (
+    _settle,
+    from_memory,
+    steady_wall_clock,
+    witness_unavailable_reason,
+)
+
 
 _GIT_ENV = {
     "GIT_CONFIG_GLOBAL": os.devnull,
@@ -118,6 +125,7 @@ def _refs_authority(
 
 
 @pytest.mark.parametrize("linked_worktree", [False, True])
+@steady_wall_clock
 def test_admin_tree_validation_git_discovery_is_constant_per_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -142,8 +150,7 @@ def test_admin_tree_validation_git_discovery_is_constant_per_tree(
         calls.append(args)
         return original_git(cwd, *args, **kwargs)
 
-    monkeypatch.setattr(journals, "_git", counting_git)
-    with journals.workspace_mutation_lock(worktree):
+    def validation_calls() -> list[tuple[str, ...]]:
         calls.clear()
         assert journal._bound_git_admin_tree_matches(
             refs,
@@ -151,12 +158,49 @@ def test_admin_tree_validation_git_discovery_is_constant_per_tree(
             entries=entries,
             label="large refs proof",
         )
+        return list(calls)
 
-    # One pre-proof and one successful terminal proof.  Each performs the
-    # checkout/superproject and common-dir discovery commands, independently
-    # of the number of entries validated between them.
-    assert len(calls) == 4
-    assert all(call[0] == "rev-parse" for call in calls)
+    monkeypatch.setattr(journals, "_git", counting_git)
+    git_dir = repo / ".git"
+    if linked_worktree:
+        git_dir = git_dir / "worktrees" / "lane"
+    head = git_dir / "HEAD"
+    _settle(worktree)
+    with journals.workspace_mutation_lock(worktree):
+        unchanged = validation_calls()
+        head.write_bytes(head.read_bytes())
+        _settle(worktree)
+        after_change = validation_calls()
+        repeated = validation_calls()
+        (tmp_path / ".git").mkdir()
+        try:
+            below_git_directory = validation_calls()
+        finally:
+            (tmp_path / ".git").rmdir()
+
+    # The batch proves the held authority before and after the tree.  Both
+    # proofs run every layer; Git's own discovery (the superproject and the
+    # common-dir command) is started unless the witness of what Git reads for
+    # it equals the one under which Git last named the held common directory.
+    # The lock's acquisition asked Git and, the checkout having settled, kept
+    # the answer, so an unchanged checkout with a kept answer needs no Git
+    # process, whatever the number of entries validated.
+    if witness_unavailable_reason(worktree) is None:
+        from_memory(unchanged == [], unchanged)
+        # A rewritten HEAD costs one discovery, at the first proof after it:
+        # never less, and no more once the change has settled.
+        assert len(after_change) >= 2
+        from_memory(len(after_change) == 2, after_change)
+        from_memory(repeated == [], repeated)
+    else:
+        # Where no answer can be remembered, both proofs ask Git every time.
+        assert len(unchanged) == len(after_change) == len(repeated) == 4
+    # An entry named .git above the checkout: Git is asked by both proofs.
+    assert len(below_git_directory) == 4
+    assert all(
+        call[0] == "rev-parse"
+        for call in (*unchanged, *after_change, *repeated, *below_git_directory)
+    )
 
 
 def test_admin_tree_batch_rejects_forged_cross_context_capabilities(
