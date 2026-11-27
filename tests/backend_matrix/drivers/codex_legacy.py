@@ -66,10 +66,22 @@ from ..provider import (
     Reply,
     SeenRequest,
     answered_from,
+    refused_from,
     require_cut_in_body,
+    require_decoded_arguments,
     whole_and_partial,
 )
-from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, Step
+from ..script import (
+    Call,
+    Drop,
+    Empty,
+    Malformed,
+    ProviderScript,
+    Reason,
+    Refuse,
+    Say,
+    Step,
+)
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
@@ -134,6 +146,33 @@ def _text(content: Any) -> str:
     )
 
 
+def _spelled(key: str) -> str:
+    return key.replace("_", "").replace("-", "").lower()
+
+
+def _response_cap(session: Mapping[str, Any], *requests: Mapping[str, Any]) -> int | None:
+    """A cap on the output tokens of a response, wherever the client states one.
+
+    In a request that opens a thread or a turn, at its top level or in the
+    configuration it carries, and in a setting on the command line of the
+    tool, under any spelling of a maximum of output tokens. The protocol has
+    no field of that meaning in the generated types; the tool has a setting
+    of its own for it.
+    """
+
+    for params in requests:
+        nested = params.get("config")
+        for holder in (params, nested if isinstance(nested, dict) else {}):
+            for key, value in holder.items():
+                if _spelled(str(key)).endswith("maxoutputtokens") and type(value) is int:
+                    return value
+    for item in session.get("argv") or ():
+        key, found, value = str(item).partition("=")
+        if found and _spelled(key).endswith("maxoutputtokens") and value.strip().isdigit():
+            return int(value)
+    return None
+
+
 def _turn_control(*requests: Mapping[str, Any]) -> int | None:
     """A turn ceiling in a request of the client, under any spelling of the key."""
 
@@ -150,18 +189,26 @@ class CodexAppServerDialect:
     name = "codex_app_server"
     path = "/codex-app-server/v1/response"
     provider = "app_server"
+    # Where the peer asks what the app-server answers a request to resume a
+    # thread it finds no rollout for: the tool keeps the threads of this wire.
+    resume_path = peer_program.RESUME_PATH
     behaviours: tuple[str, ...] = (
         "agent_message",
         # A response that reasons and writes no message.
         "reasoning",
         "tool_call_started",
         "tool_call_completed",
+        # A call that its tool server answered with an error.
+        "tool_call_failed",
         "raw_response_completed",
         "token_usage_updated",
         "turn_completed",
         # The one refusal the notifications can carry: a failed turn whose
         # error names a policy of the provider.
         "turn_failed_policy",
+        # No notification: the error object that answers a request to resume
+        # a thread the tool finds no rollout for.
+        "resume_rejected",
     )
 
     def __init__(self, *, client: str = "") -> None:
@@ -250,6 +297,9 @@ class CodexAppServerDialect:
             schema_field=turn.get("outputSchema") is not None,
             host=lowered.get("host", ""),
             evidence=evidence,
+            # The dialect does not state that the wire has the field: a cap
+            # that shows is held against a route that declares none.
+            response_cap=_response_cap(self.session(evidence)[0], thread, turn),
         )
 
     def launch_problems(
@@ -310,6 +360,27 @@ class CodexAppServerDialect:
 
     # -- answering it ------------------------------------------------------------
 
+    def refuse_resume(self, body: bytes) -> tuple[str, Reply]:
+        """What the app-server answers a request to resume a thread it finds no rollout for.
+
+        The error object of the answer, rendered from its envelope; the peer
+        adds the id of the request. Emulated, not observed: the envelope
+        says what it rests on.
+        """
+
+        try:
+            asked = _mapping(json.loads(body.decode("utf-8")) if body else {})
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            asked = {}
+        thread_id = str(asked.get("thread", ""))
+        envelope = envelope_files.load(f"{self.name}/{self.provider}.resume_rejected")
+        error = envelope.fill({"thread_id": thread_id})["error"]
+        return thread_id, Reply(
+            200,
+            {"error": {**error, "message": "".join(error["message"])}},
+            envelopes=(envelope.name,),
+        )
+
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
         if isinstance(step, Refuse) and step.form != REFUSAL:
             raise MatrixSetupError(
@@ -318,7 +389,7 @@ class CodexAppServerDialect:
                 "response and no refusal part of a message, so the cell is pinned "
                 "not expressible in the inventory"
             )
-        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop)):
+        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop, Empty)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__}: the "
                 "wire names no served model, and every other step lands with the "
@@ -343,16 +414,22 @@ class CodexAppServerDialect:
 
         for item in _records(evidence.get("tool_results")):
             if item.get("is_error"):
-                # How the tool reports a failed call is not known.
-                return Reply(
-                    200,
-                    {
-                        "frames": [],
-                        "call": None,
-                        "unsupported": "a tool call that its server answered with an "
-                        "error has no envelope: the scenario that needs it adds one",
-                    },
+                # The tool server answered the call with an error: the item
+                # is reported as failed, with the text of that answer.
+                frame(
+                    "tool_call_failed",
+                    created=now(),
+                    call_id=str(item.get("call_id", "")),
+                    tool_server=str(item.get("server", "")),
+                    tool_name=str(item.get("name", "")),
+                    tool_input=item.get("arguments"),
+                    tool_result="".join(
+                        str(block.get("text", ""))
+                        for block in _records(item.get("content"))
+                        if block.get("type") == "text"
+                    ),
                 )
+                continue
             frame(
                 "tool_call_completed",
                 created=now(),
@@ -392,6 +469,7 @@ class CodexAppServerDialect:
             )
 
         if isinstance(step, Call):
+            require_decoded_arguments(self.name, step)
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
             listed = _mapping(evidence.get("tools"))
@@ -432,6 +510,11 @@ class CodexAppServerDialect:
                 item_id=f"rs_{call_id}",
                 reasoning_text=REASONING_TEXT,
             )
+        elif isinstance(step, Empty):
+            # The response produced nothing: the wire names a message as an
+            # item the model produced, so the turn completes without one,
+            # after the usage of a response with no output token.
+            pass
         else:
             frame("agent_message", created=now(), item_id=f"msg_{call_id}", text=step.text)
         account()
@@ -716,6 +799,9 @@ class CodexLegacyDriver:
 
     def answers(self, script: ProviderScript) -> tuple[str, ...]:
         return answered_from(CodexAppServerDialect(), script)
+
+    def refuses(self) -> tuple[str, ...]:
+        return refused_from(CodexAppServerDialect())
 
     def _dialect(self) -> CodexAppServerDialect:
         return LegacyDialect(client=sdk_client())

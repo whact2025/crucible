@@ -47,7 +47,9 @@ from .scenarios import SCENARIOS, TEXT, history_replayed
 from .script import (
     READ_A,
     Call,
+    Cut,
     Drop,
+    Empty,
     Malformed,
     ProviderScript,
     Refuse,
@@ -573,6 +575,19 @@ def test_the_dialect_reads_a_responses_request_and_renders_only_from_envelopes()
     assert terminal["response"]["model"] == "asked"
     assert reply.call is not None and reply.call[1] == "call-7"
     assert reply.envelope == "deepseek_responses/deepseek.tool_call"
+    assert not reply.call_malformed
+    # The arguments of a function call travel as text in a string, so a text
+    # that is no JSON object travels too, through the same envelope; the
+    # reply says that the call names no arguments.
+    cut = dialect.render(Call(READ_A, malformed='{"file_path": "notes'), seen, "call-8")
+    carried = [
+        item["arguments"]
+        for item in cut.body[-1]["response"]["output"]
+        if item["type"] == "function_call"
+    ]
+    assert carried == ['{"file_path": "notes']
+    assert cut.call_malformed and cut.call is not None and cut.call[2] == {}
+    assert cut.envelope == reply.envelope
     with pytest.raises(MatrixSetupError, match="does not render"):
         dialect.render(object(), seen, "1")  # type: ignore[arg-type]
 
@@ -766,12 +781,19 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
         # response that declines in a refusal part is a completed one.
         "content_filter": ("response.incomplete", "ResponseIncompleteEvent"),
         "refusal_part": ("response.completed", "ResponseCompletedEvent"),
+        # A response the provider ended at the cap on its output tokens ends
+        # as an incomplete one too; a response in which nothing was produced
+        # is a completed one.
+        "Cut": ("response.incomplete", "ResponseIncompleteEvent"),
+        "Empty": ("response.completed", "ResponseCompletedEvent"),
     }
     steps: tuple[Step, ...] = (
         Say("the answer"),
         Call(READ_A),
         Refuse("content_filter"),
         Refuse("refusal_part"),
+        Cut("what the cap left"),
+        Empty(),
     )
     for step in steps:
         events = dialect.render(step, blank, "call-1").body
@@ -811,6 +833,35 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
         ("guard", "-c")
     ] * len(steps)
     assert locked_worker_launch.violations() == []
+    # Two replies end on the terminal of an incomplete response, and only
+    # the reason in that terminal tells them apart: the cap on the output
+    # tokens, or the content filter. The cells of the column cannot stand
+    # for this: the adapter is handed no reason, so the cell of a cut shows
+    # the same codes for either. A response the cap ended carries the text
+    # that was produced in the output of its terminal; a response in which
+    # nothing was produced completes with no output item and no output
+    # token.
+    cut = dialect.render(Cut("what the cap left"), blank, "call-1")
+    filtered = dialect.render(Refuse("content_filter"), blank, "call-1")
+    silent = dialect.render(Empty(), blank, "call-1")
+    ended, stopped, nothing = (reply.body[-1]["response"] for reply in (cut, filtered, silent))
+    assert (ended["status"], ended["incomplete_details"]) == (
+        "incomplete",
+        {"reason": "max_output_tokens"},
+    )
+    assert (stopped["status"], stopped["incomplete_details"]) == (
+        "incomplete",
+        {"reason": "content_filter"},
+    )
+    (message,) = ended["output"]
+    assert (message["status"], message["content"][0]["text"]) == ("incomplete", "what the cap left")
+    assert cut.envelope == f"deepseek_responses/deepseek.{driver.OUTPUT_CUT}"
+    assert cut.usage == Cut("what the cap left").usage
+    assert (nothing["status"], nothing["output"]) == ("completed", [])
+    assert "incomplete_details" not in nothing
+    assert nothing["usage"]["output_tokens"] == 0
+    assert silent.envelope == f"deepseek_responses/deepseek.{driver.EMPTY_COMPLETION}"
+    assert silent.usage == Empty().usage and len(silent.body) == 3
     # The third refusal is no stream: a rejected request is answered with an
     # error object of the SDK's four fields, bills nothing and names no model.
     rejected = dialect.render(Refuse("http_policy"), blank, "call-1")
@@ -939,7 +990,9 @@ def test_every_cell_of_the_column_is_graded_by_the_envelopes_it_used(
     loop = {"deepseek_responses/deepseek.completion", "deepseek_responses/deepseek.tool_call"}
     reasoning = {"deepseek_responses/deepseek.reasoning_only"}
     unended = f"deepseek_responses/deepseek.{driver.MALFORMED}"
-    refusals = set(DRIVER.envelopes) - loop - reasoning - {unended}
+    cut = f"deepseek_responses/deepseek.{driver.OUTPUT_CUT}"
+    silent = f"deepseek_responses/deepseek.{driver.EMPTY_COMPLETION}"
+    refusals = set(DRIVER.envelopes) - loop - reasoning - {unended, cut, silent}
     assert set(text.observation.provider.envelopes) == {"deepseek_responses/deepseek.completion"}
     assert set(tools.observation.provider.envelopes) == loop
     assert set(DRIVER.envelopes) == {
@@ -961,6 +1014,11 @@ def test_every_cell_of_the_column_is_graded_by_the_envelopes_it_used(
     # That a stream of the route ends in order before its terminal is stated
     # by no source either: the envelope of that reply is constructed.
     assert envelopes.load(unended).grade == "constructed"
+    # The vendor names the terminal of an incomplete response and does not
+    # say when it is sent, and no source states a response without output:
+    # the envelopes of a reply cut at the cap and of a reply in which
+    # nothing was produced are constructed.
+    assert {envelopes.load(name).grade for name in (cut, silent)} == {"constructed"}
     # The schema answer of the planner shape travels in the prompt, once, and
     # in no provider field: what the route declares.
     assert SCENARIOS["S04"].governing == ("structured_output",)

@@ -96,8 +96,15 @@ only, each scenario from the change that defines it. A blocked column runs
 its three scenarios. A form of refusal that the wire of a kind cannot carry
 is pinned not expressible in [the inventory](backend_matrix/inventory.yaml)
 and has no cell: the refusal part on the Claude columns, the content-filter
-stop and the refusal part on both Codex kinds. No such pin exists on an
-open-weight kind.
+stop and the refusal part on both Codex kinds. One other step is pinned, on
+the same three kinds: a tool call whose argument text is no JSON object
+(`S05`). The wire the matrix scripts for them is a session of the vendor's
+tool, on which a tool call travels to the adapter as a decoded object (the
+control channel of the Claude tool, the tool bridge of the Codex
+app-server). No such pin exists on an open-weight kind. A pin is a property
+of the scripted wire, not of what stands between that wire and the adapter:
+the Kimi worker reads the provider's chat stream, which carries the
+argument text of a call in a string, so the Kimi kind plays that scenario.
 
 The two turn cells hold a count. The turn limit asks every turn of the count
 of the provider, so a limit that is typed after fewer tool-bearing requests
@@ -221,6 +228,142 @@ of the plain completion of its dialect; the envelopes of `S26` on the four
 HTTP columns are `constructed`, because no source states that a provider
 sends such a reply.
 
+Four scenarios of pack B are about a tool loop. Two hold a limit inside it.
+`S10b` is the turn limit of `S10a` under the policy that asks for no error
+at the limit (`on_max_turns="continue_with_warning"`, the one field a static
+test admits for it): the limit is reached and recorded as there, the result
+carries no error, and what the model had written is the final message. The
+scripted model writes nothing before the limit, so the final message is
+empty, unless the route may ask once more without tools (`turn_limit:
+round_boundary`): then the answer to that request is the final message. So
+the cell can fail for text that was dropped only on such a route. Where the
+model is never asked again (`hard`, `provider_stop`) it holds that the
+result carries no text of the adapter's own, and an adapter that dropped
+what a model wrote beside its tool calls would pass it: no script writes
+text beside a tool call. A
+route that claims no turn limit plays a finite script to its answer. `S14`
+is a USD budget that the second response of a tool loop crosses. Every
+variant owes the typed budget stop with its limit event and all four
+completeness flags, so clause C6 holds the reported usage to exactly the
+responses the provider billed. The declared `tool_loop` selects how far the
+loop may run: an adapter that runs the loop itself (`adapter_owned`) asks
+for no third round, and a request for one is unscripted; a loop that a
+vendor's tool or SDK runs (`sdk_owned`) ends where that tool ends it, after
+two to four tool rounds or with the answer, which the script holds ready and
+never requires. Nothing is stated for a route that declares no tool loop
+(`none`); no column does, and the plan of that value raises a setup error.
+The Claude tool is started with the budget on its command line, and the
+scripted peer emulates its budget terminal between two model turns as it
+emulates its turn terminal: the reply to the turn with which the cost of the
+session reaches the budget carries the terminal frame, which the peer emits
+after the tool call of that turn in the place of a further model turn. The
+frame is `constructed`: the pinned SDK names its subtype and no source in
+reach shows the frame. That the session stops after that turn is therefore
+the peer's doing. The adapter types the overrun from the cost of the
+session, by its own comparison with the budget, so the Claude cell shows
+that it accounts for both turns and types the stop, and does not show that
+it reads the tool's budget terminal: no cell depends on the subtype of that
+frame. On the official Codex route the budget stop is not typed: the route
+reports the last response of a turn of several and judges the budget on that
+cost. Its cell is an expected failure for that under the record of the
+reading of `last`, and the test that plays both readings holds exactly the
+three codes of a budget that is not typed beside the usage code where the
+plan has a budget, and nothing beside it where it has none.
+
+The two others are tool calls that must not be dispatched, followed by the
+model's answer. `S05` is three calls for an attached tool, one a response,
+none with a JSON object for its arguments: a text that is no JSON document,
+a JSON text that says "nothing" (`null`) and a JSON list that is not empty.
+None of the calls names any arguments: clause C10 aligns them with no
+dispatch, and whatever reaches the ToolSet in their place is a deviation:
+the tool with an empty object or with any other arguments, the value a
+text decodes to, the text itself. The recorder of the fixture keeps what a
+ToolSet was handed as it came and hands the ToolSet's own answer back, so
+a call that hands it a list, a text or nothing is on record as one, and it
+is the dispatch of no scripted call. The scenario runs on the kinds whose
+scripted wire carries the argument text of a call in a string (both
+gateway kinds, the DeepSeek kind and the Kimi kind); on the three others
+it is pinned not expressible. It passes the ten minutes of the catalogue
+scenario as its invocation deadline, the one field a static test admits
+for it: its four requests take a backend that starts a worker for every
+request a third of the base policy's minute, and more than the minute
+where two other busy processes share its hardware thread, and the scenario
+is not about a deadline either. `S06` is a call for a tool that no fixture
+attaches: neither that name nor an attached tool in its place may reach the
+ToolSet. It runs on every kind. On the three session wires the model's call
+does not travel: the scripted tool forwards it to the first tool server it
+knows, which refuses the name, and the Codex app-server dialect reports
+such a call as a failed item. Both are choices of the dialects, said in the
+envelopes (`constructed`): no source in reach says what the real tools do
+with a call for a name they never listed, nor which status the app-server
+reports. Both scenarios ask that the model is answered and the turn ends as
+the provider ends it, with complete accounting. A decision panel ruled that
+this stands: a backend that ends the call with a typed error instead
+deviates, and so does one that clears the trace flag of a call whose events
+are all in the trace.
+
+Four more scenarios of pack B attach no ToolSet and run in the raw lens.
+`S02` is a schema answer without tools, on the difference table of `S04`:
+where the schema travels follows `structured_output`. `S17` is a reply the
+provider ended at the cap on the tokens of the response. It is a complete
+reply of its wire: the text that was produced, the mark of a cut where the
+wire states how a turn ended (the finish reason `length` on the three chat
+wires, the terminal of an incomplete response with the reason
+`max_output_tokens` on the DeepSeek route) and its usage. The scenario
+expects a transport error that is not retriable, with the stop reason
+`max_tokens`, a `limit` event named `response_tokens` and all four flags:
+never a turn limit and never an answer. It does not assert that no other
+`limit` event stands beside that one, what the final message of the error
+result holds, or the value of the cap. It is governed by
+`response_token_limit`. A route that declares an enforced cap (`hard`,
+`provider_stop`) owes the cap in every request on a wire that has a field
+for one, which the dialect of the wire says (`ResponseCapDialect`, as the
+turn count of `S11`); the value is the route's own and is not asserted. A
+route that declares none, as the three reference kinds do, plays the
+complete reply: its cell is the clean finish of `S01`, and a request that
+carries a cap deviates. `S25` is a clean stop that produced nothing: no
+text, no reasoning and no output token, with the input billed. It expects a
+transport error that a caller may retry, whose stop reason is none of those
+a workflow reads, with all four flags. On the Codex wire such a response
+has no item of an agent message. Two reference cells of `S25` are known
+gaps by a decision panel's ruling: the Claude adapter returns the error
+under the stop reason of the session (`R19`), and on the app-server Codex
+route the client library raises first and the error is not retried (`R20`).
+`S50` asks to continue a conversation
+under a handle that nobody holds, and is governed by `session_continuity`.
+A route that declares `workflow_bound` returns the typed stale
+conversation, which is not retriable, with an outcome that names no handle
+and carries the identity fingerprint and the operation digest of the
+request; the handle is refused before a model turn is asked, so the script
+is empty and the three flags a scenario may waive are not asked. On the two
+session wires the vendor tool keeps the conversations, so the refusal is
+the scripted peer's: the Claude peer says on its standard error that it
+found no conversation and exits, the Codex peer answers the request to
+resume the thread with an error object. Both are emulated, not observed.
+The sentence of the one and the error code of the other are written from
+memory of the tools, each in an envelope of the grade `constructed` that
+the provider side renders for the peer, and each decides a cell: the Claude
+adapter types a refused session by the words the tool printed, and the
+official Codex route by the code of the error object. A lying counterpart
+of each peer (the same refusal in other words, or under another code) shows
+it in the module of the kind. On such a wire the cell also holds that the
+tool was asked for the handle of the request and for no other
+(`conversation:unasked`). A route that declares `none` or `retry_only`
+refuses the request before transport with `NotImplementedError`, the one
+type the scenario names; a raise counts as that refusal only where `invoke`
+raised it in the module of the backend the cell built. The cell does not
+hold that an accepted conversation request returns a handle, or that a
+second call continues the conversation: both need a second call, so a
+stale result is no observation that a route continues conversations. The
+replies of `S17` and `S25` on the four HTTP columns are `constructed`, and
+so is the refusal of a handle on the three reference kinds. No model
+answers those three cells and their script is empty; what static cell `H03`
+reads of a cell without playing it is the plan, so it finds the envelope of
+the refusal there and a record that names a closing grade cannot close on
+it. The cell of the official Codex route is carried so, as an unconfirmed
+known gap (`R21`): red under the emulated code, and its entry goes only on
+an observed or documented answer of the tool.
+
 Two static cells run on the toy columns only: `P01` (the protocol surface)
 and `P02` (the profile binding). So on a real column no cell asserts that the
 backend instance declares the profile routing computes for its route, or that
@@ -290,10 +433,13 @@ sanitised, and the control handshake preceded the prompt. The peer's journal
 names the variables of its environment and keeps none of their values beyond
 the three the canary reads. Nothing was observed of the real tool, so every
 frame of the peer is `constructed` and its session accounting is an emulation.
-The peer emulates one terminal of the tool: a session that has used up its
+The peer emulates two terminals of the tool. A session that has used up its
 turn allowance ends, after the tool call of its last allowed turn, with the
 error result the pinned SDK names for it (`error_max_turns`) and a status
-other than zero, and the model is not asked again. A refusal reaches the
+other than zero, and the model is not asked again. A session whose cost has
+reached the budget on its command line ends in the same way, after the tool
+call of the turn that took the cost there, with the error result the pinned
+SDK names for that (`error_max_budget_usd`). A refusal reaches the
 adapter in the two forms the frames of the tool can carry: a model turn whose
 stop reason is the refusal, and the error terminal of a request the provider
 rejected with an HTTP status, with the accounting the tests of the product
@@ -301,8 +447,9 @@ state for that terminal. Every cell that rests on one of these frames
 rests on an emulation of the reference. Where the script says so the peer
 goes away: it ends its output in order and exits with status 0 without a
 terminal frame, or it is killed inside a line of its output, after the
-frames that had travelled whole. What the peer does not emulate (the budget
-terminal between two turns) ends the cell as a setup error, never as an
+frames that had travelled whole. What the peer does not emulate (a turn that
+is asked for beyond the turn allowance or with the budget spent, the tool's
+retries of a schema answer) ends the cell as a setup error, never as an
 observation. A known gap on a reference column needs the owner's ruling in
 its ledger entry. A ruling that keeps a gap is always written in the entries of
 the gap: on a registry record a ruling is the licence to withdraw a cell of
@@ -415,7 +562,7 @@ lies inside the worker's own environment, because such a program opens its
 sockets where the network guard does not see them: without the stage the
 bundled runtime never starts, and the attempt is a violation.
 
-Five known gaps of the reference columns lean on a proof that the verifier
+Eight known gaps of the reference columns lean on a proof that the verifier
 requires by name, because the codes of their cells do not say what the gap
 is, or what its record says of the result. On a write the trace of the
 Claude adapter binds a tool-authority digest
@@ -434,16 +581,35 @@ Codex route a billed turn whose last response shows no message ends as a
 transport error; the two codes of its cell are those of any error after the
 accounting, so the proof shows that the error is not retriable and carries
 the sentence the client library of the route raises for a turn without a
-final assistant message. Where the limit
-guard replaces a result of the official route, its two codes do not say what
-the guard missed: a twin of the test that plays both readings of `last`
-shows that the guard misses the token flag alone and that nothing but the
-usage code moves with the reading. Each proof has lying counterparts beside
-it that show it failing on what it is there to exclude. An entry must not
-outlive a proof it leans on: `RECORD_PROOFS` in `backend_matrix/cells.py`
-names, by registry record, the proofs its entries lean on, and static cell
-`H03` fails when an entry names such a record while the verifier does not
-require the proof that plays the entry's cell.
+final assistant message. An empty completion on that route ends in the same
+protocol error; the one code of its cell says that the error is not
+retriable and not why, so a proof of its own shows the sentence, the one
+billed response and the one request. On the official Codex route a refused
+resume is typed by the code of the error object, which is emulated: the
+three codes of its cell do not say that they turn on it, so the test that
+plays the cell under the emulated code and under the code of invalid
+parameters is required by name as it was written. On the official Codex
+route a call for a tool that no server lists ends as a transport error with
+no usage; the codes of its cell are those of any error of the route that
+reports no usage, so the proof shows that the worker handed over a completed
+turn with one failed item of the unlisted name, and that the error is not
+retriable and carries the sentence of the adapter's check of the item names.
+Where the limit guard replaces a result of the official route, its two codes
+do not say what the guard missed: a twin of the test that plays both
+readings of `last` shows that the guard misses the token flag alone and that
+nothing but the usage code moves with the reading. Each proof but one has
+lying counterparts beside it that show it failing on what it is there to
+exclude: the test of the refused resume plays its cell under the other code
+itself. An entry must not outlive a proof it leans on: `RECORD_PROOFS` in
+`backend_matrix/cells.py` names, by registry record, the proofs its entries
+lean on, and static cell `H03` fails when an entry names such a record while
+the verifier does not require the proof that plays the entry's cell. One
+known gap of an open-weight column leans on a proof in the same way. Where
+the Kimi route ends a call because of a tool call it will not run (a tool
+that is not attached, arguments that are no JSON object), the codes of the
+cell are those of any error of the worker after its first billed reply; the
+proof holds each of the two cells to one matched request, no dispatch and
+the text of its refusal.
 
 A column whose profile the catalogs call blocked runs three scenarios as soon
 as its kind is driven: the canary, the plain call and the admission scenario
@@ -587,7 +753,11 @@ needs Linux, no network and no credentials; a network guard fails any test of
 the package that reaches beyond loopback. The scripted peer of a reference
 column runs in processes of its own, and its launcher installs the same guard
 there: a peer that reaches beyond loopback crashes, which ends its cell as a
-setup error.
+setup error. By hand the package is called as one directory
+(`tests/backend_matrix`), or with its modules named side by side in one
+call: pytest drops the fixtures of the package, the guard among them, for a
+module it collects after a file outside the package, and the package refuses
+such a run at collection.
 
 After the CI shards, the coverage job runs the cell-inventory verifier on
 their JUnit files:
@@ -612,7 +782,8 @@ whose scenario waives the flag that asks for the check (a refusal that is an
 HTTP rejection bills nothing, so it owes no accounting flag) or expects that
 flag false (a reply that is cut inside the turn, or one that is no terminal
 of its wire and was billed nothing), where the cell itself does not ask it
-either. A run
+either, and a cell whose selected variant expects a refusal and no result
+(a conversation request on a route that declares no continuity). A run
 that writes a JUnit file also writes
 `matrix-report-<n>.json` beside it: the codes, gaps, declared values, clause
 outcomes and grade of every cell the process judged, and for each kind what

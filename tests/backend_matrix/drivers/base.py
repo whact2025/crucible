@@ -100,6 +100,26 @@ class Driver(Protocol):
     ) -> ContextManager[Bound]: ...
 
 
+@runtime_checkable
+class KeeperDriver(Protocol):
+    """A driver of a kind on whose wire a tool beside the adapter keeps the conversations.
+
+    The peer of a cell stands where that tool is and holds no conversation
+    of an earlier call. A handle that an invocation asks to continue is one
+    the tool refuses, and what it says then is rendered by the dialect of
+    the kind from an envelope. A cell whose route answers such a request is
+    answered from that envelope, whatever its script holds.
+    """
+
+    def refuses(self) -> tuple[str, ...]:
+        """The envelopes the dialect renders the refusal of a handle from, by name.
+
+        Read without a backend and without an exchange, as
+        :meth:`Driver.answers` is: static cell H03 asks it for the grade of
+        what a cell that asks to continue a conversation is answered from.
+        """
+
+
 _REGISTRY: dict[str, Driver] = {}
 
 

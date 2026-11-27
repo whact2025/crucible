@@ -89,6 +89,9 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"raise:\w+@after_request/[\w.]+", "C1"),
     (r"raise:\w+@before_request/[\w.]+", SCENARIO),
     (r"raise:\w+@close/[\w.]+", "C8"),
+    # A result where the selected variant expects a refusal: what the
+    # scenario contract says of it, no clause about a result.
+    (r"kind:\w+!=refused", SCENARIO),
     (r"kind:\w+!=\w+", "C2"),
     (r"retriable:(True|False)", "C2"),
     (r"http_status:\w+!=\w+", "C2"),
@@ -113,6 +116,7 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"context:over_budget", SCENARIO),
     (r"progress:write_not_credited", SCENARIO),
     (r"mutation:(in_process|host_alive|left_behind|deadline_unbound)", SCENARIO),
+    (r"conversation:(missing|state|unbound|unasked)", SCENARIO),
     (r"admission:\w+:\w+!=\w+", SCENARIO),
     (r"decl\.(changed|over|under|mismatch):\w+", "D"),
     (r"static:\w+", "static"),
@@ -144,13 +148,20 @@ class Raised:
     module: str
     # What a workflow would log. Never part of the code; C9 reads it.
     message: str = ""
+    # Whether the exception left ``invoke`` itself, and not the building of
+    # the backend or the attaching of a ToolSet before it. Never part of the
+    # code: it tells a refusal of the route from the same type raised where
+    # no call was made.
+    left_invoke: bool = False
 
     @property
     def code(self) -> str:
         return f"raise:{self.type}@{self.phase}/{self.module}"
 
     @classmethod
-    def from_exception(cls, exc: BaseException, *, phase: str) -> Raised:
+    def from_exception(
+        cls, exc: BaseException, *, phase: str, left_invoke: bool = False
+    ) -> Raised:
         """Name the module of the innermost frame that raised."""
 
         module = "unknown"
@@ -163,6 +174,7 @@ class Raised:
             phase=phase,  # type: ignore[arg-type]
             module=module,
             message=str(exc),
+            left_invoke=left_invoke,
         )
 
 
@@ -247,6 +259,10 @@ class Observation:
     # returned and whatever a wrapper of the workflow added to it. A write
     # that ran in a host is not in it.
     toolset_returned: tuple[Dispatch, ...] = ()
+    # The module of the class of the backend the cell built; empty where it
+    # built none. A refusal is the route's own where the frame that raised
+    # it is in that module.
+    backend_module: str = ""
 
 
 @dataclass(frozen=True)
@@ -1227,16 +1243,31 @@ def _c10(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
             reads.append(item)
     # A write may run in another process, so it is judged by its effect; the
     # reads are aligned, in order, with the calls the provider actually sent.
+    # A call whose argument text was no JSON object names no arguments: it is
+    # aligned with nothing, so whatever reached the ToolSet in its place (the
+    # tool with an empty object, with the arguments of another call) is a
+    # call without a scripted counterpart. So is a call that handed the
+    # ToolSet no mapping for its arguments (a list, a text, nothing): it
+    # equals no scripted call, not even one whose arguments are empty.
     sent = list(obs.provider.sent_calls)
-    sent_reads = [index for index, call in enumerate(sent) if call.slot != ref.write_slot]
+    sent_reads = [
+        index
+        for index, call in enumerate(sent)
+        if call.slot != ref.write_slot and not call.malformed
+    ]
     matched_sent, matched_logged = _aligned(
         [(ref.bindings[sent[i].slot].name, dict(sent[i].arguments)) for i in sent_reads],
-        [(item.name, dict(item.arguments)) for item in reads],
+        [
+            (item.name, None if item.not_a_mapping else dict(item.arguments))
+            for item in reads
+        ],
     )
     dispatched_reads = {sent_reads[position] for position in matched_sent}
     for index, call in enumerate(sent):
         name = ref.bindings[call.slot].name
-        if call.slot == ref.write_slot:
+        if call.malformed:
+            dispatched = False
+        elif call.slot == ref.write_slot:
             dispatched = bool(obs.write_applied)
         else:
             dispatched = index in dispatched_reads
@@ -1254,16 +1285,24 @@ def _c10(obs: Observation, exp: Expectation, ref: Reference) -> list[Deviation]:
             out.append(
                 Deviation(
                     f"dispatch.extra:{call.slot}",
-                    f"scripted call {index + 1} ({name}) must not be dispatched "
-                    "after the terminal condition",
+                    f"scripted call {index + 1} ({name}) reached the ToolSet and the "
+                    "scenario allows no dispatch of it: it follows a terminal "
+                    "condition, or it names a tool that is not attached",
                 )
             )
     for position, item in enumerate(reads):
         if position not in matched_logged:
+            handed = (
+                f" with a {type(item.not_a_mapping[0]).__name__} in the place of "
+                "an argument object"
+                if item.not_a_mapping
+                else ""
+            )
             out.append(
                 Deviation(
                     f"dispatch.extra:{slot_by_name[item.name]}",
-                    f"{item.name} reached the ToolSet without a matching scripted call",
+                    f"{item.name} reached the ToolSet{handed} without a matching "
+                    "scripted call",
                 )
             )
     return out
@@ -1298,6 +1337,27 @@ def _scenario(
     for check in checks:
         out.extend(check(obs, ref))
     return out
+
+
+def _the_route_refused(obs: Observation, exp: Expectation) -> bool:
+    """Whether what was raised is the refusal the selected variant expects.
+
+    Three facts, and the type alone is none of them: the exception is of the
+    agreed type, it left ``invoke`` itself, and the frame that raised it is
+    in the module of the backend the cell built. The agreed type from
+    anywhere else before the first request (the driver or routing while the
+    backend is built, the attaching of a ToolSet, a module the adapter calls
+    into) is no refusal of the route and keeps its code.
+    """
+
+    raised = obs.raised
+    assert raised is not None
+    return (
+        raised.type == exp.refused_type
+        and raised.left_invoke
+        and bool(obs.backend_module)
+        and raised.module == obs.backend_module
+    )
 
 
 def _outcome(deviations: Sequence[Deviation]) -> ClauseOutcome:
@@ -1404,9 +1464,18 @@ def evaluate(
         detail = f"{raised.type} left the call {raised.phase.replace('_', ' ')}"
         if raised.phase == "after_request":
             c1.append(Deviation(raised.code, detail))
-        elif expects_result or raised.type != exp.refused_type:
-            wanted = "a result" if expects_result else f"a {exp.refused_type} refusal"
-            scenario.append(Deviation(raised.code, f"{detail}; expected {wanted}"))
+        elif expects_result:
+            scenario.append(Deviation(raised.code, f"{detail}; expected a result"))
+        elif not _the_route_refused(obs, exp):
+            came = "out of invoke" if raised.left_invoke else "before invoke was called"
+            scenario.append(
+                Deviation(
+                    raised.code,
+                    f"{detail}, {came}, raised in {raised.module}; expected a "
+                    f"{exp.refused_type} refusal that invoke raises in the module "
+                    f"of the backend ({obs.backend_module or 'none was built'})",
+                )
+            )
     elif not expects_result:
         assert obs.result is not None
         error = obs.result.error

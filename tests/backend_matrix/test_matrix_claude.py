@@ -65,17 +65,19 @@ from .columns import CANARY_CREDENTIAL, CLAUDE_KIND, COLUMN_PRODUCT, Column
 from .drivers import MatrixSetupError
 from .drivers import claude as claude_driver
 from .peers import claude_cli as peer_program
-from .provider import LoopbackProvider, Reply, SeenRequest
+from .provider import LoopbackProvider, Reply, ResponseCapDialect, SeenRequest
 from .scenarios import (
     BASE_POLICY,
     SCENARIOS,
     SCHEMA,
     SCHEMA_ANSWER,
     SCHEMA_KEY,
+    STALE_HANDLE,
     SYSTEM,
     TEXT,
     TURN_LIMIT,
     USER,
+    handle_asked_of_its_keeper,
     suite_default_max_turns,
 )
 from .script import (
@@ -84,6 +86,7 @@ from .script import (
     Call,
     Cut,
     Drop,
+    Empty,
     Malformed,
     ProviderScript,
     Refuse,
@@ -649,15 +652,59 @@ def test_the_dialect_reads_the_command_line_and_answers_only_what_it_has_an_enve
     assert renamed.served_model == renamed.body["frames"][1]["message"]["model"] == "asked-served"
     # A step without an envelope is refused, and so is the one form of
     # refusal the frames of the tool cannot carry (it is pinned not
-    # expressible in the inventory).
+    # expressible in the inventory). The kind declares no cap on the tokens
+    # of a response, so no cell of it plays a reply that was cut at one.
     with pytest.raises(MatrixSetupError, match="does not render Cut yet"):
-        dialect.render(Cut(), plain, "1")
+        dialect.render(Cut("cut"), plain, "1")
     with pytest.raises(MatrixSetupError, match="has no refusal part"):
         dialect.render(Refuse("refusal_part"), plain, "1")
-    assert list(claude_driver.ClaudeDriver().inexpressible) == ["S23b/Refuse(refusal_part)"]
+    # Nor is a tool call whose arguments are no JSON object: it reaches the
+    # adapter through the control channel, decoded.
+    with pytest.raises(MatrixSetupError, match="reaches the adapter as a decoded object"):
+        dialect.render(Call(READ_A, malformed="{"), plain, "1")
+    assert list(claude_driver.ClaudeDriver().inexpressible) == [
+        "S23b/Refuse(refusal_part)",
+        "S05/Call(malformed)",
+    ]
     assert set(dialect.envelope_names()) == {
         name for name in envelopes.all_envelopes() if name.startswith(f"{dialect.name}/")
     }
+
+
+def test_a_turn_that_produced_nothing_and_a_cap_of_the_tool_are_what_the_dialect_reads() -> None:
+    dialect = claude_driver.ClaudeCliDialect()
+    plain = _turn()
+
+    # A turn in which nothing was produced is the frames of a plain turn with
+    # the empty string as its text and as the result text, and a usage
+    # without an output token; the input the provider read is billed.
+    silent = dialect.render(Empty(), plain, "call-1")
+    opened, turn, terminal = (parse_message(frame) for frame in silent.body["frames"])
+    assert isinstance(opened, sdk_types.SystemMessage) and opened.subtype == "init"
+    assert isinstance(turn, sdk_types.AssistantMessage)
+    assert turn.content == [sdk_types.TextBlock(text="")]
+    assert isinstance(terminal, sdk_types.ResultMessage)
+    assert (terminal.result, terminal.is_error) == ("", False)
+    assert silent.usage == Empty().usage and silent.body["exit"] == 0
+    assert silent.envelopes == (
+        "claude_cli/cli.init",
+        "claude_cli/cli.assistant_text",
+        "claude_cli/cli.result",
+    )
+    assert {envelopes.load(name).grade for name in silent.envelopes} == {"constructed"}
+    # The tool takes a cap on the tokens of a response from one variable of
+    # its environment, which the journal of the peer keeps under a key of
+    # its own. The dialect reads it and does not say that the wire has the
+    # field: a cap that shows is held against a route that declares none,
+    # and none is asked of a route that should declare one.
+    assert plain.response_cap is None and not isinstance(dialect, ResponseCapDialect)
+    started = {"argv": ["--model", "asked"], "env_names": [], "env": {}, "forbidden_seen": False}
+    capped = {
+        "pid": 7,
+        "journal": [{"role": "session", "pid": 7, "ppid": 1, **started, "response_cap": "512"}],
+    }
+    read = dialect.parse("POST", dialect.path, {}, json.dumps(capped).encode(), credential="")
+    assert read.response_cap == 512
 
 
 def test_what_the_peer_does_not_emulate_is_refused_not_improvised() -> None:
@@ -770,6 +817,123 @@ def test_the_turn_terminal_and_the_two_refusals_parse_through_the_installed_sdk(
         "claude_cli/cli.assistant_api_error",
         "claude_cli/cli.result_api_error",
     )
+
+
+def test_the_budget_terminal_parses_through_the_installed_sdk() -> None:
+    dialect = claude_driver.ClaudeCliDialect()
+    rate = matrix_columns.matrix_rate("asked")
+    budget = ["--max-budget-usd", "0.001"]
+
+    # The session has spent less than its budget and this turn takes its
+    # cost to it: the reply carries the frames of the turn and, apart from
+    # them, the budget terminal the peer plays after the tool call.
+    crossing = dialect.render(
+        Call(READ_A, usage=TokenUsage(150, 60)), _turn(argv=budget, turn=2, spent=(150, 60)), "c-2"
+    )
+    assert [frame["type"] for frame in crossing.body["frames"]] == ["assistant"]
+    assert crossing.body["budget_limit"]["exit"] == 1 and "turn_limit" not in crossing.body
+    (limit,) = (parse_message(frame) for frame in crossing.body["budget_limit"]["frames"])
+    assert isinstance(limit, sdk_types.ResultMessage)
+    assert (limit.subtype, limit.is_error, limit.result, limit.errors) == (
+        "error_max_budget_usd",
+        True,
+        None,
+        None,
+    )
+    # The accounting of the session so far, this turn included, at the rate
+    # the adapter is configured with; the turns are those that ran.
+    assert limit.usage is not None
+    assert (limit.usage["input_tokens"], limit.usage["output_tokens"]) == (300, 120)
+    spent = rate.compute_cost(input_tokens=300, output_tokens=120)
+    assert limit.total_cost_usd == spent > 0.001 and limit.num_turns == 2
+    assert crossing.usage == TokenUsage(150, 60) and crossing.call is not None
+    assert crossing.envelopes[-1] == "claude_cli/cli.result_max_budget"
+    # Below the budget the same turn carries no terminal, and a session
+    # without a budget never does.
+    below = dialect.render(
+        Call(READ_A, usage=TokenUsage(150, 60)), _turn(argv=budget, turn=1), "c-1"
+    )
+    assert "budget_limit" not in below.body and "turn_limit" not in below.body
+    unbounded = dialect.render(
+        Call(READ_A, usage=TokenUsage(5000, 5000)), _turn(turn=2, spent=(5000, 5000)), "c-2"
+    )
+    assert "budget_limit" not in unbounded.body
+    # A turn that also uses up the turn allowance ends at the turn terminal.
+    both = dialect.render(
+        Call(READ_A, usage=TokenUsage(150, 60)), _turn(argv=budget, turn=5, spent=(150, 60)), "c-5"
+    )
+    assert "budget_limit" not in both.body and both.body["turn_limit"]["exit"] == 1
+    # An answer above the budget is the tool's last turn: it ends as any
+    # answer does, and the adapter's own accounting types the budget.
+    answer = dialect.render(
+        Say("x", TokenUsage(1000, 1000)), _turn(argv=budget, turn=1), "c-1"
+    )
+    assert "budget_limit" not in answer.body and answer.body["exit"] == 0
+
+
+class _PastTheBudget(claude_driver.ClaudeDriver):
+    """Its peer does not stop at the budget: it asks for one more turn."""
+
+    faults = (peer_program.SKIP_BUDGET_TERMINAL,)
+
+
+def _two_round_session(played_by: claude_driver.ClaudeDriver, tmp_path: Path) -> Any:
+    """Every round asks for a tool, and the second takes the cost to the budget."""
+
+    fixture = toolsets.build(toolsets.READ, tmp_path / "workspace")
+    step = Call(READ_A, usage=TokenUsage(150, 60))
+    opened = played_by.open(
+        _column(),
+        capability="read_only",
+        lens="raw",
+        # A third model turn is scripted and must never be asked for.
+        script=ProviderScript((step, step, Say("never reached"))),
+        tmp_path=tmp_path,
+    )
+    with opened as bound:
+        bound.backend.attach_toolset(fixture.toolset)
+        result = bound.backend.invoke(
+            Invocation(
+                system=SYSTEM,
+                user=USER,
+                tools=None,
+                max_turns=8,
+                budget_usd=0.001,
+                policy=BASE_POLICY,
+            )
+        )
+        seen = bound.provider.freeze()
+    return fixture, result, seen
+
+
+def test_a_session_that_reaches_its_budget_ends_at_the_budget_terminal_of_the_tool(
+    tmp_path: Path,
+) -> None:
+    fixture, result, seen = _two_round_session(claude_driver.ClaudeDriver(), tmp_path / "honest")
+
+    # The tool was started with the budget, ran the call of the turn that
+    # took its cost to it, reported its budget terminal and was not asked
+    # for another model turn. That the session stops there is the scripted
+    # peer's emulation of the tool, not something the adapter did. What the
+    # adapter does is account for both turns and type the overrun, and it
+    # types it from the cost of the session: its own comparison of that
+    # cost with the budget builds the result. So nothing asserted here, and
+    # no cell, depends on the subtype of the terminal frame or on its error
+    # flag: an adapter that read neither would return the same error, stop
+    # reason and usage for this session.
+    assert {request.budget_control for request in seen.requests} == {0.001}
+    assert [item.name for item in fixture.log] == [toolsets.BINDINGS[READ_A].name] * 2
+    assert (seen.request_count, seen.extra, seen.unconsumed) == (2, 0, 1)
+    assert seen.envelopes[-1] == "claude_cli/cli.result_max_budget"
+    assert result.error is not None and result.error.kind == "budget_exhausted"
+    assert result.stop_reason == "budget_exhausted"
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (300, 120)
+
+    # The lying counterpart: a peer that does not stop there asks for a turn
+    # with the budget spent. That is no observation of the adapter: the
+    # provider side refuses to answer it, and the cell is a setup error.
+    with pytest.raises(MatrixSetupError, match=r"did not play the session.*budget terminal"):
+        _two_round_session(_PastTheBudget(), tmp_path / "lying")
 
 
 class _PastTheTurnLimit(claude_driver.ClaudeDriver):
@@ -1025,6 +1189,158 @@ def test_the_peer_answers_the_two_probes_and_refuses_any_other_command(tmp_path:
     assert (quiet.returncode, quiet.stderr) == (0, b"")
     answers = [json.loads(line)["type"] for line in quiet.stdout.splitlines()]
     assert answers == ["control_response"] * 2
+
+
+def test_the_peer_refuses_a_session_id_it_holds_no_conversation_for(tmp_path: Path) -> None:
+    handle = "00000000-0000-4000-8000-00000000abcd"
+    dialect = claude_driver.ClaudeCliDialect()
+    emulated = envelopes.load("claude_cli/cli.resume_rejected")
+    sentence = "".join(emulated.fill({"session_id": handle})["stderr"])
+    resumed = [*_SESSION_ARGV, f"--resume={handle}"]
+    with LoopbackProvider(
+        ProviderScript(()), credential=CANARY_CREDENTIAL, dialect=dialect
+    ) as provider:
+        address = provider.url + dialect.path
+        for name, flag in (
+            ("one-token", [f"--resume={handle}"]),
+            ("two-tokens", ["--resume", handle]),
+        ):
+            peer = _peer(tmp_path / name, address)
+            refused = _run(peer, [*_SESSION_ARGV, *flag], _PROMPT)
+            (record,) = peer.records()
+
+            # The tool says on its standard error that it found no
+            # conversation, emits no frame and exits with the status of a
+            # failure, before it read a prompt or asked the model anything.
+            # That is not a failure of the peer: the journal says what
+            # happened.
+            assert peer_program.resumed_session([*_SESSION_ARGV, *flag]) == handle
+            assert (refused.returncode, refused.stdout) == (emulated.body["exit"], b"")
+            assert refused.stderr.decode("utf-8") == sentence + "\n"
+            assert (record["role"], record["resumed"]) == ("resume_rejected", handle)
+            assert record["forbidden_seen"] is False and peer.failures() == []
+        # A lying counterpart refuses in other words, with the same status.
+        lying = _peer(
+            tmp_path / "other-words", address, faults=(peer_program.REJECT_IN_OTHER_WORDS,)
+        )
+        reworded = _run(lying, resumed, _PROMPT)
+        shown = provider.freeze()
+    assert (reworded.returncode, reworded.stdout) == (emulated.body["exit"], b"")
+    assert reworded.stderr.decode("utf-8") == (
+        peer_program.OTHER_WORDS.format(session_id=handle) + "\n"
+    )
+    assert reworded.stderr.decode("utf-8") != sentence + "\n" and lying.failures() == []
+    # What the tool says there is emulated, not observed. It is no sentence
+    # of the peer: the provider side renders it from an envelope that says
+    # so, and the ledger keeps the handle the tool was asked for and the
+    # envelope it was answered from. No model was asked: the exchange is no
+    # request of the script.
+    assert emulated.grade == "constructed"
+    assert emulated.provenance["reason"].startswith("Emulated, not observed.")
+    assert emulated.body["stderr"][0].strip() not in Path(peer_program.__file__).read_text("utf-8")
+    assert shown.conversation_keeper and shown.refused_handles == [handle] * 3
+    assert set(shown.envelopes) == {emulated.name}
+    assert (shown.request_count, shown.extra) == (0, 0)
+    # A provider side that does not answer for the tool leaves the peer
+    # without words of its own: the session is not played.
+    with LoopbackProvider(ProviderScript(()), credential=CANARY_CREDENTIAL) as silent:
+        alone = _peer(tmp_path / "alone", silent.url + dialect.path)
+        unanswered = _run(alone, resumed, _PROMPT)
+    assert unanswered.returncode == peer_program.EXIT_UNSUPPORTED
+    assert alone.failures() == [
+        "unsupported: the provider side does not say what the tool answers a session "
+        "id it holds no conversation for"
+    ]
+    assert peer_program.resumed_session(_SESSION_ARGV) is None
+    # A session that an earlier process of the cell opened is one the tool
+    # holds: its journal record names the id. Continuing it is not played.
+    held = _peer(tmp_path / "held")
+    opened = _run(held, _SESSION_ARGV, _PROMPT[:2])
+    (session,) = held.records()
+    again = _run(held, [*_SESSION_ARGV, f"--resume={session['session_id']}"], _PROMPT[:2])
+    assert (opened.returncode, session["role"]) == (0, "session")
+    assert again.returncode == peer_program.EXIT_UNSUPPORTED
+    assert held.failures()[-1].startswith("unsupported: the resumption of a session")
+
+
+def test_a_handle_nobody_holds_is_refused_by_the_tool_before_a_model_turn(tmp_path: Path) -> None:
+    execution = _played(_column(), "S50", tmp_path)
+    observation = execution.observation
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "claude-peer" / "journal.jsonl").read_text("utf-8").splitlines()
+    ]
+
+    # The session route ran its two probes and started the tool with the
+    # handle of the request; the tool found no conversation and asked the
+    # provider nothing. The result is the typed stale conversation, bound to
+    # the request, and the cell is green.
+    assert [record["role"] for record in journal] == ["auth_status", "version", "resume_rejected"]
+    assert journal[-1]["resumed"] == STALE_HANDLE
+    assert observation.provider.request_count == 0 and execution.report.codes == frozenset()
+    result = observation.result
+    assert result is not None and result.error is not None and result.conversation is not None
+    assert (result.error.kind, result.conversation.state) == ("stale_conversation", "stale")
+    assert result.error.retriable is False
+    assert execution.current == {"session_continuity": "workflow_bound"}
+    # The tool keeps the conversations of this wire, and the cell holds that
+    # it was asked for the handle of the request and for no other. What it
+    # answered is emulated: the cell is answered from that envelope and
+    # carries its grade.
+    assert observation.provider.conversation_keeper
+    assert observation.provider.refused_handles == [STALE_HANDLE]
+    assert observation.provider.envelopes == ["claude_cli/cli.resume_rejected"]
+    assert execution.grade == "constructed"
+    # What static cell H03 reads of the cell without playing it is what the
+    # play was answered from, and its grade.
+    assert cells.answered_from(execution.cell.id) == tuple(observation.provider.envelopes)
+    assert cells.grade_of(execution.cell.id) == execution.grade == "constructed"
+    assert handle_asked_of_its_keeper in execution.plan.checks
+
+
+class _InOtherWords(claude_driver.ClaudeDriver):
+    """Its peer refuses a session id in other words than the emulated ones."""
+
+    faults = (peer_program.REJECT_IN_OTHER_WORDS,)
+
+
+def test_the_cell_of_a_refused_handle_rests_on_the_words_the_tool_is_emulated_to_print(
+    tmp_path: Path,
+) -> None:
+    cell = Cell(_column(), "S50", "raw")
+    execution = runner.execute(cell, tmp_path / "played", driver=_InOtherWords())
+    observation = execution.observation
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "played" / "claude-peer" / "journal.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+    ]
+
+    # The same refusal: the tool was started with the handle of the request,
+    # found no conversation, asked the model nothing and left with the same
+    # status ...
+    assert [record["role"] for record in journal] == ["auth_status", "version", "resume_rejected"]
+    assert journal[-1]["resumed"] == STALE_HANDLE
+    assert observation.provider.refused_handles == [STALE_HANDLE]
+    assert observation.provider.request_count == 0
+    # ... and said it in other words. The adapter types a refused session by
+    # the words the tool printed, and these are none of its markers: the
+    # result is a transport error whose outcome still calls the handle
+    # active. So the green cell rests on the sentence the tool is emulated
+    # to print, which nobody observed.
+    assert execution.report.codes == {"kind:transport!=stale_conversation", "conversation:state"}
+    result = observation.result
+    assert result is not None and result.error is not None and result.conversation is not None
+    assert (result.conversation.state, result.conversation.opaque_id) == ("active", STALE_HANDLE)
+    with pytest.raises(ledger.LedgerMismatch, match="unexpected deviation"):
+        runner.run_cell(
+            cell,
+            tmp_path / "judged",
+            preflight={CLAUDE_KIND: None},
+            known=LEDGER,
+            driver=_InOtherWords(),
+        )
 
 
 def test_the_peer_takes_its_turns_from_the_scripted_provider_on_loopback_only(
@@ -1301,16 +1617,19 @@ def test_every_frame_of_a_cell_counts_towards_its_grade(tmp_path: Path) -> None:
         "constructed"
     }
     # The starter cells use the frames of a session that ends on an answer;
-    # the turn terminal of the tool, the frames of the two refusals and the
-    # frame of a turn that thinks and writes no text are used by other cells
-    # alone.
+    # the turn terminal and the budget terminal of the tool, the frames of
+    # the two refusals, the frame of a turn that thinks and writes no text
+    # and what the tool says of a session id it holds no conversation for
+    # are used by other cells alone.
     assert set(claude_driver.ClaudeDriver().envelopes) - set().union(*used.values()) == named(
         "assistant_thinking",
         "result_max_turns",
+        "result_max_budget",
         "assistant_refusal",
         "result_refusal",
         "assistant_api_error",
         "result_api_error",
+        "resume_rejected",
     )
     # The schema travels on the command line of every turn's session, and the
     # decoded answer comes back as the final message. Only the structured

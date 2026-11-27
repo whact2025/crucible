@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# What the command-line tool does when its command line asks it to continue
+# a session it holds no conversation for: one line on its standard error, no
+# frame, and the exit status of a failure. Nothing was observed of the real
+# tool (see cli.init): the behaviour is emulated, so every cell that uses
+# this envelope rests on an emulation of the reference.
+#
+# The body is no frame of the wire. It states what the peer writes to its
+# standard error and the status it exits with. The line is written as its
+# parts, in order, because a slot stands for a whole value; the dialect
+# joins them.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: resume_rejected
+
+provenance:
+  grade: constructed
+  reason: >-
+    Emulated, not observed. The sentence is the one the vendor tool is known
+    to print for a session id it holds no conversation for, written from
+    memory of the tool: no vendor source in reach states it and no run of
+    the real tool was made. That the tool prints it on its standard error,
+    emits no frame and exits with status 1 before it reads a prompt is the
+    same memory. The sentence decides the cell that is answered from it. The
+    adapter types a rejected resume by words in what the tool printed
+    (crucible/backends/claude.py, the markers of a rejected resume), and the
+    opening words of this sentence are the first of those markers; the same
+    refusal in other words is typed as a transport error, which the lying
+    counterpart of the peer shows. So this envelope shows only that the
+    adapter recognises the sentence it was written to recognise.
+
+status: 200
+
+body:
+  stderr:
+    - "No conversation found with session ID: "
+    - {slot: session_id}
+  exit: 1

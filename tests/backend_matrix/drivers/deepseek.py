@@ -60,11 +60,30 @@ from ..provider import (
     answered_from,
     cut_after,
     require_cut_in_body,
+    stated_cap,
 )
-from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
+from ..script import (
+    Call,
+    Cut,
+    Drop,
+    Empty,
+    Malformed,
+    ProviderScript,
+    Reason,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+)
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
-from .openai_compat import MALFORMED, REASONING_ONLY, REFUSALS
+from .openai_compat import (
+    EMPTY_COMPLETION,
+    MALFORMED,
+    OUTPUT_CUT,
+    REASONING_ONLY,
+    REFUSALS,
+)
 
 _SDK = "openai"
 _WORKER_PROJECT = launch.REPOSITORY / "backends" / "deepseek_worker"
@@ -111,6 +130,7 @@ class DeepSeekResponsesDialect:
     name = "deepseek_responses"
     path = "/responses"
     provider = "deepseek"
+    response_cap_field = True  # ``max_output_tokens`` in the body of a request
 
     def __init__(
         self,
@@ -139,6 +159,8 @@ class DeepSeekResponsesDialect:
                 REASONING_ONLY,
                 *REFUSALS.values(),
                 MALFORMED,
+                OUTPUT_CUT,
+                EMPTY_COMPLETION,
             )
         )
 
@@ -211,6 +233,7 @@ class DeepSeekResponsesDialect:
                 ],
                 "launches": [] if self._journal is None else self._journal.launches(),
             },
+            response_cap=stated_cap(payload.get("max_output_tokens")),
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -325,12 +348,19 @@ class DeepSeekResponsesDialect:
         elif isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
+            if step.malformed is not None:
+                arguments = {}
             behaviour, call = _TOOL_CALL, (step.slot, call_id, arguments)
             slots = {
                 "call_id": call_id,
                 "tool_name": binding.name,
-                # The wire carries the arguments as a JSON document in a string.
-                "tool_arguments": json.dumps(arguments, sort_keys=True),
+                # The wire carries the arguments as a JSON document in a
+                # string, so it also carries a text that is none.
+                "tool_arguments": (
+                    json.dumps(arguments, sort_keys=True)
+                    if step.malformed is None
+                    else step.malformed
+                ),
                 "item_id": f"fc-{call_id}",
                 "reasoning_item_id": f"rs-{call_id}",
                 "reasoning_text": REASONING_TEXT,
@@ -341,6 +371,16 @@ class DeepSeekResponsesDialect:
             behaviour, call = REFUSALS[step.form], None
             # Only the form that declines in an output message has an item.
             slots = {"item_id": f"msg-{call_id}"} if step.form == "refusal_part" else {}
+        elif isinstance(step, Cut):
+            # The stream of an answer that ends at the cap: the events of the
+            # text that was produced, then the terminal of an incomplete
+            # response with the cap as its reason.
+            behaviour, call = OUTPUT_CUT, None
+            slots = {"text": step.text, "item_id": f"msg-{call_id}"}
+        elif isinstance(step, Empty):
+            # The stream of a response in which nothing was produced: the
+            # terminal of a completed response without an output item.
+            behaviour, call, slots = EMPTY_COMPLETION, None, {}
         else:
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
@@ -397,6 +437,7 @@ class DeepSeekResponsesDialect:
             envelope.name,
             raw=server_sent_events(events),
             content_type="text/event-stream",
+            call_malformed=isinstance(step, Call) and step.malformed is not None,
         )
 
 

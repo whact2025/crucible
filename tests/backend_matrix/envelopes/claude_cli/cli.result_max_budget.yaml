@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# The terminal frame of a session that the tool stopped at its USD budget
+# between two model turns. Nothing was observed of the real tool here (see
+# cli.init): when the tool sends this frame and what its counters hold is
+# emulated, so every cell that uses this envelope rests on an emulation of
+# the reference.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: claude_cli
+provider: cli
+behaviour: result_max_budget
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    claude_agent_sdk.types.ResultMessage with is_error true and the subtype
+    "error_max_budget_usd", as parsed by
+    claude_agent_sdk._internal.message_parser.parse_message (case "result")
+  sdk_version: claude-agent-sdk 0.2.121
+  reason: >-
+    The subtype is the one the pinned SDK names for this terminal: its
+    option for the budget says that the query stops if the budget is
+    exceeded, "returning an error_max_budget_usd result"
+    (claude_agent_sdk.types.ClaudeAgentOptions.max_budget_usd), and its
+    process transport hands the option to the tool on the command line
+    (--max-budget-usd). No vendor source in reach shows the frame itself.
+    It is written here with is_error true, after which the tool exits with
+    a status other than zero, as the SDK's reader says of a result with
+    is_error true (claude_agent_sdk._internal.query). The adapter of the
+    product notes that reviewed versions of the tool have sent this subtype
+    with both values of is_error and reads the subtype alone; the other
+    value is not played. The frame has no result text and no errors list,
+    both optional in the SDK's type. Its stop reason is that of the last
+    model turn, a tool call, and its turn count is the number of model
+    turns the session ran. That the tool compares its budget with the cost
+    of the session after every model turn, stops as soon as the cost has
+    reached it, and runs the tool call of that turn before it stops, is a
+    choice of the scripted peer.
+    The session accounting (usage, turn count, cost and the usage record per
+    model) is emulated as in the terminal frame of a text answer, and its
+    two parts that have no source but the adapter are the same
+    (cli.result). The usage block holds the totals of the session, as there;
+    the adapter of the product also notes that on this terminal the tool can
+    state the usage of its last response alone beside the record per model,
+    and that form is not played.
+    No cell and no test depends on the subtype of this frame or on its
+    is_error. The cost the frame reports is above the budget, and the
+    adapter types such an overrun by its own comparison of the session's
+    cost with the budget: played with an adapter that does not read the
+    subtype, the cell of the budget inside a tool loop ends with the same
+    error, stop reason, usage and flags, and one limit event of the budget
+    in its trace where the adapter as shipped records two. So a cell that
+    uses this envelope shows that the adapter accounts for the session and
+    types the overrun, not that it reads the tool's budget terminal. A
+    terminal of this subtype whose cost is below the budget would show that,
+    and is not played.
+
+status: 200
+
+body:
+  type: result
+  subtype: error_max_budget_usd
+  is_error: true
+  duration_ms: 1
+  duration_api_ms: 1
+  num_turns: {slot: turns}
+  stop_reason: tool_use
+  session_id: {slot: session_id}
+  total_cost_usd: {slot: cost_usd}
+  usage:
+    input_tokens: {slot: input_tokens}
+    output_tokens: {slot: output_tokens}
+    cache_creation_input_tokens: 0
+    cache_read_input_tokens: 0
+  modelUsage:
+    "${slot:served_model}":
+      inputTokens: {slot: input_tokens}
+      outputTokens: {slot: output_tokens}
+      cacheReadInputTokens: 0
+      cacheCreationInputTokens: 0
+      webSearchRequests: 0
+      costUSD: {slot: cost_usd}
+      contextWindow: 200000
+      maxOutputTokens: 64000
+      canonicalModel: {slot: served_model}
+      provider: firstParty
+  uuid: {slot: frame_id}

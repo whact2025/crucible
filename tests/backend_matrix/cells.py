@@ -38,7 +38,7 @@ from . import declarations, drivers, envelopes, ledger
 from .columns import REAL_KINDS, TOY_KIND, Column
 from .contract import ADMITTED, CLAUSES
 from .drivers import toy
-from .drivers.base import MatrixSetupError
+from .drivers.base import KeeperDriver, MatrixSetupError
 from .scenarios import (
     D_CDX_SERVED,
     D_COST_BOUND_UNRANKED,
@@ -47,6 +47,7 @@ from .scenarios import (
     PACK_B,
     SCENARIOS,
     STARTER,
+    Plan,
     Scenario,
     difference_alternatives,
     difference_variants,
@@ -128,6 +129,16 @@ SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE: tuple[str, ...] = (
     "S41",
     "S44",
     "S45",
+    # The turn limit without an error (on this route a finite script that
+    # ends with its answer) and the USD budget inside a tool loop. On the
+    # second more than the usage code moves with the reading: the route
+    # compares the budget with the cost it reports, so the reading also
+    # decides whether the budget is typed. The proof holds exactly the
+    # three codes of a budget that is not typed beside the usage code where
+    # the plan has a budget, and nothing beside it where it has none; the
+    # entry of that cell names the record for all four, by a ruling.
+    "S10b",
+    "S14",
 )
 # Those of them that run in the guarded lens too: where the limit guard
 # replaces the result (known gap R04) of a turn that shows R05.
@@ -141,6 +152,11 @@ GUARDED_SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE: tuple[str, ...] = (
 DISPATCH_DENIAL_ON_THE_OFFICIAL_CODEX_ROUTE = ledger.cell_id(
     matrix_columns.CODEX_OFFICIAL_KIND, "S12", "primary", "raw"
 )
+# The cell of the official Codex column whose model calls a tool that no
+# server lists: where known gap R17 shows.
+UNLISTED_TOOL_CALL_ON_THE_OFFICIAL_CODEX_ROUTE = ledger.cell_id(
+    matrix_columns.CODEX_OFFICIAL_KIND, "S06", "primary", "raw"
+)
 # The cell of the app-server Codex column whose result is that of the same
 # denial: where known gap R08 shows.
 DISPATCH_DENIAL_ON_THE_APP_SERVER_CODEX_ROUTE = ledger.cell_id(
@@ -150,6 +166,11 @@ DISPATCH_DENIAL_ON_THE_APP_SERVER_CODEX_ROUTE = ledger.cell_id(
 # message: where known gap R16 shows.
 EMPTY_FINAL_TURN_ON_THE_APP_SERVER_CODEX_ROUTE = ledger.cell_id(
     matrix_columns.CODEX_LEGACY_KIND, "S44", "primary", "raw"
+)
+# The cell of the same column whose one response completes with nothing: where
+# known gap R20 shows.
+EMPTY_COMPLETION_ON_THE_APP_SERVER_CODEX_ROUTE = ledger.cell_id(
+    matrix_columns.CODEX_LEGACY_KIND, "S25", "primary", "raw"
 )
 # The cells of the Claude kind that attach a ToolSet with write names and end
 # in a result of the attempt: where known gap R13 shows. A scenario of the
@@ -163,6 +184,13 @@ WRITES_ON_THE_CLAUDE_COLUMNS: tuple[str, ...] = (
         ledger.cell_id(matrix_columns.CLAUDE_KIND, scenario, "primary", "raw")
         for scenario in ("S41", "S44", "S45")
     ),
+)
+# The cells of the Kimi kind on which the route ends the invocation because
+# of a tool call it will not run: where known gap M18 shows. A tool that is
+# not attached, and a call whose argument text is no JSON object.
+REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE: tuple[str, ...] = tuple(
+    ledger.cell_id(matrix_columns.KIMI_KIND, scenario, "primary", "raw")
+    for scenario in ("S06", "S05")
 )
 # Proofs a module holds beside its cells, which the verifier requires by name:
 # product behaviour that no clause states, so no cell's verdict shows when it
@@ -185,7 +213,7 @@ WRITES_ON_THE_CLAUDE_COLUMNS: tuple[str, ...] = (
 # that is flagged incomplete to no number: only this proof compares what the
 # route reports for a response with what the provider billed. What the route
 # reports for a turn of several responses is known gap R05 of the ledger,
-# unconfirmed: its one code shows only while the cost is flagged complete, so
+# unconfirmed: its usage code shows only while the cost is flagged complete, so
 # the record leans on the test that plays both readings of the usage
 # notification on the raw cell of every scenario whose turn has several
 # responses, and that test is held here too, cell by cell. In the guarded lens
@@ -207,11 +235,35 @@ WRITES_ON_THE_CLAUDE_COLUMNS: tuple[str, ...] = (
 # error of another text and a retriable error among them: only a proof
 # shows that the error is not retriable and carries the sentence the client
 # library of the route raises for a turn without a final assistant message.
+# The same raise ends an empty completion on that route as a transport error
+# that is not retried (known gap R20). The one code of its cell says that the
+# error is not retriable and not why: a protocol error of another text shows
+# the same code, so a proof of its own holds the sentence, and that the one
+# billed response is reported.
+# On the official route a refused resume is typed by the code of the error
+# object the tool answers with, and that code is emulated, not observed
+# (known gap R21, unconfirmed). The three codes of its cell do not say that
+# they turn on it: the test that plays the cell under the emulated code and
+# under the code of invalid parameters is held here too, as it was written
+# before the record.
+# Where the model calls a tool that no server lists, the official Codex
+# route ends the call with a transport error and no usage (known gap R17).
+# The codes of its cell are those of any error of the route that reports no
+# usage, a turn the tool reports as failed and a tool outside the attached
+# set that ran among them: only a proof shows that the worker handed over a
+# completed turn with one failed item of the unlisted name and that the
+# adapter's check of the item names ended the call.
 # On a write the trace of the Claude adapter binds a tool-authority digest
 # that is not the shared one (known gap R13). The one code of its cells says
 # that the digest differs, not why: only the proof that plays every write
 # cell of the kind shows that the value is the digest of the same tools
 # without a path scope, and that nothing else stands behind the code.
+# Where the Kimi route ends a call because of a tool call it will not run
+# (known gap M18), the codes of the cell are those of any call that ends in
+# an error of the worker after its first billed reply: a worker that dies on
+# the reply or a bridge that is broken would show them too. Only the proof
+# holds each cell to its cause: one matched request, nothing dispatched, and
+# the text of the refusal.
 REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
     MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]: tuple(
         "test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope"
@@ -227,11 +279,16 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
         "test_a_route_with_the_cost_bound_gets_its_budget_and_its_policy",
         "test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_diagnostic",
         "test_the_bounds_of_an_honest_interval_are_the_shipped_price_of_what_was_billed",
+        *(
+            f"test_the_call_ends_where_the_route_refuses_a_tool_call_it_will_not_run[{cell}]"
+            for cell in REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE
+        ),
     ),
     MODULE_BY_KIND[matrix_columns.CODEX_LEGACY_KIND]: (
         "test_the_result_of_a_dispatch_budget_denial_reports_every_response_the_provider_billed",
         "test_a_billed_turn_that_shows_no_message_ends_in_the_protocol_error_of_the_client"
         "_and_is_not_retried",
+        "test_an_empty_completion_ends_in_the_protocol_error_of_the_client_and_is_not_retried",
     ),
     MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]: (
         "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
@@ -245,6 +302,8 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
             for name in GUARDED_SEVERAL_RESPONSES_ON_THE_OFFICIAL_CODEX_ROUTE
         ),
         "test_the_result_of_a_dispatch_budget_denial_reports_no_usage_for_what_the_provider_billed",
+        "test_a_call_for_a_tool_no_server_lists_ends_in_the_adapters_check_of_its_failed_item",
+        "test_the_cells_of_a_refused_thread_rest_on_the_code_the_tool_is_emulated_to_answer_with",
     ),
 }
 # The private names of the product that a required proof replaces in the test
@@ -301,7 +360,10 @@ class RecordProof:
 # entry's cell (static:entry_proof_not_required). A change that deletes a
 # proof and its name from the list above therefore deletes the entries that
 # lean on it, or fails. Each proof refuses, for its part, an entry that
-# attributes a code to its record on a cell it does not play.
+# attributes a code to its record on a cell it does not play; the one
+# exception is the test R21 leans on, which was written before its record
+# and is taken as it stands, so there the words of the entry say what the
+# record covers.
 # The official Codex route: while the column-wide flag code of R04 stands,
 # clause C6 compares no reported token with the provider's ledger on any cell
 # of the kind, and the test of a turn of one response does. The usage code of
@@ -312,11 +374,26 @@ class RecordProof:
 # of a write on the Claude columns says that the digest differs, not why
 # (R13). The two codes of a billed turn without a message on the app-server
 # route say neither that its error is not retriable nor what its text is
-# (R16).
+# (R16). The one code of an empty completion on that route does not say why
+# its error is not retriable (R20). The three codes of a refused resume on
+# the official route do not say that they rest on the code the tool is
+# emulated to answer with (R21). The codes of a call the Kimi route ends
+# because of a tool call it will not run say that the call ended in an
+# error, not which (M18). Nor do the codes of the call the official Codex
+# route ends for the failed item of a tool that no server lists say what
+# the worker handed over (R17).
 _CLAUDE_MODULE = MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]
+_KIMI_MODULE = MODULE_BY_KIND[matrix_columns.KIMI_KIND]
 _APP_SERVER_MODULE = MODULE_BY_KIND[matrix_columns.CODEX_LEGACY_KIND]
 _OFFICIAL_MODULE = MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]
 RECORD_PROOFS: Mapping[str, tuple[RecordProof, ...]] = {
+    "M18": (
+        RecordProof(
+            _KIMI_MODULE,
+            "test_the_call_ends_where_the_route_refuses_a_tool_call_it_will_not_run",
+            per="cell",
+        ),
+    ),
     "R04": (
         RecordProof(
             _OFFICIAL_MODULE,
@@ -360,6 +437,24 @@ RECORD_PROOFS: Mapping[str, tuple[RecordProof, ...]] = {
             _APP_SERVER_MODULE,
             "test_a_billed_turn_that_shows_no_message_ends_in_the_protocol_error_of_the_client"
             "_and_is_not_retried",
+        ),
+    ),
+    "R17": (
+        RecordProof(
+            _OFFICIAL_MODULE,
+            "test_a_call_for_a_tool_no_server_lists_ends_in_the_adapters_check_of_its_failed_item",
+        ),
+    ),
+    "R20": (
+        RecordProof(
+            _APP_SERVER_MODULE,
+            "test_an_empty_completion_ends_in_the_protocol_error_of_the_client_and_is_not_retried",
+        ),
+    ),
+    "R21": (
+        RecordProof(
+            _OFFICIAL_MODULE,
+            "test_the_cells_of_a_refused_thread_rest_on_the_code_the_tool_is_emulated_to_answer_with",
         ),
     ),
 }
@@ -707,15 +802,39 @@ def cost_bounded_guarded_cells() -> frozenset[str]:
     )
 
 
+def envelopes_of(kind: str, plan: Plan) -> tuple[str, ...]:
+    """The envelopes the dialect of ``kind`` answers a play of ``plan`` from, by name.
+
+    The steps of the script, each rendered by the driver of the kind against
+    a blank request. Where the invocation of the plan asks to continue a
+    conversation, the route answers the request and a tool beside the
+    adapter keeps the conversations of the wire, that tool is asked before
+    any model is. It holds no conversation of an earlier call, so what it
+    says of a handle it does not hold is what the cell is answered from,
+    whatever the script holds. A route that refuses the request before
+    transport asks nobody.
+    """
+
+    driver = drivers.get(kind)
+    names = driver.answers(plan.script)
+    if (
+        plan.conversation is not None
+        and plan.expect.outcome != "refused"
+        and isinstance(driver, KeeperDriver)
+    ):
+        names = (*driver.refuses(), *names)
+    return names
+
+
 @functools.cache
 def answered_from(cell: str) -> tuple[str, ...]:
     """The envelopes the dialect of a cell's kind answers the cell from, by name.
 
-    Read without playing the cell: the script of the variant that the routed
-    profile of the cell's column selects, each step rendered by the driver of
-    the kind against a blank request. The optional tail that a declared
-    difference adds is not in it. A static cell, an admission cell and a
-    cell of a kind without a driver are answered from nothing.
+    Read without playing the cell: the plan of the variant that the routed
+    profile of the cell's column selects, read as :func:`envelopes_of` reads
+    a plan. The optional tail that a declared difference adds is not in it.
+    A static cell, an admission cell and a cell of a kind without a driver
+    are answered from nothing.
     """
 
     kind, scenario, role, _lens = ledger.parse_cell_id(cell)
@@ -726,7 +845,7 @@ def answered_from(cell: str) -> tuple[str, ...]:
     if not columns:
         raise MatrixSetupError(f"cell {cell} names no column")
     variants = declarations.select(defined.differences, declarations.routed(columns[0]))
-    return drivers.get(kind).answers(plan_for(defined, variants).script)
+    return envelopes_of(kind, plan_for(defined, variants))
 
 
 def grade_of(cell: str) -> str | None:
@@ -827,6 +946,39 @@ def cell_of_item(module: str, name: str) -> str | None:
     """The cell a pytest item judges, by its module and test name."""
 
     return _cell_by_item().get((module, name))
+
+
+def refuse_items_without_fixtures(
+    items: Sequence[Any], root: Path, fixtures: Sequence[str]
+) -> None:
+    """Refuse the run when an item under ``root`` would run without ``fixtures``.
+
+    The fixtures a ``conftest.py`` applies to every test are in force for an
+    item by the directory pytest collected it under. A module that pytest
+    collects after it has left that directory (a call that names files of the
+    directory on both sides of a file outside it) gets none of them, and
+    nothing says so: its tests would run without the network guard and
+    outside the isolated environment. An item states the fixtures that are
+    in force for it, so such a run is refused here, before any test.
+    """
+
+    wanted = set(fixtures)
+    unguarded = [
+        item.nodeid
+        for item in items
+        if root in Path(str(item.path)).parents
+        and not wanted <= set(getattr(item, "fixturenames", ()))
+    ]
+    if unguarded:
+        raise pytest.UsageError(
+            f"the fixtures of the backend matrix ({', '.join(fixtures)}) are not in "
+            f"force for {len(unguarded)} item(s) of the package, the first "
+            f"{unguarded[0]}: pytest collected them after it had left the "
+            "directory of the package, and they would run without its network "
+            "guard and outside its isolated environment. Call the package as "
+            "one directory, or name its modules side by side in one call, never "
+            "on both sides of a file outside the package"
+        )
 
 
 def refuse_skip_markers(items: Sequence[Any], root: Path) -> None:

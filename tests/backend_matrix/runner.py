@@ -310,15 +310,22 @@ def execute(
         budget_usd=route_budget if plan.budget_usd is None else plan.budget_usd,
         policy=scenario.policy,
         response_schema=plan.response_schema,
+        conversation=plan.conversation,
     )
-    probe = replace(invocation, max_turns=1, budget_usd=route_budget, response_schema=None)
+    probe = replace(
+        invocation,
+        max_turns=1,
+        budget_usd=route_budget,
+        response_schema=None,
+        conversation=None,
+    )
     capture = _LogCapture()
     baseline = contract.settlement_baseline()
     started = time.monotonic()
     result = raised = terminal = second = declared = None
     hosted: Mutation | None = None
     endpoint: str | None = None
-    name = model = ""
+    name = model = built_in = ""
     log_dirs: tuple[Path, ...] = ()
     secrets: tuple[str, ...] = ()
     provider_ledger = ProviderLedger(unconsumed=_required_steps(plan.script))
@@ -336,6 +343,9 @@ def execute(
     try:
         with contextlib.ExitStack() as stack:
             bound = None
+            # True for as long as ``invoke`` runs: a raise is a refusal of
+            # the route only if it left that call.
+            calling = False
             hosts = stack.enter_context(mutation.watch()) if watched else None
             try:
                 bound = stack.enter_context(
@@ -351,12 +361,15 @@ def execute(
                 endpoint = _route_endpoint(column, role, bound)
                 declared = getattr(backend, "features", None)
                 name, model = str(backend.name), str(backend.model)
+                built_in = type(backend).__module__
                 if fixture is not None:
                     backend.attach_toolset(
                         fixture.toolset, context_budget=plan.context_budget
                     )
                 invoked_at = time.monotonic()
+                calling = True
                 result = backend.invoke(invocation)
+                calling = False
                 returned_at = time.monotonic()
                 if hosts is not None:
                     # Read before close(): what is left of a host once the
@@ -372,7 +385,9 @@ def execute(
             except Exception as exc:  # noqa: BLE001 - every raise is an observation
                 sent = bound is not None and bound.provider.request_count > 0
                 raised = Raised.from_exception(
-                    exc, phase="after_request" if sent else "before_request"
+                    exc,
+                    phase="after_request" if sent else "before_request",
+                    left_invoke=calling,
                 )
             if bound is not None:
                 log_dirs, secrets = tuple(bound.log_dirs), tuple(bound.secrets)
@@ -424,6 +439,7 @@ def execute(
         debug_dump_text=_debug_text(log_dirs, capture),
         mutation=hosted,
         toolset_returned=() if fixture is None else tuple(fixture.returned),
+        backend_module=built_in,
     )
     reference = Reference(
         routed=routed,

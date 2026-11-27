@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed chat completion that ends cleanly and produced nothing, in the
+# dialect of the Moonshot route: no reasoning and no text arrive, the finish
+# chunk names an ordinary stop, and the usage holds no completion token.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: empty_completion
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletionChunk objects: a first chunk whose delta
+    holds the role and an empty content, then the finish chunk, the
+    statistics chunk and the closing message of the completion envelope
+  sdk_version: openai 2.14.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach for this reply:
+    every one of the four raw streams of the live observation of 2026-11-18
+    that the completion envelope cites reasoned and held visible text, and
+    the vendor's chat reference (primary source, read 2026-11-18) states no
+    stream without output. What is taken from those sources is what the
+    completion envelope takes: the finish chunk with its repeated usage, the
+    statistics chunk with empty choices, the keys of the usage of a request
+    that read nothing from the cache, and "[DONE]" last. Constructed: that
+    such a stream opens with a chunk that carries the role and an empty
+    content and has no reasoning delta, that its finish reason is "stop",
+    and that its usage states no completion token and no reasoning token.
+    The renderer fills the counters, and the scripted step allows no output
+    token. So this envelope proves that such a stream parses through the
+    pinned SDK, not that the route sends it. The last entry is the closing
+    message of the stream, which is no JSON document.
+
+status: 200
+body:
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          role: assistant
+          content: ""
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta: {}
+        finish_reason: stop
+        usage:
+          prompt_tokens: {slot: input_tokens}
+          completion_tokens: {slot: output_tokens}
+          total_tokens: {slot: total_tokens}
+          prompt_tokens_details:
+            cache_write_tokens: 0
+          completion_tokens_details:
+            reasoning_tokens: 0
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices: []
+    usage:
+      prompt_tokens: {slot: input_tokens}
+      completion_tokens: {slot: output_tokens}
+      total_tokens: {slot: total_tokens}
+      prompt_tokens_details:
+        cache_write_tokens: 0
+      completion_tokens_details:
+        reasoning_tokens: 0
+  - "[DONE]"

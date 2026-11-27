@@ -32,7 +32,7 @@ from crucible.tools import (
 from crucible.tools.profiles import build_autonomous_implementer_profile
 from crucible.tools.source import build_source_tools
 
-from .script import READ_A, READ_B, WRITE
+from .script import READ_A, READ_B, UNATTACHED, WRITE
 
 # The directory of a cell in which its fixture is built.
 WORKSPACE = "workspace"
@@ -40,6 +40,7 @@ NOTES_FILE = "notes.txt"
 WRITE_FILE = "result.txt"
 WRITE_CONTENT = "written by the matrix writer scenario\n"
 _NEEDLE = "matrix-needle"
+UNATTACHED_TOOL = "matrix_unlisted_tool"
 # Long enough that one read result exceeds every context budget a scenario sets.
 _NOTES = "".join(
     f"line {number:02d}: {_NEEDLE if number == 3 else 'filler'} "
@@ -62,6 +63,9 @@ BINDINGS: Mapping[str, ToolBinding] = {
     WRITE: ToolBinding(
         "write_source", {"file_path": WRITE_FILE, "content": WRITE_CONTENT}
     ),
+    # No fixture attaches this name and the product has no tool of it: a call
+    # for it is a call for a tool the model was never offered.
+    UNATTACHED: ToolBinding(UNATTACHED_TOOL, {"query": _NEEDLE}),
 }
 
 
@@ -90,11 +94,19 @@ def WRITER(max_consecutive_read_calls: int) -> ToolsetSpec:  # noqa: N802
 
 @dataclass(frozen=True)
 class Dispatch:
-    """One call a ToolSet object of the fixture answered, with the text it returned."""
+    """One call a ToolSet object of the fixture answered, with the text it returned.
+
+    ``arguments`` is the mapping the ToolSet was handed. Where it was handed
+    something else in the place of one (a list, a text, a number, nothing at
+    all), ``arguments`` is empty and ``not_a_mapping`` holds that value as
+    it came, alone in a tuple: such a call names no arguments, whatever the
+    ToolSet made of it, and it is the dispatch of no scripted call.
+    """
 
     name: str
     arguments: Mapping[str, Any]
     result: str
+    not_a_mapping: tuple[Any, ...] = ()
 
 
 @dataclass
@@ -131,9 +143,16 @@ class Fixture:
 def _record(inner: Any, log: list[Dispatch]) -> None:
     original = inner.dispatch
 
-    def dispatch(name: str, arguments: dict) -> str:
+    def dispatch(name: str, arguments: Any) -> str:
+        # What the ToolSet is handed is kept as it came and converted to
+        # nothing: the recorder never fails where the ToolSet answers, so
+        # the caller gets the ToolSet's own answer and the call is on record
+        # whatever its arguments were.
+        mapping = isinstance(arguments, Mapping)
+        kept: dict[str, Any] = dict(arguments) if mapping else {}
+        other: tuple[Any, ...] = () if mapping else (arguments,)
         result = original(name, arguments)
-        log.append(Dispatch(name=name, arguments=dict(arguments or {}), result=result))
+        log.append(Dispatch(name=name, arguments=kept, result=result, not_a_mapping=other))
         return result
 
     # An instance attribute shadows the method for this one object only.

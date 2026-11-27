@@ -18,7 +18,10 @@ from typing import Any, Literal, Mapping, Union
 READ_A = "read_a"
 READ_B = "read_b"
 WRITE = "write"
-SLOTS = (READ_A, READ_B, WRITE)
+# A tool that no ToolSet of the matrix attaches: what a model calls when it
+# names a tool it was never offered.
+UNATTACHED = "unattached"
+SLOTS = (READ_A, READ_B, WRITE, UNATTACHED)
 
 
 @dataclass(frozen=True)
@@ -42,11 +45,19 @@ class Say:
 
 @dataclass(frozen=True)
 class Call:
-    """One tool call for a fixture slot; ``args`` overrides the slot's own."""
+    """One tool call for a fixture slot; ``args`` overrides the slot's own.
+
+    ``malformed`` is the text of the arguments as the model wrote it, where
+    that text is no JSON object (no JSON at all, or a JSON document of
+    another type): the call then names no arguments at all. A wire that
+    carries the arguments of a call in a string carries such a text; a wire
+    on which a tool call travels as a decoded object cannot.
+    """
 
     slot: str
     args: Mapping[str, Any] | None = None
     usage: TokenUsage = DEFAULT_USAGE
+    malformed: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,9 +77,38 @@ class Refuse:
 
 @dataclass(frozen=True)
 class Cut:
-    """A reply cut by the route's output-token cap."""
+    """A reply cut by the route's output-token cap.
 
+    A complete reply of its wire: it carries ``text``, what was produced
+    before the cap, the provider's own mark of a cut in the place where the
+    wire states how a turn ended, and the usage of the response, which the
+    provider bills.
+    """
+
+    text: str
     usage: TokenUsage = DEFAULT_USAGE
+
+
+# What a reply that produced nothing is billed for: the input it read.
+NO_OUTPUT_USAGE = TokenUsage(input_tokens=DEFAULT_USAGE.input_tokens, output_tokens=0)
+
+
+@dataclass(frozen=True)
+class Empty:
+    """A clean stop that produced nothing.
+
+    A complete reply of its wire with the mark of an ordinary finish: no
+    text, no reasoning and no output token. ``Say`` with an empty text is
+    not this step: a dialect renders that from the reply it has for a plain
+    answer, and a reply without output has a rendering, and a grade, of its
+    own.
+    """
+
+    usage: TokenUsage = NO_OUTPUT_USAGE
+
+    def __post_init__(self) -> None:
+        if self.usage.output_tokens:
+            raise ValueError("a reply that produced nothing bills no output token")
 
 
 @dataclass(frozen=True)
@@ -134,7 +174,9 @@ class Loop:
     """``step`` again for every request, at most ``limit`` times.
 
     A request beyond ``limit`` is unscripted. Fewer than ``at_least`` requests
-    leave the step unconsumed.
+    leave the step unconsumed; with ``at_least=0`` the step is never
+    required: the model has it ready, and a call that ended before asking
+    for it leaves nothing unconsumed.
     """
 
     step: Step
@@ -143,7 +185,7 @@ class Loop:
 
 
 Step = Union[
-    Say, Call, Reason, Refuse, Cut, HttpError, Drop, Stall, Malformed, ServedAs, Loop
+    Say, Call, Reason, Refuse, Cut, Empty, HttpError, Drop, Stall, Malformed, ServedAs, Loop
 ]
 
 

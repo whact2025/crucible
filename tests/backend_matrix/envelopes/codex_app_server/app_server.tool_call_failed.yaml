@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A tool call that its tool server answered with an error, as the app-server
+# reports it once the answer is there. Nothing was observed of the real tool
+# (see app_server.agent_message).
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: tool_call_failed
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai_codex.generated.v2_all.ItemCompletedNotification with a
+    McpToolCallThreadItem whose status is the McpToolCallStatus value failed
+    and whose error is a McpToolCallError (method item/completed in
+    openai_codex.generated.notification_registry)
+  sdk_version: openai-codex 0.144.4
+  reason: >-
+    The notification holds exactly the required fields of the generated type
+    of the vendor and the item the required fields of McpToolCallThreadItem
+    with its error, whose one field is the message. The message is the text
+    of the content the tool server returned for the call. The generated
+    types give a call the status failed and an error beside the status
+    completed and a result; which of the two the real tool reports for a
+    call that its server answered with an error result, and what its
+    message then holds, is not known: that the item is reported as failed,
+    with the text of the server's answer as its message, is a choice of
+    this dialect. The model turn that follows is the scripted one in either
+    case.
+    One cell reaches this envelope by a second choice that no source states
+    either. The model there calls a tool that no configured server lists.
+    What the real tool does with such a call is not known: it may answer
+    the model itself and ask no server, and it may report no item for it.
+    The scripted tool forwards the call to the first tool server it was
+    configured with, which refuses the name, and reports the call as an
+    mcpToolCall item of that server (started, then failed). So what an
+    adapter sees of a call for a tool outside the attached set, on this
+    wire, is this dialect's choice of what the tool does with it, not the
+    model's call.
+
+status: 200
+
+body:
+  method: item/completed
+  params:
+    threadId: {slot: thread_id}
+    turnId: {slot: turn_id}
+    completedAtMs: {slot: created}
+    item:
+      type: mcpToolCall
+      id: {slot: call_id}
+      server: {slot: tool_server}
+      tool: {slot: tool_name}
+      status: failed
+      arguments: {slot: tool_input}
+      error:
+        message: {slot: tool_result}

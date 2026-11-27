@@ -34,7 +34,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from assay import BackendPolicy
+from assay import BackendPolicy, ConversationTransportRequest
 
 from .contract import (
     ACCOUNTING_FLAGS,
@@ -46,14 +46,17 @@ from .contract import (
     Observation,
     Reference,
 )
-from .declarations import BASE, FALLBACK, Differences, Variant
+from .declarations import BASE, FALLBACK, REFUSED, Differences, Variant
 from .drivers.base import LENSES, MatrixSetupError
 from .script import (
     READ_A,
     READ_B,
+    UNATTACHED,
     WRITE,
     Call,
+    Cut,
     Drop,
+    Empty,
     Loop,
     Malformed,
     ProviderScript,
@@ -84,6 +87,9 @@ TEXT = "matrix final answer"
 # on its way when the connection or the peer goes away.
 UNENDED_TEXT = "matrix answer of a turn without its terminal"
 DROPPED_TEXT = "matrix answer that was cut off on its way"
+# What the provider had produced of an answer when it ended the reply at the
+# output-token cap of the route.
+CUT_TEXT = "matrix answer that the output cap cut"
 SCHEMA_KEY = "matrix_answer"
 # The title occurs once in the schema, so it counts renderings of the schema.
 SCHEMA_TITLE = "matrix-schema-7c41"
@@ -119,12 +125,55 @@ CATALOGUE_TURNS = 2 * CATALOGUE_ROUNDS + 1
 # minute, and three times as long where the test shares one hardware thread
 # with another busy process. The scenario is not about a deadline: the value
 # is several times the longer figure, so that it ends a call that hangs and
-# no other.
+# no other. The scenario of the malformed tool arguments passes the same
+# deadline: its four requests take such a backend a third of that minute,
+# and more than the minute where two other busy processes share the thread.
 CATALOGUE_TIMEOUT_SECONDS = 600
 # How much later than the deadline of the invocation the deadline of a write
 # host may be: the two clocks are read a moment apart. Every backend that
 # hosts writes is within a few milliseconds.
 DEADLINE_SLACK_SECONDS = 0.5
+
+# What the model answers where it is asked once more, without tools, at the
+# turn limit: the partial answer of a call that ended there.
+PARTIAL_TEXT = "partial answer at the turn limit"
+# The scenario about a budget inside a tool loop: the model asks for a tool
+# in each of this many rounds and then answers, and every tool round bills
+# the same usage. At the matrix rate one round costs less than the budget
+# and two cost more, so the budget is crossed by the second response.
+LOOP_ROUNDS = 4
+OVERRUN_ROUND = 2
+LOOP_ROUND_USAGE = TokenUsage(150, 60)
+# What a model wrote in the place of the arguments of a tool call, three
+# times: none of the texts is a JSON object, so none of the calls names any
+# arguments. The first is the JSON of the first read tool's arguments, cut
+# before its closing brace: no JSON document. The second is a JSON document
+# that says "nothing", which a reader may take for a call without
+# arguments. The third is a JSON document that is neither an object nor
+# empty: a list of the file name.
+MALFORMED_ARGUMENT_TEXTS = ('{"file_path": "notes.txt"', "null", '["notes.txt"]')
+
+# The conversation a workflow asks to continue in the scenario about
+# continuity: a handle that no session of the cell issued, in the form both
+# vendor tools name a session by, bound to two digests of the matrix. Whoever
+# keeps the conversations of a wire holds none under it.
+STALE_HANDLE = "00000000-0000-4000-8000-000000000050"
+
+
+def _matrix_digest(what: str) -> str:
+    return "sha256:" + hashlib.sha256(f"backend matrix {what}".encode()).hexdigest()
+
+
+CONVERSATION = ConversationTransportRequest(
+    mode="workflow_bound",
+    action="reuse",
+    opaque_id=STALE_HANDLE,
+    identity_fingerprint=_matrix_digest("conversation identity"),
+    operation_digest=_matrix_digest("conversation operation"),
+)
+# The one type a route that declares no continuity for a workflow refuses a
+# conversation request with, before transport.
+CONTINUITY_REFUSAL = NotImplementedError.__name__
 
 # The base policy. No scenario relies on an adapter default: they differ.
 BASE_POLICY = BackendPolicy(
@@ -148,6 +197,9 @@ class Plan:
     response_schema: Mapping[str, Any] | None = None
     context_budget: int | None = None
     checks: tuple[Check, ...] = ()
+    # The conversation the invocation asks to continue; ``None`` for a call
+    # that asks for none.
+    conversation: ConversationTransportRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -557,6 +609,121 @@ def no_overshoot(obs: Observation, _ref: Reference) -> list[Deviation]:
     return [Deviation("usage.cost_usd:gt", "a hard USD ceiling was overshot")]
 
 
+def response_cap_in_request(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """Every request carries a response cap, where its wire has a field for one.
+
+    Asked of a route that declares that its cap on the tokens of a response
+    is enforced where the provider is. On a wire that has a field for the
+    cap, a request without it is an adapter that kept the cap of its route
+    to itself: the provider then applies whatever it applies unasked. The
+    value is the route's own and is not asserted. A wire without the field
+    carries no cap from any adapter, so there the check says nothing.
+    """
+
+    requests = _matched(obs)
+    untold = [
+        request
+        for request in requests
+        if request.response_cap is None or request.response_cap < 1
+    ]
+    if not obs.provider.response_cap_field or not untold:
+        return []  # with no request at all C0 reports the script
+    return [
+        Deviation(
+            "request.content:response_cap",
+            f"{len(untold)} of {len(requests)} request(s) carry no cap on the "
+            "tokens of the response on a wire that has a field for one and a "
+            "route that declares an enforced cap",
+        )
+    ]
+
+
+def no_response_cap(obs: Observation, _ref: Reference) -> list[Deviation]:
+    if all(request.response_cap is None for request in obs.provider.requests):
+        return []
+    return [
+        Deviation(
+            "request.content:response_cap",
+            "a cap on the tokens of the response was sent on a route that "
+            "declares none",
+        )
+    ]
+
+
+def stale_outcome_of_the_request(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The result of a handle that was refused says so, for the request it answers.
+
+    A workflow that asked to continue a conversation reads from the outcome
+    what became of it. Where the handle was refused the result carries an
+    outcome whose state is stale, which names no handle, and which is bound
+    to the request: its identity fingerprint and its operation digest are
+    those of the request. An outcome of another operation would be booked
+    against the wrong record.
+    """
+
+    assert obs.result is not None
+    outcome = obs.result.conversation
+    if outcome is None:
+        return [
+            Deviation(
+                "conversation:missing",
+                "the invocation asked to continue a conversation and the result "
+                "carries no conversation outcome",
+            )
+        ]
+    out: list[Deviation] = []
+    if outcome.state != "stale" or outcome.opaque_id is not None:
+        names = "" if outcome.opaque_id is None else " and names a handle"
+        out.append(
+            Deviation(
+                "conversation:state",
+                f"the conversation outcome is {outcome.state!r}{names}; nobody "
+                "holds the handle the invocation named, so the outcome is stale "
+                "and names none",
+            )
+        )
+    if (outcome.identity_fingerprint, outcome.operation_digest) != (
+        CONVERSATION.identity_fingerprint,
+        CONVERSATION.operation_digest,
+    ):
+        out.append(
+            Deviation(
+                "conversation:unbound",
+                "the identity fingerprint or the operation digest of the "
+                "conversation outcome is not that of the request",
+            )
+        )
+    return out
+
+
+def handle_asked_of_its_keeper(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """The tool that keeps the conversations of the wire was asked for the handle.
+
+    Asked on a wire where a tool beside the adapter keeps the conversations
+    (the provider ledger says so). There an adapter cannot know by itself
+    that nobody holds a handle: a result for a handle nobody holds rests on
+    that tool having been asked for the handle of the request, and for no
+    other one. An adapter that calls every handle stale without asking is
+    told apart by this alone. On a wire where the adapter keeps its
+    conversations itself there is nobody else to ask, and the check says
+    nothing.
+    """
+
+    refused = obs.provider.refused_handles
+    if not obs.provider.conversation_keeper or set(refused) == {CONVERSATION.opaque_id}:
+        return []
+    asked = f"for {len(set(refused))} other handle(s)" if refused else "for none"
+    return [
+        Deviation(
+            "conversation:unasked",
+            "a tool beside the adapter keeps the conversations of this wire and "
+            f"was asked {asked}; the result of a handle nobody holds rests on "
+            "that tool having been asked for the handle of the request, and "
+            "for no other",
+        )
+    ]
+
+
 def _visible_payload(result: str, replayed: str) -> int:
     """Bytes of ``result``'s leading payload that ``replayed`` shows the provider."""
 
@@ -802,6 +969,43 @@ def messages_are_the_workflows(obs: Observation, ref: Reference) -> list[Deviati
     return [Deviation("request.content:messages", "; ".join(problems))]
 
 
+def partial_text_kept(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """What the model had written when the turn limit ended the call is the final message.
+
+    A call that ends at its turn limit without an error returns the partial
+    answer, and nothing in its place. Where one further request without
+    tools was asked and answered, that answer is the partial answer; where
+    the model was never asked again it had written no text, and the final
+    message is empty: a warning of the adapter's own, or any other text, is
+    not what the model said.
+
+    So the check can fail for text that was dropped only where that further
+    request was answered. Where the model is never asked again, the script
+    has no text to keep: there it holds that the result carries no text of
+    the adapter's own, and says nothing of an adapter that would drop what
+    a model wrote beside its tool calls.
+    """
+
+    assert obs.result is not None
+    if obs.result.error is not None:
+        return []  # an error result promises no answer; clause C2 reports the kind
+    kept = PARTIAL_TEXT if obs.provider.tail_served else ""
+    if obs.result.final_message == kept:
+        return []
+    return [
+        Deviation(
+            "text:mismatch",
+            "final_message is not the partial answer of the call that ended at its "
+            "turn limit"
+            + (
+                ": the answer to the one further request without tools"
+                if obs.provider.tail_served
+                else ": the model had written no text, so it is empty"
+            ),
+        )
+    ]
+
+
 def _reads_and_writes_in_turn() -> ProviderScript:
     """Read, write, and again: every write replaces the file with a longer text.
 
@@ -837,7 +1041,7 @@ def _tool_rounds_then(text: str) -> ProviderScript:
 
 
 def _final_request_without_tools(plan: Plan) -> Plan:
-    tail = Say("partial answer at the turn limit")
+    tail = Say(PARTIAL_TEXT)
     return replace(plan, script=replace(plan.script, tail=tail))
 
 
@@ -862,6 +1066,72 @@ def _no_turn_control(plan: Plan) -> Plan:
 
 def _cost_reported_only(plan: Plan) -> Plan:
     return replace(plan, expect=CLEAN)
+
+
+def _noted_after_overrun(plan: Plan) -> Plan:
+    """The limit is noted after more rounds than it allows; the answer is kept."""
+
+    overrun = _typed_after_overrun(_swap_check(plan, partial_text_kept, None))
+    answer = overrun.script.steps[-1]
+    assert isinstance(answer, Say)
+    return replace(overrun, expect=replace(overrun.expect, final_text=answer.text))
+
+
+def _no_turn_control_and_an_answer(plan: Plan) -> Plan:
+    """No turn limit is claimed: the finite script ends with its answer."""
+
+    return _no_turn_control(_swap_check(plan, partial_text_kept, None))
+
+
+def _loop_ends_with_its_owner(plan: Plan) -> Plan:
+    """The tool loop is a vendor's: it ends where the vendor's tool ends it.
+
+    At the earliest after the round in which the budget was crossed, at the
+    latest with the answer after the last tool round. The answer is asked
+    for only while the loop still runs and is never required. Every call
+    after the first may or may not be dispatched.
+    """
+
+    rounds = Loop(
+        Call(READ_A, usage=LOOP_ROUND_USAGE), limit=LOOP_ROUNDS, at_least=OVERRUN_ROUND
+    )
+    return replace(
+        plan,
+        script=ProviderScript((rounds, Loop(Say(TEXT), limit=1, at_least=0))),
+        expect=replace(plan.expect, dispatch_optional=(READ_A,) * (LOOP_ROUNDS - 1)),
+    )
+
+
+def _unstated(scenario: str, field_name: str, value: str) -> Callable[[Plan], Plan]:
+    """The plan of a declared value for which nothing is stated yet: none.
+
+    No column declares the value and the scenario does not say what it owes
+    under it. A column that comes to declare it cannot run the cell before
+    that is stated: the cell is an error of the matrix, never a pass.
+    """
+
+    def refuse(_plan: Plan) -> Plan:
+        raise MatrixSetupError(
+            f"scenario {scenario} states nothing for {field_name}={value!r}: what "
+            "a route that declares it owes is stated before the cell is played"
+        )
+
+    return refuse
+
+
+def _complete_reply(plan: Plan) -> Plan:
+    """No response cap is claimed: the reply is complete, the finish a clean one.
+
+    The plan of the plain text scenario in full, and one assertion more: no
+    request carries a cap on the tokens of the response.
+    """
+
+    return replace(
+        plan,
+        script=ProviderScript((Say(TEXT),)),
+        expect=replace(CLEAN, events=("request/-",)),
+        checks=(*_CLEAN_TEXT_CHECKS, no_response_cap),
+    )
 
 
 # Declared differences (the ledger holds their citation, owner and scope).
@@ -1295,6 +1565,267 @@ _ALL: tuple[Scenario, ...] = (
             checks=(write_is_progress, history_replayed),
         ),
     ),
+    # -- limits inside a tool loop ------------------------------------------
+    Scenario(
+        id="S10b",
+        set=PACK_B,
+        title="Turn limit, on_max_turns=continue_with_warning",
+        toolset=READ,
+        lenses=("raw",),
+        policy=replace(BASE_POLICY, on_max_turns="continue_with_warning"),
+        # The turn limit of the scenario above under the other policy: the
+        # limit is reached and recorded as there, and the call returns no
+        # error. What the model had written is kept as the final message.
+        plan=lambda: Plan(
+            ProviderScript((Loop(Call(READ_A), limit=TURN_LIMIT, at_least=TURN_LIMIT),)),
+            expect=Expectation(
+                stop=("max_turns",),
+                events=("limit/max_turns",),
+                dispatch=(READ_A,),
+                dispatch_optional=(READ_A,),
+            ),
+            max_turns=TURN_LIMIT,
+            checks=(partial_text_kept, history_replayed),
+        ),
+        differences={
+            "turn_limit": {
+                "hard": BASE,
+                "provider_stop": BASE,
+                "round_boundary": FALLBACK(
+                    "final_request_without_tools",
+                    "crucible/backends/openai_compat.py:1619-1624 (forced "
+                    "finalisation after the last tool round)",
+                ),
+                "post_hoc": FALLBACK(
+                    "noted_after_overrun",
+                    "crucible/backends/limits.py:364-373 (post_hoc is terminal "
+                    "accounting)",
+                ),
+                "unsupported": FALLBACK(
+                    "no_turn_control",
+                    "crucible/backends/features.py:39-40 (no reviewed max-turn "
+                    "request control)",
+                ),
+            }
+        },
+        fallbacks={
+            "final_request_without_tools": _final_request_without_tools,
+            "noted_after_overrun": _noted_after_overrun,
+            "no_turn_control": _no_turn_control_and_an_answer,
+        },
+    ),
+    Scenario(
+        id="S14",
+        set=PACK_B,
+        title="USD overrun inside a tool loop",
+        toolset=READ,
+        lenses=("raw",),
+        # The second response takes the cost of the call above its budget.
+        # Whose the tool loop is decides where the call can end: an adapter
+        # that runs the loop itself asks for no third round; a loop that a
+        # vendor's tool runs ends where that tool ends it, and the result
+        # accounts for every round the provider billed until then.
+        plan=lambda: Plan(
+            ProviderScript(
+                (
+                    Loop(
+                        Call(READ_A, usage=LOOP_ROUND_USAGE),
+                        limit=OVERRUN_ROUND,
+                        at_least=OVERRUN_ROUND,
+                    ),
+                )
+            ),
+            expect=Expectation(
+                kind="budget_exhausted",
+                stop=("budget_exhausted",),
+                retriable=False,
+                events=("limit/budget_usd",),
+                dispatch=(READ_A,),
+                dispatch_optional=(READ_A,),
+            ),
+            budget_usd=BUDGET_USD,
+            checks=(history_replayed,),
+        ),
+        differences={
+            "tool_loop": {
+                "adapter_owned": BASE,
+                "sdk_owned": FALLBACK(
+                    "loop_ends_with_its_owner",
+                    "crucible/backends/features.py:36 (the tool loop of the route "
+                    "is run by the vendor's SDK or tool)",
+                ),
+                "none": FALLBACK(
+                    "tool_loop_none",
+                    "assay/src/assay/backend/features.py:24 (a route may declare "
+                    "that it runs no tool loop)",
+                ),
+            }
+        },
+        fallbacks={
+            "loop_ends_with_its_owner": _loop_ends_with_its_owner,
+            "tool_loop_none": _unstated("S14", "tool_loop", "none"),
+        },
+    ),
+    # -- tool calls that must not be dispatched -----------------------------
+    Scenario(
+        id="S05",
+        set=PACK_B,
+        title="Malformed tool arguments",
+        toolset=READ,
+        lenses=("raw",),
+        # The model names an attached tool and writes no JSON object for its
+        # arguments, three times: a text that is no JSON, a JSON text that
+        # says "nothing", a JSON list. Nothing is dispatched for any of the
+        # calls: not the tool with an empty object, not the value a text
+        # decodes to, not the text. The model is answered each time, and
+        # the turn ends as the provider ends it. Four requests and nothing
+        # about a deadline: the invocation gets the long one.
+        policy=replace(BASE_POLICY, timeout_seconds=CATALOGUE_TIMEOUT_SECONDS),
+        plan=lambda: Plan(
+            ProviderScript(
+                (
+                    *(Call(READ_A, malformed=text) for text in MALFORMED_ARGUMENT_TEXTS),
+                    Say(TEXT),
+                )
+            ),
+            checks=(history_replayed,),
+        ),
+    ),
+    Scenario(
+        id="S06",
+        set=PACK_B,
+        title="Tool outside the attached set",
+        toolset=READ,
+        lenses=("raw",),
+        # The model names a tool it was never offered. Nothing reaches the
+        # ToolSet for the call, neither that name nor an attached tool in
+        # its place; the model is answered, and the turn ends as the
+        # provider ends it.
+        plan=lambda: Plan(
+            ProviderScript((Call(UNATTACHED), Say(TEXT))),
+            checks=(history_replayed,),
+        ),
+    ),
+    # -- schema without tools; output-token cut; empty completion -----------
+    Scenario(
+        id="S02",
+        set=PACK_B,
+        title="Text with response schema",
+        toolset=None,
+        lenses=("raw",),
+        plan=lambda: Plan(
+            ProviderScript((Say(SCHEMA_ANSWER),)),
+            # No verbatim text: an adapter may serialise the object again.
+            # The answer is compared as a JSON value by the first check.
+            expect=replace(CLEAN, final_text=None),
+            response_schema=SCHEMA,
+            checks=(schema_answer_returned, schema_in_field),
+        ),
+        # The table of the scenario of a tool loop that ends in a schema
+        # answer, value for value: where the schema travels follows the
+        # declaration, with or without tools. A self-test holds the two
+        # tables to each other. The declared difference of a schema
+        # finalisation after a tool loop has no alternative here: without a
+        # ToolSet there is no loop to finalise, and a second request is an
+        # extra one.
+        differences={
+            "structured_output": {
+                "native": BASE,
+                "prompt_only": FALLBACK(
+                    "schema_in_prompt",
+                    "crucible/backends/features.py:143-145 (one canonical schema "
+                    "through the Assay prompt ABI)",
+                ),
+                "unsupported": FALLBACK(
+                    "schema_unclaimed",
+                    "crucible/backends/features.py:79-81 (no native-schema "
+                    "conformance claim)",
+                    difference=D_STRUCT_UNQUALIFIED,
+                ),
+            }
+        },
+        fallbacks={
+            "schema_in_prompt": lambda plan: _swap_check(
+                plan, schema_in_field, schema_in_prompt
+            ),
+            "schema_unclaimed": lambda plan: _swap_check(plan, schema_in_field, None),
+        },
+    ),
+    Scenario(
+        id="S17",
+        set=PACK_B,
+        title="Output-token cut",
+        toolset=None,
+        lenses=("raw",),
+        # The provider ends the reply at the cap of the route. The reply is
+        # a complete reply of its wire that states its usage, so every flag
+        # is owed and the usage is the bill. The result is an error of the
+        # general kind, not retriable, told apart by its stop reason and by
+        # a limit event of its own: never a turn limit, never an answer.
+        # Not asserted: that no other limit event stands beside that one,
+        # what the final message of the error result holds, and the value
+        # of the cap a request carries.
+        plan=lambda: Plan(
+            ProviderScript((Cut(CUT_TEXT),)),
+            expect=Expectation(
+                kind="transport",
+                stop=("max_tokens",),
+                retriable=False,
+                events=("limit/response_tokens",),
+            ),
+        ),
+        # An enforced cap is declared as hard or as provider_stop, and the
+        # product places both where the provider is: such a route owes the
+        # cap in every request on a wire that has a field for one. A route
+        # that claims no cap sends none, and its reply is complete.
+        differences={
+            "response_token_limit": {
+                "hard": FALLBACK(
+                    "cap_in_request",
+                    "crucible/backends/limits.py:364-373 (hard is enforced at "
+                    "the provider)",
+                ),
+                "provider_stop": FALLBACK(
+                    "cap_in_request",
+                    "crucible/backends/limits.py:364-373 (provider_stop is "
+                    "enforced by the provider)",
+                ),
+                "round_boundary": BASE,
+                "post_hoc": BASE,
+                "unsupported": FALLBACK(
+                    "complete_reply",
+                    "assay/src/assay/backend/features.py:27-29 (unsupported "
+                    "claims no enforcement)",
+                ),
+            }
+        },
+        fallbacks={
+            "cap_in_request": lambda plan: replace(
+                plan, checks=(*plan.checks, response_cap_in_request)
+            ),
+            "complete_reply": _complete_reply,
+        },
+    ),
+    Scenario(
+        id="S25",
+        set=PACK_B,
+        title="Empty completion, no tools",
+        toolset=None,
+        lenses=("raw",),
+        # A clean stop that produced nothing is no answer: a transport error
+        # that a caller may retry, at the one attempt the policy allows, and
+        # never named after the stop reason of a success. The reply is
+        # complete and states its usage, so every flag is owed.
+        plan=lambda: Plan(
+            ProviderScript((Empty(),)),
+            expect=Expectation(
+                kind="transport",
+                stop=(),
+                stop_not=READ_STOP_REASONS,
+                retriable=True,
+            ),
+        ),
+    ),
     # -- broken terminals ---------------------------------------------------
     Scenario(
         id="S26",
@@ -1380,6 +1911,45 @@ _ALL: tuple[Scenario, ...] = (
             max_turns=CATALOGUE_TURNS,
             checks=(tools_are_the_attached_ones, messages_are_the_workflows, history_replayed),
         ),
+    ),
+    # -- a conversation request ---------------------------------------------
+    Scenario(
+        id="S50",
+        set=PACK_B,
+        title="Conversation request",
+        toolset=None,
+        lenses=("raw",),
+        # The invocation asks to continue a conversation under a handle that
+        # nobody holds. Whoever keeps the conversations of the wire refuses
+        # it before a model turn is asked, so the script is empty, no usage
+        # was reported and the three flags a scenario may waive are not
+        # asked. The result is the typed stale conversation, with the
+        # outcome of the request: no error a caller may try again, since
+        # the same handle is refused again. Where a tool beside the adapter
+        # keeps the conversations of the wire, that tool was asked for the
+        # handle.
+        plan=lambda: Plan(
+            ProviderScript(()),
+            expect=Expectation(
+                kind="stale_conversation",
+                stop=(),
+                stop_not=READ_STOP_REASONS,
+                retriable=False,
+                flags=("trace_complete",),
+            ),
+            checks=(stale_outcome_of_the_request, handle_asked_of_its_keeper),
+            conversation=CONVERSATION,
+        ),
+        # A route that declares continuity for a workflow answers the
+        # request. One that declares none, or continuity for its own retries
+        # only, refuses it before transport, with the one agreed type.
+        differences={
+            "session_continuity": {
+                "workflow_bound": BASE,
+                "retry_only": REFUSED(CONTINUITY_REFUSAL),
+                "none": REFUSED(CONTINUITY_REFUSAL),
+            }
+        },
     ),
     Scenario(
         id="S51",

@@ -1,0 +1,150 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed response that the provider ended at the cap on its output
+# tokens: the events of one response of the DeepSeek Responses route whose
+# output message ends incomplete and whose terminal is that of an incomplete
+# response, with the cap as its reason. It is billed and holds the text that
+# was produced before the cap.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: deepseek_responses
+provider: deepseek
+behaviour: output_cut
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    the events of the completion envelope of this dialect, the last of them
+    replaced by openai.types.responses.ResponseIncompleteEvent with a
+    Response of status "incomplete" whose incomplete_details.reason is
+    "max_output_tokens" (openai.types.responses.response.IncompleteDetails);
+    the output message carries the status "incomplete", a value of
+    openai.types.responses.ResponseOutputMessage.status
+  sdk_version: openai 2.53.0
+  notes: >-
+    The vendor's guide to its Responses route (primary source, read
+    2026-11-18) names response.incomplete among the terminals of a stream
+    and says that usage is null until the terminal event; it does not say
+    when the route sends that terminal, and no response of the route was
+    driven into its cap. That a capped response ends with it, with the
+    reason "max_output_tokens", is the reading of the pinned SDK's types:
+    the reason is one of the two values the SDK types for an incomplete
+    response. That the events of the text arrive as those of a plain answer
+    do, that the output message is closed with the status "incomplete" and
+    is repeated in the output of the terminal, and that the usage block is
+    the one of the completion envelope, are choices of this envelope. So it
+    proves that such a stream parses through the pinned SDK, not that the
+    route sends it.
+
+status: 200
+body:
+  - type: response.created
+    sequence_number: 0
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.in_progress
+    sequence_number: 1
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.output_item.added
+    sequence_number: 2
+    output_index: 0
+    item:
+      id: {slot: item_id}
+      type: message
+      role: assistant
+      status: in_progress
+      content: []
+  - type: response.content_part.added
+    sequence_number: 3
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    part:
+      type: output_text
+      text: ""
+      annotations: []
+  - type: response.output_text.delta
+    sequence_number: 4
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    delta: {slot: text}
+    logprobs: []
+  - type: response.output_text.done
+    sequence_number: 5
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    text: {slot: text}
+    logprobs: []
+  - type: response.content_part.done
+    sequence_number: 6
+    item_id: {slot: item_id}
+    output_index: 0
+    content_index: 0
+    part:
+      type: output_text
+      text: {slot: text}
+      annotations: []
+  - type: response.output_item.done
+    sequence_number: 7
+    output_index: 0
+    item:
+      id: {slot: item_id}
+      type: message
+      role: assistant
+      status: incomplete
+      content:
+        - type: output_text
+          text: {slot: text}
+          annotations: []
+  - type: response.incomplete
+    sequence_number: 8
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: incomplete
+      model: {slot: served_model}
+      incomplete_details:
+        reason: max_output_tokens
+      output:
+        - id: {slot: item_id}
+          type: message
+          role: assistant
+          status: incomplete
+          content:
+            - type: output_text
+              text: {slot: text}
+              annotations: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage:
+        input_tokens: {slot: input_tokens}
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: {slot: output_tokens}
+        output_tokens_details:
+          reasoning_tokens: 0
+        total_tokens: {slot: total_tokens}

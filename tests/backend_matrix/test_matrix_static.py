@@ -918,8 +918,10 @@ def test_claude_driver_reads_one_private_name_and_patches_none() -> None:
     ]
     assert driver.fidelity == "wire" and driver.dialect == "claude_cli"
     assert len(driver.bypassed_layers) == 2
-    # The one step the frames of the tool cannot carry: a refusal part.
-    assert list(driver.inexpressible) == ["S23b/Refuse(refusal_part)"]
+    # The one step the frames of the tool cannot carry, a refusal part; and
+    # the one a session of the tool cannot, a call whose arguments are no
+    # object.
+    assert list(driver.inexpressible) == ["S23b/Refuse(refusal_part)", "S05/Call(malformed)"]
     # Nothing of the product is replaced: the driver sets no attribute and
     # uses no patching helper.
     called = {
@@ -1032,6 +1034,8 @@ def test_kimi_driver_touches_two_private_names_and_patches_through_the_interpose
     assert not {item for item in called if "setattr" in item or "patch" in item}
     assert "launch.at_subprocess" in called
     assert driver.fidelity == "wire" and driver.dialect == "moonshot_chat"
+    # The scripted wire is the provider's chat stream, which the worker
+    # reads: no step of a scenario is pinned on it.
     assert len(driver.bypassed_layers) == 3 and driver.inexpressible == {}
     # The driver overlays nothing on the shipped routes.
     assert matrix_columns.KIMI_KIND not in matrix_columns.ALLOWED_OVERLAY
@@ -1065,7 +1069,12 @@ def test_a_test_that_requires_a_worker_environment_carries_the_marker() -> None:
     assert paired > 0
 
 
-_APP_SERVER_INEXPRESSIBLE = ["S23a/Refuse(content_filter)", "S23b/Refuse(refusal_part)"]
+_APP_SERVER_INEXPRESSIBLE = [
+    "S23a/Refuse(content_filter)",
+    "S23b/Refuse(refusal_part)",
+    # On the session wire of both routes a tool call is a decoded object.
+    "S05/Call(malformed)",
+]
 
 
 def test_codex_drivers_touch_only_the_seams_they_list() -> None:
@@ -1274,6 +1283,77 @@ def test_every_envelope_is_rendered_by_a_dialect_and_exists() -> None:
         path = envelopes.ROOT / f"{name}.yaml"
         assert envelope.grade in envelopes.GRADES and envelope.slots() <= envelopes.SLOTS
         assert envelopes.hygiene_problems(path.read_text(encoding="utf-8")) == []
+
+
+# -- a mapping key is written once ------------------------------------------------
+
+
+def keys_written_twice(text: str) -> list[str]:
+    """The mapping keys a YAML text writes more than once, at any depth.
+
+    The loader of the package keeps the last of two equal keys and says
+    nothing, so a record, a code or a whole block that is written under a
+    key a second time takes the place of the first.
+    """
+
+    found: list[tuple[int, str]] = []
+
+    class Strict(yaml.SafeLoader):
+        pass
+
+    def mapping(loader: Any, node: Any, deep: bool = False) -> Any:
+        first: dict[Any, int] = {}
+        for key_node, _value in node.value:
+            key = loader.construct_object(key_node, deep=True)
+            line = key_node.start_mark.line + 1
+            if key in first:
+                found.append((line, f"{key!r} is already a key at line {first[key]}"))
+            first.setdefault(key, line)
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+    Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    loader = Strict(text)
+    try:
+        loader.get_single_data()
+    finally:
+        loader.dispose()
+    # A mapping is read when the loader comes to it, the outer one first.
+    return [f"line {line}: {problem}" for line, problem in sorted(found)]
+
+
+def test_no_yaml_file_of_the_package_writes_a_mapping_key_twice() -> None:
+    files = sorted(PACKAGE.rglob("*.yaml"))
+    problems = [
+        f"{path.relative_to(PACKAGE).as_posix()} {problem}"
+        for path in files
+        for problem in keys_written_twice(path.read_text(encoding="utf-8"))
+    ]
+
+    # The ledger, the inventory, the snapshot of the declarations and every
+    # envelope: each key of each mapping stands once.
+    data = (ledger.LEDGER_PATH, cells.INVENTORY_PATH, declarations.SNAPSHOT_PATH)
+    assert {path.resolve() for path in data} <= set(files)
+    assert len(files) == len(data) + len(envelopes.all_envelopes())
+    assert problems == []
+    # The check is loud where the loader is not: two records under one id,
+    # and a top-level block that is opened a second time.
+    twice = (
+        "registry:\n"
+        "  G01: {title: the first}\n"
+        "  G01: {title: the second}\n"
+        "known_gaps: [one]\n"
+        "known_gaps:\n"
+    )
+    assert yaml.safe_load(twice) == {
+        "registry": {"G01": {"title": "the second"}},
+        "known_gaps": None,
+    }
+    assert keys_written_twice(twice) == [
+        "line 3: 'G01' is already a key at line 2",
+        "line 5: 'known_gaps' is already a key at line 4",
+    ]
+    # The same key in two mappings is no repetition.
+    assert keys_written_twice("a: {title: one}\nb: {title: one}\n") == []
 
 
 # -- stated versions -----------------------------------------------------------
@@ -1627,8 +1707,17 @@ def test_every_scenario_passes_the_complete_base_policy() -> None:
     # every request needs most of the base policy's minute for them, and
     # three times as long where the test shares one hardware thread with
     # another busy process. The scenario is not about a deadline, so its
-    # deadline is several times the longer figure.
-    exceptions = {"S45": ("timeout_seconds", 600)}
+    # deadline is several times the longer figure. The scenario of the
+    # malformed tool arguments is four requests long: a third of that
+    # minute for such a backend, and more than the minute where two other
+    # busy processes share the thread. It is not about a deadline either
+    # and passes the same one. The second form of the turn limit is the
+    # limit under the policy that asks for no error.
+    exceptions = {
+        "S45": ("timeout_seconds", 600),
+        "S05": ("timeout_seconds", 600),
+        "S10b": ("on_max_turns", "continue_with_warning"),
+    }
     for scenario in SCENARIOS.values():
         policy = scenario.policy
         expected = {
@@ -1653,6 +1742,9 @@ class _CollectedItem:
         self.name = name
         self.nodeid = f"{self.path.name}::{name}"
         self.limits: list[float] = []
+        # The fixtures of the package are in force for it, as for every item
+        # pytest collects under the directory of the package.
+        self.fixturenames = matrix_conftest._IN_FORCE
 
     def get_closest_marker(self, _name: str) -> None:
         return None
@@ -1671,8 +1763,8 @@ def test_the_item_of_a_cell_with_a_long_deadline_has_a_limit_above_it(
     # ended by its deadline: the suite would end the item first, a plain
     # failure that the verifier refuses for a cell the ledger expects to
     # fail. The item of such a cell gets a limit of its own at collection,
-    # the deadline and a margin; today those are the cells of the one
-    # scenario that passes another deadline than the base policy's.
+    # the deadline and a margin; today those are the cells of the two
+    # scenarios that pass another deadline than the base policy's.
     options = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["pytest"]
     configured = float(options["ini_options"]["timeout"])
     long = {
@@ -1695,8 +1787,17 @@ def test_the_item_of_a_cell_with_a_long_deadline_has_a_limit_above_it(
         for cell in cells.behaviour_cells()
         if cell.scenario in long
     }
-    assert long == {"S45": 600} and cells.LIMIT_MARGIN_SECONDS >= configured
-    assert len(expected) == len(REAL_KINDS) + len(cells.toy_columns())
+    assert long == {"S05": 600, "S45": 600} and cells.LIMIT_MARGIN_SECONDS >= configured
+    # The catalogue scenario has a cell on every kind, the scenario of the
+    # malformed arguments on the kinds whose wire carries the step, the
+    # open-weight ones; both have one on every toy column.
+    toys = len(cells.toy_columns())
+    carried = {name: sum(1 for item in expected if f"/{name}/" in item) for name in long}
+    assert carried == {
+        "S05": len(matrix_columns.OPEN_WEIGHT_KINDS) + toys,
+        "S45": len(REAL_KINDS) + toys,
+    }
+    assert len(expected) == sum(carried.values())
     assert limits(configured) == expected
     # A deadline below the limit can end its call, and without a limit there
     # is nothing to exceed: no item is touched. Nor is an item that judges

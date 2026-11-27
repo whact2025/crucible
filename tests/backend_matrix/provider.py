@@ -48,7 +48,9 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from .drivers.base import MatrixSetupError
 from .script import (
     Call,
+    Cut,
     Drop,
+    Empty,
     Loop,
     Malformed,
     ProviderScript,
@@ -92,6 +94,9 @@ class SeenRequest:
     # dialect's own seam check and by the proof of a column's canary; never
     # used to pick a reply.
     evidence: Mapping[str, Any] = field(default_factory=dict)
+    # The cap on the tokens of the response that the request carries, where
+    # the dialect reads one; ``None`` for a request without it.
+    response_cap: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,9 @@ class SentCall:
     call_id: str
     request_index: int
     arguments: Mapping[str, Any]
+    # Whether the argument text of the call was no JSON object: such a call
+    # names no arguments, so nothing a ToolSet was handed can be its dispatch.
+    malformed: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +162,17 @@ class ProviderLedger:
     # prompt, a turn of the model nor a tool result
     # (:class:`ConversationDialect`); empty where the dialect has no such rule.
     foreign_messages: list[str] = field(default_factory=list)
+    # Whether the wire of the exchange has a field for a cap on the tokens of
+    # a response (:class:`ResponseCapDialect`). Where it has none, a request
+    # without a cap says nothing about the adapter.
+    response_cap_field: bool = False
+    # Whether a tool beside the adapter keeps the conversations of the wire
+    # (:class:`KeeperDialect`), and every handle that tool was asked to
+    # continue and refused because it holds no conversation under it, in the
+    # order asked. On a wire without such a tool nobody but the adapter can
+    # be asked.
+    conversation_keeper: bool = False
+    refused_handles: list[str] = field(default_factory=list)
 
     @property
     def request_count(self) -> int:
@@ -188,6 +207,9 @@ class Reply:
     # this many bytes of it are sent, and the socket is closed. ``None`` for
     # a reply that travels whole.
     cut: int | None = None
+    # Whether the argument text of ``call`` is no JSON object (its mapping is
+    # then empty).
+    call_malformed: bool = False
 
 
 class Dialect(Protocol):
@@ -263,6 +285,54 @@ class TurnControlDialect(Protocol):
 
 
 @runtime_checkable
+class ResponseCapDialect(Protocol):
+    """A dialect of a wire that has a field for a cap on the tokens of a response.
+
+    Such a dialect reads the field into :attr:`SeenRequest.response_cap`, and
+    the ledger keeps that the wire has one
+    (:attr:`ProviderLedger.response_cap_field`). On such a wire a request
+    without the cap is an adapter that kept the cap of its route to itself;
+    on a wire without the field every request is without it. The scenario of
+    the output-token cut asks for the cap on the first kind of wire only. A
+    dialect may read a cap that shows somewhere without stating that its
+    wire has the field: a cap it reads is then held against a route that
+    declares none, and none is asked of a route that declares one.
+    """
+
+    response_cap_field: bool
+
+
+def stated_cap(value: Any) -> int | None:
+    """A cap on the tokens of a response as a request states it; ``None`` for none."""
+
+    return value if type(value) is int else None
+
+
+@runtime_checkable
+class KeeperDialect(Protocol):
+    """A dialect of a wire on which a tool beside the adapter keeps the conversations.
+
+    On such a wire the adapter cannot tell by itself whether a handle is
+    held: it asks the tool, and the peer of the cell stands where the tool
+    is. The peer holds no conversation of an earlier call, so a handle that
+    a cell names is one it refuses. What the tool says then is no reply of a
+    model, and nothing of it was observed. It is rendered here, from an
+    envelope with its provenance and its grade, and not written into the
+    peer: the peer asks the provider side at ``resume_path`` and relays the
+    answer. The exchange is no model request, so clause C0 does not count
+    it. The ledger keeps the handle
+    (:attr:`ProviderLedger.refused_handles`) and the envelope, so a cell
+    that rests on the refusal shows that the tool was asked, and for which
+    handle, and carries the grade of what it was answered with.
+    """
+
+    resume_path: str
+
+    def refuse_resume(self, body: bytes) -> tuple[str, Reply]:
+        """The handle the tool was asked to continue, and what it answers."""
+
+
+@runtime_checkable
 class ConversationDialect(Protocol):
     """A dialect of a wire on which every request carries its conversation.
 
@@ -277,6 +347,24 @@ class ConversationDialect(Protocol):
 
     def foreign_messages(self, requests: Sequence[SeenRequest]) -> list[str]:
         """The messages of the matched requests that are none of the three kinds."""
+
+
+def require_decoded_arguments(dialect: str, step: Call) -> None:
+    """A wire that is a session of a vendor's tool carries no malformed call.
+
+    What such a dialect scripts is what the tool tells its client, and there
+    a tool call is a request to a tool server with a decoded object for its
+    arguments. A dialect that scripts the provider's own reply, with the
+    arguments of a call in a string, renders the text instead.
+    """
+
+    if step.malformed is not None:
+        raise MatrixSetupError(
+            f"the {dialect} dialect renders no tool call whose argument text is no "
+            "JSON object: the wire it scripts is a session of the vendor's tool, "
+            "on which a call reaches the adapter as a decoded object, so the cell "
+            "is pinned not expressible in the inventory"
+        )
 
 
 def require_cut_in_body(dialect: str, step: Drop) -> None:
@@ -359,6 +447,18 @@ def answered_from(dialect: Dialect, script: ProviderScript) -> tuple[str, ...]:
     return tuple(names)
 
 
+def refused_from(dialect: KeeperDialect) -> tuple[str, ...]:
+    """The envelopes ``dialect`` renders the refusal of a handle from, in order.
+
+    Read without an exchange: the refusal is rendered for a request that
+    names no handle, and these are the names the provider keeps in its
+    ledger when the peer of a cell asks for a handle.
+    """
+
+    _handle, refusal = dialect.refuse_resume(b"{}")
+    return refusal.envelopes
+
+
 class ToyDialect:
     """The toy driver's own wire: one JSON request and reply per model turn."""
 
@@ -366,6 +466,7 @@ class ToyDialect:
     path = "/toy/v1/turn"
     user_agent = "crucible-matrix-toy/1"
     turn_control_field = True  # ``max_turns`` in the body of a request
+    response_cap_field = True  # ``max_output_tokens`` in the body of a request
 
     def parse(
         self,
@@ -407,6 +508,7 @@ class ToyDialect:
                 for name in ("answered", "notes")
                 if isinstance(payload.get(name), list)
             },
+            response_cap=stated_cap(payload.get("max_output_tokens")),
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -485,6 +587,36 @@ class ToyDialect:
             "input_tokens": getattr(step, "usage", TokenUsage(0, 0)).input_tokens,
             "output_tokens": getattr(step, "usage", TokenUsage(0, 0)).output_tokens,
         }
+        if isinstance(step, Cut):
+            # The document of an answer that the provider ended at the cap:
+            # what was produced so far, and the mark of a cut as the finish.
+            return Reply(
+                200,
+                {
+                    "model": served,
+                    "type": "message",
+                    "text": step.text,
+                    "finish": "length",
+                    "usage": usage,
+                },
+                step.usage,
+                served,
+            )
+        if isinstance(step, Empty):
+            # A clean stop that produced nothing: an ordinary finish, the
+            # empty text and no output token.
+            return Reply(
+                200,
+                {
+                    "model": served,
+                    "type": "message",
+                    "text": "",
+                    "finish": "stop",
+                    "usage": usage,
+                },
+                step.usage,
+                served,
+            )
         if isinstance(step, Reason):
             # A clean stop with reasoning and no visible text.
             return Reply(
@@ -516,19 +648,30 @@ class ToyDialect:
         if isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
+            malformed = step.malformed is not None
+            if malformed:
+                arguments = {}
             return Reply(
                 200,
                 {
                     "model": served,
                     "type": "tool_calls",
                     "calls": [
-                        {"id": call_id, "name": binding.name, "arguments": arguments}
+                        {
+                            "id": call_id,
+                            "name": binding.name,
+                            # The toy wire carries the arguments as an object;
+                            # where the model wrote none, it carries the text
+                            # the model wrote in its place.
+                            "arguments": step.malformed if malformed else arguments,
+                        }
                     ],
                     "usage": usage,
                 },
                 step.usage,
                 served,
                 (step.slot, call_id, arguments),
+                call_malformed=malformed,
             )
         if isinstance(step, Refuse):
             if step.form == "content_filter":
@@ -603,6 +746,10 @@ class LoopbackProvider:
             self._ledger.cache_counts = []
         if isinstance(self._dialect, TurnControlDialect):
             self._ledger.turn_control_field = self._dialect.turn_control_field
+        if isinstance(self._dialect, ResponseCapDialect):
+            self._ledger.response_cap_field = self._dialect.response_cap_field
+        if isinstance(self._dialect, KeeperDialect):
+            self._ledger.conversation_keeper = True
         # A step the dialect cannot render, or a reply whose cache counts it
         # cannot read back, is a setup error here, in the test's thread, not a
         # dropped connection inside the server's.
@@ -711,8 +858,10 @@ class LoopbackProvider:
                 self._loop_served += 1
                 return step.step
             if self._loop_served >= step.at_least:
-                # The loop is satisfied; what follows it decides.
+                # The loop is satisfied; what follows it decides, and a loop
+                # that follows counts its own requests.
                 self._position += 1
+                self._loop_served = 0
                 return self._next_step(seen)
             return None
         if self._script.tail is not None and not self._tail_served and not seen.tools:
@@ -734,6 +883,18 @@ class LoopbackProvider:
             if self._closed_for_cell:
                 self._ledger.late_requests += 1
                 return unscripted
+            if (
+                isinstance(self._dialect, KeeperDialect)
+                and method == "POST"
+                and path == self._dialect.resume_path
+            ):
+                # The tool that keeps the conversations is asked to continue
+                # one it does not hold. No model is asked: the exchange is
+                # kept apart from the requests of the script.
+                handle, refusal = self._dialect.refuse_resume(body)
+                self._ledger.refused_handles.append(handle)
+                self._ledger.envelopes.extend(refusal.envelopes)
+                return refusal
             if self._probing:
                 self._ledger.probe_requests += 1
                 return self._dialect.render(Say(PROBE_TEXT), seen, "probe")
@@ -777,7 +938,13 @@ class LoopbackProvider:
                 slot, call_id, arguments = reply.call
                 self._pending_call_ids = (call_id,)
                 self._ledger.sent_calls.append(
-                    SentCall(slot, call_id, len(self._ledger.requests) - 1, arguments)
+                    SentCall(
+                        slot,
+                        call_id,
+                        len(self._ledger.requests) - 1,
+                        arguments,
+                        malformed=reply.call_malformed,
+                    )
                 )
             return reply
 
@@ -786,8 +953,10 @@ class LoopbackProvider:
         for index, step in enumerate(self._script.steps):
             if index < self._position:
                 continue
-            satisfied = isinstance(step, Loop) and self._loop_served >= step.at_least
-            if index == self._position and satisfied:
+            # A loop that was never reached has served nothing: it is
+            # satisfied only where it requires nothing.
+            served = self._loop_served if index == self._position else 0
+            if isinstance(step, Loop) and served >= step.at_least:
                 continue
             count += 1
         return count
@@ -831,6 +1000,7 @@ class LoopbackProvider:
                     seam_problems=list(self._ledger.seam_problems),
                     replay_problems=list(self._ledger.replay_problems),
                     foreign_messages=list(self._ledger.foreign_messages),
+                    refused_handles=list(self._ledger.refused_handles),
                 )
             return self._frozen
 

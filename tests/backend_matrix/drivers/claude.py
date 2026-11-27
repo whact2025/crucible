@@ -64,10 +64,23 @@ from ..provider import (
     Reply,
     SeenRequest,
     answered_from,
+    refused_from,
     require_cut_in_body,
+    require_decoded_arguments,
     whole_and_partial,
 )
-from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
+from ..script import (
+    Call,
+    Drop,
+    Empty,
+    Malformed,
+    ProviderScript,
+    Reason,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+)
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
@@ -143,6 +156,9 @@ class ClaudeCliDialect:
     path = "/claude-cli/v1/turn"
     provider = "cli"
     turn_control_field = True  # ``--max-turns`` on the command line of the tool
+    # Where the peer asks what the tool says of a session id it holds no
+    # conversation for: the tool keeps the conversations of this wire.
+    resume_path = peer_program.RESUME_PATH
     behaviours: tuple[str, ...] = (
         "init",
         "assistant_text",
@@ -154,10 +170,15 @@ class ClaudeCliDialect:
         "result_structured",
         # The tool's own turn terminal, and the two refusals its frames carry.
         "result_max_turns",
+        # The tool's own budget terminal, between two model turns.
+        "result_max_budget",
         "assistant_refusal",
         "result_refusal",
         "assistant_api_error",
         "result_api_error",
+        # No frame: what the tool prints, and the status it exits with, when
+        # it is asked to continue a session it holds no conversation for.
+        "resume_rejected",
     )
 
     @property
@@ -237,6 +258,11 @@ class ClaudeCliDialect:
             schema_field=peer_program.argument(argv, "--json-schema") is not None,
             host=lowered.get("host", ""),
             evidence=evidence,
+            # The tool takes a cap on the tokens of a response from its
+            # environment and from nowhere on its command line. The dialect
+            # does not state that the wire has the field: a cap that shows
+            # is held against a route that declares none.
+            response_cap=_number(session.get("response_cap"), int),
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -290,6 +316,27 @@ class ClaudeCliDialect:
 
     # -- answering it ------------------------------------------------------------
 
+    def refuse_resume(self, body: bytes) -> tuple[str, Reply]:
+        """What the tool says of a session id it holds no conversation for.
+
+        The line it writes to its standard error and the status it exits
+        with, rendered from their envelope. Emulated, not observed: the
+        envelope says what it rests on.
+        """
+
+        try:
+            asked = _mapping(json.loads(body.decode("utf-8")) if body else {})
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            asked = {}
+        session_id = str(asked.get("resumed", ""))
+        envelope = envelope_files.load(f"{self.name}/{self.provider}.resume_rejected")
+        said = envelope.fill({"session_id": session_id})
+        return session_id, Reply(
+            200,
+            {"stderr": "".join(said["stderr"]), "exit": said["exit"]},
+            envelopes=(envelope.name,),
+        )
+
     def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
         served = seen.model
         if isinstance(step, ServedAs):
@@ -301,7 +348,7 @@ class ClaudeCliDialect:
                 f"{step.form!r}: a message the tool relays has no refusal part, so "
                 "the cell is pinned not expressible in the inventory"
             )
-        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop)):
+        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop, Empty)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
                 "the scenario that needs it adds the envelope with its liar"
@@ -325,8 +372,10 @@ class ClaudeCliDialect:
 
         # The tool's own turn terminal is emulated by the peer, which ends the
         # session after the last turn it is allowed (see below): a turn beyond
-        # the allowance is a turn the peer must never ask for. Its budget
-        # terminal is not emulated: no scenario spends a budget between turns.
+        # the allowance is a turn the peer must never ask for. So is its
+        # budget terminal: a turn that is asked for when the cost of the
+        # session has reached the budget is a turn the peer must never ask
+        # for either.
         unplayed = None
         if seen.turn_control is not None and turn > seen.turn_control:
             unplayed = (
@@ -339,8 +388,8 @@ class ClaudeCliDialect:
         ):
             unplayed = (
                 f"turn {turn} was asked for with --max-budget-usd "
-                f"{seen.budget_control} already spent: the tool's budget terminal "
-                "between two turns is not emulated"
+                f"{seen.budget_control} already spent: the peer ends a session at "
+                "its budget terminal"
             )
         if unplayed is not None:
             return Reply(200, {"frames": [], "call": None, "unsupported": unplayed})
@@ -385,6 +434,7 @@ class ClaudeCliDialect:
                 envelopes=tuple(used),
             )
         if isinstance(step, Call):
+            require_decoded_arguments(self.name, step)
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
             listed = _mapping(evidence.get("tools"))
@@ -410,6 +460,30 @@ class ClaudeCliDialect:
                     "arguments": arguments,
                 },
             }
+            spent_in = int(spent.get("input_tokens", 0)) + usage.input_tokens
+            spent_out = int(spent.get("output_tokens", 0)) + usage.output_tokens
+            spent_usd = rate.compute_cost(input_tokens=spent_in, output_tokens=spent_out)
+            at_turn_limit = seen.turn_control is not None and turn >= seen.turn_control
+            if (
+                not at_turn_limit
+                and seen.budget_control is not None
+                and seen.budget_control <= spent_usd
+            ):
+                # The cost of the session has reached its budget with this
+                # turn. The tool then reports the budget terminal instead of
+                # asking the model again, and exits with a status other than
+                # zero. The peer plays it after the tool call of this turn,
+                # as it plays the turn terminal below.
+                played, frames = frames, []
+                frame(
+                    "result_max_budget",
+                    turns=turn,
+                    served_model=served,
+                    input_tokens=spent_in,
+                    output_tokens=spent_out,
+                    cost_usd=spent_usd,
+                )
+                body["frames"], body["budget_limit"] = played, {"frames": frames, "exit": 1}
             if seen.turn_control is not None and turn >= seen.turn_control:
                 # The session has used up its turn allowance with this turn.
                 # The tool then reports the turn terminal instead of asking
@@ -417,8 +491,6 @@ class ClaudeCliDialect:
                 # The peer plays it after the tool call of this turn; the
                 # frame is rendered here, with the accounting of the session
                 # so far, so that no reply shape lives in the peer.
-                spent_in = int(spent.get("input_tokens", 0)) + usage.input_tokens
-                spent_out = int(spent.get("output_tokens", 0)) + usage.output_tokens
                 played, frames = frames, []
                 frame(
                     "result_max_turns",
@@ -461,7 +533,9 @@ class ClaudeCliDialect:
         answer: Any = None
         if seen.schema_field:
             try:
-                answer = None if isinstance(step, Reason) else json.loads(step.text)
+                answer = (
+                    None if isinstance(step, (Reason, Empty)) else json.loads(step.text)
+                )
             except json.JSONDecodeError:
                 answer = None
             if not isinstance(answer, dict):
@@ -482,6 +556,12 @@ class ClaudeCliDialect:
             # block, and the result text of the terminal frame is empty.
             text = ""
             frame("assistant_thinking", **turn_slots, reasoning_text=REASONING_TEXT)
+        elif isinstance(step, Empty):
+            # The turn produced nothing: the frames of a plain turn with the
+            # empty string as its text and as the result text, and a usage
+            # without an output token.
+            text = ""
+            frame("assistant_text", **turn_slots, text=text)
         else:
             text = SCHEMA_SESSION_TEXT if seen.schema_field else step.text
             frame("assistant_text", **turn_slots, text=text)
@@ -673,6 +753,9 @@ class ClaudeDriver:
 
     def answers(self, script: ProviderScript) -> tuple[str, ...]:
         return answered_from(self._dialect(), script)
+
+    def refuses(self) -> tuple[str, ...]:
+        return refused_from(self._dialect())
 
     def _dialect(self) -> ClaudeCliDialect:
         return ClaudeCliDialect()

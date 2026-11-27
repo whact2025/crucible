@@ -49,11 +49,13 @@ from assay import (
     BackendFeatureSet,
     BudgetExhausted,
     ContentRejected,
+    ConversationTransportOutcome,
     ExecutionCompleteness,
     Invocation,
     InvocationResult,
     MaxTurnsExceeded,
     Message,
+    StaleConversation,
     TransportError,
     Usage,
     UsagePricingEvidence,
@@ -75,7 +77,7 @@ from .. import write_host as host_program
 from ..columns import CANARY_CREDENTIAL, TOY_ADAPTER, TOY_KIND, Column
 from ..provider import POLICY_ERROR_CODE, LoopbackProvider, ToyDialect
 from ..scenarios import D_OAI_SCHEMA_FINAL, SCHEMA_KEY
-from ..script import READ_A, READ_B, ProviderScript
+from ..script import READ_A, READ_B, UNATTACHED, ProviderScript
 from ..toolsets import WORKSPACE
 from .base import Lens, MatrixSetupError, bind_as_routing, register
 
@@ -86,7 +88,13 @@ SUPPORTED: Mapping[str, frozenset[str]] = {
     "event_detail": frozenset({"terminal_only", "usage", "tool_calls", "agent_graph"}),
     "turn_limit": frozenset({"hard", "provider_stop", "round_boundary", "unsupported"}),
     "usd_limit": frozenset({"post_hoc", "round_boundary"}),
+    "tool_loop": frozenset({"adapter_owned", "sdk_owned"}),
+    "response_token_limit": frozenset({"hard", "provider_stop", "unsupported"}),
+    "session_continuity": frozenset({"none", "retry_only", "workflow_bound"}),
 }
+# The cap on the tokens of a response that the toy route owns: what a request
+# of a route that declares an enforced cap carries.
+_RESPONSE_CAP = 4096
 _OWN_TURN_CEILING = 64
 _UNATTACHED_TOOL = "matrix_unattached"
 # What a trace names under the fault that records another endpoint than the
@@ -218,6 +226,68 @@ DROP_READ_TOOLS_ON_LAST_TURN = "drop_read_tools_on_last_turn"
 NOTE_TO_MODEL = "note_to_model"
 NOTE_IN_SYSTEM_PROMPT = "note_in_system_prompt"
 NOTE_IN_TOOL_RESULT = "note_in_tool_result"
+# Faults at a limit inside a tool loop. At the turn limit under the policy
+# that asks for no error: the adapter returns the error all the same; it
+# puts a warning of its own into the final message; it drops the answer to
+# its one further request without tools; or it clears the accounting flags
+# of a result that ends there. At a USD budget that is crossed between two
+# rounds of a loop it runs itself, it asks for the next round. Or it
+# accounts for the last response of a loop alone.
+ERROR_DESPITE_WARNING_POLICY = "error_despite_warning_policy"
+WARNING_AS_FINAL_TEXT = "warning_as_final_text"
+DROP_PARTIAL_TEXT = "drop_partial_text"
+CLEAR_FLAGS_AT_TURN_LIMIT = "clear_flags_at_turn_limit"
+CONTINUE_PAST_BUDGET = "continue_past_budget"
+LAST_RESPONSE_USAGE_ONLY = "last_response_usage_only"
+# Faults on a tool call that must not be dispatched. The arguments of a
+# call are no JSON object: the adapter dispatches the tool with an empty
+# object, or the exception of reading them leaves the call. Or it hands the
+# ToolSet what it was given and tells the model whatever comes back: the
+# argument text itself, or, where that text is a JSON document, the value it
+# decodes to, a list or nothing at all. The model names
+# a tool that is not attached: the adapter hands the name to the ToolSet, or
+# dispatches an attached tool in its place.
+MALFORMED_ARGUMENTS_AS_EMPTY = "malformed_arguments_as_empty"
+RAISE_ON_MALFORMED_ARGUMENTS = "raise_on_malformed_arguments"
+ARGUMENT_TEXT_HANDED_ON = "argument_text_handed_on"
+DECODED_ARGUMENTS_HANDED_ON = "decoded_arguments_handed_on"
+DISPATCH_UNATTACHED_NAME = "dispatch_unattached_name"
+ATTACHED_TOOL_IN_ITS_PLACE = "attached_tool_in_its_place"
+_OWN_WARNING = "[the turn limit was reached]"
+# Faults on a reply the provider cut at the output-token cap. The cut is
+# returned as a turn limit, or as an answer of the text that had arrived.
+# The result records no limit event of the cut, or names its stop reason
+# after nothing. The usage of the reply is dropped. The cap of the route is
+# kept from the provider, or a route that declares none sends one.
+CUT_AS_TURN_LIMIT = "cut_as_turn_limit"
+CUT_AS_ANSWER = "cut_as_answer"
+NO_CUT_LIMIT_EVENT = "no_cut_limit_event"
+CUT_STOP_UNNAMED = "cut_stop_unnamed"
+DROP_CUT_USAGE = "drop_cut_usage"
+DROP_RESPONSE_CAP = "drop_response_cap"
+SEND_RESPONSE_CAP = "send_response_cap"
+# Faults on a clean stop that produced nothing. It is returned as an empty
+# answer; its error is not retriable; the error keeps the stop reason of a
+# clean finish; or the usage of the reply is dropped.
+EMPTY_COMPLETION_IS_AN_ANSWER = "empty_completion_is_an_answer"
+EMPTY_COMPLETION_NOT_RETRIABLE = "empty_completion_not_retriable"
+EMPTY_COMPLETION_ENDS_END_TURN = "empty_completion_ends_end_turn"
+DROP_EMPTY_COMPLETION_USAGE = "drop_empty_completion_usage"
+# Faults on a conversation request. Where the route declares continuity for
+# a workflow and nobody holds the handle: the refusal is a transport error
+# without an outcome; the outcome is that of another operation; the outcome
+# still calls the conversation active under the handle; or the adapter says
+# nothing and starts a conversation of its own. Where the route declares
+# none: the request is ignored and the call is made, it is refused with
+# another type than the agreed one, or the agreed type is raised where no
+# call was made: while the backend is built.
+STALE_HANDLE_AS_TRANSPORT = "stale_handle_as_transport"
+OUTCOME_OF_ANOTHER_OPERATION = "outcome_of_another_operation"
+STALE_HANDLE_KEPT_ACTIVE = "stale_handle_kept_active"
+STALE_HANDLE_STARTS_FRESH = "stale_handle_starts_fresh"
+SERVE_CONVERSATION_UNDECLARED = "serve_conversation_undeclared"
+REFUSE_CONVERSATION_WITH_VALUE_ERROR = "refuse_conversation_with_value_error"
+REFUSE_CONVERSATION_AT_BUILD = "refuse_conversation_at_build"
 _FAR_BEYOND = 86_400.0
 # How long the adapter of the fault above takes before it builds its host.
 _TAKES_ITS_TIME = 0.8
@@ -241,6 +311,8 @@ class _Run:
     answered: list[str] = field(default_factory=list)
     # The deadline of the invocation, on the monotonic clock.
     deadline: float = 0.0
+    # The output tokens the provider billed for the last reply.
+    last_output_tokens: int = 0
 
 
 class WriteHost:
@@ -386,6 +458,10 @@ class HonestBackend:
         self._calls = 0
         self._closes = 0
         self._closed = False
+        # The conversations this backend opened, by the handle it gave each:
+        # the toy keeps them itself, as a vendor tool keeps its sessions. No
+        # scenario opens one, so it holds none.
+        self._conversations: dict[str, Any] = {}
 
     # -- protocol surface ---------------------------------------------------
 
@@ -500,6 +576,13 @@ class HonestBackend:
         if DROP_TURN_CONTROL in self._faults:
             # The turn count stays with the adapter: the provider is told none.
             body.pop("max_turns", None)
+        # A route that declares an enforced cap on the tokens of a response
+        # enforces it where the provider is: every request carries the cap.
+        capped = self._profile.response_token_limit in ("hard", "provider_stop")
+        if (capped and DROP_RESPONSE_CAP not in self._faults) or (
+            SEND_RESPONSE_CAP in self._faults
+        ):
+            body["max_output_tokens"] = _RESPONSE_CAP
         if EMPTY_TOOL_RESULTS in self._faults:
             results = [{"id": item["id"], "text": ""} for item in results]
         answered = [] if FORGET_EARLIER_ROUNDS in self._faults else list(run.answered)
@@ -574,15 +657,18 @@ class HonestBackend:
         if self._closed:
             raise RuntimeError("the toy backend is closed")
         policy = invocation.policy
-        if policy is None or policy.on_max_turns != "raise" or policy.retry_budget != 1:
+        if policy is None or policy.retry_budget != 1:
             raise MatrixSetupError(
-                "the toy plays on_max_turns='raise' with retry_budget=1 only; the "
-                "scenario that needs another policy adds the behaviour with its liar"
+                "the toy plays retry_budget=1 only; the scenario that needs another "
+                "policy adds the behaviour with its liar"
             )
         if OWN_TURN_CEILING in self._faults and invocation.max_turns > _OWN_TURN_CEILING:
             raise ValueError(f"max_turns must not exceed {_OWN_TURN_CEILING}")
         run = _Run(invocation)
         self._calls += 1
+        refused = self._conversation_refusal(run)
+        if refused is not None:
+            return refused
         if NO_REQUEST_EVENT not in self._faults and REQUEST_EVENT_PER_ROUND not in self._faults:
             run.events.append(("request", None))
         if TWO_REQUEST_EVENTS in self._faults:
@@ -637,6 +723,10 @@ class HonestBackend:
                     if RETURN_SCHEMA_DRAFT not in self._faults:
                         text = str(final.get("text", ""))
                 return self._answer(run, text)
+            if self._stops_between_rounds(run):
+                # A loop the adapter runs itself: the budget is enforced
+                # between two rounds, before the calls of this one run.
+                return self._budget_stop(run, "")
             limited = self._profile.turn_limit != "unsupported"
             at_limit = limited and turn >= invocation.max_turns
             if at_limit and self._profile.turn_limit != "round_boundary":
@@ -660,6 +750,76 @@ class HonestBackend:
                 return self._turn_limit(
                     run, turn, [], timeout, partial=str(reply.get("text", ""))
                 )
+
+    def _conversation_refusal(self, run: _Run) -> InvocationResult | None:
+        """What becomes of a conversation request before anything is sent.
+
+        A route that declares no continuity for a workflow refuses the
+        request before transport. One that declares it continues the
+        conversation it holds under the handle; where it holds none, the
+        result is the typed stale conversation, with the outcome of the
+        request, and no request is made.
+        """
+
+        request = run.invocation.conversation
+        if request is None:
+            return None
+        faults = self._faults
+        if self._profile.session_continuity != "workflow_bound":
+            if SERVE_CONVERSATION_UNDECLARED in faults:
+                return None
+            if REFUSE_CONVERSATION_WITH_VALUE_ERROR in faults:
+                raise ValueError("the toy route does not continue conversations")
+            raise NotImplementedError(
+                "the toy route declares no conversation continuity for a workflow"
+            )
+        if request.action != "reuse" or request.opaque_id in self._conversations:
+            raise MatrixSetupError(
+                "the toy plays the request to continue a conversation it does not "
+                "hold; the scenario that needs another adds the behaviour with its liar"
+            )
+        if STALE_HANDLE_STARTS_FRESH in faults:
+            return None
+        run.usage_known = False
+        message = "the toy holds no conversation under the handle of the request"
+        if STALE_HANDLE_AS_TRANSPORT in faults:
+            return self._result(
+                run,
+                final="",
+                stop="error",
+                error=TransportError(message=message, retriable=False),
+                ended=False,
+            )
+        outcome = ConversationTransportOutcome(
+            state="stale",
+            opaque_id=None,
+            identity_fingerprint=request.identity_fingerprint,
+            operation_digest=(
+                request.identity_fingerprint
+                if OUTCOME_OF_ANOTHER_OPERATION in faults
+                else request.operation_digest
+            ),
+        )
+        if STALE_HANDLE_KEPT_ACTIVE in faults:
+            # The handle is refused and the outcome still names it as active.
+            return self._result(
+                run,
+                final="",
+                stop="error",
+                error=TransportError(message=message, retriable=False),
+                ended=False,
+                conversation=dataclasses.replace(
+                    outcome, state="active", opaque_id=request.opaque_id
+                ),
+            )
+        return self._result(
+            run,
+            final="",
+            stop="stale_conversation",
+            error=StaleConversation(message=message),
+            ended=False,
+            conversation=outcome,
+        )
 
     def _exchange(
         self,
@@ -742,6 +902,7 @@ class HonestBackend:
         cost = pricing_for_model(self.model).compute_cost(
             input_tokens=tokens_in, output_tokens=tokens_out
         )
+        run.last_output_tokens = tokens_out
         if DROP_OUTPUT_TOKENS in self._faults:
             tokens_out = 0
         run.segments.append(UsagePricingSegment(tokens_in, tokens_out, 0, 0, cost))
@@ -749,7 +910,48 @@ class HonestBackend:
             return self._refusal(run, "refusal")
         if reply["type"] == "message" and reply.get("finish") == "content_filter":
             return self._refusal(run, "content_filter")
+        if reply["type"] == "message" and reply.get("finish") == "length":
+            return self._cut(run, str(reply.get("text", "")))
         return reply
+
+    def _cut(self, run: _Run, text: str) -> InvocationResult:
+        """The typed result of a reply the provider cut at the output-token cap.
+
+        The reply is complete and states its usage, which is kept. The cut
+        is no turn limit and no answer: an error of the general kind that a
+        retry does not cure, with a stop reason and one limit event of its
+        own. The text that had arrived is not returned.
+        """
+
+        faults = self._faults
+        if CUT_AS_ANSWER in faults:
+            return self._result(run, final=text, stop="end_turn", error=None)
+        if DROP_CUT_USAGE in faults:
+            run.segments.clear()
+            run.usage_known = False
+        if CUT_AS_TURN_LIMIT in faults:
+            run.events.append(("limit", "max_turns"))
+            return self._result(
+                run,
+                final=text,
+                stop="max_turns",
+                error=MaxTurnsExceeded(
+                    turns_used=run.invocation.max_turns,
+                    turns_limit=run.invocation.max_turns,
+                    message="the provider ended the reply at its output cap",
+                ),
+            )
+        if NO_CUT_LIMIT_EVENT not in faults and CUT_STOP_UNNAMED not in faults:
+            run.events.append(("limit", "response_tokens"))
+        return self._result(
+            run,
+            final="",
+            stop="error" if CUT_STOP_UNNAMED in faults else "max_tokens",
+            error=TransportError(
+                message="the provider ended the reply at the output-token cap of the route",
+                retriable=False,
+            ),
+        )
 
     def _broken(self, run: _Run, message: str, *, final: str = "") -> InvocationResult:
         """The typed result of a turn that never reached its terminal.
@@ -798,6 +1000,26 @@ class HonestBackend:
         invocation = run.invocation
         if DISPATCH_UNATTACHED in self._faults and self._toolset is not None:
             self._toolset.dispatch(_UNATTACHED_TOOL, {})
+        if not text and run.last_output_tokens == 0:
+            # A clean stop that produced nothing at all is no answer: a
+            # stalled completion, which a caller may try again. The reply
+            # stated its usage, which is kept.
+            if EMPTY_COMPLETION_IS_AN_ANSWER in self._faults:
+                return self._result(run, final="", stop="end_turn", error=None)
+            if DROP_EMPTY_COMPLETION_USAGE in self._faults:
+                run.segments.clear()
+                run.usage_known = False
+            return self._result(
+                run,
+                final="",
+                stop=(
+                    "end_turn" if EMPTY_COMPLETION_ENDS_END_TURN in self._faults else "error"
+                ),
+                error=TransportError(
+                    message="the provider ended the turn cleanly and produced nothing",
+                    retriable=EMPTY_COMPLETION_NOT_RETRIABLE not in self._faults,
+                ),
+            )
         if EMPTY_FINAL_IS_FAILURE in self._faults and not text:
             # Whatever the provider billed for the turn: no visible text is
             # taken for a stalled completion.
@@ -815,21 +1037,43 @@ class HonestBackend:
             # Another object of the schema: it validates, and the provider
             # never sent it.
             text = json.dumps({SCHEMA_KEY: "an answer the provider never gave"})
-        spent = math.fsum(segment.cost_usd for segment in run.segments)
-        over = invocation.budget_usd is not None and spent > invocation.budget_usd
-        if over and IGNORE_USD_BUDGET not in self._faults:
-            run.events.append(("limit", "budget_usd"))
-            return self._result(
-                run,
-                final=text,
-                stop="budget_exhausted",
-                error=BudgetExhausted(
-                    spent_usd=spent,
-                    limit_usd=float(invocation.budget_usd or 0.0),
-                    message="the call cost more than its USD budget",
-                ),
-            )
+        if self._over_budget(run) and IGNORE_USD_BUDGET not in self._faults:
+            return self._budget_stop(run, text)
         return self._result(run, final=text, stop="end_turn", error=None)
+
+    @staticmethod
+    def _over_budget(run: _Run) -> bool:
+        budget = run.invocation.budget_usd
+        spent = math.fsum(segment.cost_usd for segment in run.segments)
+        return budget is not None and spent > budget
+
+    def _stops_between_rounds(self, run: _Run) -> bool:
+        """Whether the budget ends the tool loop here, before its next round.
+
+        Only a loop the adapter runs itself can be ended between two rounds;
+        a loop that a vendor's tool runs goes on to its answer, and the
+        budget is typed when the turn is over.
+        """
+
+        return (
+            self._profile.tool_loop == "adapter_owned"
+            and self._over_budget(run)
+            and IGNORE_USD_BUDGET not in self._faults
+            and CONTINUE_PAST_BUDGET not in self._faults
+        )
+
+    def _budget_stop(self, run: _Run, text: str) -> InvocationResult:
+        run.events.append(("limit", "budget_usd"))
+        return self._result(
+            run,
+            final=text,
+            stop="budget_exhausted",
+            error=BudgetExhausted(
+                spent_usd=math.fsum(segment.cost_usd for segment in run.segments),
+                limit_usd=float(run.invocation.budget_usd or 0.0),
+                message="the call cost more than its USD budget",
+            ),
+        )
 
     def _turn_limit(
         self,
@@ -846,6 +1090,19 @@ class HonestBackend:
             run.events.append(("limit", "max_turns"))
         if SUCCESS_AT_TURN_LIMIT in self._faults:
             return self._result(run, final=partial, stop="end_turn", error=None)
+        policy = run.invocation.policy
+        if (
+            policy is not None
+            and policy.on_max_turns == "continue_with_warning"
+            and ERROR_DESPITE_WARNING_POLICY not in self._faults
+        ):
+            # The policy asks for no error at the limit: the limit is
+            # recorded, and what the model had written is the final message.
+            if DROP_PARTIAL_TEXT in self._faults:
+                partial = ""
+            if WARNING_AS_FINAL_TEXT in self._faults:
+                partial = _OWN_WARNING
+            return self._result(run, final=partial, stop="max_turns", error=None)
         return self._result(
             run,
             final=partial,
@@ -860,7 +1117,29 @@ class HonestBackend:
     def _dispatch(
         self, run: _Run, turn: int, call: Mapping[str, Any]
     ) -> str | InvocationResult:
-        name, arguments = str(call["name"]), dict(call["arguments"])
+        name, arguments = str(call["name"]), call["arguments"]
+        if not isinstance(arguments, dict):
+            # The model wrote no JSON object for the arguments: the call
+            # names none, and nothing is dispatched for it.
+            if RAISE_ON_MALFORMED_ARGUMENTS in self._faults:
+                arguments = dict(arguments)
+            elif MALFORMED_ARGUMENTS_AS_EMPTY in self._faults:
+                arguments = {}
+            elif ARGUMENT_TEXT_HANDED_ON in self._faults:
+                return self._handed_on(name, arguments)
+            elif DECODED_ARGUMENTS_HANDED_ON in self._faults and _is_json(arguments):
+                # The text that is no JSON document is refused; one that is a
+                # document goes to the ToolSet as the value it decodes to.
+                return self._handed_on(name, json.loads(arguments))
+            else:
+                return "ERROR: the arguments of the call are not a JSON object"
+        if name not in self._tool_names():
+            # The model names a tool it was never offered: nothing reaches
+            # the ToolSet for it.
+            if ATTACHED_TOOL_IN_ITS_PLACE in self._faults:
+                name = max(self._tool_names())
+            elif DISPATCH_UNATTACHED_NAME not in self._faults:
+                return f"ERROR: no tool named {name!r} is attached"
         events = (
             self._profile.event_detail in ("tool_calls", "agent_graph")
             and NO_TOOL_EVENTS not in self._faults
@@ -881,6 +1160,14 @@ class HonestBackend:
         if events:
             run.events.append(("tool_result", name))
         return self._bounded(run, str(text))
+
+    def _handed_on(self, name: str, arguments: Any) -> str:
+        """Hand the ToolSet something that is no argument object; tell the model what comes back."""
+
+        try:
+            return str(self._toolset.dispatch(name, arguments))
+        except Exception as exc:  # noqa: BLE001 - the fault passes on whatever comes back
+            return f"ERROR dispatching {name}: {exc}"
 
     def _hosted_write(self, run: _Run, name: str, arguments: Mapping[str, Any]) -> str:
         """Run one write in the host of the invocation, and credit it as progress."""
@@ -966,9 +1253,19 @@ class HonestBackend:
     # -- result ---------------------------------------------------------------
 
     def _result(
-        self, run: _Run, *, final: str, stop: str, error: Any, ended: bool = True
+        self,
+        run: _Run,
+        *,
+        final: str,
+        stop: str,
+        error: Any,
+        ended: bool = True,
+        conversation: ConversationTransportOutcome | None = None,
     ) -> InvocationResult:
         faults = self._faults
+        if LAST_RESPONSE_USAGE_ONLY in faults:
+            # Of a loop of several responses the last one alone is accounted.
+            del run.segments[:-1]
         events = list(run.events)
         terminal = ("terminal", "done" if TERMINAL_MISNAMED in faults else stop)
         if LIMIT_AFTER_TERMINAL in faults and ("limit", "max_turns") in events:
@@ -988,6 +1285,8 @@ class HonestBackend:
         if ZERO_COST_NO_EVIDENCE in faults:
             usage, evidence = dataclasses.replace(usage, cost_usd=0.0), None
         if CLEAR_ACCOUNTING_FLAGS in faults and run.invocation.response_schema is not None:
+            accounted, evidence = False, None
+        if CLEAR_FLAGS_AT_TURN_LIMIT in faults and stop == "max_turns":
             accounted, evidence = False, None
         if RETRIABLE_ERROR in faults and error is not None:
             error = dataclasses.replace(error, retriable=True)
@@ -1044,6 +1343,7 @@ class HonestBackend:
             ),
             execution_trace=trace,
             pricing_evidence=evidence,
+            conversation=conversation,
         )
 
 
@@ -1135,6 +1435,12 @@ class ToyDriver:
             raise FeatureAdmissionError(
                 f"the toy route of column {column.id} refuses the writer role"
             )
+        if REFUSE_CONVERSATION_AT_BUILD in self.faults:
+            # The agreed type of a refusal, from the building of the backend:
+            # no call was made, so no route refused one.
+            raise NotImplementedError(
+                f"the toy route of column {column.id} is not built for a conversation"
+            )
         log_dir = tmp_path / "toy-debug"
         with LoopbackProvider(script, credential=CANARY_CREDENTIAL) as provider:
             backend = HonestBackend(
@@ -1171,6 +1477,16 @@ class ToyDriver:
                 yield _Bound(backend, provider, log_dirs=(log_dir,))
             finally:
                 backend.reap()
+
+
+def _is_json(text: Any) -> bool:
+    """Whether ``text`` is a JSON document."""
+
+    try:
+        json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def unsupported_values(profile: BackendFeatureSet) -> list[str]:
@@ -1221,6 +1537,11 @@ _RAISE = f"@after_request/{__name__}"
 _BEFORE = f"@before_request/{__name__}"
 _UNTOLD = ("flag:token_usage_complete=False", "flag:cost_complete=False")
 _SUBSTITUTED = ("request.content:model", "served_model:not_requested")
+# What the liars of the output-token cut and of the conversation request need
+# of their column.
+_CAPPED = {"response_token_limit": "provider_stop"}
+_CONTINUES = {"session_continuity": "workflow_bound"}
+_NO_CONTINUITY = {"session_continuity": "none"}
 _S40_COMMON = (
     "progress:write_not_credited",
     "stop:tool_budget_exhausted!=end_turn",
@@ -1516,6 +1837,105 @@ LIARS: tuple[Liar, ...] = (
         rehearses=("G03",),
         composite=True,
     ),
+    # A schema answer without tools: the answer is the provider's, and the
+    # schema travels where the route declares it.
+    _liar("S02", SCHEMA_ANSWER_INVALID, ("text:mismatch",), ("S",)),
+    _liar("S02", SCHEMA_ANSWER_REPLACED, ("text:mismatch",), ("S",)),
+    _liar(
+        "S02",
+        SCHEMA_MISPLACED,
+        ("request.content:schema",),
+        ("S",),
+        needs={"structured_output": "native"},
+    ),
+    _liar(
+        "S02",
+        SCHEMA_MISPLACED,
+        ("request.content:schema", "request.content:schema_prompt"),
+        ("S",),
+        needs={"structured_output": "prompt_only"},
+    ),
+    _liar(
+        "S02",
+        SCHEMA_NOT_IN_PROMPT,
+        ("request.content:schema_prompt",),
+        ("S",),
+        needs={"structured_output": "prompt_only"},
+    ),
+    _liar("S02", CLEAR_ACCOUNTING_FLAGS, _UNTOLD, ("C6",)),
+    # A reply the provider cut at the output-token cap. It is returned as a
+    # turn limit, or as an answer of the text that had arrived. Its result
+    # records no limit event of the cut, or names its stop reason after
+    # nothing. Its error is retriable. Its usage is dropped.
+    _liar(
+        "S17",
+        CUT_AS_TURN_LIMIT,
+        (
+            "kind:max_turns!=transport",
+            "stop:max_turns!=max_tokens",
+            "event.missing:limit/response_tokens",
+        ),
+        ("C2", "C3", "S"),
+        rehearses=("G35",),
+        needs=_CAPPED,
+    ),
+    _liar(
+        "S17",
+        CUT_AS_ANSWER,
+        (
+            "kind:none!=transport",
+            "stop:end_turn!=max_tokens",
+            "event.missing:limit/response_tokens",
+        ),
+        ("C2", "C3", "S"),
+        needs=_CAPPED,
+    ),
+    _liar(
+        "S17",
+        NO_CUT_LIMIT_EVENT,
+        ("event.missing:limit/response_tokens",),
+        ("S",),
+        rehearses=("G13",),
+        needs=_CAPPED,
+    ),
+    _liar(
+        "S17",
+        CUT_STOP_UNNAMED,
+        ("stop:error!=max_tokens", "event.missing:limit/response_tokens"),
+        ("C3", "S"),
+        rehearses=("G27",),
+        needs=_CAPPED,
+    ),
+    _liar("S17", RETRIABLE_ERROR, ("retriable:True",), ("C2",), needs=_CAPPED),
+    _liar("S17", DROP_CUT_USAGE, _UNTOLD, ("C6",), needs=_CAPPED),
+    # The cap of a route that declares it enforced is in every request, and
+    # a route that declares none sends none: only the wire shows either.
+    _liar(
+        "S17",
+        DROP_RESPONSE_CAP,
+        ("request.content:response_cap",),
+        ("S",),
+        needs=_CAPPED,
+    ),
+    _liar(
+        "S17",
+        SEND_RESPONSE_CAP,
+        ("request.content:response_cap",),
+        ("S",),
+        needs={"response_token_limit": "unsupported"},
+    ),
+    # A clean stop that produced nothing is no answer, may be tried again,
+    # is not named after the stop of a success, and keeps its usage.
+    _liar(
+        "S25",
+        EMPTY_COMPLETION_IS_AN_ANSWER,
+        ("kind:none!=transport", "stop:end_turn!=other"),
+        ("C2", "C3"),
+        rehearses=("G25",),
+    ),
+    _liar("S25", EMPTY_COMPLETION_NOT_RETRIABLE, ("retriable:False",), ("C2",)),
+    _liar("S25", EMPTY_COMPLETION_ENDS_END_TURN, ("stop:end_turn!=other",), ("C3",)),
+    _liar("S25", DROP_EMPTY_COMPLETION_USAGE, _UNTOLD, ("C6",)),
     # A reply that holds no turn. The adapter reads the first turn of none
     # and the exception leaves the call; it flags the terminal of the turn
     # complete; it names the stop a clean finish; or it returns an empty
@@ -1623,6 +2043,198 @@ LIARS: tuple[Liar, ...] = (
     _liar("S45", NOTE_TO_MODEL, ("request.content:messages",), ("S",)),
     _liar("S45", NOTE_IN_SYSTEM_PROMPT, ("request.content:messages",), ("S",)),
     _liar("S45", NOTE_IN_TOOL_RESULT, ("request.content:messages",), ("S",)),
+    # The turn limit under the policy that asks for no error. The adapter
+    # returns the error whatever the policy says; it ends the call as a
+    # clean finish; it records no limit; it asks for a round beyond the
+    # limit; or it returns a warning of its own where the model wrote
+    # nothing. Where one further request without tools is allowed, it drops
+    # the answer to it, or clears the accounting flags of the result.
+    _liar(
+        "S10b",
+        ERROR_DESPITE_WARNING_POLICY,
+        ("kind:max_turns!=none",),
+        ("C2",),
+        rehearses=("M17",),
+        needs={"turn_limit": "hard"},
+    ),
+    _liar(
+        "S10b",
+        SUCCESS_AT_TURN_LIMIT,
+        ("stop:end_turn!=max_turns",),
+        ("C3",),
+        needs={"turn_limit": "hard"},
+    ),
+    _liar(
+        "S10b",
+        NO_LIMIT_EVENT,
+        ("event.missing:limit/max_turns",),
+        ("S",),
+        needs={"turn_limit": "hard"},
+    ),
+    _liar(
+        "S10b",
+        EXTRA_TOOL_REQUEST,
+        ("request.extra",),
+        ("C0",),
+        needs={"turn_limit": "hard"},
+    ),
+    _liar(
+        "S10b",
+        WARNING_AS_FINAL_TEXT,
+        ("text:mismatch",),
+        ("S",),
+        needs={"turn_limit": "hard"},
+    ),
+    _liar(
+        "S10b",
+        DROP_PARTIAL_TEXT,
+        ("text:mismatch",),
+        ("S",),
+        needs={"turn_limit": "round_boundary"},
+    ),
+    _liar(
+        "S10b",
+        CLEAR_FLAGS_AT_TURN_LIMIT,
+        _UNTOLD,
+        ("C6",),
+        rehearses=("G29",),
+        needs={"turn_limit": "round_boundary"},
+    ),
+    # A USD budget that is crossed inside a tool loop. An adapter that runs
+    # the loop itself asks for the round after it: the request is one the
+    # provider never scripted. A loop that a vendor's tool runs ends as a
+    # clean finish above the budget, or the result accounts for its last
+    # response alone.
+    _liar(
+        "S14",
+        CONTINUE_PAST_BUDGET,
+        (
+            "request.extra",
+            "kind:transport!=budget_exhausted",
+            "stop:error!=budget_exhausted",
+            "event.missing:limit/budget_usd",
+            *_UNTOLD,
+        ),
+        ("C0", "C2", "C3", "C6", "S"),
+        needs={"tool_loop": "adapter_owned"},
+    ),
+    _liar(
+        "S14",
+        RETRIABLE_ERROR,
+        ("retriable:True",),
+        ("C2",),
+        needs={"tool_loop": "adapter_owned"},
+    ),
+    _liar(
+        "S14",
+        IGNORE_USD_BUDGET,
+        (
+            "kind:none!=budget_exhausted",
+            "stop:end_turn!=budget_exhausted",
+            "event.missing:limit/budget_usd",
+        ),
+        ("C2", "C3", "S"),
+        needs={"tool_loop": "sdk_owned"},
+    ),
+    _liar(
+        "S14",
+        LAST_RESPONSE_USAGE_ONLY,
+        ("usage.input_tokens:lt", "usage.output_tokens:lt", "usage.cost_usd:lt"),
+        ("C6",),
+        needs={"tool_loop": "sdk_owned"},
+    ),
+    # A tool call whose arguments are no JSON object: dispatched with an
+    # empty object, or the exception of reading them leaves the call.
+    _liar(
+        "S05",
+        MALFORMED_ARGUMENTS_AS_EMPTY,
+        (f"dispatch.extra:{READ_A}",),
+        ("C10",),
+        rehearses=("M16",),
+    ),
+    _liar(
+        "S05",
+        RAISE_ON_MALFORMED_ARGUMENTS,
+        (f"raise:ValueError{_RAISE}", "request.unconsumed"),
+        ("C1", "C0"),
+    ),
+    # Or the ToolSet is handed what is no argument object: the text as the
+    # model wrote it, or the value a text that is a JSON document decodes
+    # to. The tool may refuse it or run without arguments; either way a
+    # call reached the ToolSet that names no arguments. The second is the
+    # adapter that answers the model only where the text is no JSON at all.
+    _liar("S05", ARGUMENT_TEXT_HANDED_ON, (f"dispatch.extra:{READ_A}",), ("C10",)),
+    _liar(
+        "S05",
+        DECODED_ARGUMENTS_HANDED_ON,
+        (f"dispatch.extra:{READ_A}",),
+        ("C10",),
+        rehearses=("M16",),
+    ),
+    # A call for a tool that is not attached: the name is handed to the
+    # ToolSet, or an attached tool is dispatched in its place.
+    _liar("S06", DISPATCH_UNATTACHED_NAME, (f"dispatch.extra:{UNATTACHED}",), ("C10",)),
+    _liar("S06", ATTACHED_TOOL_IN_ITS_PLACE, (f"dispatch.extra:{READ_A}",), ("C10",)),
+    # A request to continue a conversation that nobody holds, on a route
+    # that declares continuity for a workflow: the refusal is typed as a
+    # transport error without an outcome; the outcome is that of another
+    # operation; the outcome still names the handle as active; nothing is
+    # said and a conversation of the adapter's own is started; or the stale
+    # conversation is flagged as an error a caller may try again.
+    _liar(
+        "S50",
+        STALE_HANDLE_AS_TRANSPORT,
+        ("kind:transport!=stale_conversation", "conversation:missing"),
+        ("C2", "S"),
+        needs=_CONTINUES,
+    ),
+    _liar(
+        "S50",
+        OUTCOME_OF_ANOTHER_OPERATION,
+        ("conversation:unbound",),
+        ("S",),
+        needs=_CONTINUES,
+    ),
+    _liar(
+        "S50",
+        STALE_HANDLE_KEPT_ACTIVE,
+        ("kind:transport!=stale_conversation", "conversation:state"),
+        ("C2", "S"),
+        needs=_CONTINUES,
+    ),
+    _liar(
+        "S50",
+        STALE_HANDLE_STARTS_FRESH,
+        ("request.extra", "kind:transport!=stale_conversation", "conversation:missing"),
+        ("C0", "C2", "S"),
+        needs=_CONTINUES,
+    ),
+    _liar("S50", RETRIABLE_ERROR, ("retriable:True",), ("C2",), needs=_CONTINUES),
+    # On a route that declares none: the request is ignored and the call is
+    # made, it is refused with another type than the agreed one, or the
+    # agreed type is raised while the backend is built, where no call was
+    # made and so no route refused one.
+    _liar(
+        "S50",
+        SERVE_CONVERSATION_UNDECLARED,
+        ("request.extra", "kind:transport!=refused"),
+        ("C0", "S"),
+        needs=_NO_CONTINUITY,
+    ),
+    _liar(
+        "S50",
+        REFUSE_CONVERSATION_WITH_VALUE_ERROR,
+        (f"raise:ValueError{_BEFORE}",),
+        ("S",),
+        needs=_NO_CONTINUITY,
+    ),
+    _liar(
+        "S50",
+        REFUSE_CONVERSATION_AT_BUILD,
+        (f"raise:NotImplementedError{_BEFORE}",),
+        ("S",),
+        needs=_NO_CONTINUITY,
+    ),
     # Admission: a capability the column's pin admits is refused, a backend
     # that is only built asks its provider something, and a role is built
     # although the profile of its route does not meet what the role asks.

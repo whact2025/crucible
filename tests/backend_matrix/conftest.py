@@ -7,6 +7,10 @@
   violation fails the test at teardown;
 - every test gets the scripted route environment, the matrix rate card and a
   private home directory;
+- a run in which those two fixtures are not in force for an item of the
+  package is refused at collection: pytest drops them for a module it
+  collects after it has left this directory, so the modules of the package
+  are named side by side in one call;
 - an item with a skip or xfail marker is refused at collection;
 - the test item of a cell whose scenario passes an invocation deadline that is
   not below the suite's limit for a test gets a limit above that deadline;
@@ -53,7 +57,12 @@ def matrix_preflight() -> dict[str, str | None]:
     return runner.preflight_all()
 
 
+# The fixtures above that apply to every test of the package, by name.
+_IN_FORCE = ("_matrix_network_guard", "_matrix_environment")
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[Any]) -> None:
+    cells.refuse_items_without_fixtures(items, _PACKAGE, _IN_FORCE)
     cells.refuse_skip_markers(items, _PACKAGE)
     cells.limit_long_cells(items, _PACKAGE, cells.suite_limit(config))
 

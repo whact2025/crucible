@@ -25,13 +25,23 @@ the next turn and adds up the usage of the turns it relayed. It also ends a
 session that has used up its turn allowance: the reply to the last allowed
 turn carries the frames of the tool's turn terminal, and the peer emits them
 after the tool call of that turn in the place of a further model turn, then
-exits with the status the reply names. It emulates no budget terminal: a
+exits with the status the reply names. A session whose cost has reached its
+budget ends in the same way, at the frames of the tool's budget terminal. A
 reply that says ``unsupported`` ends the session with a journal entry, which
 fails the cell as a setup error. And it goes away where a reply says so
 (``gone``): after the frames of the reply it writes the leading part of a
 line the reply names, without a line end, and then either ends its output and
 exits with status 0, as a tool whose stream ends without its terminal frame,
-or kills itself, as a tool that is gone in the middle of a turn.
+or kills itself, as a tool that is gone in the middle of a turn. And it
+refuses to continue a session it holds no conversation for: the tool keeps
+its conversations in its home, the home of a cell is new, and a command line
+that names a session id which no earlier process of the cell opened is
+answered with one line on the standard error, no frame and the status of a
+failure, before a prompt is read or the model is asked anything. That
+behaviour of the tool is emulated, not observed, and neither the line nor
+the status is in this file: the peer asks the provider side for them, which
+renders them from an envelope that says what it rests on. Continuing a
+session that an earlier process of the cell did open is not played.
 
 Every process appends one record to the journal of the cell: its role, its
 pids, its command line, the names of its environment and whether it saw a
@@ -53,8 +63,9 @@ Protocol sources, all in the pinned ``claude-agent-sdk``:
   (``_build_command``, ``connect``). Every flag that the peer or its dialect
   reads is followed by its value as a token of its own. Three others are
   passed as one ``--flag=value`` token each (``--resume``, ``--session-id``,
-  ``--setting-sources``); nothing here reads them, and :func:`argument`
-  would not find them;
+  ``--setting-sources``), and :func:`argument` would not find them. Of the
+  three the peer reads ``--resume``, in either form
+  (:func:`resumed_session`); nothing here reads the two others;
 - control frames: ``types.py`` (``SDKControlRequest``, ``SDKControlResponse``,
   ``SDKControlMcpMessageRequest``) and ``_internal/query.py``
   (``_send_control_request``, ``_handle_control_request``);
@@ -79,9 +90,25 @@ SKIP_BRIDGE = "skip_bridge"
 FABRICATED_RESULT = "a result the peer made up without asking the tool server"
 SKIP_ADDRESS_CHECK = "skip_address_check"
 SKIP_TURN_TERMINAL = "skip_turn_terminal"
+SKIP_BUDGET_TERMINAL = "skip_budget_terminal"
 # The only variables the journal keeps by value: how the SDK marks a tool it
 # starts, and the home directory the tool was given.
 JOURNALLED_ENV = ("CLAUDE_AGENT_SDK_VERSION", "CLAUDE_CODE_ENTRYPOINT", "HOME")
+# Where the tool takes a cap on the tokens of a response from: a variable of
+# its environment (the vendor's list of the tool's environment variables).
+# The journal says what it was started with there, under a key of its own.
+RESPONSE_CAP_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+# How a session is asked to continue an earlier one, and where the peer asks
+# what the tool says of a session id it holds no conversation for: the
+# origin of the scripted provider, this path. The answer is rendered from an
+# envelope; what the real tool prints was not observed.
+RESUME_FLAG = "--resume"
+RESUME_PATH = "/claude-cli/v1/resume"
+# A lying counterpart for the matrix's own tests: the same refusal in other
+# words. A client that types a refused session by what the tool printed may
+# type this one otherwise.
+REJECT_IN_OTHER_WORDS = "reject_in_other_words"
+OTHER_WORDS = "Error: the conversation {session_id} could not be restored"
 MASKED = "<forbidden value>"
 
 EXIT_PROVIDER_FAILED = 1
@@ -131,6 +158,17 @@ def argument(argv: list[str], flag: str) -> str | None:
     return None
 
 
+def resumed_session(argv: list[str]) -> str | None:
+    """The session a command line asks to continue: one token with its value, or two."""
+
+    for index, item in enumerate(argv):
+        if item.startswith(RESUME_FLAG + "="):
+            return item.partition("=")[2]
+        if item == RESUME_FLAG and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
 def sdk_servers(argv: list[str]) -> list[str]:
     """The SDK-hosted tool servers the command line configures, by name."""
 
@@ -175,6 +213,9 @@ def started_as(argv: list[str], config: dict[str, Any]) -> dict[str, Any]:
         "env": {
             name: shown(environment[name]) for name in JOURNALLED_ENV if name in environment
         },
+        "response_cap": (
+            shown(environment[RESPONSE_CAP_ENV]) if RESPONSE_CAP_ENV in environment else None
+        ),
         "forbidden_seen": any(
             holds(item) for item in (*argv, *environment, *environment.values())
         ),
@@ -192,6 +233,68 @@ def read_journal(config: dict[str, Any]) -> list[dict[str, Any]]:
             return [json.loads(line) for line in stream if line.strip()]
     except FileNotFoundError:
         return []
+
+
+def post_to_provider(
+    config: dict[str, Any], body: dict[str, Any], path: str | None = None
+) -> tuple[int, bytes]:
+    """Send one JSON document to the scripted provider; the status and the answer.
+
+    To the address of the configuration, or to ``path`` at its origin.
+    """
+
+    import http.client  # noqa: PLC0415 - the two probes never need it
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    target = urlsplit(str(config["provider"]))
+    # A lying counterpart for the matrix's own tests skips this check.
+    # The network guard that the launcher installed is then what stands
+    # between the peer and an address that is not loopback.
+    unchecked = SKIP_ADDRESS_CHECK in config.get("faults", ())
+    host = target.hostname or ""
+    if not unchecked and (target.scheme != "http" or host != "127.0.0.1"):
+        raise _Unsupported("the scripted provider is not on loopback")
+    connection = http.client.HTTPConnection(host, target.port, timeout=30.0)
+    try:
+        connection.request(
+            "POST",
+            target.path if path is None else path,
+            body=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "crucible-matrix-claude-peer",
+            },
+        )
+        response = connection.getresponse()
+        payload = response.read()
+    finally:
+        connection.close()
+    return response.status, payload
+
+
+def refusal_of(config: dict[str, Any], resumed: str) -> tuple[str, int]:
+    """What the tool prints for a session id it holds no conversation for, and its status.
+
+    Asked of the provider side, which renders both from an envelope: no
+    sentence of the tool lives in this file.
+    """
+
+    status, payload = post_to_provider(
+        config, {"pid": os.getpid(), "resumed": resumed}, RESUME_PATH
+    )
+    said = json.loads(payload) if status == 200 else None
+    if (
+        not isinstance(said, dict)
+        or not isinstance(said.get("stderr"), str)
+        or type(said.get("exit")) is not int
+    ):
+        raise _Unsupported(
+            "the provider side does not say what the tool answers a session id it "
+            "holds no conversation for"
+        )
+    if REJECT_IN_OTHER_WORDS in config.get("faults", ()):
+        return OTHER_WORDS.format(session_id=resumed), said["exit"]
+    return said["stderr"], said["exit"]
 
 
 def _text_of(content: Any) -> str:
@@ -224,7 +327,7 @@ class Session:
         self._stdout = stdout
         import uuid  # noqa: PLC0415 - the two probes never need it
 
-        self._session_id = str(uuid.uuid4())
+        self.session_id = str(uuid.uuid4())
         self._control: list[dict[str, Any]] = []
         self._mcp: list[dict[str, Any]] = []
         self._tools: dict[str, list[str]] = {}
@@ -380,36 +483,9 @@ class Session:
     # -- the model side --------------------------------------------------------
 
     def _ask_provider(self, body: dict[str, Any]) -> dict[str, Any]:
-        import http.client  # noqa: PLC0415 - the two probes never need it
-        from urllib.parse import urlsplit  # noqa: PLC0415
-
-        target = urlsplit(str(self._config["provider"]))
-        # A lying counterpart for the matrix's own tests skips this check.
-        # The network guard that the launcher installed is then what stands
-        # between the peer and an address that is not loopback.
-        unchecked = SKIP_ADDRESS_CHECK in self._config.get("faults", ())
-        host = target.hostname or ""
-        if not unchecked and (target.scheme != "http" or host != "127.0.0.1"):
-            raise _Unsupported("the scripted provider is not on loopback")
-        connection = http.client.HTTPConnection(host, target.port, timeout=30.0)
-        try:
-            connection.request(
-                "POST",
-                target.path,
-                body=json.dumps(body).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "crucible-matrix-claude-peer",
-                },
-            )
-            response = connection.getresponse()
-            payload = response.read()
-        finally:
-            connection.close()
-        if response.status != 200:
-            sys.stderr.write(
-                f"scripted peer: the provider answered HTTP {response.status}\n"
-            )
+        status, payload = post_to_provider(self._config, body)
+        if status != 200:
+            sys.stderr.write(f"scripted peer: the provider answered HTTP {status}\n")
             raise SystemExit(EXIT_PROVIDER_FAILED)
         reply = json.loads(payload)
         if not isinstance(reply, dict):
@@ -439,7 +515,7 @@ class Session:
                     "control": self._control,
                     "mcp": self._mcp,
                     "tools": self._tools,
-                    "session_id": self._session_id,
+                    "session_id": self.session_id,
                     "turn": self._turn,
                     "spent": dict(self._spent),
                     "user": user,
@@ -467,6 +543,16 @@ class Session:
                 for frame in terminal.get("frames", ()):
                     self._emit(frame)
                 return int(terminal.get("exit", 0) or 0)
+            spent = reply.get("budget_limit")
+            # A lying counterpart for the matrix's own tests does not stop at
+            # the budget either: it asks the provider for one more turn.
+            if spent and SKIP_BUDGET_TERMINAL not in self._config.get("faults", ()):
+                # The cost of the session has reached its budget: the tool
+                # does not ask the model again. It reports its budget
+                # terminal and exits.
+                for frame in spent.get("frames", ()):
+                    self._emit(frame)
+                return int(spent.get("exit", 0) or 0)
 
     def run(self) -> int:
         """Serve the session until the SDK closes the input."""
@@ -506,8 +592,27 @@ def main(argv: list[str], config: dict[str, Any]) -> int:
             or argument(argv, "--input-format") != "stream-json"
         ):
             raise _Unsupported(f"the command line {record['argv'][:3]} ...")
-        append_journal(config, {**record, "role": "session"})
-        return Session(argv, config, sys.stdin.buffer, sys.stdout.buffer).run()
+        resumed = resumed_session(argv)
+        if resumed is not None:
+            # The tool keeps its conversations in its home, and the home of a
+            # cell is new: it holds a session only if an earlier process of
+            # the cell opened it. Continuing such a session is not played.
+            # For any other id the tool finds no conversation: it says so on
+            # its standard error and exits before it asks the model anything.
+            # What it says is emulated: the provider side renders it.
+            if any(item.get("session_id") == resumed for item in read_journal(config)):
+                raise _Unsupported(
+                    "the resumption of a session that an earlier process of the "
+                    "cell opened"
+                )
+            append_journal(config, {**record, "role": "resume_rejected", "resumed": resumed})
+            line, code = refusal_of(config, resumed)
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+            return code
+        session = Session(argv, config, sys.stdin.buffer, sys.stdout.buffer)
+        append_journal(config, {**record, "role": "session", "session_id": session.session_id})
+        return session.run()
     except _Gone as gone:
         return go_away(gone, sys.stdout.buffer)
     except _Unsupported as exc:

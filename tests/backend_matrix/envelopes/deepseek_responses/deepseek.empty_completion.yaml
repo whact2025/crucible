@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed response that ends cleanly and produced nothing: the events of
+# one response of the DeepSeek Responses route that ends with the terminal
+# of a completed response whose output is empty and whose usage holds no
+# output token.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: deepseek_responses
+provider: deepseek
+behaviour: empty_completion
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    the events openai.types.responses.ResponseCreatedEvent,
+    ResponseInProgressEvent and ResponseCompletedEvent, the last with a
+    Response of status "completed" whose output is the empty list, a value
+    of the type of openai.types.responses.Response.output
+  sdk_version: openai 2.53.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach for this reply:
+    the three responses of the live observation that the completion
+    envelope cites held output, and the vendor's guide to its Responses
+    route (primary source, read 2026-11-18) states the events of a stream
+    and no response without output. Taken from that guide: the opening
+    events, the terminal response.completed, and that the terminal carries
+    the usage. Constructed: that a response which produced nothing has no
+    output item and no event of one, and that its usage block is the one of
+    the completion envelope with no output token. The renderer fills the
+    counters, and the scripted step allows no output token. So this
+    envelope proves that such a stream parses through the pinned SDK, not
+    that the route sends it.
+
+status: 200
+body:
+  - type: response.created
+    sequence_number: 0
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.in_progress
+    sequence_number: 1
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: in_progress
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage: null
+  - type: response.completed
+    sequence_number: 2
+    response:
+      id: {slot: response_id}
+      object: response
+      created_at: {slot: created}
+      status: completed
+      model: {slot: served_model}
+      output: []
+      parallel_tool_calls: true
+      tool_choice: auto
+      tools: []
+      usage:
+        input_tokens: {slot: input_tokens}
+        input_tokens_details:
+          cached_tokens: 0
+        output_tokens: {slot: output_tokens}
+        output_tokens_details:
+          reasoning_tokens: 0
+        total_tokens: {slot: total_tokens}

@@ -518,6 +518,48 @@ def test_expected_items_are_the_items_pytest_collects() -> None:
     assert len(REAL) == len({(item.module, item.name) for item in REAL})
 
 
+# A test file outside the package; it imports nothing of the product.
+_OUTSIDE = "tests/test_test_shard.py"
+_PACKAGE_FIXTURES = ("_matrix_network_guard", "_matrix_environment")
+
+
+def test_no_call_order_sets_a_test_of_the_package_up_without_its_fixtures() -> None:
+    here = f"tests/backend_matrix/{Path(__file__).name}"
+    first = f"{here}::{test_expected_items_are_the_items_pytest_collects.__name__}"
+    second = f"{here}::{test_a_complete_run_is_accepted.__name__}"
+
+    def plans(run: subprocess.CompletedProcess[str]) -> list[str]:
+        # What pytest would set up for each test of the package; nothing runs.
+        lines = (line.strip() for line in run.stdout.splitlines())
+        return [line for line in lines if line.startswith(f"{here}::")]
+
+    def whole(run: subprocess.CompletedProcess[str]) -> bool:
+        found = plans(run)
+        return (
+            run.returncode == 0
+            and [line.split(" ")[0] for line in found] == [first, second]
+            and all(name in line for line in found for name in _PACKAGE_FIXTURES)
+        )
+
+    # The tests of the package named side by side, as a CI shard names its
+    # sorted files and as the package is called by hand: both are set up
+    # under the network guard and in the isolated environment.
+    together = _pytest("--setup-plan", first, second, _OUTSIDE)
+    assert whole(together), together.stdout + together.stderr
+    # The lying call: a test of the package named after a file outside it.
+    # The pytest of the lock collects that test without the fixtures of the
+    # package and says nothing, so the package refuses the run before any
+    # test. Should a later pytest keep the fixtures in force, the run is not
+    # refused and both tests are set up whole; what never shows is a test of
+    # the package that is set up without them.
+    apart = _pytest("--setup-plan", first, _OUTSIDE, second)
+    output = apart.stdout + apart.stderr
+    refused = apart.returncode == pytest.ExitCode.USAGE_ERROR and not plans(apart)
+    assert refused or whole(apart), output
+    if refused:
+        assert "side by side" in output and second in output
+
+
 def test_the_reports_of_a_real_run_are_read_back(tmp_path: Path) -> None:
     junit = tmp_path / "test-results-0.xml"
     run = _pytest(f"tests/backend_matrix/{cells.STATIC_MODULE}.py", f"--junitxml={junit}", "-q")
@@ -603,10 +645,12 @@ def test_the_cell_report_says_what_a_behaviour_cell_showed(tmp_path: Path) -> No
     assert kind["fidelity"] == "wire" and kind["dialect"] == "openai_chat"
     assert any("DNS and TLS" in layer for layer in kind["bypassed_layers"])
     # Two envelopes of the tool loop, one for a reply that reasons and shows
-    # no text, one for each form of refusal and one for a reply that is no
-    # terminal of the wire. The driver replaces no private name of the
-    # product, and no required proof of the kind's module does.
-    assert kind["private_seams"] == [] and len(kind["envelopes"]) == 7
+    # no text, one for each form of refusal, one for a reply that is no
+    # terminal of the wire, one for a reply cut at the cap on its tokens and
+    # one for a reply in which nothing was produced. The driver replaces no
+    # private name of the product, and no required proof of the kind's
+    # module does.
+    assert kind["private_seams"] == [] and len(kind["envelopes"]) == 9
     assert kind["proof_seams"] == []
     # None of the four scenarios attaches write tools, so no cell of the run
     # played under the watch of write hosts and the report names nothing

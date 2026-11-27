@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# What the app-server answers a request to resume a thread it finds no
+# rollout for: an error object in the place of a result, after which the
+# session goes on. Nothing was observed of the real tool: the answer is
+# emulated, so every cell that uses this envelope rests on an emulation of
+# the reference.
+#
+# The body is the error member of the answer; the peer adds the id of the
+# request it answers. The message is written as its parts, in order, because
+# a slot stands for a whole value; the dialect joins them.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: codex_app_server
+provider: app_server
+behaviour: resume_rejected
+
+provenance:
+  grade: constructed
+  reason: >-
+    Emulated, not observed. An answer that holds an error object in the
+    place of a result is how the protocol answers a request that failed.
+    The code, that of an invalid request, and the sentence are those of the
+    vendor's open-source app-server for a thread id it finds no rollout
+    for, written from memory of that source. The sentence stands in the
+    runtime the official SDK bundles at the release the worker locks, read
+    as bytes and not run. No source in reach states the code, or that the
+    sentence answers this request, and no run of the real tool was made.
+    The code decides a cell that is answered from it. The client library
+    of the app-server route raises one error for any error object, so that
+    route types the rejection alike under any code. The official SDK raises
+    a type per code, and the adapter of that route names some of those
+    types as a rejected resume (crucible/backends/codex_official.py) and
+    not the type of this code; the same rejection under the code of invalid
+    parameters is typed as a stale conversation there, which the lying
+    counterpart of the peer shows.
+
+status: 200
+
+body:
+  error:
+    code: -32600
+    message:
+      - "no rollout found for thread id "
+      - {slot: thread_id}
