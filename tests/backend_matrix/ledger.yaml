@@ -116,7 +116,7 @@ schema_version: crucible.backend-matrix.ledger.v1
 ceilings:
   max_known_gaps:
     pack_a: 74
-    pack_b: 58
+    pack_b: 83
   frozen: [pack_a]
   max_declared_differences: 4
 
@@ -458,6 +458,14 @@ registry:
         observed_under: {expected_served_model: not_admitted}
         closes_under: {expected_served_model: not_admitted}
         predicted: ["digest.mismatch:tool_authority"]
+      # The deadline and the cancellation while a read handler is held: two
+      # more tool cells that return a result.
+      - cell: deepseek/S16a/primary/raw
+        observed_under: {deadline: request_only, cancellation: boundary_only}
+        closes_under: {deadline: request_only, cancellation: boundary_only}
+      - cell: deepseek/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
 
   G28:
     title: The gateway adapter records one request event per completion, which the limit guard rejects
@@ -1271,6 +1279,55 @@ registry:
         observed_under: {}
         closes_under: {}
 
+  # The deadline and the cancellation scenarios, first run on the primary
+  # columns: three records the gap list names.
+  # One of them, G11, stands further down with the records of a route
+  # without its credential, which holds a cell of it too.
+  G05:
+    title: A Kimi tool call without its result invalidates the outcome of a call that is cut during the tool call
+    origin: gap list
+    severity: medium
+    # Predicted on the deadline during a tool call, as an outcome whose
+    # stop reason is rewritten to a generic error (stop:error!=timeout).
+    # The play of the deadline while a read handler is held did not show
+    # that, and its cell is no cell of this record: the call ends in a
+    # raise, so no result is there to show anything of this gap, and a cell
+    # that never carried a code of a record would read as one the record had
+    # closed. Today the adapter keeps the stop reason of a call that is cut
+    # while a tool call has no result, and flags the trace of its result
+    # incomplete: it pairs the tool events of a trace, and the call of the
+    # handler that never returned has no result. The cell that shows it is
+    # the cancellation while a read handler is held, whose call returns a
+    # result.
+    cells:
+      - cell: kimi/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+
+  G22:
+    title: DeepSeek types no cancellation
+    origin: gap list
+    severity: medium
+    # Predicted on the cancellation. close() stops the worker of the call
+    # at once, or stops the next worker from starting; the adapter then
+    # builds its result in the branch for a qualification failure of the
+    # worker: a transport error with the stop reason of a generic error and
+    # no cancellation event, whatever the policy of the call asks, so
+    # under the policy that asks for the raise the same result comes back.
+    # What that branch flags of its trace is another record's (M13).
+    # The gap list has a second thing under this id, an indeterminate write
+    # that always raises. No cell shows such a raise.
+    cells:
+      - cell: deepseek/S30a/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+      - cell: deepseek/S30b/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+      - cell: deepseek/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+
   M10:
     title: Kimi does not read the refusal field of a reply, which ends as a retriable transport error
     origin: matrix
@@ -1479,6 +1536,16 @@ registry:
       - cell: deepseek/S27/primary/raw
         observed_under: {}
         closes_under: {}
+      # A call that close() ends, while a request stalls and after a held
+      # read handler has returned: the adapter builds both results in the
+      # same branch, and both traces are flagged incomplete. The kind and
+      # the stop reason of the two results are G22's.
+      - cell: deepseek/S30a/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+      - cell: deepseek/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
 
   M14:
     title: The DeepSeek adapter ends the call at a tool result over the byte budget instead of truncating it
@@ -1529,6 +1596,155 @@ registry:
       - cell: openai_compat:local/S27/primary/raw
         observed_under: {}
         closes_under: {}
+      # Predicted for the call that ends at its deadline, and seen on every
+      # form of the deadline and of the cancellation that returns a result:
+      # the result is the one the scenario asks, with both accounting flags
+      # false, and its terminal is flagged complete.
+      - cell: openai_compat:hosted/S15/primary/raw
+        observed_under: {deadline: request_only}
+        closes_under: {deadline: request_only}
+      - cell: openai_compat:hosted/S16a/primary/raw
+        observed_under: {deadline: request_only, cancellation: boundary_only}
+        closes_under: {deadline: request_only, cancellation: boundary_only}
+      - cell: openai_compat:hosted/S30a/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+      - cell: openai_compat:hosted/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+      - cell: openai_compat:local/S15/primary/raw
+        observed_under: {deadline: request_only}
+        closes_under: {deadline: request_only}
+      - cell: openai_compat:local/S16a/primary/raw
+        observed_under: {deadline: request_only, cancellation: boundary_only}
+        closes_under: {deadline: request_only, cancellation: boundary_only}
+      - cell: openai_compat:local/S30a/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+      - cell: openai_compat:local/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+
+  # The deadline scenarios, first run on the primary columns: two records
+  # of the matrix's own.
+  M24:
+    title: The Kimi result of a call that ended at its deadline holds no limit event, and a Kimi worker asks the provider again after the deadline of the call
+    origin: matrix
+    severity: medium
+    # Not predicted. Two defects, each with its code.
+    # A call whose request the provider never answers ends as the scenario
+    # asks (a transport error that is not retriable, the stop reason of a
+    # deadline, the three flags false), and its trace holds no limit event.
+    # Where a read handler is held past the deadline, the tool server of the
+    # route, which is bound to the deadline of the invocation counted from
+    # the call, answers the worker's call with a timeout at that moment, and
+    # the worker, which the adapter has not stopped yet, asks the provider
+    # again: one more request after the deadline of the call, which the
+    # script does not hold. The call then ends in a raise, which is another
+    # record's (G11).
+    # Observed beside both, and asserted by no code of any cell: the
+    # deadline that ends a Kimi call is the worker's, which the adapter
+    # starts counting when it starts the worker, after the checks that come
+    # before a launch, so the call returns some seconds after the deadline
+    # it was given. A cell holds the return of such a call to its deadline
+    # from below and, for a call that hangs, to a wide bound from above; it
+    # does not measure how late a deadline is, and the cell report keeps
+    # the moment. So a fix that records the limit event and stops the
+    # worker with its tool server closes both cells and says nothing of the
+    # late count: that is a finding of its own, with no failing cell.
+    cells:
+      - cell: kimi/S15/primary/raw
+        observed_under: {deadline: hard_invocation}
+        closes_under: {deadline: hard_invocation}
+      - cell: kimi/S16a/primary/raw
+        observed_under: {deadline: hard_invocation, cancellation: boundary_only}
+        closes_under: {deadline: hard_invocation, cancellation: boundary_only}
+
+  M25:
+    title: The DeepSeek result of a call that ended at its deadline is a generic error stop without a terminal event
+    origin: matrix
+    severity: medium
+    # Predicted for the stop reason (a row of the parity audit, under no id
+    # of the gap list); the trace code was not predicted. A call whose
+    # deadline passes, while the provider stalls or between two responses
+    # once a held tool handler has returned, ends as a transport error that
+    # is not retriable, with a limit event named after the deadline and the
+    # three flags false, as the scenario asks. Its stop reason is that of a
+    # generic error, not of a deadline, and its trace ends on the limit
+    # event: no terminal event follows, and the trace is flagged incomplete.
+    cells:
+      - cell: deepseek/S15/primary/raw
+        observed_under: {deadline: request_only}
+        closes_under: {deadline: request_only}
+        predicted: ["stop:error!=timeout"]
+      - cell: deepseek/S16a/primary/raw
+        observed_under: {deadline: request_only, cancellation: boundary_only}
+        closes_under: {deadline: request_only, cancellation: boundary_only}
+
+  # A record of the same first run that waited for a ruling on a question
+  # asked of the reference columns; it was given on 2026-11-27.
+  M27:
+    title: The Kimi cancellation result that is built after a reply names no served model
+    origin: matrix
+    severity: medium
+    # Not predicted. close() while a read handler is held, after the one
+    # reply, which named the model: the cancellation the call returns is
+    # the parent's own outcome, built when close() stopped the worker, and
+    # it names no served model. An outcome that the worker's exception
+    # classifier returned lacks the model too, which is M11's; this one is
+    # built by the parent, and no worker outcome stands behind it. Whether
+    # such a result owes the model was the question of the observation on
+    # the Claude reference, so the code was booked where that ruling could
+    # reach it and under no record of the gap list, and the record waited.
+    # Ruled on 2026-11-27 by a decision panel that acts under a standing
+    # instruction of the release owner, who may overrule it: it does. The
+    # clause on the identity of a result owes the served model on every
+    # result once a reply of the call named one, whoever built the result;
+    # the code is a gap of Kimi as entered, the record waits for nothing,
+    # and the observation on the Claude reference is a record of its own
+    # (R03).
+    cells:
+      - cell: kimi/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+
+  R03:
+    title: Error results the Claude adapter's attempt controller builds carry no served model and no tool-authority digest
+    origin: reference
+    severity: low
+    # Known by reading before the matrix played it; registered here for the
+    # first time, on its first observed cells, as one record for both values. A
+    # known gap of the reference by the ruling of a decision panel of
+    # 2026-11-27, not an answer of the release owner in person. That ruling is
+    # the `ruling` of every known-gap entry that names this record and no field
+    # of the record: nothing is withdrawn.
+    # A result that the attempt controller of the adapter builds itself at its
+    # wall deadline is built with no served model and no tool-authority digest
+    # (crucible/backends/claude.py, _invoke_with_retries_core, where the
+    # cumulative deadline is exhausted), although a reply of the call had named
+    # the model and a ToolSet was attached. The clause on the identity of a
+    # result owes the served model once a reply named one and the digest
+    # wherever a ToolSet is attached. The two cells: the deadline while a read
+    # handler is held, and the cancellation while one is held, where close()
+    # ended nothing and the call ran on to that same site (R18).
+    # In the run that entered the entries the two tool cells of the starter set
+    # on the column showed neither code, and the same deadline form passed on
+    # the app-server Codex column. Neither value is booked under R13, which is
+    # a digest of another value on a write.
+    # The typed result the adapter returns for a terminal tool dispatch (the
+    # deadline during a write, with the held write let go) lacks the same two
+    # values, by run; no cell returns that result today and no entry accepts
+    # it.
+    # No grade holds the record: the cause is read in the adapter. The severity
+    # is the one the gap list has. Reopened by a Claude cell that shows one of
+    # the two values alone.
+    cells:
+      - cell: claude/S16a/primary/raw
+        observed_under: {deadline: request_only, cancellation: process_kill}
+        closes_under: {deadline: request_only, cancellation: process_kill}
+      - cell: claude/S30c/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
 
   M16:
     title: The gateway adapter hands a tool call whose arguments are no JSON object to the ToolSet, as a call without arguments or with the value the text decodes to
@@ -2434,27 +2650,53 @@ registry:
   # The records entered with the scenario of a route without its credential
   # (S28).
   G11:
-    title: Kimi raises out of invoke() where a typed result is owed (a missing credential among them)
+    title: Kimi raises out of invoke() where a typed result is owed (a missing credential among them), and out of the call when its bridge is stopped while a read handler runs, and its cancellation result records no cancellation event
     origin: gap list
     severity: medium
-    # The gap list names several raises of the adapter under this id. One
-    # has a cell: with the key variable of the route absent at the call, the
-    # check of the runtime credentials raises a qualification error before
-    # any worker is started, where the scenario asks for a typed transport
-    # error that is not retried and no provider request. The route names
-    # the variable, routing reads it whenever it loads the file and the
-    # adapter reads it again at each call, so the cell takes it away at the
-    # call and not before. The raise stands for the result clauses: no
-    # column-wide code of the kind is owed on the cell while its entry
+    # The gap list names several raises of the adapter under this id. Two
+    # have a cell. The first: with the key variable of the route absent at
+    # the call, the check of the runtime credentials raises a qualification
+    # error before any worker is started, where the scenario asks for a
+    # typed transport error that is not retried and no provider request. The
+    # route names the variable, routing reads it whenever it loads the file
+    # and the adapter reads it again at each call, so the cell takes it away
+    # at the call and not before. The raise stands for the result clauses:
+    # no column-wide code of the kind is owed on the cell while its entry
     # holds the raise. The fix that turns the raise into a result adds, in
     # its own change, the rows of the inventory for the two flag codes of
     # M06 on the cell, because the scenario does not ask the accounting
     # flags.
+    # The second raise with a cell, and the cancellation result, are of the
+    # deadline and the cancellation scenarios (S16a, S30a, S30c).
+    # Predicted on the cancellation as a raise out of the call. What the
+    # cells show differs by the way the call is ended.
+    # A call that close() ends while a request stalls or while a read
+    # handler is held returns a typed cancellation, and under the policy
+    # that asks for the raise it raises the cancellation: the policy is
+    # kept, and that cell passes. The result of the cancellation records no
+    # cancellation event: the outcome is the parent's own, built when
+    # close() stopped the worker. That the same result names no served
+    # model after a reply had named one is another record's (M27).
+    # A call whose deadline passes while a read handler is held ends in a
+    # raise. The route stops its tool server when the worker is stopped; a
+    # handler that is still running then cannot be settled, and the
+    # qualification error of a tool-server lifecycle that did not settle
+    # leaves the call, after a billed reply, and no result is built. The
+    # gap list has this in so many words.
     cells:
       - cell: kimi/S28/primary/raw
         observed_under: {}
         closes_under: {}
         predicted: ["raise:KimiSDKQualificationError@before_request/crucible.backends.kimi"]
+      - cell: kimi/S16a/primary/raw
+        observed_under: {deadline: hard_invocation, cancellation: boundary_only}
+        closes_under: {deadline: hard_invocation, cancellation: boundary_only}
+      - cell: kimi/S30a/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
+      - cell: kimi/S30c/primary/raw
+        observed_under: {cancellation: boundary_only}
+        closes_under: {cancellation: boundary_only}
   G21:
     title: DeepSeek types nothing as retriable and keeps no HTTP status, and raises before dispatch when its key is absent
     origin: gap list
@@ -3049,6 +3291,134 @@ registry:
       - cell: codex:official/S50/primary/raw
         observed_under: {session_continuity: workflow_bound}
         closes_under: {session_continuity: workflow_bound}
+
+  # Deadlines and cancellation, first run of the five forms on the reference
+  # columns: four records. Each is a known gap of the reference by the ruling
+  # of a decision panel of 2026-11-27, not an answer of the release owner in
+  # person, who may overrule. The ruling is the `ruling` of the entries that
+  # name a record and no field of the record: nothing is withdrawn. None names
+  # a closing grade and none waits for a ruling: each cause is read in the
+  # adapter.
+  R18:
+    title: The Claude adapter ends no call in flight when close() is called from another thread
+    origin: reference
+    severity: medium
+    # Not predicted. The scenario makes close() the cancellation: the cell
+    # closes the backend from another thread while the provider holds the one
+    # request, or while a read handler is held. close() settles the dispatch
+    # workers, the tool servers and the hosts of writes it has registered, and
+    # holds no handle on a call in flight (crucible/backends/claude.py, close).
+    # It ended nothing: the call ran on to its wall deadline and returned the
+    # timeout result of the attempt controller, with no cancellation event, and
+    # under the policy that asks for the raise it raised nothing.
+    # The cells assert the cut itself: a route that declares that it can cut a
+    # call returns within three seconds of the close(), and a later return is a
+    # code of the cell. So a change that made the deadline site return a
+    # cancellation and cut nothing would leave the cells red.
+    # The profile of the kind declares `cancellation: process_kill`
+    # (crucible/backends/features.py). That declaration is of a cancellation
+    # that reaches the call in the task that made it, which no cell plays. The
+    # record names no change of the declaration, and each cell closes under the
+    # values it was observed under.
+    # Where a read handler is held, the result of that deadline site lacks two
+    # identity values (R03), and the close() itself raises for the dispatch
+    # worker it could not settle (R24).
+    # Reopened by a cell that plays a cancellation in the calling task, by a
+    # changed declaration of the kind, and by the fix of close().
+    cells:
+      - cell: claude/S30a/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
+      - cell: claude/S30b/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
+      - cell: claude/S30c/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
+
+  R22:
+    title: The app-server Codex adapter ends no call in flight when close() is called from another thread
+    origin: reference
+    severity: medium
+    # Not predicted. The scenario makes close() the cancellation, as on the
+    # Claude column (R18): the cell closes the backend from another thread.
+    # close() settles the tool servers and the hosts of writes it has
+    # registered and holds no handle on a call in flight
+    # (crucible/backends/codex.py, close). While the provider stalls, the call
+    # ran on to its wall deadline and returned the timeout result of the
+    # attempt controller, under either policy.
+    # The profile of the kind declares `cancellation: process_kill`
+    # (crucible/backends/features.py). That declaration is of a cancellation
+    # that reaches the call in the task that made it, which no cell plays. The
+    # record names no change of the declaration, and each cell closes under the
+    # values it was observed under.
+    # While a read handler is held, close() waited five seconds on the handler
+    # and stopped the tool server. The call then ended by what the script
+    # holds, not by a cut: the scripted tool asked the provider again, got no
+    # reply and left, and the adapter returned a transport error with the stop
+    # reason of a generic error, its usage and its cost flagged complete. Of
+    # the codes of that cell the missing cancellation event, the kind and the
+    # late return are the gap. The extra request, the stop reason and the two
+    # flags follow the stopped tool server under a script that holds no further
+    # reply, and are a ground for no flag on another cell. That the adapter
+    # flags usage and cost complete on that transport error is a finding of its
+    # own on the gap list; a fix of the cut takes the cell off that path.
+    # Reopened as R18 is.
+    cells:
+      - cell: codex:legacy/S30a/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
+      - cell: codex:legacy/S30b/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
+      - cell: codex:legacy/S30c/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
+
+  R23:
+    title: The official Codex route returns the cancellation of a close() where on_cancellation asks for a raise
+    origin: reference
+    severity: low
+    # Not predicted. Confined to a cancellation by close(). The route ends a
+    # call whose backend is closed: the branch of a closed backend in its
+    # per-attempt function (crucible/backends/codex_official.py, _invoke_once,
+    # lines 372 to 379 when this was entered) types the failure of the worker a
+    # cancellation, records the cancellation event and returns the result. The
+    # policy of the call is read nowhere in that module, so under the policy
+    # that asks for the raise the typed cancellation comes back, a fiftieth of
+    # a second after the close(). A cancellation of the calling task is raised
+    # on from the same function to the inherited controller, which keeps the
+    # policy (crucible/backends/codex.py).
+    # The control is the same play under the policy that converts, on the same
+    # column: it passes, with the cut asserted. So the gap is the policy alone,
+    # on this one path.
+    # Reopened by another code on the cell. The fix of the branch deletes the
+    # entry.
+    cells:
+      - cell: codex:official/S30b/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
+
+  R24:
+    title: A dispatch worker the Claude adapter cannot settle in its bounded cleanup ends close() in a raise
+    origin: reference
+    severity: medium
+    # Not predicted. The cause is a dispatch worker that the adapter could not
+    # settle in its bounded cleanup: the adapter dispatched a tool call on a
+    # worker of its bridge, the handler did not return, and the cleanup found
+    # the worker still live.
+    # The site, on the Claude column: the close() of the cell at the entry of
+    # a held read handler raises the lifecycle error of the bridge
+    # (crucible/backends/claude.py, close, through _detach_toolset to the
+    # shutdown of crucible/tools/_mcp_bridge.py). close() raises there by
+    # design and keeps what it could not settle for a later close(). What
+    # close() owes while a handler it cannot end still runs is a question on
+    # the gap list, not a fix.
+    # Reopened by a fix of that cleanup path.
+    cells:
+      - cell: claude/S30c/primary/raw
+        observed_under: {cancellation: process_kill}
+        closes_under: {cancellation: process_kill}
 
 known_gaps:
   # The gateway columns, first run (starter set). In the guarded lens the
@@ -4766,6 +5136,246 @@ known_gaps:
       to a panel; the entry may lose the dispatch code to a fix and never
       grows.
 
+  # Deadlines and cancellation, first run of the five forms on the primary
+  # columns: the open-weight cells.
+  # The gateway adapter flags the terminal of a result complete on every
+  # path (M15).
+  - cell: openai_compat:hosted/S15/primary/raw
+    observed_under: {deadline: request_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:hosted/S16a/primary/raw
+    observed_under: {deadline: request_only, cancellation: boundary_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:hosted/S30a/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:hosted/S30c/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:local/S15/primary/raw
+    observed_under: {deadline: request_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:local/S16a/primary/raw
+    observed_under: {deadline: request_only, cancellation: boundary_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:local/S30a/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  - cell: openai_compat:local/S30c/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "flag:terminal_complete=True": M15
+  # The DeepSeek result of a deadline has a generic error stop and no
+  # terminal event (M25). Its cancellation is the result of a worker that
+  # failed (G22, with the trace flag of M13), under either policy.
+  # The worker of the kind is started for every provider request. On a
+  # machine where it needs longer than the driver allows, a cell of these
+  # forms is not judged: it fails as not played, with its times. One thing
+  # of a starved machine the cell cannot tell from a change of the adapter:
+  # the adapter's close() waits a few seconds for its worker to settle, and
+  # where that is not enough the close() of the S30c cell raises, which
+  # shows as another code set (seen once, on one hardware thread beside a
+  # busy loop; never at ordinary load).
+  - cell: deepseek/S15/primary/raw
+    observed_under: {deadline: request_only}
+    codes:
+      "stop:error!=timeout": M25
+      "flag:trace_complete=False": M25
+  - cell: deepseek/S16a/primary/raw
+    observed_under: {deadline: request_only, cancellation: boundary_only}
+    codes:
+      "stop:error!=timeout": M25
+      "flag:trace_complete=False": M25
+      "digest.mismatch:tool_authority": G24
+  - cell: deepseek/S30a/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "kind:transport!=cancellation": G22
+      "stop:error!=cancelled": G22
+      "event.missing:cancellation/-": G22
+      "flag:trace_complete=False": M13
+  - cell: deepseek/S30b/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "kind:transport!=raised": G22
+  - cell: deepseek/S30c/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "kind:transport!=cancellation": G22
+      "stop:error!=cancelled": G22
+      "event.missing:cancellation/-": G22
+      "flag:trace_complete=False": M13
+      "digest.mismatch:tool_authority": G24
+  # Kimi ends a stalled call at the deadline of its worker and records no
+  # limit event (M24). Where a read handler is held past the deadline the
+  # call ends in a raise (G11), after one more request to the provider
+  # (M24). The cancellation is typed, and raised where the policy asks for
+  # it: that cell passes. Its result records no cancellation event (G11)
+  # and, after a reply that named the model, no served model (M27); its
+  # trace is flagged incomplete where the held tool call has no result
+  # (G05).
+  - cell: kimi/S15/primary/raw
+    observed_under: {deadline: hard_invocation}
+    codes:
+      "event.missing:limit/deadline": M24
+  - cell: kimi/S16a/primary/raw
+    observed_under: {deadline: hard_invocation, cancellation: boundary_only}
+    codes:
+      "raise:KimiSDKQualificationError@after_request/crucible.backends.kimi": G11
+      "request.extra": M24
+  - cell: kimi/S30a/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "event.missing:cancellation/-": G11
+  - cell: kimi/S30c/primary/raw
+    observed_under: {cancellation: boundary_only}
+    codes:
+      "event.missing:cancellation/-": G11
+      "digest.missing:served_model": M27
+      "flag:trace_complete=False": G05
+  # Deadlines and cancellation, first run of the five forms on the primary
+  # columns: the reference cells. Eight cells, each entered with the ruling of a
+  # decision panel on that cell and not an answer of the release owner in
+  # person; each text says so, and each covers its cell and exactly its codes.
+  - cell: claude/S16a/primary/raw
+    observed_under: {deadline: request_only, cancellation: process_kill}
+    codes:
+      "digest.missing:served_model": R03
+      "digest.missing:tool_authority": R03
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. The timeout result
+      the attempt controller built at its wall deadline, returned while the
+      read handler was held, carries a trace without the served model the reply
+      had named and without a tool-authority digest; the three flags are false
+      and the usage equals the bill.
+  - cell: claude/S30a/primary/raw
+    observed_under: {cancellation: process_kill}
+    codes:
+      "kind:transport!=cancellation": R18
+      "stop:timeout!=cancelled": R18
+      "event.missing:cancellation/-": R18
+      "return:not_cut": R18
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. close() from another
+      thread, which row S30 makes the cancellation, returned without a raise
+      and ended nothing: the call returned the timeout result of its attempt
+      controller at its deadline, 9.9 s after the close(). return:not_cut and
+      its three seconds were added on review, after plays; the cell is red
+      without it.
+  - cell: claude/S30b/primary/raw
+    observed_under: {cancellation: process_kill}
+    codes:
+      "kind:transport!=raised": R18
+      "return:not_cut": R18
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. The play of S30a
+      under on_cancellation=raise: the timeout result at the deadline, and no
+      raise. return:not_cut and its three seconds were added on review, after
+      plays; the cell is red without it.
+  - cell: claude/S30c/primary/raw
+    observed_under: {cancellation: process_kill}
+    codes:
+      "kind:transport!=cancellation": R18
+      "stop:timeout!=cancelled": R18
+      "event.missing:cancellation/-": R18
+      "digest.missing:served_model": R03
+      "digest.missing:tool_authority": R03
+      "raise:McpDispatchLifecycleError@close/crucible.tools._mcp_bridge": R24
+      "return:not_cut": R18
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. close() at the entry
+      of the held read handler ended nothing: the call ran to its deadline and
+      returned the controller's timeout result 9.9 s later, which is why the
+      two identity codes of R03 show. That close() raised the error of the
+      bridge for the dispatch worker it could not settle: clause C8's code as
+      built; close() raises there by design and keeps what it could not settle
+      for a later close(). return:not_cut and its three seconds were added on
+      review, after plays; the cell is red without it.
+  - cell: codex:legacy/S30a/primary/raw
+    observed_under: {cancellation: process_kill}
+    codes:
+      "kind:transport!=cancellation": R22
+      "stop:timeout!=cancelled": R22
+      "event.missing:cancellation/-": R22
+      "return:not_cut": R22
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. close() from another
+      thread, which row S30 makes the cancellation, returned without a raise
+      and ended nothing: the call returned the timeout result of its attempt
+      controller at its deadline, 9.9 s after the close(). return:not_cut and
+      its three seconds were added on review, after plays; the cell is red
+      without it.
+  - cell: codex:legacy/S30b/primary/raw
+    observed_under: {cancellation: process_kill}
+    codes:
+      "kind:transport!=raised": R22
+      "return:not_cut": R22
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. The play of S30a
+      under on_cancellation=raise: the timeout result at the deadline, and no
+      raise. return:not_cut and its three seconds were added on review, after
+      plays; the cell is red without it.
+  - cell: codex:legacy/S30c/primary/raw
+    observed_under: {cancellation: process_kill}
+    codes:
+      "kind:transport!=cancellation": R22
+      "stop:error!=cancelled": R22
+      "event.missing:cancellation/-": R22
+      "request.extra": R22
+      "flag:token_usage_complete=True": R22
+      "flag:cost_complete=True": R22
+      "return:not_cut": R22
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. close() waited five
+      seconds on the held read handler and stopped the tool server; the call
+      ended 5.15 s after it by the script's doing (the scripted tool asked
+      again, got no reply and left), not by a cut. The entry rests on the
+      missing cancellation event, the kind and return:not_cut; request.extra,
+      the stop and the two flags follow the stopped tool server under a script
+      that holds no further reply, and are a ground for no flag elsewhere.
+      return:not_cut and its three seconds were added on review, after plays;
+      the cell is red without it.
+  - cell: codex:official/S30b/primary/raw
+    observed_under: {cancellation: process_kill}
+    codes:
+      "kind:cancellation!=raised": R23
+    ruling: >-
+      Decision panel, 2026-11-27, under the release owner's standing
+      instruction of 2026-11-21; not the owner's own answer, and the owner may
+      overrule. Accepted as a known gap of the reference for this cell and
+      exactly these codes; nothing is accepted in advance. Under
+      on_cancellation=raise the route cut the call on close() and returned the
+      typed cancellation 0.02 s later where the policy asks for a raise; the
+      branch of a closed backend does not read the policy.
+
 declared_differences:
   - id: D-STRUCT-UNQUALIFIED
     citation: >-
@@ -4867,6 +5477,12 @@ declared_differences:
       - codex:legacy/S17/primary/raw
       - codex:legacy/S25/primary/raw
       - codex:legacy/S50/primary/raw
+      # The deadline and the cancellation scenarios.
+      - codex:legacy/S15/primary/raw
+      - codex:legacy/S16a/primary/raw
+      - codex:legacy/S30a/primary/raw
+      - codex:legacy/S30b/primary/raw
+      - codex:legacy/S30c/primary/raw
       - codex:official/S01/primary/raw
       - codex:official/S01/primary/guarded
       - codex:official/S03/primary/raw
@@ -4894,6 +5510,12 @@ declared_differences:
       - codex:official/S17/primary/raw
       - codex:official/S25/primary/raw
       - codex:official/S50/primary/raw
+      # The deadline and the cancellation scenarios.
+      - codex:official/S15/primary/raw
+      - codex:official/S16a/primary/raw
+      - codex:official/S30a/primary/raw
+      - codex:official/S30b/primary/raw
+      - codex:official/S30c/primary/raw
   - id: D-COST-BOUND-UNRANKED
     citation: >-
       crucible/backends/limits.py (_normalize_returned_result: a result under

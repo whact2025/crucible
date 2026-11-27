@@ -92,6 +92,9 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     # A result where the selected variant expects a refusal: what the
     # scenario contract says of it, no clause about a result.
     (r"kind:\w+!=refused", SCENARIO),
+    # A result where the scenario expects the cancellation to be raised: the
+    # scenario's own assertion, as no result clause applies to such a cell.
+    (r"kind:\w+!=raised", SCENARIO),
     (r"kind:\w+!=\w+", "C2"),
     (r"retriable:(True|False)", "C2"),
     (r"http_status:\w+!=\w+", "C2"),
@@ -118,6 +121,11 @@ _VOCABULARY: tuple[tuple[str, str], ...] = (
     (r"progress:write_not_credited", SCENARIO),
     (r"mutation:(in_process|host_alive|left_behind|deadline_unbound)", SCENARIO),
     (r"conversation:(missing|state|unbound|unasked)", SCENARIO),
+    # When the call returned, on a scenario that plays a deadline or a
+    # cancellation: a result before the deadline that alone ends the call,
+    # and a return later than the time in which a route that declares that
+    # it can cut a call returns after close().
+    (r"return:(early|not_cut)", SCENARIO),
     (r"admission:\w+:\w+!=\w+", SCENARIO),
     (r"decl\.(changed|over|under|mismatch):\w+", "D"),
     (r"static:\w+", "static"),
@@ -234,6 +242,61 @@ class Mutation:
     timeout_seconds: float
 
 
+# The type of the one raise clause C1 allows after a request: the cancellation
+# of a call whose policy asks for it to be raised. Compared by name: no clause
+# says which class of that name, and a code carries the name alone.
+CANCELLED_ERROR = "CancelledError"
+
+
+@dataclass(frozen=True)
+class Conducted:
+    """What a cell did beside the call, and when, on the monotonic clock.
+
+    A cell that plays a deadline or a cancellation holds a tool handler at
+    its entry, closes the backend from another thread, or both. The times
+    are those of the test process: when the call began and returned, when
+    the provider reached the stall, when the held handler was entered and
+    let go, and when ``close()`` was called from the other thread. ``where``
+    says where the held handler stood: in the ToolSet object of the test
+    process. ``problems`` are the wall-time bounds the call missed and what
+    the cell could not conduct (a request that was taken, a handler that was
+    entered or a ``close()`` that came too late for the scenario to be
+    played; a last resort of the conductor that acted): they fail the cell
+    and are no deviation.
+    """
+
+    deadline_seconds: float
+    invoked_at: float
+    returned_at: float
+    # When the provider took the first request of the cell.
+    first_request_at: float | None = None
+    stalled_at: float | None = None
+    entered_at: float | None = None
+    released_at: float | None = None
+    closed_at: float | None = None
+    where: str | None = None
+    # What let the held handler go: the time the selected variant states
+    # ("plan"), the cell once the call had returned ("return"), or the last
+    # resort of the conductor for a call that hangs ("last_resort").
+    released_by: str | None = None
+    # What the last resort of the conductor did, in order: it let go what
+    # the cell held ("let_go"), it killed the processes of the driver
+    # ("killed"). Empty in every play that is the scenario's.
+    last_resort: tuple[str, ...] = ()
+    # Where the route declares that it can cut a call: how long after the
+    # ``close()`` of the cell the call may take to return (``None``: not
+    # asked). A later return is ``return:not_cut``.
+    cut_seconds: float | None = None
+    # Where nothing but its deadline ends the call: how much earlier than
+    # the deadline a result may come (``None``: not asked). An earlier
+    # result is ``return:early``.
+    early_seconds: float | None = None
+    # Whether the call returned while the handler was still held (the call
+    # was cut) or only after it had been let go (it ended at a boundary).
+    returned_while_held: bool | None = None
+    problems: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class Observation:
     """Everything a cell may assert on."""
@@ -264,6 +327,8 @@ class Observation:
     # built none. A refusal is the route's own where the frame that raised
     # it is in that module.
     backend_module: str = ""
+    # What the cell did beside the call; ``None`` where it only called.
+    conducted: Conducted | None = None
 
 
 @dataclass(frozen=True)
@@ -303,7 +368,10 @@ class Reference:
 class Expectation:
     """The result a scenario's selected variant expects."""
 
-    outcome: Literal["result", "refused"] = "result"
+    # "cancelled": the call raises its cancellation after its one request,
+    # as a policy that asks for the raise is owed (clause C1 allows that one
+    # raise after a request); no result clause applies.
+    outcome: Literal["result", "refused", "cancelled"] = "result"
     refused_type: str = ""
     kind: str = "none"
     stop: tuple[str, ...] = ("end_turn",)
@@ -1436,6 +1504,51 @@ def evaluate_admission(
     return Report(outcomes, tuple(obs.provider.seam_problems))
 
 
+def _returned_when(obs: Observation) -> list[Deviation]:
+    """When the call returned, where the cell plays a deadline or a cancellation.
+
+    Asked of every such call, whether it returned a result or raised, from
+    the moments the cell kept. A route that declares that it can cut a call
+    returns or raises within a stated time of the ``close()`` of the cell;
+    one that returns later ran on, whatever it then returned. And a call
+    that nothing but its deadline ends does not return a result before the
+    deadline it was made with: an earlier result is the adapter's own
+    clock, not the policy's. A raise before the deadline is clause C1's.
+    """
+
+    conducted = obs.conducted
+    if conducted is None:
+        return []
+    out: list[Deviation] = []
+    took = conducted.returned_at - conducted.invoked_at
+    if conducted.early_seconds is not None and obs.result is not None:
+        ahead = conducted.deadline_seconds - took
+        if ahead > conducted.early_seconds:
+            out.append(
+                Deviation(
+                    "return:early",
+                    f"the call returned a result {took:.1f} s after it began, "
+                    f"{ahead:.1f} s before the deadline of "
+                    f"{conducted.deadline_seconds:g} s it was made with, and "
+                    "nothing but that deadline ends it",
+                )
+            )
+    if conducted.cut_seconds is not None and conducted.closed_at is not None:
+        after = conducted.returned_at - conducted.closed_at
+        if after > conducted.cut_seconds:
+            out.append(
+                Deviation(
+                    "return:not_cut",
+                    f"the call returned {after:.1f} s after the close() of the "
+                    f"cell ({took:.1f} s after it began, of a deadline of "
+                    f"{conducted.deadline_seconds:g} s): the route declares "
+                    "that it can cut a call, and a call that is cut returns "
+                    f"within {conducted.cut_seconds:g} s",
+                )
+            )
+    return out
+
+
 def evaluate(
     obs: Observation,
     exp: Expectation,
@@ -1449,6 +1562,7 @@ def evaluate(
     """Evaluate every clause that applies to the cell."""
 
     expects_result = exp.outcome == "result"
+    expects_cancellation = exp.outcome == "cancelled"
     clauses = applicable(lens=lens, toolset=toolset, expects_result=expects_result)
     outcomes: dict[str, ClauseOutcome] = {"C0": _outcome(_c0(obs))}
     if canary:
@@ -1465,9 +1579,17 @@ def evaluate(
     if raised is not None:
         detail = f"{raised.type} left the call {raised.phase.replace('_', ' ')}"
         if raised.phase == "after_request":
-            c1.append(Deviation(raised.code, detail))
-        elif expects_result:
-            scenario.append(Deviation(raised.code, f"{detail}; expected a result"))
+            # The one raise the clause allows after a request: the
+            # cancellation, where the policy of the call asks for the raise.
+            if not (expects_cancellation and raised.type == CANCELLED_ERROR):
+                c1.append(Deviation(raised.code, detail))
+        elif expects_result or expects_cancellation:
+            wanted = (
+                "a result"
+                if expects_result
+                else "the cancellation, raised after the one request"
+            )
+            scenario.append(Deviation(raised.code, f"{detail}; expected {wanted}"))
         elif not _the_route_refused(obs, exp):
             came = "out of invoke" if raised.left_invoke else "before invoke was called"
             scenario.append(
@@ -1484,11 +1606,18 @@ def evaluate(
         got = "none" if error is None else str(error.kind)
         scenario.append(
             Deviation(
-                f"kind:{got}!=refused",
-                f"invoke returned a result; expected a {exp.refused_type} refusal",
+                f"kind:{got}!={'raised' if expects_cancellation else 'refused'}",
+                "invoke returned a result; expected "
+                + (
+                    "the cancellation to be raised"
+                    if expects_cancellation
+                    else f"a {exp.refused_type} refusal"
+                ),
             )
         )
     outcomes["C1"] = _outcome(c1)
+    # When the call returned is the scenario's to say, whatever came back.
+    scenario.extend(_returned_when(obs))
 
     result = obs.result
     rewrote = "C5" in clauses and _guard_rewrote(obs)

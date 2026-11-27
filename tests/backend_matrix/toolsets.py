@@ -15,10 +15,19 @@ back: a wrapper of the workflow may add words of its own to a result, and
 those are the ToolSet's. The wrappers and the types stay the product's own, so
 an adapter that inspects the attached object sees exactly what a workflow
 would hand it.
+
+A cell that plays a deadline or a cancellation during a tool call holds one
+handler at its entry (:class:`Hold`): the first call of the held tool stops
+before anything of the tool has run, says that it is there, and goes on only
+when the cell lets it go. No clock lets it go. The fixture holds the handler
+where it runs in the test process, in the same shadow of the innermost
+ToolSet object.
 """
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
@@ -109,6 +118,79 @@ class Dispatch:
     not_a_mapping: tuple[Any, ...] = ()
 
 
+IN_TOOLSET = "toolset"
+
+
+class Hold:
+    """One tool handler, held at its entry until the cell lets it go.
+
+    The first call of the tool of ``slot`` that reaches a place the cell
+    watches stops there: before the handler of the test process runs. Every
+    later call of the tool passes. ``entered`` is set when the call stands
+    there, ``left`` when the handler it was held in front of has returned or
+    raised. ``where`` says which place it was.
+    """
+
+    def __init__(self, slot: str) -> None:
+        self.slot = slot
+        self.name = BINDINGS[slot].name
+        self.entered = threading.Event()
+        self.released = threading.Event()
+        self.left = threading.Event()
+        self.where: str | None = None
+        self.entered_at: float | None = None
+        self.released_at: float | None = None
+        self._lock = threading.Lock()
+        self._listeners: list[Callable[[], None]] = []
+
+    def on_entered(self, listener: Callable[[], None]) -> None:
+        """Call ``listener`` once, from the thread of the held call, when it stands."""
+
+        with self._lock:
+            self._listeners.append(listener)
+
+    def enter(self, name: str, where: str) -> bool:
+        """Stand here until let go, if this is the first call of the held tool."""
+
+        with self._lock:
+            if name != self.name or self.where is not None:
+                return False
+            self.where = where
+            self.entered_at = time.monotonic()
+            listeners = list(self._listeners)
+        self.entered.set()
+        for listener in listeners:
+            listener()
+        self.released.wait()
+        return True
+
+    def release(self) -> None:
+        with self._lock:
+            if self.released_at is None:
+                self.released_at = time.monotonic()
+        self.released.set()
+
+    def leave(self) -> None:
+        self.left.set()
+
+
+def _held(inner: Any, hold: Hold) -> None:
+    """Hold the handler of ``hold``'s tool where ``inner`` dispatches it."""
+
+    original = inner.dispatch
+
+    def dispatch(name: str, arguments: dict) -> str:
+        held = hold.enter(name, IN_TOOLSET)
+        try:
+            return original(name, arguments)
+        finally:
+            if held:
+                hold.leave()
+
+    # An instance attribute shadows the method for this one object only.
+    inner.dispatch = dispatch
+
+
 @dataclass
 class Fixture:
     """An attached ToolSet with what the cell may observe about it."""
@@ -175,13 +257,17 @@ def writer_profile(workspace: Path, *, scoped: bool = True) -> Any:
     )
 
 
-def build(spec: ToolsetSpec, workspace: Path, *, scoped: bool = True) -> Fixture:
+def build(
+    spec: ToolsetSpec, workspace: Path, *, scoped: bool = True, hold: Hold | None = None
+) -> Fixture:
     """Build the fixture in a fresh ``workspace`` directory.
 
     A writer states one path scope, the file its script writes. With
     ``scoped`` false it is the same tools with no path scope stated: what a
     cell attaches is always the scoped one, and a proof builds the other to
-    say which authority a digest names.
+    say which authority a digest names. With ``hold`` the first call of its
+    tool that reaches the innermost ToolSet object of this process stops at
+    the entry of the handler until the cell lets it go.
     """
 
     workspace.mkdir(parents=True, exist_ok=False)
@@ -191,6 +277,8 @@ def build(spec: ToolsetSpec, workspace: Path, *, scoped: bool = True) -> Fixture
         assert spec.limit is not None
         inner = writer_profile(workspace, scoped=scoped)
         _record(inner, fixture.log)
+        if hold is not None:
+            _held(inner, hold)
         bounded = ProgressBoundedMutatingToolSet(
             inner, max_consecutive_read_calls=spec.limit
         )
@@ -202,6 +290,8 @@ def build(spec: ToolsetSpec, workspace: Path, *, scoped: bool = True) -> Fixture
         ToolContext(workspace_root=workspace, repo_root=workspace)
     ).filter_to({BINDINGS[READ_A].name, BINDINGS[READ_B].name})
     _record(read, fixture.log)
+    if hold is not None:
+        _held(read, hold)
     if spec.kind == "READ":
         fixture.toolset = read
         fixture.returned = fixture.log

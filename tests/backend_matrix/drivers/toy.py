@@ -10,8 +10,9 @@ the attached ToolSet, prices usage through pricing discovery and builds its
 results from public assay types. It behaves as its declared profile says, so
 every variant a real column selects has an honest pass before a real driver
 exists. A write it does not run itself: it hands each one to a process of its
-own (:class:`WriteHost`), which it starts for the invocation, binds to the
-invocation's deadline and stops before the call returns.
+own (:class:`WriteHost`), which it binds to the invocation's deadline and
+stops before the call returns. The process is started when a writer is
+attached, before the call: the toy starts nothing inside a deadline.
 
 A *liar* is ``HonestBackend`` with one named fault (two faults are the
 driver's: it binds the limit guard to another profile, or builds the adapter
@@ -25,6 +26,7 @@ The toy touches no private product name.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import http.client
@@ -37,6 +39,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +54,7 @@ from assay import (
     ContentRejected,
     ConversationTransportOutcome,
     ExecutionCompleteness,
+    ExternalCancellation,
     IncompleteEvidence,
     Invocation,
     InvocationResult,
@@ -82,9 +86,11 @@ from ..scenarios import D_OAI_SCHEMA_FINAL, SCHEMA_KEY, SERVED_MODEL_FIELD
 from ..script import READ_A, READ_B, UNATTACHED, ProviderScript
 from ..toolsets import WORKSPACE
 from .base import (
+    Cancellation,
     Lens,
     MatrixSetupError,
     bind_as_routing,
+    close_when,
     refuse_the_scripted_credential,
     register,
 )
@@ -99,10 +105,23 @@ SUPPORTED: Mapping[str, frozenset[str]] = {
     "tool_loop": frozenset({"adapter_owned", "sdk_owned"}),
     "response_token_limit": frozenset({"hard", "provider_stop", "unsupported"}),
     "session_continuity": frozenset({"none", "retry_only", "workflow_bound"}),
+    # The toy binds every call to the deadline of its invocation, counted
+    # from the call, whatever its profile declares: what a declared value
+    # owes is the scenario's to say.
+    "deadline": frozenset({"hard_invocation", "request_only", "post_hoc", "unsupported"}),
+    # A route that can cut a call (``process_kill``, ``interruptible``) leaves
+    # a stalled request and a blocked tool handler behind when it is closed
+    # or at its deadline. One that stops only between two steps
+    # (``boundary_only``) looks at both when the step has ended. One without
+    # cancellation (``unsupported``) does the same and never hears a close.
+    "cancellation": frozenset(
+        {"process_kill", "interruptible", "boundary_only", "unsupported"}
+    ),
 }
 # The cap on the tokens of a response that the toy route owns: what a request
 # of a route that declares an enforced cap carries.
 _RESPONSE_CAP = 4096
+_CUTS: frozenset[str] = frozenset({"process_kill", "interruptible"})
 _OWN_TURN_CEILING = 64
 _UNATTACHED_TOOL = "matrix_unattached"
 # What a trace names under the fault that records another endpoint than the
@@ -314,6 +333,32 @@ RAISE_WITHOUT_CREDENTIAL = "raise_without_credential"
 SEND_PLACEHOLDER_KEY = "send_placeholder_key"
 # The key of the second fault: a word that is no credential of any route.
 _PLACEHOLDER_KEY = "no-key"
+# Faults at a deadline and at a cancellation. The result of a call that
+# ended at its deadline names its stop a generic error, or holds no limit
+# event. The adapter does not bind a stalled request to the deadline at
+# all. On a route that stops only between two steps it goes on to the next
+# request although the deadline passed while the handler ran. It does not
+# hear a close. It asks the provider again after the call was cancelled. Its
+# cancellation holds no event of that kind. Where the policy asks for the
+# cancellation to be raised, it returns the result instead, or raises
+# another type.
+TIMEOUT_AS_GENERIC_ERROR = "timeout_as_generic_error"
+NO_DEADLINE_EVENT = "no_deadline_event"
+IGNORE_DEADLINE = "ignore_deadline"
+GO_ON_AFTER_DEADLINE = "go_on_after_deadline"
+IGNORE_CLOSE = "ignore_close"
+RETRY_AFTER_CANCEL = "retry_after_cancel"
+NO_CANCELLATION_EVENT = "no_cancellation_event"
+CONVERT_CANCELLATION = "convert_cancellation"
+RAISE_OTHER_ON_CANCEL = "raise_other_on_cancel"
+# Two faults of when a call returns, with the result the scenario asks. The
+# adapter notes a close and acts on it only when the deadline of the call
+# has come: it cuts nothing, on a route that declares that it can. And it
+# ends every call a time of its own after it began, whatever deadline the
+# policy states, and reports that as the deadline.
+CLOSE_AT_DEADLINE = "close_at_deadline"
+OWN_DEADLINE = "own_deadline"
+_OWN_DEADLINE_SECONDS = 1.0
 _FAR_BEYOND = 86_400.0
 # How long the adapter of the fault above takes before it builds its host.
 _TAKES_ITS_TIME = 0.8
@@ -341,6 +386,74 @@ class _Run:
     last_output_tokens: int = 0
 
 
+# How long the process of a write host may take to say that it is ready. A
+# limit of its own: the start of that process is bound to the deadline of no
+# call. The toy states no allowance for its seam, so nothing of it may take
+# a share of a deadline of two seconds on a busy machine.
+_HOST_START_SECONDS = 60.0
+
+
+def _spawn_host(workspace: Path, *, leaves_a_process: bool) -> subprocess.Popen[bytes]:
+    """Start the process that runs the writes of one invocation."""
+
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            host_program.__name__,
+            str(workspace),
+            host_program.SCOPED,
+            *((host_program.LEAVES_A_PROCESS,) if leaves_a_process else ()),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+
+
+def _host_line(process: subprocess.Popen[bytes], until: float) -> dict[str, Any] | None:
+    """The next line of a host process, read before ``until``; ``None`` if none came."""
+
+    if process.stdout is None:
+        return None
+    remaining = max(0.0, until - time.monotonic())
+    ready, _, _ = select.select([process.stdout], [], [], remaining)
+    line = process.stdout.readline() if ready else b""
+    if not line:
+        return None
+    answer = json.loads(line)
+    return answer if isinstance(answer, dict) else {}
+
+
+def _end_host(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    process.wait(timeout=10)
+    for stream in (process.stdin, process.stdout):
+        if stream is not None:
+            stream.close()
+
+
+def _host_ready(process: subprocess.Popen[bytes]) -> int | None:
+    """Wait until the host says that it is ready, under the guard; what it left.
+
+    A host that does not say so in time, or not under the network guard of
+    the matrix, is ended, and that is an error of the matrix.
+    """
+
+    said = _host_line(process, time.monotonic() + _HOST_START_SECONDS)
+    ready = None if said is None else said.get(host_program.READY)
+    stated = ready if isinstance(ready, dict) else {}
+    if stated.get(host_program.GUARDED) is not True:
+        _end_host(process)
+        raise MatrixSetupError(
+            "the toy's write host did not say that it runs under the network "
+            f"guard of the matrix: it said {ready!r}"
+        )
+    left = stated.get(host_program.LEFT)
+    return left if isinstance(left, int) else None
+
+
 class WriteHost:
     """The toy's own process for the writes of one invocation.
 
@@ -353,6 +466,12 @@ class WriteHost:
     a liar: the process starts another, in a session of its own, which the
     kill of the host does not reach (:attr:`left` names it for the driver's
     last resort).
+
+    The deadline of the invocation binds the writes: the answer to one is
+    read before it. It does not bind the start of the process, which has a
+    limit of its own; ``ready`` is a process that was started before the
+    call and has said that it is ready, with what it left, and the host
+    takes it instead of starting one.
     """
 
     def __init__(
@@ -361,10 +480,12 @@ class WriteHost:
         *,
         invocation_deadline: float,
         leaves_a_process: bool = False,
+        ready: tuple[subprocess.Popen[bytes], int | None] | None = None,
     ) -> None:
         self._workspace = workspace
         self._deadline = float(invocation_deadline)
         self._leaves_a_process = leaves_a_process
+        self._ready = ready
         self._process: subprocess.Popen[bytes] | None = None
         self._pid: int | None = None
         self._started: list[str] = []
@@ -379,49 +500,34 @@ class WriteHost:
         return tuple(self._started)
 
     def start(self) -> None:
-        self._process = subprocess.Popen(
-            [
-                sys.executable,
-                "-B",
-                "-m",
-                host_program.__name__,
-                str(self._workspace),
-                host_program.SCOPED,
-                *((host_program.LEAVES_A_PROCESS,) if self._leaves_a_process else ()),
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-        )
-        self._pid = self._process.pid
-        ready = self._answer().get(host_program.READY)
-        said = ready if isinstance(ready, dict) else {}
-        left = said.get(host_program.LEFT)
-        self.left = left if isinstance(left, int) else None
-        if said.get(host_program.GUARDED) is not True:
+        ready, self._ready = self._ready, None
+        if ready is not None:
+            self._process, self.left = ready
+            self._pid = self._process.pid
+            return
+        process = _spawn_host(self._workspace, leaves_a_process=self._leaves_a_process)
+        self._process, self._pid = process, process.pid
+        try:
+            self.left = _host_ready(process)
+        except MatrixSetupError:
             self.stop()
-            raise MatrixSetupError(
-                "the toy's write host did not say that it runs under the network "
-                f"guard of the matrix: it said {ready!r}"
-            )
+            raise
 
     def _answer(self) -> dict[str, Any]:
-        """The next line of the host, read before the deadline of the invocation."""
+        """The answer of the host to a write, read before the deadline of the invocation."""
 
         process = self._process
         if process is None or process.stdout is None:
             raise MatrixSetupError("the toy's write host was not started")
-        remaining = max(0.0, self._deadline - time.monotonic())
-        ready, _, _ = select.select([process.stdout], [], [], remaining)
-        line = process.stdout.readline() if ready else b""
-        if not line:
+        answer = _host_line(process, self._deadline)
+        if answer is None:
             self.stop()
             raise MatrixSetupError(
                 "the toy's write host did not answer before the deadline of its "
                 "invocation, or it ended: the scenario that needs either adds "
                 "the behaviour with its liar"
             )
-        answer = json.loads(line)
-        return answer if isinstance(answer, dict) else {}
+        return answer
 
     def dispatch(self, name: str, arguments: Mapping[str, Any]) -> str:
         process = self._process
@@ -435,14 +541,8 @@ class WriteHost:
 
     def stop(self) -> None:
         process, self._process = self._process, None
-        if process is None:
-            return
-        if process.poll() is None:
-            process.kill()
-        process.wait(timeout=10)
-        for stream in (process.stdin, process.stdout):
-            if stream is not None:
-                stream.close()
+        if process is not None:
+            _end_host(process)
 
 
 class HonestBackend:
@@ -484,6 +584,9 @@ class HonestBackend:
         # writes of the invocation in flight.
         self._workspace = workspace
         self._host: WriteHost | None = None
+        # The process for the writes of the next call, started when a writer
+        # is attached and ready before the call begins, with what it left.
+        self._ready_host: tuple[subprocess.Popen[bytes], int | None] | None = None
         # What a stopped host left running (the fault of a liar), for reap().
         self._left: list[int] = []
         self._calls = 0
@@ -493,6 +596,11 @@ class HonestBackend:
         # the toy keeps them itself, as a vendor tool keeps its sessions. No
         # scenario opens one, so it holds none.
         self._conversations: dict[str, Any] = {}
+        # Set by close(): the call in flight is cancelled. And the request
+        # in flight, which a route that can cut a call ends from close().
+        self._cancel = threading.Event()
+        self._inflight: http.client.HTTPConnection | None = None
+        self._inflight_lock = threading.Lock()
 
     # -- protocol surface ---------------------------------------------------
 
@@ -509,6 +617,33 @@ class HonestBackend:
         validate_toolset_capability(self.capability, toolset)  # type: ignore[arg-type]
         self._toolset = toolset
         self._context_budget = context_budget if toolset is not None else None
+        self._ready_the_host()
+
+    def _ready_the_host(self) -> None:
+        """Start the process for the writes of the next call, where it may write.
+
+        Before the call, not inside it: the start of an interpreter is no
+        part of what the toy does within a deadline, and the toy states no
+        allowance for it. The host of the call is still built at its first
+        write, with the deadline of that call, and takes this process.
+        """
+
+        self._drop_ready_host()
+        writes = getattr(self._toolset, "write_names", ())
+        if not writes or self._workspace is None or WRITE_IN_PROCESS in self._faults:
+            return
+        process = _spawn_host(
+            self._workspace, leaves_a_process=HOST_LEAVES_A_PROCESS in self._faults
+        )
+        self._ready_host = (process, _host_ready(process))
+
+    def _drop_ready_host(self) -> None:
+        ready, self._ready_host = self._ready_host, None
+        if ready is not None:
+            process, left = ready
+            _end_host(process)
+            if left is not None:
+                self._left.append(left)
 
     def children(self) -> tuple[int, ...]:
         return tuple(child.pid for child in self._children)
@@ -520,13 +655,36 @@ class HonestBackend:
         if LATE_REQUEST in self._faults and self._closes == 1:
             self._send("POST", ToyDialect.path, {"model": self.model}, 5.0)
         self._closed = True
+        self._cancel_call()
+        self._drop_ready_host()
         if LEAVE_CHILD not in self._faults and LEAVE_LISTENER not in self._faults:
             self.reap()
+
+    def _cuts(self) -> bool:
+        """Whether the route can cut a call: a stalled request, a blocked handler."""
+
+        return self._profile.cancellation in _CUTS
+
+    def _cancel_call(self) -> None:
+        """Cancel the call in flight, as far as the route's declared class reaches."""
+
+        if self._profile.cancellation == "unsupported" or IGNORE_CLOSE in self._faults:
+            return
+        self._cancel.set()
+        if not self._cuts() or CLOSE_AT_DEADLINE in self._faults:
+            return  # the call hears of it between two of its steps
+        with self._inflight_lock:
+            connection = self._inflight
+        sock = None if connection is None else connection.sock
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
 
     def reap(self) -> None:
         """Stop and close whatever this backend started (the driver's last resort)."""
 
         self._stop_host()
+        self._drop_ready_host()
         for pid in self._left:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
@@ -645,6 +803,8 @@ class HonestBackend:
         agent = ToyDialect.user_agent
         if FOREIGN_USER_AGENT in self._faults:
             agent = "python-requests/2"
+        with self._inflight_lock:
+            self._inflight = connection
         try:
             connection.request(
                 method,
@@ -662,6 +822,8 @@ class HonestBackend:
             payload = json.loads(response.read().decode("utf-8"))
             return response.status, payload
         finally:
+            with self._inflight_lock:
+                self._inflight = None
             connection.close()
 
     def _dump(self, record: Mapping[str, Any]) -> None:
@@ -749,6 +911,8 @@ class HonestBackend:
             return self._result(run, final="canned answer", stop="end_turn", error=None)
 
         timeout = float(policy.timeout_seconds or 60.0)
+        if OWN_DEADLINE in self._faults:
+            timeout = _OWN_DEADLINE_SECONDS  # not the one the policy states
         run.deadline = time.monotonic() + timeout
         results: list[dict[str, str]] = []
         turn = 0
@@ -880,6 +1044,17 @@ class HonestBackend:
     ) -> dict[str, Any] | InvocationResult:
         """One provider round: a reply to continue with, or the typed terminal."""
 
+        if GO_ON_AFTER_DEADLINE in self._faults and time.monotonic() >= run.deadline:
+            timeout = 5.0  # one more request although the deadline has passed
+        else:
+            # Between two steps: a close that arrived, then the deadline.
+            over = self._over(run)
+            if over is not None:
+                return over
+            if IGNORE_DEADLINE in self._faults:
+                timeout = 3600.0  # the request is bound to no deadline
+            else:
+                timeout = min(timeout, max(run.deadline - time.monotonic(), 0.05))
         body = self._body(run, turn, results, tools, finalize=finalize)
         self._dump({"turn": turn, "request": body})
         run.rounds += 1
@@ -890,10 +1065,21 @@ class HonestBackend:
             if GET_BEFORE_TURN in self._faults:
                 self._send("GET", "/toy/v1/models", None, timeout)
             status, reply = self._post(body, timeout)
+        except TimeoutError:
+            # The provider had not answered when the deadline of the
+            # invocation passed. A route that stops only between two steps
+            # hears of a close here.
+            if self._cancel.is_set():
+                return self._cancelled(run)
+            return self._timed_out(run)
         except (http.client.HTTPException, ConnectionError) as exc:
+            if self._cancel.is_set():
+                return self._cancelled(run)  # close() ended the request
             # The connection went away inside the reply.
             return self._dropped(run, bytes(getattr(exc, "partial", b"")))
         except OSError as exc:
+            if self._cancel.is_set():
+                return self._cancelled(run)  # close() ended the request
             run.usage_known = False
             return self._result(
                 run,
@@ -1021,6 +1207,57 @@ class HonestBackend:
                 message="the provider ended the reply at the output-token cap of the route",
                 retriable=False,
             ),
+        )
+
+    def _over(self, run: _Run) -> InvocationResult | None:
+        """The typed end of a call that was closed or is past its deadline, if it is."""
+
+        late = time.monotonic() >= run.deadline
+        if self._cancel.is_set() and (late or CLOSE_AT_DEADLINE not in self._faults):
+            return self._cancelled(run)
+        if late and IGNORE_DEADLINE not in self._faults:
+            return self._timed_out(run)
+        return None
+
+    def _timed_out(self, run: _Run) -> InvocationResult:
+        """The call ended at the deadline of its invocation: nothing ended the turn."""
+
+        run.usage_known = False
+        if NO_DEADLINE_EVENT not in self._faults:
+            run.events.append(("limit", "deadline"))
+        return self._result(
+            run,
+            final="",
+            stop="error" if TIMEOUT_AS_GENERIC_ERROR in self._faults else "timeout",
+            error=TransportError(
+                message="the call passed the deadline of its invocation", retriable=False
+            ),
+            ended=False,
+        )
+
+    def _cancelled(self, run: _Run) -> InvocationResult:
+        """The call was closed from another thread: its cancellation, or the raise."""
+
+        faults = self._faults
+        message = "the toy backend was closed during the call"
+        if RETRY_AFTER_CANCEL in faults:
+            with contextlib.suppress(OSError, http.client.HTTPException):
+                self._post(self._body(run, 1, [], self._tool_names(run)), 5.0)
+        policy = run.invocation.policy
+        if policy is not None and policy.on_cancellation == "raise":
+            if RAISE_OTHER_ON_CANCEL in faults:
+                raise RuntimeError(message)
+            if CONVERT_CANCELLATION not in faults:
+                raise asyncio.CancelledError(message)
+        run.usage_known = False
+        if NO_CANCELLATION_EVENT not in faults:
+            run.events.append(("cancellation", "close"))
+        return self._result(
+            run,
+            final="",
+            stop="cancelled",
+            error=ExternalCancellation(cause="close", message=message, retriable=False),
+            ended=False,
         )
 
     def _broken(self, run: _Run, message: str, *, final: str = "") -> InvocationResult:
@@ -1216,20 +1453,61 @@ class HonestBackend:
         )
         if events:
             run.events.append(("tool_call", name))
-        hosted = (
-            name in getattr(self._toolset, "write_names", ())
-            and WRITE_IN_PROCESS not in self._faults
-        )
-        try:
+        writes = name in getattr(self._toolset, "write_names", ())
+        hosted = writes and WRITE_IN_PROCESS not in self._faults
+
+        def handed() -> str:
             if hosted:
-                text = self._hosted_write(run, name, arguments)
-            else:
-                text = self._toolset.dispatch(name, arguments)
+                return self._hosted_write(run, name, arguments)
+            return str(self._toolset.dispatch(name, arguments))
+
+        try:
+            text = self._run_tool(run, handed)
         except ToolDispatchBudgetExceeded as exc:
             return self._dispatch_budget_stop(run, turn, exc)
+        if isinstance(text, InvocationResult):
+            return text
         if events:
             run.events.append(("tool_result", name))
-        return self._bounded(run, str(text))
+        return self._bounded(run, text)
+
+    def _run_tool(self, run: _Run, call: Any) -> str | InvocationResult:
+        """Run one tool call: the text it returned, or the typed end of the call.
+
+        A route that can cut a call runs the handler on a thread it can
+        leave behind, and leaves it there when the call is closed or passes
+        its deadline: it returns while the handler still blocks. A route
+        that stops only between two steps waits for the handler and looks at
+        both once it has returned.
+        """
+
+        if not self._cuts():
+            text: str = call()
+            if GO_ON_AFTER_DEADLINE in self._faults:
+                return text
+            over = self._over(run)
+            if over is not None:
+                return over
+            return text
+        box: dict[str, Any] = {}
+
+        def target() -> None:
+            try:
+                box["text"] = call()
+            except BaseException as exc:  # noqa: BLE001 - handed to the calling thread
+                box["error"] = exc
+
+        thread = threading.Thread(target=target, name="matrix-toy-tool-call", daemon=True)
+        thread.start()
+        while thread.is_alive():
+            thread.join(0.01)
+            over = self._over(run) if thread.is_alive() else None
+            if over is not None:
+                return over  # the handler is left behind
+        error = box.get("error")
+        if error is not None:
+            raise error
+        return str(box["text"])
 
     def _handed_on(self, name: str, arguments: Any) -> str:
         """Hand the ToolSet something that is no argument object; tell the model what comes back."""
@@ -1256,10 +1534,12 @@ class HonestBackend:
                 deadline = time.monotonic() + float(
                     run.invocation.policy.timeout_seconds or 60.0
                 )
+            ready, self._ready_host = self._ready_host, None
             self._host = WriteHost(
                 self._workspace,
                 invocation_deadline=deadline,
                 leaves_a_process=HOST_LEAVES_A_PROCESS in self._faults,
+                ready=ready,
             )
             self._host.start()
         text = self._host.dispatch(name, arguments)
@@ -1431,11 +1711,8 @@ class _Bound:
     secrets: tuple[str, ...] = (TOY_SESSION_TOKEN,)
     tool_path: Literal["function_call", "mcp_bridge", "control_channel"] = "function_call"
 
-    def cancel_when(self, marker: str) -> None:
-        raise MatrixSetupError(
-            f"the toy dialect has no marker {marker!r}: cancellation scenarios add "
-            "it with their liars"
-        )
+    def cancel_when(self, marker: str) -> Cancellation:
+        return close_when(self.provider, self.backend, marker)
 
     def children(self) -> tuple[int, ...]:
         return self.backend.children()
@@ -1453,6 +1730,7 @@ class ToyDriver:
         "DNS and TLS",
     )
     private_seams: tuple[str, ...] = ()
+    startup_seconds: float = 0.0  # the client of the toy lives in the test process
     inexpressible: Mapping[str, str] = {}
     envelopes: tuple[str, ...] = ()  # the toy dialect renders its own replies
 
@@ -2109,6 +2387,93 @@ LIARS: tuple[Liar, ...] = (
             "text:mismatch",
         ),
         ("C2", "C3", "C4", "C6", "S"),
+    ),
+    # A call that ended at its deadline, by a stall of the provider or while
+    # a tool handler blocked, and a call that close() ended. One liar for
+    # each flag such a result is expected to flag false, on every form: the
+    # flag returned true, and nothing else of the result changed.
+    *(
+        _liar(scenario, fault, (f"flag:{flag}=True",), (clause,))
+        for scenario in ("S15", "S16a", "S30a", "S30c")
+        for fault, flag, clause in (
+            (CLAIM_TOKENS_OF_A_BROKEN_TURN, "token_usage_complete", "C6"),
+            (CLAIM_COST_OF_A_BROKEN_TURN, "cost_complete", "C6"),
+            (CLAIM_TERMINAL_OF_A_BROKEN_TURN, "terminal_complete", "C4"),
+        )
+    ),
+    # The stop of a deadline is named a generic error; the result holds no
+    # limit event; the error is marked retriable.
+    *(
+        _liar(scenario, TIMEOUT_AS_GENERIC_ERROR, ("stop:error!=timeout",), ("C3",))
+        for scenario in ("S15", "S16a")
+    ),
+    _liar("S15", NO_DEADLINE_EVENT, ("event.missing:limit/deadline",), ("S",)),
+    _liar("S15", RETRIABLE_ERROR, ("retriable:True",), ("C2",)),
+    # A route that stops only between two steps goes on after the handler
+    # has returned although the deadline passed meanwhile: a request after
+    # the handler was released, answered by nothing the script holds.
+    _liar(
+        "S16a",
+        GO_ON_AFTER_DEADLINE,
+        (
+            "request.extra",
+            "stop:error!=timeout",
+            "event.missing:limit/deadline",
+            "flag:terminal_complete=True",
+        ),
+        ("C0", "C3", "C4", "S"),
+        needs={"cancellation": "boundary_only"},
+    ),
+    # A close that the adapter does not hear: the call ends at its deadline
+    # and returns the result of one, and on a route that declares that it
+    # can cut a call it was not cut. A cancellation that is followed by
+    # another request, and one whose trace holds no event of that kind.
+    *(
+        _liar(
+            scenario,
+            IGNORE_CLOSE,
+            (
+                "kind:transport!=cancellation",
+                "stop:timeout!=cancelled",
+                "event.missing:cancellation/-",
+                "return:not_cut",
+            ),
+            ("C2", "C3", "S"),
+            needs={"cancellation": "process_kill"},
+        )
+        for scenario in ("S30a", "S30c")
+    ),
+    _liar("S30a", RETRY_AFTER_CANCEL, ("request.extra",), ("C0",)),
+    _liar("S30a", NO_CANCELLATION_EVENT, ("event.missing:cancellation/-",), ("S",)),
+    # The policy asks for the cancellation to be raised: a result in its
+    # place deviates, and so does another type.
+    _liar("S30b", CONVERT_CANCELLATION, ("kind:cancellation!=raised",), ("S",)),
+    _liar("S30b", RAISE_OTHER_ON_CANCEL, (f"raise:RuntimeError{_RAISE}",), ("C1",)),
+    # When the call returns. A deadline of the adapter's own, shorter than
+    # the one the policy states: the result is the one a deadline owes, and
+    # it comes before the deadline. A close that is noted and acted on only
+    # at the deadline of the call, on a route that declares that it can cut
+    # a call: the result is the cancellation the scenario asks (or its
+    # raise), and nothing was cut.
+    *(
+        _liar(
+            scenario,
+            OWN_DEADLINE,
+            ("return:early",),
+            ("S",),
+            needs={"cancellation": "process_kill"},
+        )
+        for scenario in ("S15", "S16a")
+    ),
+    *(
+        _liar(
+            scenario,
+            CLOSE_AT_DEADLINE,
+            ("return:not_cut",),
+            ("S",),
+            needs={"cancellation": "process_kill"},
+        )
+        for scenario in ("S30a", "S30b", "S30c")
     ),
     # A writer: the write runs in the process of the adapter; the process
     # that ran it is still there when the call has returned; it is gone and a

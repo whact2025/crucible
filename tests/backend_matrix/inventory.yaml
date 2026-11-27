@@ -109,38 +109,40 @@ schema_version: crucible.backend-matrix.inventory.v1
 
 cell_counts:
   # The starter set and pack A (17 cells) and, of pack B, S02, S05, S06, S10b,
-  # S14, S17, S24, S25, S26, S27, S28, S41, S44, S45, S50 and S51 on each toy
-  # column. There are five toy columns: one for every combination of the
-  # declared values that govern a scenario.
-  toy: 165
+  # S14, S15, S16a, S17, S24, S25, S26, S27, S28, S30a, S30b, S30c, S41, S44,
+  # S45, S50 and S51 on each toy column. There are five toy columns: one for
+  # every combination of the declared values that govern a scenario.
+  toy: 190
   # Starter set (S00, and S01, S03, S04 in both lenses: 7 cells) and pack A
   # without the refusal part (9 cells), on each of the two columns; S02, S06,
-  # S10b, S14, S17, S24, S25, S26, S27, S28, S41, S44, S45, S50 and S51 on the
-  # primary column.
-  claude: 47
+  # S10b, S14, S15, S16a, S17, S24, S25, S26, S27, S28, S30a, S30b, S30c, S41,
+  # S44, S45, S50 and S51 on the primary column.
+  claude: 52
   # Starter set (7 cells), pack A with one form of refusal, the policy
-  # error (8 cells), and S02, S06, S10b, S14, S17, S25, S26, S27, S28, S41,
-  # S44, S45, S50 and S51, on the one column; S24 is pinned not expressible.
-  "codex:legacy": 29
+  # error (8 cells), and S02, S06, S10b, S14, S15, S16a, S17, S25, S26, S27,
+  # S28, S30a, S30b, S30c, S41, S44, S45, S50 and S51, on the one column; S24
+  # is pinned not expressible.
+  "codex:legacy": 34
   # Starter set (7 cells), pack A with one form of refusal, the policy
-  # error (8 cells), and S02, S06, S10b, S14, S17, S25, S26, S27, S28, S41,
-  # S44, S45, S50 and S51, on the one column; S24 is pinned not expressible.
-  "codex:official": 29
+  # error (8 cells), and S02, S06, S10b, S14, S15, S16a, S17, S25, S26, S27,
+  # S28, S30a, S30b, S30c, S41, S44, S45, S50 and S51, on the one column; S24
+  # is pinned not expressible.
+  "codex:official": 34
   # Starter set (7 cells), pack A (10 cells) and S02, S05, S06, S10b, S14,
-  # S17, S24, S25, S26, S27, S28, S41, S44, S45, S50 and S51 on the one
-  # column.
-  deepseek: 33
+  # S15, S16a, S17, S24, S25, S26, S27, S28, S30a, S30b, S30c, S41, S44, S45,
+  # S50 and S51 on the one column.
+  deepseek: 38
   # Starter set and pack A on the two diagnostic columns (17 each) and S02,
-  # S05, S06, S10b, S14, S17, S24, S25, S26, S27, S28, S41, S44, S45, S50 and
-  # S51 on the primary one; S00, S01 in both lenses and S51 on the blocked
-  # column.
-  kimi: 54
+  # S05, S06, S10b, S14, S15, S16a, S17, S24, S25, S26, S27, S28, S30a, S30b,
+  # S30c, S41, S44, S45, S50 and S51 on the primary one; S00, S01 in both
+  # lenses and S51 on the blocked column.
+  kimi: 59
   # Starter set (7 cells) and pack A (10 cells) on each column; S02, S05,
-  # S06, S10b, S14, S17, S24, S25, S26, S27, S41, S44, S45, S50 and S51 on the
-  # primary column of each kind, and S28 on that of the local kind: it is
-  # pinned not expressible on the hosted one.
-  "openai_compat:hosted": 49
-  "openai_compat:local": 33
+  # S06, S10b, S14, S15, S16a, S17, S24, S25, S26, S27, S30a, S30b, S30c, S41,
+  # S44, S45, S50 and S51 on the primary column of each kind, and S28 on that
+  # of the local kind: it is pinned not expressible on the hosted one.
+  "openai_compat:hosted": 54
+  "openai_compat:local": 38
 
 not_evaluated:
   - scenario: S00
@@ -445,6 +447,127 @@ column_wide_not_owed:
       The scenario is a reply answered under another model than the route
       asked for, whose price is not the route's, so it expects the cost flag
       false: the check that reports this code is not asked of its result.
+  # The deadline and the cancellation scenarios (S15, S16a, S30a, S30b,
+  # S30c) on the kinds that carry a column-wide code. A cell whose own
+  # entry holds a raise out of the call needs no row.
+  - cell: kimi/S15/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: kimi/S15/primary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: kimi/S30a/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: kimi/S30a/primary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: kimi/S30c/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: kimi/S30c/primary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: kimi/S30b/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The variant of the scenario that the route selects expects the
+      cancellation to be raised and no result, so no clause about a result
+      applies to the cell.
+  - cell: kimi/S30b/primary/raw
+    code: "flag:cost_complete=False"
+    reason: >-
+      The variant of the scenario that the route selects expects the
+      cancellation to be raised and no result, so no clause about a result
+      applies to the cell.
+  - cell: codex:official/S15/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: codex:official/S15/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects the cost flag false:
+      pricing evidence is asked only of a result that may flag its cost
+      complete.
+  - cell: codex:official/S16a/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: codex:official/S16a/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects the cost flag false:
+      pricing evidence is asked only of a result that may flag its cost
+      complete.
+  - cell: codex:official/S30a/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: codex:official/S30a/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects the cost flag false:
+      pricing evidence is asked only of a result that may flag its cost
+      complete.
+  - cell: codex:official/S30c/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects both accounting flags
+      false: the check that reports this code is not asked of its result.
+  - cell: codex:official/S30c/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The scenario is a call that ends at its deadline or by close() before
+      its turn reached a terminal, so it expects the cost flag false:
+      pricing evidence is asked only of a result that may flag its cost
+      complete.
+  - cell: codex:official/S30b/primary/raw
+    code: "flag:token_usage_complete=False"
+    reason: >-
+      The variant of the scenario that the route selects expects the
+      cancellation to be raised and no result, so no clause about a result
+      applies to the cell.
+  - cell: codex:official/S30b/primary/raw
+    code: "pricing:unreconciled"
+    reason: >-
+      The variant of the scenario that the route selects expects the
+      cancellation to be raised and no result, so no clause about a result
+      applies to the cell.
+  - cell: deepseek/S30b/primary/raw
+    code: "digest.missing:feature_profile"
+    reason: >-
+      The variant of the scenario that the route selects expects the
+      cancellation to be raised and no result, so no clause about a result
+      applies to the cell.
 
 worker_skip_files: {}
 

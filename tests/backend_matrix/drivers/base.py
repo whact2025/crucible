@@ -11,6 +11,8 @@ belongs to the shared runner.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -55,7 +57,8 @@ class Bound(Protocol):
     log_dirs: tuple[Path, ...]
     secrets: tuple[str, ...]
 
-    def cancel_when(self, marker: str) -> None: ...
+    def cancel_when(self, marker: str) -> Cancellation:
+        """Close the backend from another thread when the cell reaches ``marker``."""
 
     def children(self) -> tuple[int, ...]: ...
 
@@ -69,6 +72,20 @@ class Driver(Protocol):
     fidelity: Literal["wire", "worker_protocol"]
     bypassed_layers: tuple[str, ...]
     private_seams: tuple[str, ...]
+    # How long the seam of the kind may need before a first request of a call
+    # reaches the provider, in seconds and with a wide margin for a busy
+    # machine: zero where the client lives in the test process and nothing is
+    # started for a call, the start of a scripted tool where the route starts
+    # one, and the start of a locked worker interpreter where one is started
+    # for every provider request. A scenario that plays a deadline is called
+    # with its own deadline plus this, so that on every kind the request is
+    # on the wire, and a tool handler entered, before the deadline; a cell
+    # in which they were not is not judged, it fails with its times. Where
+    # a route stops a call only between two steps, the cell also holds a
+    # handler this much longer than the deadline before it lets it go: an
+    # adapter may count its deadline from a moment of its own inside this
+    # time, the start of its worker.
+    startup_seconds: float
 
     @property
     def inexpressible(self) -> Mapping[str, str]:
@@ -195,6 +212,57 @@ def at_the_call(bound: Bound) -> None:
     step = getattr(bound, "before_call", None)
     if step is not None:
         step()
+
+
+class Cancellation:
+    """One ``close()`` of a backend from another thread, armed for a moment of the cell.
+
+    The thread waits until the provider side of the cell has noted the
+    marker, then calls ``close()`` once. ``closed_at`` is when it called, on
+    the monotonic clock, and ``raised`` what that call raised. A cell whose
+    call returned before the moment came disarms it; nothing is closed then.
+    """
+
+    def __init__(self, provider: LoopbackProvider, backend: Any, marker: str) -> None:
+        self.marker = marker
+        self.closed_at: float | None = None
+        self.raised: BaseException | None = None
+        self._reached = provider.reached(marker)
+        self._disarmed = threading.Event()
+        self._backend = backend
+        self._thread = threading.Thread(
+            target=self._run, name=f"matrix-close-at-{marker}", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._reached.wait(0.01):
+            if self._disarmed.is_set():
+                return
+        if self._disarmed.is_set():
+            return
+        self.closed_at = time.monotonic()
+        try:
+            self._backend.close()
+        except BaseException as exc:  # noqa: BLE001 - observed by the cell as a raise of close()
+            self.raised = exc
+
+    def disarm(self) -> None:
+        """The call is over: a moment that has not come is not acted on any more."""
+
+        self._disarmed.set()
+
+    def settled(self, timeout: float) -> bool:
+        """Wait for the thread; whether it ended in time."""
+
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+
+def close_when(provider: LoopbackProvider, backend: Any, marker: str) -> Cancellation:
+    """What every driver's ``cancel_when`` does: arm one close for ``marker``."""
+
+    return Cancellation(provider, backend, marker)
 
 
 def bind_as_routing(

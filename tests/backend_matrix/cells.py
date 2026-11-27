@@ -41,6 +41,7 @@ from .drivers import toy
 from .drivers.base import KeeperDriver, MatrixSetupError
 from .peers.claude_cli import JOINED, TOOL_REQUEST_FORMS
 from .scenarios import (
+    CONDUCTED,
     D_CDX_SERVED,
     D_COST_BOUND_UNRANKED,
     GUARDED,
@@ -1154,6 +1155,29 @@ def suite_limit(config: Any) -> float | None:
     return None
 
 
+def call_deadline(cell: str) -> float | None:
+    """The invocation deadline the cell is called with, in seconds; ``None`` for no cell.
+
+    The deadline of the scenario's policy. A scenario that plays a deadline
+    or a cancellation is called with its own plus what the driver of the
+    kind states as the time its seam needs before a request reaches the
+    provider, as the runner adds it. Which scenarios those are is read from
+    their list, and no plan is built for it: this runs for every cell when
+    the package is collected. It is the deadline of the call, not the time
+    the cell may take: where the cell lets a held handler go only after the
+    deadline, the call returns after that release.
+    """
+
+    kind, name, _role, _lens = ledger.parse_cell_id(cell)
+    scenario = SCENARIOS.get(name)
+    if scenario is None or not scenario.policy.timeout_seconds:
+        return None
+    deadline = float(scenario.policy.timeout_seconds)
+    if name in CONDUCTED and kind in drivers.load():
+        deadline += float(drivers.get(kind).startup_seconds)
+    return deadline
+
+
 def limit_long_cells(items: Sequence[Any], root: Path, limit: float | None) -> None:
     """Give the test item of a cell with a long invocation deadline a limit above it.
 
@@ -1172,8 +1196,7 @@ def limit_long_cells(items: Sequence[Any], root: Path, limit: float | None) -> N
         if root not in path.parents:
             continue
         cell = cell_of_item(path.stem, str(item.name))
-        scenario = None if cell is None else SCENARIOS.get(ledger.parse_cell_id(cell)[1])
-        deadline = None if scenario is None else scenario.policy.timeout_seconds
+        deadline = None if cell is None else call_deadline(cell)
         if deadline and deadline >= limit:
             item.add_marker(pytest.mark.timeout(deadline + LIMIT_MARGIN_SECONDS))
 

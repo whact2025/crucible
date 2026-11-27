@@ -51,8 +51,10 @@ import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, Mapping
@@ -2215,6 +2217,65 @@ def test_a_peer_that_goes_away_ends_its_output_in_order_or_is_killed_inside_a_li
     ended = gone("", "in order")
     assert ended.stdout.startswith(b"a whole line\n") and ended.returncode == 0
     assert b'"an answ' not in ended.stdout
+
+
+def test_a_tool_server_that_goes_away_inside_a_call_is_a_call_that_failed() -> None:
+    # A stand-in for a tool server on loopback. It takes the request of a
+    # call and then goes away: it closes the connection without a byte, or
+    # announces an answer in chunks and closes before the first one.
+    def server(reply: bytes) -> tuple[socket.socket, threading.Thread]:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+
+        def serve() -> None:
+            connection, _address = listener.accept()
+            with connection:
+                connection.settimeout(10.0)
+                received = b""
+                while b"\r\n\r\n" not in received:
+                    received += connection.recv(65536)
+                connection.sendall(reply)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return listener, thread
+
+    whole = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "read"}]}}
+    ).encode("utf-8")
+    answered = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(whole)}\r\nConnection: close\r\n\r\n".encode("ascii")
+        + whole
+    )
+    cut = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+    )
+    seen: dict[str, tuple[list[Any], bool]] = {}
+    for name, reply in (("answered", answered), ("reset", b""), ("cut", cut)):
+        listener, thread = server(reply)
+        try:
+            port = listener.getsockname()[1]
+            tools = peer_program.ToolServer("a-server", f"http://127.0.0.1:{port}/mcp", {})
+            seen[name] = tools.call("read_source", {"file_path": "a.py"})
+        finally:
+            thread.join(10.0)
+            listener.close()
+    # A server that answers: its content, and no error. The control of the
+    # two cases below.
+    assert seen["answered"] == ([{"type": "text", "text": "read"}], False)
+    # A server that goes away: the call failed, and the peer says so in the
+    # words of the transport. It does not end: a session whose tool server
+    # is closed under it goes on to its next model response, as the tool
+    # does, and the provider ledger of the cell then holds that request.
+    for name in ("reset", "cut"):
+        content, failed = seen[name]
+        assert failed is True, name
+        ((item,),) = (content,)
+        assert item["type"] == "text" and item["text"].startswith("the tool server went away (")
+    assert seen["reset"][0] != seen["cut"][0]
 
 
 def test_a_stream_without_its_terminal_and_a_cut_response_are_what_the_tool_sends() -> None:

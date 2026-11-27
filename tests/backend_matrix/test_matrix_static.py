@@ -41,7 +41,16 @@ from .columns import REAL_KINDS, TOY_KIND, WORKER_KINDS, Column
 from .contract import Deviation
 from .drivers import toy
 from .peers import launch, worker_harness
-from .scenarios import PACK_A, SCENARIOS
+from .scenarios import (
+    CONDUCTED,
+    CUT_CLEARANCE_SECONDS,
+    CUT_SECONDS,
+    DEADLINE_SECONDS,
+    EARLY_SECONDS,
+    GRACE_SECONDS,
+    PACK_A,
+    SCENARIOS,
+)
 from .script import ProviderScript
 
 LEDGER = ledger.load()
@@ -1813,11 +1822,30 @@ def test_every_scenario_passes_the_complete_base_policy() -> None:
     # busy processes share the thread. It is not about a deadline either
     # and passes the same one. The second form of the turn limit is the
     # limit under the policy that asks for no error.
-    exceptions = {
-        "S45": ("timeout_seconds", 600),
-        "S05": ("timeout_seconds", 600),
-        "S10b": ("on_max_turns", "continue_with_warning"),
+    # The scenarios that play a deadline pass their own, two seconds, to
+    # which the runner adds what the driver of the column states as the time
+    # its seam needs before a request reaches the provider. The forms of the
+    # cancellation pass a deadline too: a route that stops a call only
+    # between two steps returns the cancellation of a stalled request at the
+    # deadline, and a route without cancellation ends there as the stall
+    # does. Theirs lies the time of a cut beyond the other: a route that
+    # declares that it can cut a call is held to return within that time of
+    # the close() of the cell, and the deadline has to lie well beyond it
+    # for a call that ran on to its deadline to show. One of them asks for
+    # the cancellation to be raised.
+    played = {"timeout_seconds": DEADLINE_SECONDS}
+    closed = {"timeout_seconds": DEADLINE_SECONDS + CUT_SECONDS}
+    exceptions: dict[str, dict[str, Any]] = {
+        "S45": {"timeout_seconds": 600},
+        "S05": {"timeout_seconds": 600},
+        "S10b": {"on_max_turns": "continue_with_warning"},
+        "S15": played,
+        "S16a": played,
+        "S30a": closed,
+        "S30b": {**closed, "on_cancellation": "raise"},
+        "S30c": closed,
     }
+    assert DEADLINE_SECONDS == 2 and CUT_SECONDS == 3
     for scenario in SCENARIOS.values():
         policy = scenario.policy
         expected = {
@@ -1826,12 +1854,44 @@ def test_every_scenario_passes_the_complete_base_policy() -> None:
             "on_cancellation": "convert_to_backend_error",
             "on_max_turns": "raise",
         }
-        if scenario.id in exceptions:
-            name, value = exceptions[scenario.id]
+        for name, value in exceptions.get(scenario.id, {}).items():
             assert expected[name] != value
             expected[name] = value
         assert {name: getattr(policy, name) for name in expected} == expected, scenario.id
     assert set(exceptions) <= set(SCENARIOS)
+    # The deadline a cell of those forms is called with is the scenario's
+    # plus the allowance of its driver, which is stated per kind and is no
+    # part of what a cell owes; a cell of any other scenario is called with
+    # the policy of its scenario as it stands.
+    allowances = {kind: drivers.get(kind).startup_seconds for kind in drivers.load()}
+    assert all(0 <= value <= 30 for value in allowances.values()), allowances
+    # The toy starts nothing inside a call (the process of its writes is
+    # started when the writer is attached), so it states none.
+    assert allowances[TOY_KIND] == 0
+    conducted = {name for name in SCENARIOS if SCENARIOS[name].plan().conduct is not None}
+    assert conducted == set(exceptions) - {"S45", "S05", "S10b"} == CONDUCTED
+    # The times of such a cell, held against each other, on every kind.
+    # Where the call is held to a cut, a close() that came at the very end
+    # of the allowance still leaves the time of a cut and, beyond it, the
+    # deadline of the stall before the deadline of the call: more than the
+    # clearance a cell asks for, so a play whose seam kept the allowance is
+    # always judged, and a call that ran on to its deadline misses the time
+    # of a cut by seconds, never by a fraction of one. A result is early
+    # only by more than a tolerance that is well inside the deadline. And
+    # the bound for a call that hangs lies beyond all of it.
+    for name in ("S30a", "S30b", "S30c"):
+        cut = [SCENARIOS[name].plan().conduct.cut_seconds]  # type: ignore[union-attr]
+        assert cut == [CUT_SECONDS]
+        for kind, allowance in allowances.items():
+            called_with = cells.call_deadline(f"{kind}/{name}/primary/raw")
+            assert called_with == DEADLINE_SECONDS + CUT_SECONDS + allowance
+            assert called_with - (allowance + CUT_SECONDS) == DEADLINE_SECONDS
+    assert 0 < CUT_CLEARANCE_SECONDS <= DEADLINE_SECONDS / 2
+    assert 0 < EARLY_SECONDS <= DEADLINE_SECONDS / 4
+    assert GRACE_SECONDS > CUT_SECONDS + CUT_CLEARANCE_SECONDS
+    for name in ("S15", "S16a"):
+        base = SCENARIOS[name].plan().conduct
+        assert base is not None and base.not_before_deadline and base.cut_seconds is None
 
 
 class _CollectedItem:
@@ -1864,7 +1924,7 @@ def test_the_item_of_a_cell_with_a_long_deadline_has_a_limit_above_it(
     # failure that the verifier refuses for a cell the ledger expects to
     # fail. The item of such a cell gets a limit of its own at collection,
     # the deadline and a margin; today those are the cells of the two
-    # scenarios that pass another deadline than the base policy's.
+    # scenarios that pass a longer deadline than the base policy's.
     options = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["pytest"]
     configured = float(options["ini_options"]["timeout"])
     long = {
@@ -1908,10 +1968,37 @@ def test_the_item_of_a_cell_with_a_long_deadline_has_a_limit_above_it(
     cells.limit_long_cells([outside], PACKAGE, configured)
     assert outside.limits == []
     # Under a suite limit of a minute the base policy's deadline is not
-    # below it either: then every cell is such a cell, each with its own
-    # deadline and the margin.
+    # below it either: then every cell that is called with it is such a
+    # cell, each with its own deadline and the margin. The cells of the
+    # scenarios that play a deadline are called with a few seconds, the
+    # scenario's and the allowance of their driver, and stay as they are.
+    brief: dict[str, float] = {}
+    for cell in cells.behaviour_cells():
+        if cell.scenario in CONDUCTED:
+            called_with = cells.call_deadline(cell.id)
+            assert called_with is not None
+            brief[cell.id] = called_with
+    assert brief and all(2 <= value < 60 for value in brief.values())
+    first_toy = cells.toy_columns()[0].role
+    assert brief[f"{TOY_KIND}/S15/{first_toy}/raw"] == DEADLINE_SECONDS
+    assert brief[f"{TOY_KIND}/S30a/{first_toy}/raw"] == DEADLINE_SECONDS + CUT_SECONDS
+    assert all(
+        cells.call_deadline(cell.id) == SCENARIOS[cell.scenario].policy.timeout_seconds
+        for cell in cells.behaviour_cells()
+        if cell.id not in brief
+    )
     minute = limits(60.0)
-    assert set(minute) == {f"{cells.BEHAVIOUR_TEST}[{cell.id}]" for cell in cells.behaviour_cells()}
+    assert set(minute) == {
+        f"{cells.BEHAVIOUR_TEST}[{cell.id}]"
+        for cell in cells.behaviour_cells()
+        if cell.id not in brief
+    }
+    # Under a limit below the deadline such a cell is called with, it is a
+    # long cell too, with that deadline and the margin.
+    longest = max(brief, key=lambda name: brief[name])
+    assert limits(brief[longest])[f"{cells.BEHAVIOUR_TEST}[{longest}]"] == [
+        brief[longest] + cells.LIMIT_MARGIN_SECONDS
+    ]
     assert {name: value for name, value in minute.items() if name in expected} == expected
     assert {tuple(value) for name, value in minute.items() if name not in expected} == {
         (60 + cells.LIMIT_MARGIN_SECONDS,)

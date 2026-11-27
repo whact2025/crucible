@@ -61,7 +61,14 @@ from ..peers import codex_worker as stage
 from ..peers import launch
 from ..provider import LoopbackProvider, SeenRequest, answered_from, refused_from
 from ..script import ProviderScript
-from .base import GUARD_POLICY, Lens, MatrixSetupError, register
+from .base import (
+    GUARD_POLICY,
+    Cancellation,
+    Lens,
+    MatrixSetupError,
+    close_when,
+    register,
+)
 from .codex_legacy import (
     LOGIN_WORD,
     CodexAppServerDialect,
@@ -193,11 +200,8 @@ class _Bound:
     secrets: tuple[str, ...] = (LOGIN_WORD,)
     tool_path: Literal["function_call", "mcp_bridge", "control_channel"] = "mcp_bridge"
 
-    def cancel_when(self, marker: str) -> None:
-        raise MatrixSetupError(
-            f"the Codex driver has no marker {marker!r}: cancellation scenarios add "
-            "it with their liars"
-        )
+    def cancel_when(self, marker: str) -> Cancellation:
+        return close_when(self.provider, self.backend, marker)
 
     def children(self) -> tuple[int, ...]:
         # Every worker of the cell and every process a worker's SDK started.
@@ -224,6 +228,11 @@ class CodexOfficialDriver:
         f"{worker_client.__name__}.{_SUBPROCESS_SEAM}",
         f"{worker_client.__name__}.{_ASYNCIO_SEAM}",
     )
+    # One locked worker is started for the call, and it starts one scripted
+    # tool, which opens its session before the request of the turn: about a
+    # second on an idle machine, between five and six where the test shares
+    # one hardware thread with busy loops.
+    startup_seconds: float = 10.0
     faults: tuple[str, ...] = ()
 
     @property

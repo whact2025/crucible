@@ -24,6 +24,14 @@ A dialect of such a wire states what each request must replay
 exchange ends and the ledger keeps what it found, for the scenarios that
 attach a ToolSet.
 
+A request that is accepted and never answered (``Stall``) is held: the
+provider reads it, records it and keeps the connection open without a byte of
+reply, until the cell is over or the test lets it go. No clock of the
+provider ends it. On a wire whose requests come from a scripted tool the
+reply tells the tool to stall instead, and the tool keeps its session open
+and says nothing more. Either way the provider notes the moment under the
+marker the step names, for a cell that acts on it from another thread.
+
 A dialect may name a served model that differs from the requested one only
 for a ``ServedAs`` step. Anything else is a seam problem: a dialect that
 answers under a fixed id would switch off the "served equals requested"
@@ -42,6 +50,7 @@ import http.server
 import json
 import socketserver
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -58,6 +67,7 @@ from .script import (
     Refuse,
     Say,
     ServedAs,
+    Stall,
     Step,
     TokenUsage,
 )
@@ -67,6 +77,9 @@ UNSCRIPTED_STATUS = 409
 UNSCRIPTED_CODE = "matrix_unscripted_request"
 POLICY_ERROR_CODE = "content_policy_violation"
 PROBE_TEXT = "matrix probe answer"
+# The moment the provider notes when it has taken the first request of a
+# cell. No marker of a script step: a step names its own.
+FIRST_REQUEST_MARKER = "matrix:first-request"
 
 
 @dataclass(frozen=True)
@@ -215,6 +228,12 @@ class Reply:
     # Whether the argument text of ``call`` is no JSON object (its mapping is
     # then empty).
     call_malformed: bool = False
+    # The request is accepted and never answered: the provider keeps the
+    # connection open and sends nothing, until it is released.
+    held: bool = False
+    # The moment this reply stands for, noted when the provider has taken
+    # the request: what a cell waits for before it acts from another thread.
+    marker: str | None = None
 
 
 class Dialect(Protocol):
@@ -576,6 +595,10 @@ class ToyDialect:
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
+        if isinstance(step, Stall):
+            # The request is taken and never answered: nothing travels,
+            # nothing is billed and no model is named.
+            return Reply(200, None, held=True, marker=step.marker)
         if isinstance(step, Malformed):
             # A 200 whose document holds no turn: no type, no finish and no
             # usage. Nothing is billed for it.
@@ -747,6 +770,11 @@ class LoopbackProvider:
         self._closed_for_cell = False
         self._served_seam_reported = False
         self._frozen: ProviderLedger | None = None
+        # The moments of the cell that were reached, by marker, with the time
+        # on the monotonic clock; and whether held requests were let go.
+        self._marks: dict[str, threading.Event] = {}
+        self._marked_at: dict[str, float] = {}
+        self._released = threading.Event()
         if isinstance(self._dialect, CacheCountingDialect):
             self._ledger.cache_counts = []
         if isinstance(self._dialect, TurnControlDialect):
@@ -779,6 +807,13 @@ class LoopbackProvider:
                 reply = provider._handle(
                     self.command, self.path, dict(self.headers), body
                 )
+                if reply.held:
+                    # Accepted and never answered: the connection stays open
+                    # without a byte until the provider lets it go, then it
+                    # is closed. The other side sees no reply at all.
+                    provider._released.wait()
+                    self.close_connection = True
+                    return
                 payload = (
                     json.dumps(reply.body).encode("utf-8") if reply.raw is None else reply.raw
                 )
@@ -908,6 +943,9 @@ class LoopbackProvider:
             if self._probing:
                 self._ledger.probe_requests += 1
                 return self._dialect.render(Say(PROBE_TEXT), seen, "probe")
+            # The first request of the cell, scripted or not: a moment a
+            # cell that plays a deadline holds against that deadline.
+            self._mark(FIRST_REQUEST_MARKER)
             step = self._next_step(seen)
             if step is None:
                 self._ledger.requests.append(seen)
@@ -939,6 +977,8 @@ class LoopbackProvider:
                 self._ledger.cache_counts.append(stated)
             if reply.served_model is not None:
                 self._ledger.served_models.append(reply.served_model)
+            if reply.marker is not None:
+                self._mark(reply.marker)
             if reply.envelope is not None:
                 self._ledger.envelopes.append(reply.envelope)
             self._ledger.envelopes.extend(reply.envelopes)
@@ -970,6 +1010,39 @@ class LoopbackProvider:
                 continue
             count += 1
         return count
+
+    # -- the moments of a cell --------------------------------------------
+
+    def _mark(self, marker: str) -> None:
+        self._marked_at.setdefault(marker, time.monotonic())
+        self._marks.setdefault(marker, threading.Event()).set()
+
+    def reached(self, marker: str) -> threading.Event:
+        """The event that is set once the cell has reached ``marker``."""
+
+        with self._lock:
+            return self._marks.setdefault(marker, threading.Event())
+
+    def reached_at(self, marker: str) -> float | None:
+        """When ``marker`` was reached, on the monotonic clock; ``None`` if never."""
+
+        with self._lock:
+            return self._marked_at.get(marker)
+
+    def reach(self, marker: str) -> None:
+        """Note a moment that is not the provider's own to see.
+
+        The runner calls it where the moment a cell acts on is no request:
+        the entry of a tool handler it holds.
+        """
+
+        with self._lock:
+            self._mark(marker)
+
+    def release(self) -> None:
+        """Let every held request go: its connection is closed without a reply."""
+
+        self._released.set()
 
     # -- the cell's view -------------------------------------------------
 
@@ -1036,6 +1109,7 @@ class LoopbackProvider:
             return self._ledger.probe_requests, self._ledger.late_requests
 
     def close(self) -> None:
+        self.release()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5.0)

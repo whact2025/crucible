@@ -42,7 +42,14 @@ session of the cell is not played. And it goes away where a reply says so
 of a line the reply names, without a line end, and then either
 ends its output and exits with status 0, as a tool whose stream ends without
 the notification that ends the turn, or kills itself, as a tool that is gone
-in the middle of a response.
+in the middle of a response. And it stalls where a reply says so (``stall``):
+after the notifications of the reply it says nothing more of the turn, as a
+tool whose request the provider never answers. It keeps reading its input
+meanwhile and leaves when the input is closed or it is killed. A tool server
+that goes away inside a call (its connection is reset, or its answer ends
+before it is whole) is a call that failed: the peer feeds the transport's
+word into the next model response as the result of the call, with its error
+flag, as it does for a call the server answers with an error.
 
 The answers that open a session are not envelopes. They are the response
 shapes of the app-server protocol as the vendor's generated types state them
@@ -389,7 +396,20 @@ class ToolServer:
         if method == "tools/call":
             note["name"] = (params or {}).get("name")
         self.notes.append(note)
-        status, kind, body = self._post(message)
+        import http.client  # noqa: PLC0415 - the probe never needs it
+
+        try:
+            status, kind, body = self._post(message)
+        except TimeoutError:
+            # The peer's own limit for an answer ran out. That is no server
+            # that went away: the session could not be played, and says so.
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            # The tool server went away inside the request: its connection
+            # was reset, or its answer ended before it was whole. To the tool
+            # that is a request that failed, like one the server answered
+            # with an error, and it carries the transport's word as its text.
+            return {"error": {"message": f"the tool server went away ({type(exc).__name__})"}}
         if status >= 400:
             return {"error": {"message": f"the tool server answered HTTP {status}"}}
         for answer in _stream_messages(kind, body):
@@ -711,6 +731,31 @@ class AppServer:
         content, failed = server.call(str(call["name"]), call["arguments"])
         return {**record, "content": content, "is_error": failed}
 
+    def _stall(self) -> None:
+        """The provider never answers the response: nothing more is said of the turn.
+
+        The session stays open and silent. A notification of the client is
+        recorded; a request is one the peer does not play; the end of the
+        input ends the session as it always does.
+        """
+
+        while True:
+            message = self._read()
+            method = message.get("method")
+            if not isinstance(method, str):
+                continue
+            params = message.get("params")
+            notification = "id" not in message
+            self._requests.append(
+                {
+                    "method": method,
+                    "params": params if isinstance(params, dict) else {},
+                    "notification": notification,
+                }
+            )
+            if not notification:
+                self._refuse(message["id"], method)
+
     def _play(self) -> None:
         """Answer one turn: model responses and tool calls until the turn ends."""
 
@@ -743,6 +788,8 @@ class AppServer:
             gone = reply.get("gone")
             if isinstance(gone, dict):
                 raise _Gone(str(gone.get("partial", "")), bool(gone.get("killed")))
+            if reply.get("stall"):
+                self._stall()
             call = reply.get("call")
             if call is None:
                 return

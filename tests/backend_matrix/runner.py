@@ -11,8 +11,12 @@ ledger. The driver contributes the built backend and the provider side only.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import os
+import signal
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -46,6 +50,7 @@ from .contract import (
     ADMITTED,
     RETAINED,
     Admitted,
+    Conducted,
     Deviation,
     Mutation,
     Observation,
@@ -54,9 +59,26 @@ from .contract import (
     Report,
     SecondCall,
 )
-from .drivers.base import GUARD_POLICY, Bound, Driver, at_the_call
-from .provider import ProviderLedger
-from .scenarios import BASE_POLICY, SCENARIOS, SYSTEM, USER, Plan, plan_for
+from .drivers.base import GUARD_POLICY, Bound, Cancellation, Driver, at_the_call
+from .provider import FIRST_REQUEST_MARKER, ProviderLedger
+from .scenarios import (
+    BASE_POLICY,
+    CONDUCTED,
+    CUT_CLEARANCE_SECONDS,
+    EARLY_SECONDS,
+    GRACE_SECONDS,
+    HOLD_MARKER,
+    LEAVE_SECONDS,
+    RELEASE_AFTER_SECONDS,
+    SCENARIOS,
+    SETTLE_SECONDS,
+    STALL_MARKER,
+    SYSTEM,
+    USER,
+    Conduct,
+    Plan,
+    plan_for,
+)
 from .script import WRITE, Loop, ProviderScript, Say
 
 OUTCOMES: pytest.StashKey[dict[str, str]] = pytest.StashKey()
@@ -110,6 +132,295 @@ class _LogCapture(logging.Handler):
             logger == matrix_columns.ROUTING_LOGGER
             and matrix_columns.RETAINED_ROUTE in line
             for logger, line in zip(self.loggers[start:], self.lines[start:], strict=True)
+        )
+
+
+# How long after a missed bound the conductor waits before it ends what the
+# cell holds, so that a call that hangs is ended by the cell and reported with
+# its times, not by the limit of the suite: first the held handler and the
+# stalled request are let go, then the processes of the driver are killed.
+_LAST_RESORT_SECONDS = 8.0
+
+
+class _Conductor:
+    """What a cell does beside the call: a close from another thread, a held handler.
+
+    One thread per cell. It arms the close for the moment the scenario
+    names, lets the held handler go at the time the selected variant states
+    (or leaves that to the cell, which lets it go once the call has
+    returned), and watches the bound of the call. No clock of the conductor
+    ends a stall or a handler while the call is within its bound; past the
+    bound and a further wait it ends both, so that the cell can say what
+    happened. A play in which that last resort acted is not the scenario's:
+    the cell fails and says so.
+
+    When the call has returned the conductor also says whether the scenario
+    was played at all: the first request of the cell was taken, and a held
+    handler entered, before the deadline the call was made with, and where
+    the cell tells a call that is cut from one that ran on, its ``close()``
+    came early enough before that deadline. A play that is late there shows
+    what the seam of the kind did on a busy machine, and its codes are not
+    the scenario's.
+    """
+
+    def __init__(
+        self,
+        conduct: Conduct,
+        hold: toolsets.Hold | None,
+        bound: Bound,
+        deadline_seconds: float,
+        startup_seconds: float = 0.0,
+    ) -> None:
+        self._conduct = conduct
+        self._hold = hold
+        self._bound = bound
+        self._deadline_seconds = deadline_seconds
+        # What the driver states as the time its seam may need before a
+        # request reaches the provider. An adapter may count its deadline
+        # from a moment of its own inside that time (the start of a worker),
+        # so a handler that is to block past the deadline is held that much
+        # longer than the deadline counted from the call.
+        self._startup_seconds = startup_seconds
+        self._invoked_at = 0.0
+        self._returned_at: float | None = None
+        self._returned = threading.Event()
+        self._armed: Cancellation | None = None
+        self._while_held: bool | None = None
+        self._released_by: str | None = None
+        self._last_resort: list[str] = []
+        self._problems: list[str] = []
+        self._thread = threading.Thread(
+            target=self._run, name="matrix-conductor", daemon=True
+        )
+
+    # -- the bound ---------------------------------------------------------
+
+    def _moments(self) -> dict[str, float]:
+        """The moment of each bound of the call that has come, by its name."""
+
+        deadline = self._invoked_at + self._deadline_seconds
+        hold = self._hold
+        released = None if hold is None else hold.released_at
+        moments: dict[str, float] = {}
+        for name in self._conduct.bounds:
+            if name == "deadline":
+                moments[name] = deadline
+            elif name == "release":
+                # While the handler is held and the cell plans to let it go
+                # at a stated time, that time bounds the call: it is not
+                # late, and nothing is ended for it, before the plan of the
+                # cell has come.
+                planned = self._let_go_at() if released is None else released
+                if planned is not None:
+                    moments[name] = planned
+        return moments
+
+    def _latest(self) -> tuple[str, float]:
+        """The bound that ends first, and the last moment the call may return at.
+
+        A bound whose moment never came and is not planned (the handler was
+        never entered, the cell never closed the backend) bounds nothing;
+        the call is then held to its deadline, which every call has.
+        """
+
+        moments = self._moments() or {
+            "deadline": self._invoked_at + self._deadline_seconds
+        }
+        name = min(moments, key=lambda item: moments[item])
+        return name, moments[name] + GRACE_SECONDS
+
+    # -- the thread --------------------------------------------------------
+
+    def begin(self) -> None:
+        conduct, hold = self._conduct, self._hold
+        if hold is not None:
+            # The entry of the held handler is a moment of the cell that no
+            # request shows: the runner notes it where the stall is noted.
+            hold.on_entered(lambda: self._bound.provider.reach(HOLD_MARKER))
+        if conduct.close_at is not None:
+            marker = STALL_MARKER if conduct.close_at == "stall" else HOLD_MARKER
+            self._armed = self._bound.cancel_when(marker)
+        self._invoked_at = time.monotonic()
+        self._thread.start()
+
+    def _let_go_at(self) -> float | None:
+        """When the held handler is to be let go while the call runs; ``None``: not yet."""
+
+        hold, conduct = self._hold, self._conduct
+        if hold is None or hold.entered_at is None or conduct.release == "after_return":
+            return None
+        if conduct.release == "after_deadline":
+            return (
+                self._invoked_at
+                + self._deadline_seconds
+                + self._startup_seconds
+                + RELEASE_AFTER_SECONDS
+            )
+        closed = None if self._armed is None else self._armed.closed_at
+        return None if closed is None else closed + RELEASE_AFTER_SECONDS
+
+    def _let_go(self, by: str) -> None:
+        """Let the held handler go, and keep what let it go first."""
+
+        hold = self._hold
+        if hold is None:
+            return
+        if (
+            hold.entered_at is not None
+            and hold.released_at is None
+            and self._released_by is None
+        ):
+            self._released_by = by
+        hold.release()
+
+    def _run(self) -> None:
+        while not self._returned.wait(0.02):
+            now = time.monotonic()
+            let_go = self._let_go_at()
+            if let_go is not None and now >= let_go:
+                self._let_go("plan")
+            _name, latest = self._latest()
+            if not self._last_resort and now > latest + _LAST_RESORT_SECONDS:
+                # The call is far past its bound: end what the cell holds.
+                self._last_resort.append("let_go")
+                self._let_go("last_resort")
+                self._bound.provider.release()
+            elif (
+                self._last_resort == ["let_go"]
+                and now > latest + 2 * _LAST_RESORT_SECONDS
+            ):
+                self._last_resort.append("killed")
+                for pid in self._bound.children():
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(pid, signal.SIGKILL)
+
+    # -- the cell's side ---------------------------------------------------
+
+    def returned(self) -> None:
+        """The call has returned or raised: judge its bound, stop the thread."""
+
+        self._returned_at = time.monotonic()
+        hold = self._hold
+        if hold is not None and hold.entered_at is not None:
+            self._while_held = hold.released_at is None
+        name, latest = self._latest()
+        self._returned.set()
+        self._thread.join(5.0)
+        if self._armed is not None:
+            self._armed.disarm()
+        if self._returned_at > latest:
+            self._problems.append(
+                f"the call returned {self._returned_at - self._invoked_at:.1f} s after "
+                f"it began, {self._returned_at - (latest - GRACE_SECONDS):.1f} s after "
+                f"the moment that bounds it ({name}): more than the grace of "
+                f"{GRACE_SECONDS:g} s"
+            )
+        if self._last_resort:
+            self._problems.append(
+                "the call hung, and the last resort of the cell ended what the "
+                f"cell held ({', '.join(self._last_resort)}): what the call "
+                "returned after that is not the scenario's"
+            )
+        self._problems.extend(self._not_played())
+
+    def _not_played(self) -> list[str]:
+        """Why the play is not the scenario's: a moment of the cell that came too late.
+
+        The deadline counts from the call, and the allowance of the driver
+        is there so that the request is on the wire, and a held handler
+        entered, before it. On a machine that is busy enough they are not:
+        the call then ends at its deadline before the scenario has begun,
+        and what it returns reads like a deviation of the adapter. A moment
+        that never came is not judged here: that is the adapter's doing and
+        has its codes.
+        """
+
+        hold, armed = self._hold, self._armed
+        deadline = self._deadline_seconds
+        out: list[str] = []
+
+        def since(moment: float) -> float:
+            return moment - self._invoked_at
+
+        first = self._bound.provider.reached_at(FIRST_REQUEST_MARKER)
+        if first is not None and since(first) > deadline:
+            out.append(
+                f"the provider took the first request of the cell {since(first):.1f} s "
+                f"into a call made with a deadline of {deadline:g} s"
+            )
+        entered = None if hold is None else hold.entered_at
+        if entered is not None and since(entered) > deadline:
+            out.append(
+                f"the held handler was entered {since(entered):.1f} s into a call "
+                f"made with a deadline of {deadline:g} s"
+            )
+        cut = self._conduct.cut_seconds
+        closed = None if armed is None else armed.closed_at
+        if (
+            not out
+            and cut is not None
+            and closed is not None
+            and since(closed) + cut + CUT_CLEARANCE_SECONDS > deadline
+        ):
+            out.append(
+                f"the cell closed the backend {since(closed):.1f} s into a call made "
+                f"with a deadline of {deadline:g} s: too late to tell a call that "
+                f"is cut (it returns within {cut:g} s) from one that ran on to "
+                "its deadline"
+            )
+        return [
+            "the scenario was not played, the seam of the kind was too slow here "
+            f"(the driver allows {self._startup_seconds:g} s): {item}"
+            for item in out
+        ]
+
+    def settle(self) -> None:
+        """Let the held handler go, wait until it has left, then wait once more.
+
+        Called when the scripted exchange is over, so that a provider
+        request from here on is a request after the call, and before the
+        backend is closed: the cell closes no backend whose handler it still
+        holds.
+        """
+
+        hold = self._hold
+        if hold is not None:
+            self._let_go("return")
+            if hold.entered_at is not None:
+                if not hold.left.wait(LEAVE_SECONDS):
+                    self._problems.append(
+                        "the held handler had not left "
+                        f"{LEAVE_SECONDS:g} s after it was let go"
+                    )
+                time.sleep(SETTLE_SECONDS)
+        if self._armed is not None and not self._armed.settled(GRACE_SECONDS):
+            self._problems.append(
+                f"the close() of the cell had not returned {GRACE_SECONDS:g} s "
+                "after the call"
+            )
+
+    def close_raised(self) -> BaseException | None:
+        return None if self._armed is None else self._armed.raised
+
+    def conducted(self) -> Conducted:
+        hold, armed = self._hold, self._armed
+        assert self._returned_at is not None
+        return Conducted(
+            deadline_seconds=self._deadline_seconds,
+            invoked_at=self._invoked_at,
+            returned_at=self._returned_at,
+            first_request_at=self._bound.provider.reached_at(FIRST_REQUEST_MARKER),
+            stalled_at=self._bound.provider.reached_at(STALL_MARKER),
+            entered_at=None if hold is None else hold.entered_at,
+            released_at=None if hold is None else hold.released_at,
+            closed_at=None if armed is None else armed.closed_at,
+            where=None if hold is None else hold.where,
+            released_by=self._released_by,
+            last_resort=tuple(self._last_resort),
+            cut_seconds=self._conduct.cut_seconds,
+            early_seconds=EARLY_SECONDS if self._conduct.not_before_deadline else None,
+            returned_while_held=self._while_held,
+            problems=tuple(self._problems),
         )
 
 
@@ -284,10 +595,32 @@ def execute(
     plan = plan_for(
         scenario, declarations.select(scenario.differences, routed, states), differences
     )
+    conduct = plan.conduct
+    if (conduct is not None) != (scenario.id in CONDUCTED):
+        raise drivers.MatrixSetupError(
+            f"cell {cell.id}: the scenarios whose cells do something beside the "
+            f"call are {sorted(CONDUCTED)}, and the plan of {scenario.id} "
+            f"{'holds' if conduct is not None else 'holds no'} conduct: what a cell "
+            "is called with is read from that list"
+        )
+    hold = None if conduct is None or conduct.hold is None else toolsets.Hold(conduct.hold)
+    if hold is not None and scenario.toolset is None:
+        raise drivers.MatrixSetupError(
+            f"cell {cell.id}: the scenario holds a handler and attaches no ToolSet"
+        )
+    # A scenario that plays a deadline is called with its deadline plus the
+    # time the seam of the kind needs before a request can reach the provider.
+    policy = scenario.policy
+    if conduct is not None:
+        policy = replace(
+            policy,
+            timeout_seconds=float(policy.timeout_seconds or 0.0)
+            + float(played_by.startup_seconds),
+        )
     fixture = (
         None
         if scenario.toolset is None
-        else toolsets.build(scenario.toolset, tmp_path / toolsets.WORKSPACE)
+        else toolsets.build(scenario.toolset, tmp_path / toolsets.WORKSPACE, hold=hold)
     )
     # A route may ask a budget of every invocation (a closed extra of its
     # routing file). The cell is then called as the route asks, unless the
@@ -312,7 +645,7 @@ def execute(
         tools=None,
         max_turns=plan.max_turns,
         budget_usd=route_budget if plan.budget_usd is None else plan.budget_usd,
-        policy=scenario.policy,
+        policy=policy,
         response_schema=plan.response_schema,
         conversation=plan.conversation,
     )
@@ -328,6 +661,8 @@ def execute(
     started = time.monotonic()
     result = raised = terminal = second = declared = None
     hosted: Mutation | None = None
+    conductor: _Conductor | None = None
+    conducted: Conducted | None = None
     endpoint: str | None = None
     name = model = built_in = ""
     log_dirs: tuple[Path, ...] = ()
@@ -372,11 +707,24 @@ def execute(
                         fixture.toolset, context_budget=plan.context_budget
                     )
                 at_the_call(bound)
+                if conduct is not None:
+                    conductor = _Conductor(
+                        conduct,
+                        hold,
+                        bound,
+                        float(policy.timeout_seconds or 0.0),
+                        float(played_by.startup_seconds),
+                    )
+                    conductor.begin()
                 invoked_at = time.monotonic()
                 calling = True
-                result = backend.invoke(invocation)
-                calling = False
-                returned_at = time.monotonic()
+                try:
+                    result = backend.invoke(invocation)
+                    calling = False
+                finally:
+                    returned_at = time.monotonic()
+                    if conductor is not None:
+                        conductor.returned()
                 if hosts is not None:
                     # Read before close(): what is left of a host once the
                     # call has returned.
@@ -384,11 +732,13 @@ def execute(
                         hosts=hosts.at_return(),
                         invoked_at=invoked_at,
                         returned_at=returned_at,
-                        timeout_seconds=float(scenario.policy.timeout_seconds or 0.0),
+                        timeout_seconds=float(policy.timeout_seconds or 0.0),
                     )
             except (netguard.NetworkGuardViolation, drivers.MatrixSetupError):
                 raise  # the matrix's own failures are not observations
-            except Exception as exc:  # noqa: BLE001 - every raise is an observation
+            # A cancellation that the policy asks to be raised is no
+            # ``Exception``: it is caught by name, as the one raise it is.
+            except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - every raise is an observation
                 sent = bound is not None and bound.provider.request_count > 0
                 raised = Raised.from_exception(
                     exc,
@@ -405,11 +755,22 @@ def execute(
                 # From here on every provider request is a late request.
                 bound.provider.end_of_cell()
                 close_raised = None
+                if conductor is not None:
+                    # The held handler is let go and has left before the
+                    # backend is closed; what the close() of the cell raised
+                    # is a raise of close() like any other.
+                    conductor.settle()
+                    conducted = conductor.conducted()
+                    early = conductor.close_raised()
+                    if early is not None:
+                        close_raised = Raised.from_exception(early, phase="close")
                 for _ in range(2):  # a second close() must be a no-op
                     try:
                         bound.backend.close()
                     except Exception as exc:  # noqa: BLE001 - observed as C8
-                        close_raised = Raised.from_exception(exc, phase="close")
+                        close_raised = close_raised or Raised.from_exception(
+                            exc, phase="close"
+                        )
                         break
                 settlement = contract.settle(
                     baseline,
@@ -422,6 +783,8 @@ def execute(
                     settlement, late_requests=bound.provider.final_counts()[1]
                 )
     finally:
+        if hold is not None:
+            hold.release()  # whatever ended the cell: no handler stays held
         root_logger.setLevel(root_level)
         root_logger.removeHandler(capture)
     observation = Observation(
@@ -446,6 +809,7 @@ def execute(
         mutation=hosted,
         toolset_returned=() if fixture is None else tuple(fixture.returned),
         backend_module=built_in,
+        conducted=conducted,
     )
     reference = Reference(
         routed=routed,
@@ -771,6 +1135,15 @@ def run_cell(
         pytest.fail(
             f"cell {cell.id}: the driver seam is broken, so nothing this column "
             "shows is evidence: " + "; ".join(report.seam_problems),
+            pytrace=False,
+        )
+    conducted = execution.observation.conducted
+    if conducted is not None and conducted.problems:
+        # A wall-time bound has no code: a call that missed one fails its
+        # cell, whatever the ledger says of the cell.
+        pytest.fail(
+            f"cell {cell.id}: " + "; ".join(conducted.problems)
+            + f"\n{report.describe()}",
             pytrace=False,
         )
     if pins is None:
