@@ -173,10 +173,20 @@ _ALLOWED_EXTRA_FIELDS = {
         }
     ),
     "local": frozenset(
-        {"reasoning_effort", "max_tokens", "expected_served_model"}
+        {
+            "reasoning_effort",
+            "max_tokens",
+            "expected_served_model",
+            "timeout_seconds",
+        }
     ),
     "openai_compat": frozenset(
-        {"reasoning_effort", "max_tokens", "expected_served_model"}
+        {
+            "reasoning_effort",
+            "max_tokens",
+            "expected_served_model",
+            "timeout_seconds",
+        }
     ),
 }
 
@@ -924,6 +934,17 @@ def _validate_routing(routing: BackendRouting) -> None:
                 f"{name}.extra.expected_served_model must be an exact "
                 "non-empty string"
             )
+        if config.backend in {"local", "openai_compat"}:
+            timeout_seconds = config.extra.get("timeout_seconds")
+            if timeout_seconds is not None and (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0
+            ):
+                raise ValueError(
+                    f"{name}.extra.timeout_seconds must be a finite positive number"
+                )
 
 
 _MAX_ROUTING_CONFIG_BYTES = 4 * 1024 * 1024

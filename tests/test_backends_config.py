@@ -1157,6 +1157,61 @@ def test_codex_timeout_seconds_routing_extra_is_closed(value):
         routing_fingerprint(routing)
 
 
+@pytest.mark.parametrize("backend", ["local", "openai_compat"])
+@pytest.mark.parametrize(
+    "value",
+    [True, 0, -1, float("inf"), float("nan"), "1200"],
+)
+def test_openai_compatible_timeout_seconds_routing_extra_is_closed(backend, value):
+    routing = BackendRouting(
+        default=RoleConfig(
+            backend=backend,
+            model="model",
+            extra={"timeout_seconds": value},
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="timeout_seconds must be a finite positive number",
+    ):
+        routing_fingerprint(routing)
+
+
+@pytest.mark.parametrize("backend", ["local", "openai_compat"])
+def test_openai_compatible_timeout_seconds_reaches_adapter(
+    tmp_path,
+    monkeypatch,
+    backend,
+):
+    from crucible.backends.openai_compat import OpenAIBackend
+
+    monkeypatch.delenv("CRUCIBLE_BACKEND_CONFIG", raising=False)
+    path = tmp_path / f"{backend}-timeout-seconds.yaml"
+    _write_yaml(
+        path,
+        {
+            "default": {
+                "backend": backend,
+                "model": "model",
+                "feature_admission": "diagnostic",
+                "extra": {"timeout_seconds": 1_200},
+            },
+        },
+    )
+
+    # The route file, the factory and the adapter it builds.
+    adapter = resolve_for_role(
+        "implementer",
+        routing=load_routing(config_path=path),
+        capability="text",
+    )
+
+    # The wall of a call that carries no policy of its own.
+    assert isinstance(adapter, OpenAIBackend)
+    assert adapter._default_policy.timeout_seconds == 1_200.0
+
+
 def test_kimi_expected_worker_runtime_fingerprint_reaches_adapter(
     monkeypatch,
 ):

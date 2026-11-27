@@ -9,6 +9,7 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,10 +36,13 @@ from assay.corpus.runs import RunResult
 from assay.corpus.store import Corpus
 from assay.types.dag import ImplementationDirective, Slice, Tier, TierDAG
 
+from crucible.backends.openai_compat import OpenAIBackend
 from crucible.common.policies import BreachPolicy, ReviewPolicy
+from crucible.workflows import architect
 from crucible.workflows._build_verify import BuildVerifyOutcome, RunnerResult
 from crucible.workflows._atomic_persistence import persist_and_attach
 from crucible.workflows._run import open_run_with_capture
+from tests.test_backends_openai_compat import _stub_response, _tool_call
 
 
 class _OneShotImplementer:
@@ -2278,3 +2282,118 @@ def test_uncapped_gating_failure_sheds_advisory_without_transport(
     else:
         assert "available_reservation_usd" not in record
         assert "minimum_useful_reservation_usd" not in record
+
+
+# --- a Tier run whose implementer is the OpenAI-compatible adapter ---------------------
+
+
+def _route_roles_to_gateway_adapter(tmp_path: Path, monkeypatch, *, final_reply):
+    """Resolve every role to the real adapter over two scripted replies.
+
+    The first reply calls the write tool that Tier itself attaches, the
+    second is ``final_reply``. Returns the requests the adapter sent.
+    """
+
+    pricing = tmp_path / "pricing.yaml"
+    pricing.write_text(
+        "tier-fixture:\n  input_per_mtok: 1.4\n  output_per_mtok: 4.4\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CRUCIBLE_PRICING_CONFIG", str(pricing))
+    requests: list[dict] = []
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        if len(requests) > 1:
+            return final_reply
+        return _stub_response(
+            "",
+            in_tokens=1_000,
+            out_tokens=40,
+            model="tier-fixture",
+            tool_calls=[
+                _tool_call(
+                    "c1",
+                    "write_source",
+                    json.dumps(
+                        {"file_path": "file_0.py", "content": "# implementation\n"}
+                    ),
+                )
+            ],
+        )
+
+    def resolve(role, *args, capability="text", cwd=None, **kwargs):
+        backend = OpenAIBackend(
+            model="tier-fixture",
+            base_url="http://127.0.0.1:9/v1",
+            api_key="not-needed",
+            capability=capability,
+            cwd=cwd,
+        )
+        backend._client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            close=lambda: None,
+        )
+        return backend
+
+    monkeypatch.setattr("crucible.workflows._backends.resolve_for_role", resolve)
+    return requests
+
+
+@pytest.mark.parametrize(
+    "final_usage_reported",
+    [True, False],
+    ids=["every_reply_reports_usage", "final_reply_without_usage"],
+)
+def test_tier_run_on_the_gateway_adapter_reconciles_only_reported_usage(
+    tmp_path: Path,
+    monkeypatch,
+    final_usage_reported: bool,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_commit = _init_repo(repo)
+    spec_dir = tmp_path / "corpus" / "spec1"
+    spec_dir.mkdir(parents=True)
+    Corpus(spec_dir).put_spec(_spec(base_commit, slice_count=1))
+    final_reply = _stub_response(
+        "DONE", in_tokens=1_500, out_tokens=5, model="tier-fixture"
+    )
+    if not final_usage_reported:
+        final_reply.usage = None
+    requests = _route_roles_to_gateway_adapter(
+        tmp_path, monkeypatch, final_reply=final_reply
+    )
+
+    rc = _run_tier(
+        repo,
+        spec_dir,
+        budget_usd=1.0,
+        breach_policy=BreachPolicy(enabled=False, max_rounds=1),
+        review_policy=ReviewPolicy(rubrics=()),
+    )
+
+    summary, _result = _tier_documents(spec_dir)
+    costs = summary["costs"]
+    # What Architect asks of the cost summary of a tier child.
+    projection = architect._pricing_summary_projection(
+        costs, label="tier child summary"
+    )
+    assert len(requests) == 2
+    assert projection.active
+    if final_usage_reported:
+        assert rc == 0 and summary["status"] == "complete"
+        assert (repo / "file_0.py").read_text() == "# implementation\n"
+        assert costs["rollup_incomplete"] is False
+        assert costs["accounting_debt"] is False
+        assert costs["total_input_tokens"] == 2_500
+        assert costs["pricing_evidence"]["complete"] is True
+        assert len(costs["pricing_evidence"]["segments"]) == 2
+        assert projection.valid, projection.error
+    else:
+        assert rc != 0 and summary["status"] == "incomplete_accounting"
+        assert costs["rollup_incomplete"] is True
+        assert costs["accounting_debt"] is True
+        assert costs["pricing_evidence"]["complete"] is False
+        assert len(costs["pricing_evidence"]["segments"]) == 1
+        assert not projection.valid

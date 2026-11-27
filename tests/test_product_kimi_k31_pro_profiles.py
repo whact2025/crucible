@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import yaml
+from assay import Invocation
 
 from crucible.backends import config as config_module
 from crucible.backends import cost_bounds
@@ -22,7 +23,7 @@ from crucible.backends.config import (
     routing_fingerprint,
 )
 from crucible.backends.features import FeatureAdmissionError
-from crucible.backends.kimi import KimiBackend
+from crucible.backends.kimi import KimiBackend, KimiSDKQualificationError
 from crucible.backends.limits import (
     INVOCATION_LIMIT_LEDGER_LEAF,
     InvocationLimitContractError,
@@ -42,6 +43,9 @@ PROFILE = "kimi_k31_pro_sdk_diagnostic"
 MODEL = "kimi-k3.1-pro"
 POLICY = "kimi-k3.1-pro-cache-read-upper-bound-v1"
 WRITERS = {"implementer", "breach_defender"}
+# What every route of the DeepSWE profile states as the wall of one call: the
+# 45 minutes the Codex adapter gives a turn.
+ROLE_WALL_SECONDS = 2700
 # The two profiles with diagnostic admission; the E12 arm profile enforces.
 DIAGNOSTIC_PROFILES = (
     "backends_kimi_sdk_diagnostic.yaml",
@@ -95,8 +99,10 @@ def test_k3_profiles_pin_every_role_and_limit_writer_opt_in(product: str) -> Non
         }
         if role in WRITERS:
             expected_extra["diagnostic_workspace_write"] = True
-        if product == "deepswe" and role == "implementer":
-            expected_extra["timeout_seconds"] = 1200
+        if product == "deepswe":
+            # Every route states the wall of one call, not the implementer
+            # alone: the others would run under the adapter's ten minutes.
+            expected_extra["timeout_seconds"] = ROLE_WALL_SECONDS
         assert route["extra"] == expected_extra
         effective = routing.default if role == "default" else routing.for_role(role)
         assert effective.extra == expected_extra
@@ -173,11 +179,78 @@ def test_k3_product_route_resolves_exact_bounded_kwargs_without_credentials(
         assert kwargs["cwd"] == str(tmp_path.resolve())
         assert "api_key" not in kwargs
         assert "diagnostic_workspace_write" not in kwargs
-        if product == "deepswe" and role == "implementer":
-            assert kwargs["timeout_seconds"] == 1200
+        if product == "deepswe":
+            assert kwargs["timeout_seconds"] == ROLE_WALL_SECONDS
         else:
             assert "timeout_seconds" not in kwargs
     assert len(calls) == len(routing.roles)
+
+
+@pytest.mark.parametrize(
+    ("deadline", "wall"),
+    [(ROLE_WALL_SECONDS, ROLE_WALL_SECONDS), (1200, 1200), (5400, ROLE_WALL_SECONDS)],
+)
+@pytest.mark.parametrize("role", ["architect_planner", "implementer", "breach_judge"])
+def test_deepswe_k3_call_runs_under_the_smaller_of_role_wall_and_limit_deadline(
+    role: str,
+    deadline: int,
+    wall: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The route runs only under diagnostic limits, whose deadline is a run
+    # option and no field of the profile. A call gets the wall its role
+    # states only when the deadline is as large; a smaller one shortens it,
+    # a larger one does not extend it.
+    walls: list[float] = []
+    constructed: list[KimiBackend] = []
+
+    def worker(_request: Any, timeout: float, **_kwargs: Any) -> Any:
+        walls.append(timeout)
+        raise KimiSDKQualificationError("the wall was read; no reply is played")
+
+    def real_adapter(name: str, **kwargs: Any) -> KimiBackend:
+        assert name == "kimi"
+        backend = KimiBackend(
+            model=kwargs["model"],
+            effort=kwargs["effort"],
+            capability=kwargs["capability"],
+            expected_base_url=kwargs["expected_base_url"],
+            diagnostic_cost_upper_bound=kwargs["diagnostic_cost_upper_bound"],
+            max_response_tokens=kwargs["max_response_tokens"],
+            timeout_seconds=kwargs["timeout_seconds"],
+            _worker_runner=worker,
+        )
+        constructed.append(backend)
+        return backend
+
+    monkeypatch.setattr(config_module, "_resolve_backend", real_adapter)
+    routing = load_routing(config_path=_path("deepswe"))
+    try:
+        backend = resolve_for_role(
+            role,
+            routing=routing,
+            capability="text",
+            native_shell=False,
+            allow_trusted_project_instructions=False,
+            cwd=str(tmp_path.resolve()),
+            limit_policy=InvocationLimitPolicy("diagnostic", deadline, True, POLICY),
+            limit_ledger=InvocationLimitLedger(tmp_path / INVOCATION_LIMIT_LEDGER_LEAF),
+        )
+        backend.invoke(
+            Invocation(
+                system="system",
+                user="user",
+                tools=None,
+                max_turns=1,
+                budget_usd=1.0,
+            )
+        )
+    finally:
+        for item in constructed:
+            item.close()
+    (given,) = walls
+    assert wall - 30 < given <= wall
 
 
 @pytest.mark.parametrize("product", LOADERS)

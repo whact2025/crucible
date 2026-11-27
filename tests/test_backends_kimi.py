@@ -6963,6 +6963,152 @@ def test_kimi_host_attestation_suppresses_retry_when_worker_loses_trace(
     backend.close()
 
 
+_READ_CALL = ("grep_symbol", {"pattern": "absent"})
+_WRITE_CALL = ("write_source", {"file_path": "output.txt", "content": "progress\n"})
+# A write outside the write scope: the host refuses it and nothing is written.
+_REFUSED_WRITE_CALL = (
+    "write_source",
+    {"file_path": "elsewhere.txt", "content": "refused\n"},
+)
+
+
+def _progress_bounded_writer(tmp_path: Path, *, max_consecutive_read_calls: int) -> Any:
+    from crucible.tools import ToolContext
+    from crucible.tools._dispatch_budget import ProgressBoundedMutatingToolSet
+    from crucible.tools.profiles import build_autonomous_implementer_profile
+
+    return ProgressBoundedMutatingToolSet(
+        build_autonomous_implementer_profile(
+            ToolContext(
+                workspace_root=tmp_path,
+                repo_root=tmp_path,
+                write_scope=("output.txt",),
+            )
+        ),
+        max_consecutive_read_calls=max_consecutive_read_calls,
+    )
+
+
+def _worker_that_calls_through_the_bridge(
+    script: tuple[tuple[str, dict[str, Any]], ...],
+    replies: list[str],
+) -> Any:
+    """A worker runner that makes the scripted calls on the attached bridge."""
+
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async def call_all(request: kimi_mod._WorkerRequest) -> None:
+        assert request.mcp_url is not None
+        assert request.mcp_auth_token is not None
+        async with streamablehttp_client(
+            request.mcp_url,
+            headers={"Authorization": f"Bearer {request.mcp_auth_token}"},
+        ) as (read, write, _info):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                for name, arguments in script:
+                    response = await session.call_tool(name, arguments)
+                    replies.append(response.content[0].text)
+
+    def runner(request, _timeout, **_kwargs):
+        asyncio.run(call_all(request))
+        return _success_outcome(
+            final_message="done",
+            tool_events=tuple(
+                (kind, name, f"call-{index}")
+                for index, (name, _arguments) in enumerate(script)
+                for kind in ("tool_call", "tool_result")
+            ),
+        )
+
+    return runner
+
+
+_WRITER_POLICY = BackendPolicy(
+    retry_budget=1,
+    timeout_seconds=60.0,
+    on_cancellation="convert_to_backend_error",
+    on_max_turns="raise",
+)
+
+
+def test_kimi_hosted_write_between_reads_resets_the_consecutive_read_streak(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("KIMI_BASE_URL", _BASE_URL)
+    monkeypatch.setenv("MOONSHOT_API_KEY", _TOKEN)
+    # Two reads reach the bound of two; the write that runs in the isolated
+    # host is progress, so the two reads after it are admitted.
+    replies: list[str] = []
+    bounded = _progress_bounded_writer(tmp_path, max_consecutive_read_calls=2)
+    backend = KimiBackend(
+        capability="workspace_write",
+        _worker_runner=_worker_that_calls_through_the_bridge(
+            (_READ_CALL, _READ_CALL, _WRITE_CALL, _READ_CALL, _READ_CALL),
+            replies,
+        ),
+    )
+    backend.attach_toolset(bounded)
+
+    result = backend.invoke(_invocation(policy=_WRITER_POLICY))
+
+    assert len(replies) == 5
+    assert not any("TerminalToolDispatchError" in reply for reply in replies)
+    assert result.error is None
+    assert (result.stop_reason, result.final_message) == ("end_turn", "done")
+    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "progress\n"
+    progress = bounded.snapshot()
+    assert (progress.read_calls, progress.write_calls) == (4, 1)
+    assert (progress.denied_read_calls, progress.consecutive_read_calls) == (0, 2)
+    assert backend._active_mutation_hosts == set()  # noqa: SLF001
+    backend.close()
+
+
+@pytest.mark.parametrize(
+    "script",
+    (
+        (_READ_CALL, _READ_CALL, _READ_CALL),
+        (_READ_CALL, _READ_CALL, _REFUSED_WRITE_CALL, _READ_CALL),
+    ),
+    ids=("reads_alone", "refused_write_between_reads"),
+)
+def test_kimi_reads_alone_still_end_at_the_consecutive_read_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    script: tuple[tuple[str, dict[str, Any]], ...],
+) -> None:
+    monkeypatch.setenv("KIMI_BASE_URL", _BASE_URL)
+    monkeypatch.setenv("MOONSHOT_API_KEY", _TOKEN)
+    replies: list[str] = []
+    bounded = _progress_bounded_writer(tmp_path, max_consecutive_read_calls=2)
+    backend = KimiBackend(
+        capability="workspace_write",
+        _worker_runner=_worker_that_calls_through_the_bridge(script, replies),
+    )
+    backend.attach_toolset(bounded)
+
+    result = backend.invoke(_invocation(policy=_WRITER_POLICY))
+
+    # The third read in a row is denied, and the denial ends the call
+    # whatever the worker reports afterwards. A write that the host refused
+    # is no progress: it is not credited and the streak goes on across it.
+    assert len(replies) == len(script)
+    assert "TerminalToolDispatchError" in replies[-1]
+    assert not any("TerminalToolDispatchError" in reply for reply in replies[:-1])
+    assert result.stop_reason == "tool_budget_exhausted"
+    assert result.error is not None and result.error.retriable is False
+    assert result.final_message == ""
+    progress = bounded.snapshot()
+    assert (progress.read_calls, progress.write_calls) == (2, 0)
+    assert (progress.denied_read_calls, progress.consecutive_read_calls) == (1, 2)
+    assert not (tmp_path / "output.txt").exists()
+    assert not (tmp_path / "elsewhere.txt").exists()
+    assert backend._active_mutation_hosts == set()  # noqa: SLF001
+    backend.close()
+
+
 def test_kimi_rejects_unsupported_mutators_before_credentials_or_inference(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

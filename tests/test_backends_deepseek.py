@@ -1284,6 +1284,60 @@ def test_post_response_budget_guard_uses_the_peak_ceiling(monkeypatch):
     assert between.error.limit_usd == 0.0002
 
 
+def _wall_given_to_the_worker(monkeypatch, invocation, **backend_overrides) -> float:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek-test-key")
+    walls: list[float] = []
+
+    def runner(_request, *, timeout_seconds, **_kwargs):
+        walls.append(timeout_seconds)
+        return _terminal()
+
+    result = _backend(runner, **backend_overrides).invoke(invocation)
+
+    assert result.error is None
+    (wall,) = walls
+    return wall
+
+
+def test_a_call_without_a_policy_runs_under_the_wall_of_its_route(monkeypatch):
+    # The workflows send no policy. The wall of such a call is the route's
+    # timeout_seconds, also where that is above the adapter's default.
+    wall = _wall_given_to_the_worker(
+        monkeypatch,
+        _invocation(policy=None),
+        timeout_seconds=2_700,
+    )
+    assert 2_690 < wall <= 2_700
+
+    default = _wall_given_to_the_worker(monkeypatch, _invocation(policy=None))
+    assert 590 < default <= deepseek_mod._DEFAULT_TIMEOUT_SECONDS == 600
+
+
+@pytest.mark.parametrize(
+    ("policy_timeout", "low", "high"),
+    ((30, 20, 30), (None, 2_690, 2_700), (5_400, 2_690, 2_700)),
+)
+def test_a_policy_shortens_the_wall_of_the_route_and_never_extends_it(
+    monkeypatch,
+    policy_timeout,
+    low,
+    high,
+):
+    wall = _wall_given_to_the_worker(
+        monkeypatch,
+        _invocation(
+            policy=BackendPolicy(
+                retry_budget=1,
+                timeout_seconds=policy_timeout,
+                on_cancellation="convert_to_backend_error",
+                on_max_turns="continue_with_warning",
+            )
+        ),
+        timeout_seconds=2_700,
+    )
+    assert low < wall <= high
+
+
 class _ReadOnlyToolSet:
     write_names: set[str] = set()
     read_only_names = {"lookup"}
@@ -1433,6 +1487,129 @@ def test_real_isolated_host_applies_diagnostic_writer_without_parent_dispatch(
 
     assert result.error is None
     assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "settled\n"
+    assert backend._active_mutation_hosts == set()  # noqa: SLF001
+    backend.close()
+
+
+_READ_CALL = ("grep_symbol", {"pattern": "absent"})
+_WRITE_CALL = ("write_source", {"file_path": "output.txt", "content": "progress\n"})
+# A write outside the write scope: the host refuses it and nothing is written.
+_REFUSED_WRITE_CALL = (
+    "write_source",
+    {"file_path": "elsewhere.txt", "content": "refused\n"},
+)
+
+
+def _progress_bounded_writer(tmp_path: Path, *, max_consecutive_read_calls: int):
+    from crucible.tools import ToolContext
+    from crucible.tools._dispatch_budget import ProgressBoundedMutatingToolSet
+    from crucible.tools.profiles import build_autonomous_implementer_profile
+
+    return ProgressBoundedMutatingToolSet(
+        build_autonomous_implementer_profile(
+            ToolContext(
+                workspace_root=tmp_path,
+                repo_root=tmp_path,
+                write_scope=("output.txt",),
+            )
+        ),
+        max_consecutive_read_calls=max_consecutive_read_calls,
+    )
+
+
+def _scripted_tool_rounds(script: tuple[tuple[str, dict[str, Any]], ...]):
+    """One response per scripted call, then a plain final answer."""
+
+    yield from (
+        _terminal(
+            response_id=f"resp_{index}",
+            text="",
+            calls=(
+                deepseek_mod._DeepSeekToolCall(
+                    call_id=f"call_{index}",
+                    name=name,
+                    arguments=json.dumps(arguments),
+                ),
+            ),
+        )
+        for index, (name, arguments) in enumerate(script)
+    )
+    yield _terminal(response_id="resp_final", text="done")
+
+
+def test_hosted_write_between_reads_resets_the_consecutive_read_streak(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek-test-key")
+    # Two reads reach the bound of two; the write that runs in the isolated
+    # host is progress, so the two reads after it are admitted.
+    terminals = _scripted_tool_rounds(
+        (_READ_CALL, _READ_CALL, _WRITE_CALL, _READ_CALL, _READ_CALL)
+    )
+    bounded = _progress_bounded_writer(tmp_path, max_consecutive_read_calls=2)
+    backend = _backend(
+        lambda *_args, **_kwargs: next(terminals),
+        capability="workspace_write",
+        diagnostic_workspace_write=True,
+    )
+    backend.attach_toolset(bounded, context_budget=65_536)
+
+    result = backend.invoke(_invocation(max_turns=8))
+
+    assert result.error is None
+    assert (result.stop_reason, result.final_message) == ("end_turn", "done")
+    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "progress\n"
+    progress = bounded.snapshot()
+    assert (progress.read_calls, progress.write_calls) == (4, 1)
+    assert (progress.denied_read_calls, progress.consecutive_read_calls) == (0, 2)
+    assert backend._active_mutation_hosts == set()  # noqa: SLF001
+    backend.close()
+
+
+@pytest.mark.parametrize(
+    "script",
+    (
+        (_READ_CALL, _READ_CALL, _READ_CALL),
+        (_READ_CALL, _READ_CALL, _REFUSED_WRITE_CALL, _READ_CALL),
+    ),
+    ids=("reads_alone", "refused_write_between_reads"),
+)
+def test_reads_alone_still_end_at_the_consecutive_read_bound(
+    monkeypatch,
+    tmp_path,
+    script,
+):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek-test-key")
+    terminals = _scripted_tool_rounds(script)
+    worker_calls = 0
+
+    def runner(*_args, **_kwargs):
+        nonlocal worker_calls
+        worker_calls += 1
+        return next(terminals)
+
+    bounded = _progress_bounded_writer(tmp_path, max_consecutive_read_calls=2)
+    backend = _backend(
+        runner,
+        capability="workspace_write",
+        diagnostic_workspace_write=True,
+    )
+    backend.attach_toolset(bounded, context_budget=65_536)
+
+    result = backend.invoke(_invocation(max_turns=8))
+
+    # The third read in a row is denied and ends the call before the
+    # provider is asked again. A write that the host refused is no progress:
+    # it is not credited and the streak of reads goes on across it.
+    assert worker_calls == len(script)
+    assert result.stop_reason == "tool_budget_exhausted"
+    assert isinstance(result.error, MaxTurnsExceeded)
+    progress = bounded.snapshot()
+    assert (progress.read_calls, progress.write_calls) == (2, 0)
+    assert (progress.denied_read_calls, progress.consecutive_read_calls) == (1, 2)
+    assert not (tmp_path / "output.txt").exists()
+    assert not (tmp_path / "elsewhere.txt").exists()
     assert backend._active_mutation_hosts == set()  # noqa: SLF001
     backend.close()
 

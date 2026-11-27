@@ -108,7 +108,7 @@ schema_version: crucible.backend-matrix.ledger.v1
 
 ceilings:
   max_known_gaps:
-    pack_a: 84
+    pack_a: 74
     pack_b: 24
   frozen: [pack_a]
   max_declared_differences: 4
@@ -137,6 +137,13 @@ registry:
     title: Kimi does not credit a write as progress (frozen wrapper handed to the mutation host)
     origin: gap list
     severity: high
+    # Closed: where the attached ToolSet is the progress wrapper, the adapter
+    # hands the mutation host that wrapper, so a write that ran in the host
+    # resets the streak of reads, and the bridge serves the frozen catalogue
+    # as before. The call of the two cells ends cleanly, the three codes of
+    # M11 went with the five of this record, and the cells have no entry any
+    # more: they owe the two column-wide codes of M06 alone. Reads alone
+    # still end at the bound (tests/test_backends_kimi.py).
     cells:
       - cell: kimi/S40/primary/raw
         observed_under: {}
@@ -277,6 +284,14 @@ registry:
     title: DeepSeek does not credit a write as progress (frozen wrapper handed to the mutation host)
     origin: gap list
     severity: high
+    # Closed: where the attached ToolSet is the progress wrapper, the adapter
+    # hands the mutation host that wrapper, so a write that ran in the host
+    # resets the streak of reads. The call of the cell ends cleanly and no
+    # code of this record is left on it. Its entry stays for what every
+    # clean tool cell of the column shows: the tool-authority digest of G24
+    # and, now that the call reaches a clean finish, the terminal name of
+    # M05. Reads alone still end at the bound
+    # (tests/test_backends_deepseek.py).
     cells:
       - cell: deepseek/S40/primary/raw
         observed_under: {}
@@ -444,6 +459,13 @@ registry:
     title: The gateway adapter clears the accounting flags after a forced finalisation
     origin: gap list
     severity: high
+    # Closed. The adapter carries what the reply to the finalisation itself
+    # reported of its usage, and whether an attempt of the finalisation was
+    # discarded, into the flags of the result: they are true only where every
+    # response of the call, the finalisation included, reported its usage.
+    # No cell carries a code of this record any more. The six raw cells have
+    # no entry; the six guarded cells keep theirs for the guard codes of G28
+    # alone.
     cells:
       - cell: openai_compat:hosted/S04/primary/raw
         observed_under: {structured_output: unsupported}
@@ -518,8 +540,18 @@ registry:
     title: The gateway adapter returns no pricing evidence on any path
     origin: gap list
     severity: medium
-    # Wherever the adapter flags its cost complete. A result it flags
-    # incomplete (a forced finalisation today, G29) owes no evidence.
+    # It showed wherever the adapter flagged its cost complete. Closed: every
+    # result of the adapter carries pricing evidence priced by the price row
+    # of the route: one segment for each response, of the attempt the result
+    # reports, that reported its usage. A call without tools reports its
+    # last attempt only: an attempt that a retry discarded leaves neither
+    # its usage nor a segment in the result, and the flags and the evidence
+    # are then incomplete. The evidence is complete exactly where the
+    # accounting flags are. No cell carries the code any more and neither
+    # kind has a column-wide entry. The scope below is kept, as every record
+    # is: it names the kinds on which the code showed. With no column-wide
+    # entry the code is tolerated nowhere, and a cell that shows it again
+    # fails.
     column_wide:
       - {kind: "openai_compat:hosted", code: "pricing:none"}
       - {kind: "openai_compat:local", code: "pricing:none"}
@@ -654,6 +686,11 @@ registry:
         observed_under: {}
         closes_under: {}
       - cell: deepseek/S45/primary/raw
+        observed_under: {}
+        closes_under: {}
+      # The write as progress ends without a limit since its write is
+      # credited (G17, closed): a clean finish like the three above.
+      - cell: deepseek/S40/primary/raw
         observed_under: {}
         closes_under: {}
 
@@ -1126,10 +1163,13 @@ registry:
     # outcome typed by the builder as the fix of G02 is sketched, the two
     # codes of G02 go and all three codes of this record stay. An outcome
     # the worker types itself (a limit, a stop) carries the model identity.
-    # On S40 the codes go when the write is credited and the call ends
-    # cleanly (G03); on S23b they go when the reply of a refusal field no
-    # longer ends in an exception of the worker (M10). A change that closes
-    # codes of this record deletes them here in the same change.
+    # On S40 the codes went with the fix of G03: the write is credited, the
+    # call ends cleanly, and the two cells of S40 carry no code of this
+    # record and have no entry any more (they stay listed below, as the
+    # cells of a closed record do). On S23b they go when the reply of a
+    # refusal field no longer ends in an exception of the worker (M10). A
+    # change that closes codes of this record deletes them here in the same
+    # change.
     # The same outcome builds the result of the two cells of the blocked
     # column (kimi/S01/blocked/raw and guarded), where the strict route
     # rejects the reply before any step has settled. That result has no
@@ -2051,9 +2091,10 @@ registry:
         closes_under: {}
 
 known_gaps:
-  # The gateway columns, first run (starter set). On S04 guarded the guard
-  # codes are G28's today; once G28 is fixed the guard reports the
-  # incomplete accounting of G29 instead, and that fix edits the entry. The
+  # The gateway columns, first run (starter set). In the guarded lens the
+  # request events of a tool round and of the schema finalisation are a
+  # contract violation (G28). The accounting of the finalisation is complete
+  # since the fix of G29, and the raw S04 cells have no entry any more. The
   # hosted S04 cells owe no code for schema text in the prompt any more, and
   # no entry names M04: the hosted routes declare structured_output
   # unsupported, which is the declaration change that record names.
@@ -2062,71 +2103,45 @@ known_gaps:
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-  - cell: openai_compat:hosted/S04/primary/raw
-    observed_under: {structured_output: unsupported}
-    codes:
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:hosted/S04/primary/guarded
     observed_under: {structured_output: unsupported}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:hosted/S03/secondary/guarded
     observed_under: {event_detail: usage}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-  - cell: openai_compat:hosted/S04/secondary/raw
-    observed_under: {structured_output: unsupported}
-    codes:
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:hosted/S04/secondary/guarded
     observed_under: {structured_output: unsupported}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:local/S03/primary/guarded
     observed_under: {event_detail: usage}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-  - cell: openai_compat:local/S04/primary/raw
-    observed_under: {structured_output: unsupported}
-    codes:
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:local/S04/primary/guarded
     observed_under: {structured_output: unsupported}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   # The gateway columns, first run of pack A. The turn limit ends in a
-  # forced finalisation that clears the accounting flags (G29), and in the
-  # guarded lens its three request events are a contract violation (G28).
+  # forced finalisation whose accounting is complete since the fix of G29,
+  # so its raw cell has no entry any more; in the guarded lens its three
+  # request events are a contract violation (G28).
   # The first tool result over the byte budget ends the call (G39). No form
   # of refusal is typed as rejected content (G35). The suite's turn count,
   # the dispatch-budget denial, the USD overrun and the write as progress
-  # owe the column-wide code of G32 and nothing else.
-  - cell: openai_compat:hosted/S10a/primary/raw
-    observed_under: {turn_limit: round_boundary}
-    codes:
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
+  # pass since the fix of G32, whose code no cell of the columns owes any
+  # more.
   - cell: openai_compat:hosted/S10a/primary/guarded
     observed_under: {turn_limit: round_boundary}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:hosted/S18/primary/raw
     observed_under: {}
     codes:
@@ -2147,18 +2162,11 @@ known_gaps:
     observed_under: {}
     codes:
       "kind:transport!=content_rejected": G35
-  - cell: openai_compat:hosted/S10a/secondary/raw
-    observed_under: {turn_limit: round_boundary}
-    codes:
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:hosted/S10a/secondary/guarded
     observed_under: {turn_limit: round_boundary}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:hosted/S18/secondary/raw
     observed_under: {}
     codes:
@@ -2179,18 +2187,11 @@ known_gaps:
     observed_under: {}
     codes:
       "kind:transport!=content_rejected": G35
-  - cell: openai_compat:local/S10a/primary/raw
-    observed_under: {turn_limit: round_boundary}
-    codes:
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:local/S10a/primary/guarded
     observed_under: {turn_limit: round_boundary}
     codes:
       "guard:limit_contract_violated": G28
       "guard:revoked": G28
-      "flag:token_usage_complete=False": G29
-      "flag:cost_complete=False": G29
   - cell: openai_compat:local/S18/primary/raw
     observed_under: {}
     codes:
@@ -2211,8 +2212,6 @@ known_gaps:
     observed_under: {}
     codes:
       "kind:transport!=content_rejected": G35
-  - column_wide: {kind: "openai_compat:hosted", code: "pricing:none", gap: G32}
-  - column_wide: {kind: "openai_compat:local", code: "pricing:none", gap: G32}
 
   # The DeepSeek column, first run (starter set). The missing
   # feature-profile digest is column-wide; the tool-authority digest shows on
@@ -2254,8 +2253,10 @@ known_gaps:
   # before transport (G15). The first tool result over the byte budget ends
   # the call (M14: the byte-budget part of what G14 listed). No form of
   # refusal is typed as rejected content (G18), and two of them end as an
-  # error of the worker, whose result loses more than its kind (M13). A
-  # write is not credited as progress (G17).
+  # error of the worker, whose result loses more than its kind (M13). The
+  # write as progress was not credited at that run (G17, closed since): its
+  # call ends cleanly now and shows what every clean tool cell of the
+  # column shows (M05, G24).
   - cell: deepseek/S10a/primary/raw
     observed_under: {turn_limit: hard}
     codes:
@@ -2303,11 +2304,7 @@ known_gaps:
   - cell: deepseek/S40/primary/raw
     observed_under: {}
     codes:
-      "progress:write_not_credited": G17
-      "kind:max_turns!=none": G17
-      "stop:tool_budget_exhausted!=end_turn": G17
-      "dispatch.missing:read_a": G17
-      "request.unconsumed": G17
+      "event.terminal:response.completed!=end_turn": M05
       "digest.mismatch:tool_authority": G24
   - column_wide: {kind: deepseek, code: "digest.missing:feature_profile", gap: G24}
 
@@ -2365,14 +2362,16 @@ known_gaps:
   # owes the two column-wide codes of M06. The turn limit (G07) and the USD
   # overrun (G08) are typed and disown their terminal without a limit event;
   # the cost of the overrun against the matrix rate card is M12, for which
-  # no fix is owed. The dispatch-budget denial is a transport error (G02),
-  # and the write that is not credited ends in the same denial (G03). A
-  # refusal field is not read (M10) and an HTTP policy rejection is a
-  # transport error (G10); a content-filter stop is typed and owes M06
-  # alone, as do the suite's turn count and the byte budget. The three
-  # cells whose call ends in an exception that the worker's classifier
-  # turns into its outcome show the shape of such a result (M11). These
-  # entries need no ruling: the kind is no reference kind.
+  # no fix is owed. The dispatch-budget denial is a transport error (G02).
+  # The write as progress ended in the same denial at that run, because the
+  # write was not credited (G03, closed since): its call ends cleanly now
+  # and the cell has no entry. A refusal field is not read (M10) and an
+  # HTTP policy rejection is a transport error (G10); a content-filter stop
+  # is typed and owes M06 alone, as do the suite's turn count, the byte
+  # budget and the write as progress. The two cells whose call ends in an
+  # exception that the worker's classifier turns into its outcome show the
+  # shape of such a result (M11). These entries need no ruling: the kind is
+  # no reference kind.
   - cell: kimi/S10a/primary/raw
     observed_under: {turn_limit: hard}
     codes:
@@ -2409,17 +2408,6 @@ known_gaps:
     observed_under: {}
     codes:
       "kind:transport!=content_rejected": G10
-  - cell: kimi/S40/primary/raw
-    observed_under: {}
-    codes:
-      "progress:write_not_credited": G03
-      "kind:transport!=none": G03
-      "stop:tool_budget_exhausted!=end_turn": G03
-      "dispatch.missing:read_a": G03
-      "request.unconsumed": G03
-      "flag:terminal_complete=False": M11
-      "digest.missing:served_model": M11
-      "usage.cost_bounds:uncovered": M11
   - cell: kimi/S10a/secondary/raw
     observed_under: {turn_limit: hard}
     codes:
@@ -2456,17 +2444,6 @@ known_gaps:
     observed_under: {}
     codes:
       "kind:transport!=content_rejected": G10
-  - cell: kimi/S40/secondary/raw
-    observed_under: {}
-    codes:
-      "progress:write_not_credited": G03
-      "kind:transport!=none": G03
-      "stop:tool_budget_exhausted!=end_turn": G03
-      "dispatch.missing:read_a": G03
-      "request.unconsumed": G03
-      "flag:terminal_complete=False": M11
-      "digest.missing:served_model": M11
-      "usage.cost_bounds:uncovered": M11
   - column_wide: {kind: kimi, code: "flag:token_usage_complete=False", gap: M06}
     ruling: >-
       Decision panel, 2026-11-21, acting under a standing instruction the

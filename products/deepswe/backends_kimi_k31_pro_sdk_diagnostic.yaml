@@ -33,6 +33,13 @@
 # budget, and a budgeted reply whose read count is missing is recorded as
 # incomplete accounting, which authorizes no further paid work. A result is
 # a cost interval: diagnostic, never rankable or promotable.
+#
+# Every route states the wall of one call, extra.timeout_seconds: 2700, the
+# 45 minutes the Codex adapter gives a turn. Under diagnostic limits a call
+# runs under the smaller of that wall and --backend-limit-deadline-seconds,
+# so a run that means its calls to have the wall passes a deadline of 2700
+# or more; a smaller deadline shortens every call to it. Every route also
+# states the response bound, extra.max_response_tokens: 32768.
 
 schema_version: crucible.backend-routing.v1
 
@@ -47,6 +54,7 @@ default:
     worker_source: project_locked
     max_response_tokens: 32768
     diagnostic_cost_upper_bound: true
+    timeout_seconds: 2700
 
 roles:
   plan_planner:
@@ -60,6 +68,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   architect_planner:
     backend: kimi
     model: kimi-k3.1-pro
@@ -71,6 +80,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   architect_critic:
     backend: kimi
     model: kimi-k3.1-pro
@@ -82,6 +92,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   architect_judge:
     backend: kimi
     model: kimi-k3.1-pro
@@ -93,6 +104,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   implementer:
     backend: kimi
     model: kimi-k3.1-pro
@@ -105,7 +117,7 @@ roles:
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
       diagnostic_workspace_write: true
-      timeout_seconds: 1200
+      timeout_seconds: 2700
   breach_defender:
     backend: kimi
     model: kimi-k3.1-pro
@@ -118,6 +130,7 @@ roles:
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
       diagnostic_workspace_write: true
+      timeout_seconds: 2700
   impl_breaker:
     backend: kimi
     model: kimi-k3.1-pro
@@ -129,6 +142,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   breach_judge:
     backend: kimi
     model: kimi-k3.1-pro
@@ -140,6 +154,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   diff_scope:
     backend: kimi
     model: kimi-k3.1-pro
@@ -151,6 +166,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   tier_completeness:
     backend: kimi
     model: kimi-k3.1-pro
@@ -162,6 +178,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   api_contract_fidelity:
     backend: kimi
     model: kimi-k3.1-pro
@@ -173,6 +190,7 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700
   review_conflict_authority:
     backend: kimi
     model: kimi-k3.1-pro
@@ -184,3 +202,4 @@ roles:
       worker_source: project_locked
       max_response_tokens: 32768
       diagnostic_cost_upper_bound: true
+      timeout_seconds: 2700

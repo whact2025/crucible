@@ -127,7 +127,9 @@ _TERMINAL_TYPES = frozenset(
 )
 _DEFAULT_POLICY = BackendPolicy(
     retry_budget=1,
-    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    # No wall of its own: a call without a policy runs under the wall of its
+    # route, which may be above ``_DEFAULT_TIMEOUT_SECONDS``.
+    timeout_seconds=None,
     on_cancellation="convert_to_backend_error",
     on_max_turns="continue_with_warning",
 )
@@ -2235,6 +2237,8 @@ class DeepSeekBackend:
             raise ValueError(
                 "DeepSeek no-retry route requires policy.retry_budget == 1"
             )
+        # The wall of a call is the route's. A policy the Invocation carries
+        # can shorten it; the adapter's own default policy states none.
         timeout_seconds = (
             self._timeout_seconds
             if policy.timeout_seconds is None
@@ -2325,8 +2329,19 @@ class DeepSeekBackend:
                             raise RuntimeError(
                                 "DeepSeekBackend closed during mutation-host startup"
                             )
+                    from crucible.tools._dispatch_budget import (  # noqa: PLC0415
+                        ProgressBoundedMutatingToolSet,
+                    )
+
+                    # The host credits a write as progress only to a progress
+                    # wrapper it is handed itself: behind the frozen view a
+                    # hosted write would not reset the consecutive-read
+                    # streak. The provider is still sent the frozen
+                    # descriptors above; this object only dispatches.
                     dispatch_toolset = ProcessHostedToolSet(
-                        frozen_toolset,
+                        toolset
+                        if isinstance(toolset, ProgressBoundedMutatingToolSet)
+                        else frozen_toolset,
                         mutation_host,
                     )
                 except BaseException:

@@ -28,7 +28,7 @@ from assay import (
     MaxTurnsExceeded,
 )
 from crucible.backends.openai_compat import OpenAIBackend
-from crucible.backends.pricing import PricingConfigurationError
+from crucible.backends.pricing import PricingConfigurationError, compute_cost
 from crucible.tools import ToolContext, ToolMutationIndeterminate
 from crucible.tools.profiles import build_exact_create_recovery_profile
 
@@ -208,10 +208,10 @@ def _tool_call(call_id: str, name: str, arguments: str):
     )
 
 
-def _policy(retry_budget: int) -> BackendPolicy:
+def _policy(retry_budget: int, *, timeout_seconds: float = 1.0) -> BackendPolicy:
     return BackendPolicy(
         retry_budget=retry_budget,
-        timeout_seconds=1.0,
+        timeout_seconds=timeout_seconds,
         on_cancellation="raise",
         on_max_turns="raise",
     )
@@ -1021,6 +1021,376 @@ def test_unclassified_forced_final_fault_is_not_treated_as_budget_skip():
         ))
 
     assert calls == 2
+
+
+_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _play_tool_loop(script, *, max_turns, response_schema=None, model="x"):
+    """Play responses, or exceptions to raise, through a read-only tool loop."""
+
+    backend = OpenAIBackend(model=model, capability="read_only")
+    backend.attach_toolset(_StubToolSet())
+    steps = iter(script)
+
+    def _create(**_kwargs):
+        step = next(steps)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=_create),
+        ),
+    )
+    result = backend.invoke(Invocation(
+        system="s",
+        user="u",
+        tools=None,
+        max_turns=max_turns,
+        budget_usd=None,
+        response_schema=response_schema,
+        # No test of the wall plays through here: the call gets one that the
+        # clock of a slow runner does not reach.
+        policy=_policy(2, timeout_seconds=600.0),
+    ))
+    assert next(steps, None) is None
+    return result
+
+
+def _tool_round(**kwargs):
+    return _stub_response(
+        "",
+        tool_calls=[_tool_call("c1", "lookup", "{}")],
+        **kwargs,
+    )
+
+
+def _without_usage(response):
+    response.usage = None
+    return response
+
+
+@pytest.mark.parametrize(
+    ("script", "max_turns", "response_schema", "stop_reason"),
+    [
+        (
+            [_tool_round, lambda: _stub_response("draft"),
+             lambda: _stub_response('{"answer":"final"}')],
+            5,
+            _ANSWER_SCHEMA,
+            "end_turn",
+        ),
+        (
+            [_tool_round, lambda: _stub_response("forced answer")],
+            1,
+            None,
+            "max_turns",
+        ),
+    ],
+    ids=["schema_finalization", "turn_limit_finalization"],
+)
+def test_forced_finalization_keeps_accounting_that_every_response_reported(
+    script, max_turns, response_schema, stop_reason,
+):
+    result = _play_tool_loop(
+        [step() for step in script],
+        max_turns=max_turns,
+        response_schema=response_schema,
+    )
+
+    assert result.stop_reason == stop_reason
+    assert result.final_message in {'{"answer":"final"}', "forced answer"}
+    assert result.usage.input_tokens == 10 * len(script)
+    assert result.usage.output_tokens == 20 * len(script)
+    assert result.completeness.token_usage_complete is True
+    assert result.completeness.cost_complete is True
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        [_tool_round, lambda: _without_usage(_stub_response("forced answer"))],
+        [
+            _tool_round,
+            lambda: ConnectionError("finalization envelope was lost"),
+            lambda: _stub_response("forced answer"),
+        ],
+        [
+            lambda: _without_usage(_tool_round()),
+            lambda: _stub_response("forced answer"),
+        ],
+    ],
+    ids=["final_without_usage", "final_retried", "tool_round_without_usage"],
+)
+def test_forced_finalization_leaves_accounting_incomplete_without_all_usage(
+    script, monkeypatch,
+):
+    monkeypatch.setattr(
+        "crucible.backends.openai_compat.time.sleep",
+        lambda _delay: None,
+    )
+
+    result = _play_tool_loop([step() for step in script], max_turns=1)
+
+    assert result.stop_reason == "max_turns"
+    assert result.final_message == "forced answer"
+    assert result.completeness.token_usage_complete is False
+    assert result.completeness.cost_complete is False
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        [
+            _tool_round,
+            lambda: _stub_response("draft"),
+            lambda: _without_usage(_stub_response('{"answer":"final"}')),
+        ],
+        [
+            _tool_round,
+            lambda: _stub_response("draft"),
+            lambda: ConnectionError("finalization envelope was lost"),
+            lambda: _stub_response('{"answer":"final"}'),
+        ],
+    ],
+    ids=["schema_final_without_usage", "schema_final_retried"],
+)
+def test_schema_finalization_leaves_accounting_incomplete_without_all_usage(
+    script, monkeypatch,
+):
+    """The finalisation that carries a response schema is the planner's path.
+
+    A finalisation whose reply reported no usage, or whose first attempt was
+    discarded, leaves both accounting flags false there as well.
+    """
+
+    monkeypatch.setattr(
+        "crucible.backends.openai_compat.time.sleep",
+        lambda _delay: None,
+    )
+
+    result = _play_tool_loop(
+        [step() for step in script],
+        max_turns=5,
+        response_schema=_ANSWER_SCHEMA,
+    )
+
+    assert result.stop_reason == "end_turn"
+    assert result.final_message == '{"answer":"final"}'
+    assert result.completeness.token_usage_complete is False
+    assert result.completeness.cost_complete is False
+
+
+def _priced_segments(result):
+    """The pricing segments of a result, and whether they explain its usage."""
+
+    evidence = result.pricing_evidence
+    assert evidence is not None
+    assert evidence.complete is result.completeness.cost_complete
+    assert not evidence.complete or evidence.reconciles(result.usage)
+    return [
+        (
+            segment.input_tokens,
+            segment.output_tokens,
+            segment.cache_creation_tokens,
+            segment.cache_read_tokens,
+            segment.cost_usd,
+        )
+        for segment in evidence.segments
+    ]
+
+
+def test_single_shot_prices_its_response_at_the_rate_of_its_price_row():
+    """A zero-rate row is evidence of a zero rate, not of a missing price."""
+
+    priced = OpenAIBackend(model="gpt-5.6-sol")
+    priced._client = _stub_client(_stub_response("done"))
+    free = OpenAIBackend(model="x")
+    free._client = _stub_client(_stub_response("done"))
+    invocation = Invocation(
+        system="s", user="u", tools=None, max_turns=1, budget_usd=None,
+    )
+
+    paid_result = priced.invoke(invocation)
+    free_result = free.invoke(invocation)
+
+    cost = compute_cost("gpt-5.6-sol", input_tokens=10, output_tokens=20)
+    assert cost > 0
+    assert _priced_segments(paid_result) == [(10, 20, 0, 0, cost)]
+    assert paid_result.usage.cost_usd == cost
+    assert paid_result.pricing_evidence.complete is True
+    assert _priced_segments(free_result) == [(10, 20, 0, 0, 0.0)]
+    assert free_result.pricing_evidence.complete is True
+
+
+def test_tool_loop_returns_one_pricing_segment_per_response_in_order():
+    result = _play_tool_loop(
+        [
+            _tool_round(in_tokens=1000, out_tokens=100),
+            _stub_response("draft", in_tokens=2000, out_tokens=200),
+            _stub_response('{"answer":"final"}', in_tokens=3000, out_tokens=300),
+        ],
+        max_turns=5,
+        response_schema=_ANSWER_SCHEMA,
+        model="gpt-5.6-sol",
+    )
+
+    assert result.error is None
+    assert result.completeness.complete is True
+    assert result.pricing_evidence.complete is True
+    assert _priced_segments(result) == [
+        (
+            tokens,
+            tokens // 10,
+            0,
+            0,
+            compute_cost(
+                "gpt-5.6-sol", input_tokens=tokens, output_tokens=tokens // 10,
+            ),
+        )
+        for tokens in (1000, 2000, 3000)
+    ]
+    assert result.usage.cost_usd > 0
+
+
+@pytest.mark.parametrize(
+    ("script", "segments"),
+    [
+        (
+            [
+                lambda: _without_usage(_tool_round()),
+                lambda: _stub_response("forced answer", in_tokens=7, out_tokens=3),
+            ],
+            [(7, 3, 0, 0, 0.0)],
+        ),
+        (
+            [
+                _tool_round,
+                lambda: ConnectionError("finalization envelope was lost"),
+                lambda: _stub_response("forced answer", in_tokens=7, out_tokens=3),
+            ],
+            [(10, 20, 0, 0, 0.0), (7, 3, 0, 0, 0.0)],
+        ),
+        (
+            [_tool_round, lambda: _without_usage(_stub_response("forced answer"))],
+            [(10, 20, 0, 0, 0.0)],
+        ),
+    ],
+    ids=["tool_round_without_usage", "final_retried", "final_without_usage"],
+)
+def test_pricing_evidence_holds_only_responses_that_reported_usage(
+    script, segments, monkeypatch,
+):
+    monkeypatch.setattr(
+        "crucible.backends.openai_compat.time.sleep",
+        lambda _delay: None,
+    )
+
+    result = _play_tool_loop([step() for step in script], max_turns=1)
+
+    assert result.completeness.cost_complete is False
+    assert result.pricing_evidence.complete is False
+    assert _priced_segments(result) == segments
+
+
+def test_call_without_a_response_has_empty_incomplete_pricing_evidence():
+    backend = OpenAIBackend(model="x")
+
+    def _create(**_kwargs):
+        raise ConnectionError("connection refused")
+
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=_create),
+        ),
+    )
+
+    result = backend.invoke(Invocation(
+        system="s", user="u", tools=None, max_turns=1, budget_usd=None,
+        policy=_policy(1),
+    ))
+
+    assert result.error is not None
+    assert result.pricing_evidence.complete is False
+    assert _priced_segments(result) == []
+
+
+def test_retried_call_keeps_its_segment_and_incomplete_pricing_evidence(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "crucible.backends.openai_compat.time.sleep",
+        lambda _delay: None,
+    )
+    backend = OpenAIBackend(model="x")
+    steps = iter([ConnectionError("connection reset"), _stub_response("done")])
+
+    def _create(**_kwargs):
+        step = next(steps)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=_create),
+        ),
+    )
+
+    result = backend.invoke(Invocation(
+        system="s", user="u", tools=None, max_turns=1, budget_usd=None,
+        policy=_policy(2, timeout_seconds=600.0),
+    ))
+
+    assert result.error is None
+    assert result.final_message == "done"
+    assert result.completeness.cost_complete is False
+    assert result.pricing_evidence.complete is False
+    assert _priced_segments(result) == [(10, 20, 0, 0, 0.0)]
+
+
+def test_reply_discarded_by_a_retry_leaves_pricing_evidence_incomplete(
+    monkeypatch,
+):
+    """A reply that a retry discarded leaves the call reported incomplete."""
+
+    monkeypatch.setattr(
+        "crucible.backends.openai_compat.time.sleep",
+        lambda _delay: None,
+    )
+    backend = OpenAIBackend(model="x")
+    # An empty completion is retried; its reply reported usage of its own.
+    replies = iter([
+        _stub_response("", in_tokens=50, out_tokens=60),
+        _stub_response("answer"),
+    ])
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: next(replies)),
+        ),
+    )
+
+    result = backend.invoke(Invocation(
+        system="s", user="u", tools=None, max_turns=1, budget_usd=None,
+        policy=_policy(2, timeout_seconds=600.0),
+    ))
+
+    assert next(replies, None) is None
+    assert result.final_message == "answer"
+    assert result.completeness.token_usage_complete is False
+    assert result.completeness.cost_complete is False
+    assert result.pricing_evidence.complete is False
+    # Whatever segments the result keeps, they are those of its own usage.
+    segments = _priced_segments(result)
+    assert sum(segment[0] for segment in segments) == result.usage.input_tokens
+    assert sum(segment[1] for segment in segments) == result.usage.output_tokens
 
 
 def test_attach_toolset_stores_toolset_and_invoke_runs_tool_loop():
@@ -2924,6 +3294,67 @@ def test_close_without_callable_client_close_retains_transport_owner(
         backend.close()
 
     assert backend._client is client  # noqa: SLF001
+
+
+def _first_request_timeout(backend, monkeypatch, *, policy=None, chat=False):
+    """The timeout the SDK is handed for the first request of one call."""
+
+    monkeypatch.setattr(
+        "crucible.backends.openai_compat.time.monotonic",
+        lambda: 100.0,
+    )
+    timeouts = []
+
+    def _create(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return _stub_response("done")
+
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=_create),
+        ),
+    )
+    invocation = Invocation(
+        system="s", user="u", tools=None, max_turns=1, budget_usd=None,
+        policy=policy,
+    )
+    if chat:
+        backend.chat_with_tools(invocation, _StubToolSet())
+    else:
+        backend.invoke(invocation)
+    return timeouts[0]
+
+
+def test_default_call_wall_is_forty_five_minutes(monkeypatch):
+    backend = OpenAIBackend(model="x")
+
+    assert _first_request_timeout(backend, monkeypatch) == pytest.approx(2700.0)
+
+
+@pytest.mark.parametrize("chat", [False, True], ids=["invoke", "chat_with_tools"])
+def test_timeout_seconds_option_replaces_the_default_call_wall(
+    monkeypatch, chat,
+):
+    backend = OpenAIBackend(
+        model="x", capability="read_only", timeout_seconds=1200,
+    )
+
+    assert _first_request_timeout(
+        backend, monkeypatch, chat=chat,
+    ) == pytest.approx(1200.0)
+    # A policy on the invocation still decides the wall of that call.
+    assert _first_request_timeout(
+        backend, monkeypatch, policy=_policy(1), chat=chat,
+    ) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, 0, -1, float("inf"), float("nan"), "1200"],
+)
+def test_timeout_seconds_option_is_finite_and_positive(value):
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        OpenAIBackend(model="x", timeout_seconds=value)
 
 
 def test_invocation_deadline_stops_retry_backoff_and_decreases_timeout(
