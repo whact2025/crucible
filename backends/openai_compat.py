@@ -70,6 +70,8 @@ from assay import (
     Message,
     TransportError,
     Usage,
+    UsagePricingEvidence,
+    UsagePricingSegment,
 )
 from crucible.tools._dispatch_budget import (
     TerminalToolDispatchError,
@@ -96,9 +98,22 @@ _SOURCE_EDIT_TOOL_NAMES = frozenset({
 })
 _CONTROL_POLL_SECONDS = 0.05
 
+# One wall for a whole call: every request of a tool loop, its retries and
+# backoff, the tool dispatches between them and the forced finalization.
+# Ten minutes is less than a multi-round planner or writer call may need,
+# so the default is the 45 minutes of the Codex adapter. A route sets
+# another wall with ``timeout_seconds``; a policy on the Invocation still
+# decides the wall of that call. The wall is checked before and after each
+# request, and what is left of it is handed to the SDK as the timeout of
+# the request, which its HTTP client applies to the connect, to each read,
+# to each write and to the wait for a connection separately. Nothing
+# shorter bounds a single request, and a reply that keeps arriving is not
+# cut at the wall.
+_DEFAULT_TIMEOUT_SECONDS = 2700.0
+
 _DEFAULT_POLICY = BackendPolicy(
     retry_budget=3,
-    timeout_seconds=600.0,
+    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     on_cancellation="convert_to_backend_error",
     on_max_turns="raise",
 )
@@ -114,6 +129,10 @@ class _ForcedFinalOutcome:
     served_model: str | None
     provider_request_id: str | None
     model_identity_error: IncompleteEvidence | None
+    # Whether the reply itself reported both token counters, and whether an
+    # earlier attempt of this finalization was discarded before it arrived.
+    usage_complete: bool
+    retried: bool
 
 
 class _InvocationControl:
@@ -228,6 +247,11 @@ def _mark_prior_attempts_incomplete(
             token_usage_complete=False,
             cost_complete=False,
         ),
+        pricing_evidence=(
+            None
+            if result.pricing_evidence is None
+            else _replace(result.pricing_evidence, complete=False)
+        ),
     )
 
 
@@ -285,10 +309,24 @@ class OpenAIBackend:
         max_tokens: int | None = None,
         expected_served_model: str | None = None,
         capability: str = "text",
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         from .capabilities import normalize_capability
 
         self.capability = normalize_capability(capability)
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "OpenAIBackend timeout_seconds must be a finite positive number"
+            )
+        self._default_policy = _replace(
+            _DEFAULT_POLICY,
+            timeout_seconds=float(timeout_seconds),
+        )
         if not model:
             env_model = os.environ.get("CRUCIBLE_LOCAL_MODEL", "").strip()
             if not env_model:
@@ -373,7 +411,7 @@ class OpenAIBackend:
         from .pricing import pricing_for_model
 
         pricing_for_model(self.model)
-        policy = invocation.policy or _DEFAULT_POLICY
+        policy = invocation.policy or self._default_policy
         control = _InvocationControl(
             timeout_seconds=policy.timeout_seconds,
             close_event=self._close_event,
@@ -516,6 +554,11 @@ class OpenAIBackend:
                         policy,
                         transcript=result.transcript,
                         usage=result.usage,
+                        pricing_segments=(
+                            ()
+                            if result.pricing_evidence is None
+                            else result.pricing_evidence.segments
+                        ),
                         control=control,
                     )
                 continue
@@ -639,7 +682,7 @@ class OpenAIBackend:
             raise ValueError("max_response_tokens must be positive")
         if retry_budget <= 0:
             raise ValueError("retry_budget must be positive")
-        policy = invocation.policy or _DEFAULT_POLICY
+        policy = invocation.policy or self._default_policy
         policy = _replace(
             policy,
             retry_budget=min(policy.retry_budget, retry_budget),
@@ -807,6 +850,12 @@ class OpenAIBackend:
         response = client.chat.completions.create(**create_kwargs)
         in_tokens, out_tokens = _usage_tokens(response)
         usage = self._usage(in_tokens, out_tokens)
+        pricing_segments = _pricing_segments(
+            _usage_is_complete(response),
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            cost_usd=usage.cost_usd,
+        )
         served_model, model_identity_error = self._served_model_identity(
             response
         )
@@ -822,6 +871,7 @@ class OpenAIBackend:
                 policy,
                 transcript=(Message(role="user", content=invocation.user),),
                 usage=usage,
+                pricing_segments=pricing_segments,
                 served_model=served_model,
                 provider_request_id=provider_request_id,
                 control=control,
@@ -840,6 +890,7 @@ class OpenAIBackend:
                 ),
                 error=model_identity_error,
                 usage_complete=False,
+                pricing_segments=pricing_segments,
                 served_model=served_model,
                 provider_request_id=provider_request_id,
                 events=control.events,
@@ -872,6 +923,7 @@ class OpenAIBackend:
                     ),
                 ),
                 response=response,
+                pricing_segments=pricing_segments,
                 events=control.events,
             )
 
@@ -888,6 +940,7 @@ class OpenAIBackend:
                     message="server returned finish_reason=length",
                 ),
                 response=response,
+                pricing_segments=pricing_segments,
                 events=control.events,
             )
 
@@ -918,6 +971,7 @@ class OpenAIBackend:
                     retriable=True,
                 ),
                 response=response,
+                pricing_segments=pricing_segments,
                 events=control.events,
             )
 
@@ -927,6 +981,7 @@ class OpenAIBackend:
             usage=usage,
             stop_reason="max_turns" if finish_reason == "length" else "end_turn",
             response=response,
+            pricing_segments=pricing_segments,
             events=control.events,
         )
 
@@ -939,6 +994,7 @@ class OpenAIBackend:
         usage: Usage,
         final_message: str = "",
         message: str | None = None,
+        pricing_segments: tuple[UsagePricingSegment, ...] = (),
         served_model: str | None = None,
         provider_request_id: str | None = None,
         tool_authority_digest: str | None = None,
@@ -956,6 +1012,7 @@ class OpenAIBackend:
             stop_reason=stop_reason,
             error=error,
             usage_complete=False,
+            pricing_segments=pricing_segments,
             served_model=served_model,
             provider_request_id=provider_request_id,
             tool_authority_digest=tool_authority_digest,
@@ -1087,6 +1144,8 @@ class OpenAIBackend:
         total_in = 0
         total_out = 0
         total_cost_usd = 0.0
+        # One segment per provider response that reported its usage, in order.
+        pricing_segments: list[UsagePricingSegment] = []
         final_text = ""
         stop_reason = "end_turn"
         # True until the latest source-edit obligation is satisfied.  A later
@@ -1124,6 +1183,7 @@ class OpenAIBackend:
                     cost_usd=total_cost_usd,
                 ),
                 final_message=final_text,
+                pricing_segments=tuple(pricing_segments),
                 served_model=served_model,
                 provider_request_id=provider_request_id,
                 tool_authority_digest=tool_authority_digest,
@@ -1152,15 +1212,29 @@ class OpenAIBackend:
                 if error is not None:
                     all_usage_complete = False
                 return
-            # The compact forced-final outcome deliberately remains
-            # conservative about the complete physical usage envelope.
-            all_usage_complete = False
-            total_in += outcome.input_tokens
-            total_out += outcome.output_tokens
-            total_cost_usd += compute_cost(
+            # The finalization is one more provider response: the aggregate
+            # stays complete only if its reply reported its usage and no
+            # attempt of it was discarded.
+            all_usage_complete = (
+                all_usage_complete
+                and outcome.usage_complete
+                and not outcome.retried
+            )
+            outcome_cost_usd = compute_cost(
                 self.model,
                 input_tokens=outcome.input_tokens,
                 output_tokens=outcome.output_tokens,
+            )
+            total_in += outcome.input_tokens
+            total_out += outcome.output_tokens
+            total_cost_usd += outcome_cost_usd
+            pricing_segments.extend(
+                _pricing_segments(
+                    outcome.usage_complete,
+                    input_tokens=outcome.input_tokens,
+                    output_tokens=outcome.output_tokens,
+                    cost_usd=outcome_cost_usd,
+                )
             )
             if (
                 self._expected_served_model is not None
@@ -1311,6 +1385,7 @@ class OpenAIBackend:
                             return stopped_result(stopped)
                         continue
                     return self._result_with_evidence(
+                        pricing_segments=tuple(pricing_segments),
                         final_message=final_text,
                         transcript=tuple(transcript),
                         usage=self._usage(
@@ -1345,12 +1420,21 @@ class OpenAIBackend:
             ):
                 provider_request_id = observed_request_id
             in_tok, out_tok = _usage_tokens(response)
-            total_in += in_tok
-            total_out += out_tok
-            total_cost_usd += compute_cost(
+            response_cost_usd = compute_cost(
                 self.model,
                 input_tokens=in_tok,
                 output_tokens=out_tok,
+            )
+            total_in += in_tok
+            total_out += out_tok
+            total_cost_usd += response_cost_usd
+            pricing_segments.extend(
+                _pricing_segments(
+                    _usage_is_complete(response),
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    cost_usd=response_cost_usd,
+                )
             )
             control.record(
                 "usage",
@@ -1369,6 +1453,7 @@ class OpenAIBackend:
                 # exact physical model identity is unproved.
                 control.record("limit", name="served_model_identity")
                 return self._result_with_evidence(
+                    pricing_segments=tuple(pricing_segments),
                     final_message=final_text,
                     transcript=tuple(transcript),
                     usage=self._usage(
@@ -1541,6 +1626,7 @@ class OpenAIBackend:
                         if stopped is not None:
                             return stopped_result(stopped)
                         return self._result_with_evidence(
+                            pricing_segments=tuple(pricing_segments),
                             final_message=final_text,
                             transcript=tuple(transcript),
                             usage=self._usage(
@@ -1562,6 +1648,7 @@ class OpenAIBackend:
                                 "limit", name="served_model_identity"
                             )
                             return self._result_with_evidence(
+                                pricing_segments=tuple(pricing_segments),
                                 final_message="",
                                 transcript=tuple(transcript),
                                 usage=self._usage(
@@ -1639,6 +1726,7 @@ class OpenAIBackend:
                                 name="tool_dispatch_budget",
                             )
                         return self._result_with_evidence(
+                            pricing_segments=tuple(pricing_segments),
                             final_message=final_text,
                             transcript=tuple(transcript),
                             usage=self._usage(
@@ -1693,6 +1781,7 @@ class OpenAIBackend:
                 ):
                     control.record("limit", name="context_bytes")
                     return self._result_with_evidence(
+                        pricing_segments=tuple(pricing_segments),
                         final_message=final_text,
                         transcript=tuple(transcript),
                         usage=self._usage(
@@ -1842,6 +1931,7 @@ class OpenAIBackend:
                 if forced.model_identity_error is not None:
                     control.record("limit", name="served_model_identity")
                     return self._result_with_evidence(
+                        pricing_segments=tuple(pricing_segments),
                         final_message="",
                         transcript=tuple(transcript),
                         usage=self._usage(
@@ -1910,6 +2000,7 @@ class OpenAIBackend:
             )
 
         return self._result_with_evidence(
+            pricing_segments=tuple(pricing_segments),
             final_message=final_text,
             transcript=tuple(transcript),
             usage=final_usage,
@@ -1960,6 +2051,7 @@ class OpenAIBackend:
             ),
         }]
         response = None
+        retried = False
         for attempt in range(1, max(1, policy.retry_budget) + 1):
             stopped = control.stopped()
             if stopped is not None:
@@ -2011,6 +2103,9 @@ class OpenAIBackend:
                         "retry",
                         name=getattr(err, "kind", type(exc).__name__),
                     )
+                    # As in the tool loop: the provider may have billed the
+                    # discarded attempt, and its usage never arrived.
+                    retried = True
                     stopped = control.wait(backoff)
                     if stopped is not None:
                         error, _stop_reason = self._control_error(stopped, policy)
@@ -2026,9 +2121,10 @@ class OpenAIBackend:
             response
         )
         provider_request_id = _provider_request_id(response)
+        usage_complete = _usage_is_complete(response)
         control.record(
             "usage",
-            name="complete" if _usage_is_complete(response) else "incomplete",
+            name="complete" if usage_complete else "incomplete",
         )
         evidence = _ForcedFinalOutcome(
             text="",
@@ -2037,6 +2133,8 @@ class OpenAIBackend:
             served_model=served_model,
             provider_request_id=provider_request_id,
             model_identity_error=model_identity_error,
+            usage_complete=usage_complete,
+            retried=retried,
         )
         stopped = control.stopped()
         if stopped is not None:
@@ -2057,6 +2155,8 @@ class OpenAIBackend:
             served_model=served_model,
             provider_request_id=provider_request_id,
             model_identity_error=model_identity_error,
+            usage_complete=usage_complete,
+            retried=retried,
         ), None
 
     def _usage(
@@ -2099,6 +2199,7 @@ class OpenAIBackend:
         response: Any = None,
         usage_complete: bool | None = None,
         trace_complete: bool = True,
+        pricing_segments: tuple[UsagePricingSegment, ...] = (),
         served_model: str | None = None,
         provider_request_id: str | None = None,
         tool_authority_digest: str | None = None,
@@ -2163,6 +2264,12 @@ class OpenAIBackend:
                 ),
                 tool_authority_digest=tool_authority_digest,
                 events=tuple(trace_events),
+            ),
+            # Complete exactly where the accounting flags are: every response
+            # of the call reported its usage and has its segment.
+            pricing_evidence=UsagePricingEvidence(
+                segments=tuple(pricing_segments),
+                complete=usage_complete,
             ),
         )
 
@@ -2253,6 +2360,37 @@ def _usage_is_complete(response: Any) -> bool:
         and raw_in >= 0
         and type(raw_out) is int
         and raw_out >= 0
+    )
+
+
+def _pricing_segments(
+    usage_complete: bool,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cost_usd: float,
+) -> tuple[UsagePricingSegment, ...]:
+    """Return the pricing segment of one provider response, if it has one.
+
+    Only a response that reported both token counters is pricing evidence.
+    Its cost is what the price row of the route gives for those counters; a
+    zero-rate row prices it at zero. This adapter reads the two token
+    counters of a reply and no cache counter, so a segment records none:
+    input that a provider reports as read from its cache is priced, here as
+    in the usage of the result, at the input rate of the row and not at its
+    cache rate.
+    """
+
+    if not usage_complete:
+        return ()
+    return (
+        UsagePricingSegment(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_tokens=0,
+            cache_read_tokens=0,
+            cost_usd=cost_usd,
+        ),
     )
 
 

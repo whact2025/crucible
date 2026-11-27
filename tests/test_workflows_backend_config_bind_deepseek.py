@@ -133,6 +133,12 @@ def test_checked_in_product_template_becomes_exact_usable_route(
         kwargs["expected_worker_runtime_fingerprint"] == _DIGEST
         for _name, kwargs in constructed
     )
+    # Every role states the wall of one call, and a call without a policy
+    # runs under it. The DeepSWE template states 45 minutes, the window the
+    # Codex adapter gives a turn; the SWE-bench template keeps ten minutes.
+    wall = 2_700 if template.parent.name == "deepswe" else 600
+    assert {kwargs["timeout_seconds"] for _name, kwargs in constructed} == {wall}
+    assert loaded.default.extra["timeout_seconds"] == wall
 
 
 def test_cli_prints_only_secret_free_receipt(

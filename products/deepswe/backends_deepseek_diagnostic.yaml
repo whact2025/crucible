@@ -20,6 +20,12 @@
 # worker fingerprint contains host paths, so a real diagnostic must derive a
 # run-local copy of this file and add
 # ``expected_worker_runtime_fingerprint`` from the provider-free capture API.
+# Every role states the wall of one call, ``timeout_seconds: 2700``: the
+# 45 minutes the Codex adapter gives a turn. A call that carries no policy
+# runs under that wall; a policy on the call can only shorten it.
+# One call runs at most 64 provider rounds, and a call that asks for more
+# turns is refused before any request: a run on this profile passes
+# ``--max-turns 64`` or less (the suite's default is 90).
 # This checked-in profile reads no credential and authorizes no provider call.
 
 schema_version: crucible.backend-routing.v1
@@ -30,7 +36,7 @@ default:
   feature_admission: diagnostic
   extra:
     max_response_tokens: 32000
-    timeout_seconds: 600
+    timeout_seconds: 2700
 
 roles:
   architect_planner:
@@ -39,7 +45,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   architect_critic:
     backend: deepseek
@@ -47,7 +53,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   architect_judge:
     backend: deepseek
@@ -55,7 +61,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   implementer:
     backend: deepseek
@@ -64,7 +70,7 @@ roles:
     extra:
       diagnostic_workspace_write: true
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   breach_defender:
     backend: deepseek
@@ -73,7 +79,7 @@ roles:
     extra:
       diagnostic_workspace_write: true
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   impl_breaker:
     backend: deepseek
@@ -81,7 +87,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   breach_judge:
     backend: deepseek
@@ -89,7 +95,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   diff_scope:
     backend: deepseek
@@ -97,7 +103,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   tier_completeness:
     backend: deepseek
@@ -105,7 +111,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   api_contract_fidelity:
     backend: deepseek
@@ -113,7 +119,7 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700
 
   review_conflict_authority:
     backend: deepseek
@@ -121,4 +127,4 @@ roles:
     feature_admission: diagnostic
     extra:
       max_response_tokens: 32000
-      timeout_seconds: 600
+      timeout_seconds: 2700

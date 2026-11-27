@@ -3395,8 +3395,8 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
             ledger.parse(unknown)
     # A gap that is no provider fact closes on whatever its cells are
     # answered from: a record without the field is not held.
-    assert LEDGER.registry["G17"].closes_on_grade is None
-    assert _problem_codes(_without_the_codes_of("G17")) == set()
+    assert LEDGER.registry["G16"].closes_on_grade is None
+    assert _problem_codes(_without_the_codes_of("G16")) == set()
     # The terminal flag that the gateway adapter writes true on every path
     # is no provider fact either, and has a record of its own for that
     # reason: its cells close when they stop showing the code, whatever
@@ -3470,8 +3470,8 @@ def test_h03_holds_a_gap_open_while_its_record_waits_for_a_ruling() -> None:
             ledger.parse(blank)
     # A record that waits for no ruling closes when its cells stop deviating,
     # and the shipped ledger, in which the gap is open, is clean.
-    assert LEDGER.registry["G17"].awaits_ruling is None
-    assert _problem_codes(_without_the_codes_of("G17")) == set()
+    assert LEDGER.registry["G16"].awaits_ruling is None
+    assert _problem_codes(_without_the_codes_of("G16")) == set()
     assert _problem_codes() == set()
 
 
@@ -3646,10 +3646,11 @@ def test_h03_holds_a_frozen_ceiling_to_the_count_of_its_pack() -> None:
     # The shipped ledger states the ceiling of pack A frozen. A frozen
     # ceiling only falls, and no run has the history to see a number rise.
     # So it is held to the count of its pack, and never above the number it
-    # was frozen at: an entry that a ruling admits after the freeze raises
-    # that number here, in the change that writes the entry.
+    # was frozen at or has fallen to since, by the fix of a gap: an entry
+    # that a ruling admits after the freeze raises that number here, in the
+    # change that writes the entry.
     assert LEDGER.frozen == {"pack_a"}
-    assert LEDGER.ceilings["pack_a"] == counts["pack_a"] <= 84
+    assert LEDGER.ceilings["pack_a"] == counts["pack_a"] <= 74
     assert _problem_codes() == set()
 
     # The lying counterpart: a fix deleted its entry and left the ceiling.

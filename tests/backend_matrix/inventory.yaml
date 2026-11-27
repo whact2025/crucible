@@ -174,27 +174,6 @@ not_expressible:
       rejected content and is not retried
 
 column_wide_not_owed:
-  - cell: openai_compat:hosted/S23c/primary/raw
-    code: "pricing:none"
-    reason: >-
-      The scenario is a request the service rejects before it bills anything,
-      so it waives the cost flag, and the adapter flags the cost of the error
-      result incomplete: pricing evidence is asked only of a result that
-      flags its cost complete.
-  - cell: openai_compat:hosted/S23c/secondary/raw
-    code: "pricing:none"
-    reason: >-
-      The scenario is a request the service rejects before it bills anything,
-      so it waives the cost flag, and the adapter flags the cost of the error
-      result incomplete: pricing evidence is asked only of a result that
-      flags its cost complete.
-  - cell: openai_compat:local/S23c/primary/raw
-    code: "pricing:none"
-    reason: >-
-      The scenario is a request the service rejects before it bills anything,
-      so it waives the cost flag, and the adapter flags the cost of the error
-      result incomplete: pricing evidence is asked only of a result that
-      flags its cost complete.
   - cell: kimi/S23c/primary/raw
     code: "flag:token_usage_complete=False"
     reason: >-
@@ -282,18 +261,6 @@ column_wide_not_owed:
       asked of its result.
   - cell: codex:official/S27/primary/raw
     code: "pricing:unreconciled"
-    reason: >-
-      The scenario is a reply that is cut inside the turn, so it expects
-      the cost flag false: pricing evidence is asked only of a result that
-      may flag its cost complete.
-  - cell: openai_compat:hosted/S27/primary/raw
-    code: "pricing:none"
-    reason: >-
-      The scenario is a reply that is cut inside the turn, so it expects
-      the cost flag false: pricing evidence is asked only of a result that
-      may flag its cost complete.
-  - cell: openai_compat:local/S27/primary/raw
-    code: "pricing:none"
     reason: >-
       The scenario is a reply that is cut inside the turn, so it expects
       the cost flag false: pricing evidence is asked only of a result that

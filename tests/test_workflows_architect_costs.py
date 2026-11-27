@@ -46,9 +46,10 @@ from assay import (
 )
 from assay.corpus.store import Corpus
 from assay.corpus.runs import RunResult
-from assay.primitives.implement import capture_workspace_delta
+from assay.primitives.implement import capture_workspace_delta, implement
 from assay.types.findings import ReviewCoverage, Verdict
 from assay.types.invocation import Usage
+from crucible.backends.openai_compat import OpenAIBackend
 from crucible.common.cost import CostAccumulator
 from crucible.tools._dispatch_budget import (
     BoundedReadOnlyToolSet,
@@ -77,7 +78,11 @@ from crucible.workflows.architect import (
 )
 from crucible.workflows import architect as arch
 from crucible.workflows import _mutation_journal, _partition
+from crucible.workflows import breach as breach_mod
+from crucible.workflows import tier as tier_mod
 from crucible.workflows._run import exec_ctx_now
+from tests.test_backends_openai_compat import _StubToolSet, _stub_response, _tool_call
+from tests.test_workflows_tier_budget_terminal import _init_repo
 
 
 _COMPLETE_EXECUTION = ExecutionCompleteness(
@@ -407,6 +412,226 @@ def test_delta_walk_accepts_exact_zero_deterministic_implementation(
         summary,
         label="priced implementation plus deterministic no-transport record",
     ).valid
+
+
+def _gateway_tool_loop(model: str, replies):
+    """The OpenAI-compatible adapter on one scripted tool loop, and its call."""
+
+    backend = OpenAIBackend(
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        api_key="not-needed",
+        capability="read_only",
+    )
+    backend.attach_toolset(_StubToolSet())
+    script = iter(replies)
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: next(script)),
+        ),
+    )
+    return backend, Invocation(
+        system="s",
+        user="u",
+        tools=None,
+        max_turns=5,
+        budget_usd=None,
+        response_schema={"type": "object"},
+    )
+
+
+def test_architect_admits_a_gateway_planner_call_with_a_schema_finalisation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    pricing = tmp_path / "pricing.yaml"
+    pricing.write_text(
+        "adapter-fixture:\n  input_per_mtok: 0\n  output_per_mtok: 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CRUCIBLE_PRICING_CONFIG", str(pricing))
+    # A planner with source tools: a tool round, a draft, then the
+    # finalisation that carries the response schema.
+    backend, invocation = _gateway_tool_loop(
+        "adapter-fixture",
+        [
+            _stub_response("", tool_calls=[_tool_call("c1", "lookup", "{}")]),
+            _stub_response("draft"),
+            _stub_response('{"tiers": []}'),
+        ],
+    )
+    planning_usage = CostAccumulator()
+    planner = _PlanningUsageBackend(
+        backend, role="architect_planner", usage=planning_usage,
+    )
+
+    # Planning refuses a result with accounting debt by raising.
+    result = planner.invoke(invocation)
+
+    assert result.final_message == '{"tiers": []}'
+    summary = planning_usage.to_dict()
+    assert summary["accounting_debt"] is False
+    assert summary["total_input_tokens"] == 30
+    assert summary["pricing_evidence"]["complete"] is True
+    assert len(summary["pricing_evidence"]["segments"]) == 3
+
+
+class _GatewayWriterTools(_StubToolSet):
+    """A lookup, and one write tool that puts a file into the workspace."""
+
+    write_names = {"apply_patch"}
+
+    def __init__(self, root: Path):
+        super().__init__()
+        self._root = root
+
+    def to_openai_tools(self):
+        return [
+            *super().to_openai_tools(),
+            {
+                "type": "function",
+                "function": {"name": "apply_patch", "parameters": {}},
+            },
+        ]
+
+    def dispatch(self, name, args):
+        if name == "apply_patch":
+            (self._root / "hello.py").write_text("def hi():\n    return 'hi'\n")
+        return super().dispatch(name, args)
+
+
+def _gateway_writer_implementation(
+    tmp_path: Path,
+    corpus: Corpus,
+    slice_id: str,
+    model: str,
+    replies,
+    *,
+    budget_usd=None,
+) -> Implementation:
+    """What assay's implement records of one writer call on the adapter."""
+
+    repo = tmp_path / slice_id
+    repo.mkdir()
+    _init_repo(repo)
+    backend = OpenAIBackend(
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        api_key="not-needed",
+        capability="workspace_write",
+        cwd=str(repo),
+    )
+    backend.attach_toolset(_GatewayWriterTools(repo))
+    script = iter(replies)
+    backend._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: next(script)),
+        ),
+    )
+    record = implement(
+        corpus.latest_spec(),
+        slice_id,
+        ImplementationDirective(
+            slice_id=slice_id,
+            intent="add hi()",
+            files_in_scope=("hello.py",),
+            creates_paths=("hello.py",),
+            verify_mode="build_only",
+            blast_radius={},
+            requirement_refs=(),
+        ),
+        backend=backend,
+        corpus=corpus,
+        cwd=str(repo),
+        max_turns=9,
+        budget_usd=budget_usd,
+    )
+    assert next(script, None) is None
+    return record
+
+
+def test_records_accounted_by_the_gateway_adapter_pass_the_strict_pricing_gates(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The pricing gates of Architect, Tier and Breach on gateway writer calls.
+
+    The records are the ones assay's implement builds from the results of
+    the real adapter over scripted replies.
+    """
+
+    pricing = tmp_path / "pricing.yaml"
+    pricing.write_text(
+        "adapter-fixture:\n  input_per_mtok: 0\n  output_per_mtok: 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CRUCIBLE_PRICING_CONFIG", str(pricing))
+    corpus = _make_corpus(tmp_path)
+    baseline = corpus.latest_spec()
+    lookup = [_tool_call("c1", "lookup", "{}")]
+    # A zero-rate route: a lookup, the write and the closing message.
+    success = _gateway_writer_implementation(
+        tmp_path,
+        corpus,
+        "gateway-finished",
+        "adapter-fixture",
+        [
+            _stub_response("", tool_calls=lookup),
+            _stub_response("", tool_calls=[_tool_call("c2", "apply_patch", "{}")]),
+            _stub_response("DONE"),
+        ],
+    )
+    # A priced route whose first response crosses the budget of the call.
+    stopped = _gateway_writer_implementation(
+        tmp_path,
+        corpus,
+        "gateway-over-budget",
+        "gpt-5.5",
+        [_stub_response(
+            "", in_tokens=1_000_000, out_tokens=1_000, tool_calls=lookup,
+        )],
+        budget_usd=0.01,
+    )
+    assert success.classification == "success"
+    assert success.files_modified == ("hello.py",)
+    assert success.cost_usd == 0.0 and success.input_tokens == 30
+    assert stopped.stop_reason == "budget_exhausted"
+    assert stopped.cost_usd > 0.01
+
+    assert tier_mod._has_complete_priced_execution(success)
+    assert tier_mod._has_complete_priced_execution(stopped)
+    assert breach_mod._is_closed_budget_terminal_implementation(stopped)
+
+    refs = tuple(
+        corpus.put_record(item, kind="implementations")
+        for item in (success, stopped)
+    )
+    current = baseline.with_appended_refs(implementation_refs=refs)
+    corpus.put_spec(current)
+    costs = CostAccumulator()
+    _record_spec_delta_into_costs(
+        costs,
+        corpus=corpus,
+        prior_spec=baseline,
+        current_spec=current,
+        pre_verdict_ref_count=len(baseline.verdict_refs),
+        pre_implementation_ref_count=len(baseline.implementation_refs),
+    )
+    summary = costs.to_dict()
+
+    assert len(summary["pricing_evidence_by_call"]) == 2
+    assert len(summary["pricing_evidence"]["segments"]) == 4
+    assert summary["pricing_evidence"]["complete"] is True
+    assert arch._pricing_summary_projection(
+        summary,
+        label="two gateway calls",
+    ).valid
+    assert tier_mod._parse_breach_pricing_rollup(
+        summary,
+        input_tokens=summary["total_input_tokens"],
+        output_tokens=summary["total_output_tokens"],
+        cost_usd=summary["total_usd"],
+    ).ledger_valid
 
 
 def test_delta_walk_excludes_final_binding_from_v2_provider_call_ledger(

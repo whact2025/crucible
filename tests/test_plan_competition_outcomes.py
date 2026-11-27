@@ -47,11 +47,13 @@ from assay import (
 from assay.primitives.plan import _serialize_tier_dag
 
 from crucible.backends.openai_compat import OpenAIBackend
+from crucible.common.cost import CostAccumulator
 from crucible.rubrics import load
 from crucible.workflows import _outcome, _plan_selection, architect, plan
 from crucible.workflows import _plan_competition as competition
 from crucible.workflows._plan_validation import build_pre_review_candidate_validator
 from tests import test_plan_competition as harness
+from tests.test_backends_openai_compat import _StubToolSet, _stub_response, _tool_call
 
 
 KEPT = "plan_competition_inconclusive"
@@ -1167,7 +1169,16 @@ def test_where_one_planner_and_three_planners_still_differ(tmp_path, monkeypatch
 # --- a lost call with incomplete usage is an accounting terminal ----------------------
 
 
-def _openai_compatible_result(tmp_path, monkeypatch, create):
+def _openai_compatible_result(
+    tmp_path,
+    monkeypatch,
+    create,
+    *,
+    toolset=None,
+    response_schema=None,
+    max_turns=1,
+    timeout_seconds=1.0,
+):
     """What the OpenAI-compatible adapter returns for one single-attempt call."""
     pricing = tmp_path / "pricing.yaml"
     pricing.write_text(
@@ -1179,7 +1190,10 @@ def _openai_compatible_result(tmp_path, monkeypatch, create):
         model="adapter-fixture",
         base_url="http://127.0.0.1:9/v1",
         api_key="not-needed",
+        capability="text" if toolset is None else "read_only",
     )
+    if toolset is not None:
+        backend.attach_toolset(toolset)
     backend._client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=create))
     )
@@ -1188,11 +1202,12 @@ def _openai_compatible_result(tmp_path, monkeypatch, create):
             system="s",
             user="u",
             tools=None,
-            max_turns=1,
+            max_turns=max_turns,
             budget_usd=None,
+            response_schema=response_schema,
             policy=BackendPolicy(
                 retry_budget=1,
-                timeout_seconds=1.0,
+                timeout_seconds=timeout_seconds,
                 on_cancellation="raise",
                 on_max_turns="raise",
             ),
@@ -1239,6 +1254,58 @@ def test_a_lost_planner_call_is_named_only_with_complete_usage(tmp_path, monkeyp
         "inconclusive",
         "no planner returned a draft: ",
         DRAFT_CALLS,
+    )
+
+
+def test_drafts_accounted_as_the_gateway_adapter_accounts_them_are_selected(
+    tmp_path, monkeypatch
+):
+    # A planner call with source tools on the OpenAI-compatible route: a tool
+    # round, a draft and the schema finalisation, each reply with its usage.
+    replies = iter(
+        [
+            _stub_response("", tool_calls=[_tool_call("c1", "lookup", "{}")]),
+            _stub_response("draft"),
+            _stub_response('{"tiers": []}'),
+        ]
+    )
+    paid = _openai_compatible_result(
+        tmp_path,
+        monkeypatch,
+        lambda **_kwargs: next(replies),
+        toolset=_StubToolSet(),
+        response_schema={"type": "object"},
+        max_turns=5,
+        # Three requests, and no test of the wall: one the clock of a slow
+        # runner does not reach.
+        timeout_seconds=600.0,
+    )
+
+    assert paid.error is None and paid.completeness.complete
+    assert paid.pricing_evidence is not None
+    assert len(paid.pricing_evidence.segments) == 3
+
+    def accounted_by_the_adapter(result):
+        return replace(
+            result,
+            usage=paid.usage,
+            completeness=paid.completeness,
+            execution_trace=paid.execution_trace,
+            pricing_evidence=paid.pricing_evidence,
+        )
+
+    with monkeypatch.context() as patch:
+        _script(patch, _each(DRAFTS, accounted_by_the_adapter), {}, None)
+        _pool, ledger, _corpus, _spec, outcome, report = harness._run(tmp_path / "three")
+
+    # Three planners need complete receipts with pricing evidence for every
+    # call; Architect then reconciles the outcome with the call ledger.
+    assert outcome.accepted, (outcome.status, outcome.reason, report)
+    architect._require_plan_outcome_pricing_reconciliation(
+        outcome=outcome,
+        usage_before=CostAccumulator().to_dict(),
+        planning_usage=ledger,
+        role="competition",
     )
 
 

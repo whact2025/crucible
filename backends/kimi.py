@@ -5004,10 +5004,27 @@ class KimiBackend:
                                 self._unregister_mutation_host(mutation_host)
                                 mutation_host = None
                             raise
-                        attempt_mcp_toolset = ProcessHostedToolSet(
-                            mcp_toolset,
-                            mutation_host,
+                        from crucible.tools._dispatch_budget import (  # noqa: PLC0415
+                            ProgressBoundedMutatingToolSet,
                         )
+
+                        if isinstance(toolset, ProgressBoundedMutatingToolSet):
+                            # The host credits a write as progress only to a
+                            # progress wrapper it is handed itself: behind the
+                            # frozen view a hosted write would not reset the
+                            # consecutive-read streak. The bridge still
+                            # serves the frozen catalogue.
+                            attempt_mcp_toolset = _FrozenMcpToolset(
+                                ProcessHostedToolSet(toolset, mutation_host),
+                                names=tool_names,
+                                write_names=write_names,
+                                authority_snapshot=authority_snapshot,
+                            )
+                        else:
+                            attempt_mcp_toolset = ProcessHostedToolSet(
+                                mcp_toolset,
+                                mutation_host,
+                            )
                     from crucible.tools._mcp_http_server import (  # noqa: PLC0415
                         CrucibleHttpMcpServer,
                     )
