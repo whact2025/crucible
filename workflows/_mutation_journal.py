@@ -52,7 +52,7 @@ import subprocess
 import threading
 import time
 from contextlib import AbstractContextManager, ExitStack, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import (
@@ -66,6 +66,7 @@ from typing import (
     Mapping,
     NoReturn,
     Protocol,
+    Sequence,
     TypeVar,
     cast,
 )
@@ -664,6 +665,7 @@ def _remove_bound_regular_entry(
             directory_fd,
             prefix=quarantine_prefix,
         )
+        _ask_git_before_held_write()
         reservation_fd = os.open(
             quarantine,
             os.O_WRONLY
@@ -760,6 +762,7 @@ def _remove_bound_symlink_entry(
         ):
             raise MutationJournalError(f"{label} changed while opening")
         quarantine = _private_cleanup_quarantine_name(directory_fd)
+        _ask_git_before_held_write()
         reservation_fd = os.open(
             quarantine,
             os.O_WRONLY
@@ -990,6 +993,7 @@ def _remove_bound_directory_tree(
                     "bound cleanup directory differs from authorized inventory"
                 )
             quarantine = _private_cleanup_quarantine_name(current_fd)
+            _ask_git_before_held_write()
             os.mkdir(quarantine, mode=0o700, dir_fd=current_fd)
             reservation_fd = os.open(
                 quarantine,
@@ -1129,6 +1133,8 @@ def _remove_bound_directory_tree(
             "bound cleanup target changed before content removal"
         )
     clear(directory_fd, 0)
+    # Asked before the identity check, which stays next to the removal.
+    _ask_git_before_held_write()
     current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
         raise MutationJournalError(
@@ -1902,6 +1908,25 @@ class _WorkspaceMutationAuthority:
     external_common_key: tuple[int, int]
     external_root_key: tuple[int, int]
     owner_pid: int
+    # The witness under which Git itself last named ``common_dir`` for this
+    # checkout, or None.  Written only by ``_authority_discovery``; it lives
+    # and dies with this one lock grant.  It holds the process environment,
+    # so it takes no part in comparison or repr and is never logged.
+    _discovery_witness: tuple[object, ...] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    # Whether the last discovery answer for this checkout came from that
+    # witness instead of from Git.  A write through a held descriptor asks
+    # Git first while this is set (``_ask_git_before_held_write``).
+    _discovery_reused: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 class WorkspaceMutationLockAcquisitionLease:
@@ -2427,6 +2452,23 @@ class _GitAdminAuthorityBatch:
 
 _AUTHORITY_DISCOVERY_TIMEOUT_S = 5.0
 _CONTROL_FILE_MAX_BYTES = 1024 * 1024
+# A Git control file is witnessed by its bytes.  A larger one is not read for
+# that, and the checkout then gets no discovery witness.
+_DISCOVERY_WITNESS_MAX_FILE_BYTES = 64 * 1024
+# Local config words that can make Git's discovery depend on a path the
+# witness does not hold (an included file, a work tree outside the checkout).
+# The test is on the bytes so that it cannot miss a key; where it is too wide
+# (a branch so named) it only costs the reuse.
+_DISCOVERY_WITNESS_OUTSIDE_WORDS = (b"include", b"worktree")
+# Environment variables of these names send the loader of the Git program to
+# libraries the witness does not hold.  The witness holds the environment by
+# value, not the files a value leads to, so with one of them set there is no
+# witness.
+_DISCOVERY_WITNESS_LOADER_PREFIXES = ("LD_", "DYLD_")
+# The kernel stamps a change with a clock that advances in steps of a few
+# milliseconds; a second change inside the same step leaves the stamp as it
+# is.  An entry that changed this recently is therefore not witnessed.
+_DISCOVERY_WITNESS_SETTLE_NS = 20_000_000
 
 
 def _read_bounded_control_file(
@@ -4078,10 +4120,607 @@ def _active_workspace_mutation_authority(
     return authority
 
 
+class _NoDiscoveryWitness(Exception):
+    """An input of Git's discovery has a shape the witness does not cover."""
+
+
+def _discovery_witness_lstat(path: str) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _discovery_witness_prefixes(path: str) -> list[str]:
+    """Return ``path`` and every directory above it, outermost first."""
+
+    prefixes = [path]
+    while True:
+        parent = os.path.dirname(prefixes[-1])
+        if parent == prefixes[-1]:
+            break
+        prefixes.append(parent)
+    prefixes.reverse()
+    return prefixes
+
+
+class _EitherChangeTime(tuple[int | None, ...]):
+    """Change times of which one that stands as it was is enough.
+
+    A directory entry that is exchanged for another, and put back, moves two
+    change times: that of the directory it lies in and its own, because a
+    rename stamps the renamed entry.  The witness of ``objects`` and
+    ``refs`` rests on that stamp as well.  Each of the two times also moves
+    for other reasons, the first when any entry of that directory comes or
+    goes, the second when the entry's own content does.  As long as one of
+    them stands as it was, the entry was not exchanged.  A time that had
+    not settled when it was taken is held as ``None`` and proves nothing.
+    """
+
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _EitherChangeTime)
+            and len(other) == len(self)
+            and any(
+                mine is not None and mine == theirs
+                for mine, theirs in zip(self, other, strict=True)
+            )
+        )
+
+    def __ne__(self, other: object) -> bool:
+        return not self == other
+
+
+def _discovery_witness_directory(
+    path: str,
+    *,
+    times: list[int] | None = None,
+    changed: dict[str, int] | None = None,
+) -> tuple[object, ...]:
+    """Witness one real directory: identity, type, owner, search permission.
+
+    With ``times`` its change time is witnessed too, which moves when an
+    entry is created in it, removed from it, or renamed.  With ``changed``
+    that time is noted for ``_discovery_question_guard`` instead.
+    """
+
+    metadata = _discovery_witness_lstat(path)
+    if metadata is None or not stat.S_ISDIR(metadata.st_mode):
+        raise _NoDiscoveryWitness
+    stamp: tuple[object, ...] = (
+        "directory",
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        os.access(path, os.X_OK),
+    )
+    if changed is not None:
+        changed[path] = metadata.st_ctime_ns
+    if times is None:
+        return stamp
+    times.append(metadata.st_ctime_ns)
+    return (*stamp, metadata.st_ctime_ns)
+
+
+def _discovery_witness_spelled_way(
+    spelled: bytes,
+    start: str,
+    end: str,
+    held: Mapping[str, int],
+) -> None:
+    """Refuse a witness unless a control file's way runs over held directories.
+
+    Git follows the path a ``.git`` file or ``commondir`` names as it is
+    spelled, from ``start`` unless it is absolute.  The witness holds the
+    directories of the four held paths, which are resolved.  A spelling that
+    leaves them, through a symbolic link or through another directory and
+    ``..``, passes a place nothing holds: what lies there can be exchanged
+    for the length of one Git question and lead Git to another directory
+    while every witnessed entry stays as it was.  So each step of the
+    spelled way must arrive at a directory of ``held``, ``..`` leaves such
+    a directory for the one it lies in, and the way must end at ``end``.
+    Git itself writes such ways.
+    """
+
+    text = os.fsdecode(spelled.rstrip(b"\r\n"))
+    current = start
+    if text.startswith("/"):
+        # More than one leading slash may name another root.
+        if text.startswith("//"):
+            raise _NoDiscoveryWitness
+        current = "/"
+    for step in text.split("/"):
+        if step in ("", "."):
+            continue
+        current = (
+            os.path.dirname(current) if step == ".."
+            else os.path.join(current, step)
+        )
+        if current not in held:
+            raise _NoDiscoveryWitness
+    if current != end:
+        raise _NoDiscoveryWitness
+
+
+def _discovery_question_guard(
+    created: Sequence[int],
+    changed: Mapping[str, int],
+    begun: int,
+) -> tuple[object, ...] | None:
+    """Hold what shows that a directory changed while Git was asked.
+
+    Git's answer is kept only when nothing it read changed during the
+    question.  Two changes can be made and undone inside one question and
+    leave every witnessed identity as it was: an entry named ``git`` comes
+    to lie in a ``PATH`` directory ahead of the program and goes again, or a
+    directory on a way is exchanged for another and put back.  The ways are
+    those to such ``PATH`` directories and the four held paths, over which
+    alone Git reaches the checkout's Git directories
+    (``_discovery_witness_spelled_way``).  Each change moves a change time,
+    and this guard holds those times:
+
+    * ``created``, the change time of the last existing directory on the way
+      to each such ``PATH`` directory, which moves when an entry is created
+      there;
+    * for every directory of ``changed`` but the root, its own change time
+      and that of the directory it lies in (``_EitherChangeTime``).
+
+    The guard is compared only before and after one Git question.  Between
+    questions a directory may change as it likes: the witness holds what Git
+    would read.  A time that has not settled proves nothing, since a further
+    change might not move it.  Where a time of ``created`` has not, there
+    is no guard (``None``) and the answer to a question asked then is not
+    kept; a pair of which neither time has settled equals no other, with
+    the same end.
+    """
+
+    settled = begun - _DISCOVERY_WITNESS_SETTLE_NS
+    if any(moved > settled for moved in created):
+        return None
+    exchanges: list[object] = []
+    for path in sorted(changed):
+        above = os.path.dirname(path)
+        if above == path:
+            continue
+        exchanges.append((
+            path,
+            _EitherChangeTime(
+                moved if moved <= settled else None
+                for moved in (changed[above], changed[path])
+            ),
+        ))
+    return (tuple(created), *exchanges)
+
+
+def _discovery_witness_file(
+    path: str,
+    times: list[int],
+    *,
+    required: bool = False,
+) -> tuple[tuple[object, ...], bytes] | None:
+    """Witness one real regular file by identity, both times and its bytes.
+
+    The bytes are compared because a write in place can leave every stamp as
+    it was.  The stamp is taken again from the open file after the read, so a
+    file replaced or written during the read gives no witness.
+    """
+
+    metadata = _discovery_witness_lstat(path)
+    if metadata is None:
+        if required:
+            raise _NoDiscoveryWitness
+        return None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > _DISCOVERY_WITNESS_MAX_FILE_BYTES
+    ):
+        raise _NoDiscoveryWitness
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        payload = os.read(descriptor, _DISCOVERY_WITNESS_MAX_FILE_BYTES + 1)
+        closing = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    stamp: tuple[object, ...] = (
+        "file",
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    if stamp != (
+        "file",
+        closing.st_dev,
+        closing.st_ino,
+        closing.st_mode,
+        closing.st_nlink,
+        closing.st_uid,
+        closing.st_gid,
+        len(payload),
+        closing.st_mtime_ns,
+        closing.st_ctime_ns,
+    ):
+        raise _NoDiscoveryWitness
+    times.append(metadata.st_ctime_ns)
+    return stamp, payload
+
+
+def _discovery_witness_search_directory(
+    directory: str,
+    created: list[int],
+    changed: dict[str, int],
+) -> tuple[object, ...]:
+    """Witness one ``PATH`` directory that holds no entry named ``git``.
+
+    Every directory on the way to it is held as a real directory by
+    identity, and the first missing one as absent.  An entry named ``git``
+    can come to lie in the directory while Git is asked only if it is
+    created there, if the missing rest of the way is created, or if a
+    directory on the way is exchanged for another.  For the guard of the
+    question (``_discovery_question_guard``) the change time of the last
+    directory that exists is added to ``created`` and that of every
+    directory on the way is noted in ``changed``.
+    """
+
+    chain: list[object] = []
+    last = 0
+    for prefix in _discovery_witness_prefixes(directory):
+        metadata = _discovery_witness_lstat(prefix)
+        if metadata is None:
+            chain.append((prefix, None))
+            break
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise _NoDiscoveryWitness
+        chain.append((
+            prefix,
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+        ))
+        last = changed[prefix] = metadata.st_ctime_ns
+    created.append(last)
+    return tuple(chain)
+
+
+def _discovery_witness_program(
+    search_path: str | None,
+    created: list[int],
+    changed: dict[str, int],
+) -> tuple[object, ...]:
+    """Witness the ``git`` a child would run, if the holder cannot touch it.
+
+    A child runs the first ``git`` on ``PATH`` it can execute and silently
+    skips one it cannot, such as a file that is no program or one another
+    process holds open for writing; no stamp shows either.  A program the
+    lock holder's user can replace or hide can therefore answer one question
+    differently without leaving a trace.  So there is a witness only where
+    that user cannot do it: the holder is not the superuser, and the first
+    entry named ``git`` on ``PATH`` is a regular executable file that, with
+    every directory above it, belongs to the superuser, is writable by
+    nobody else and is no symbolic link.
+
+    A ``PATH`` directory before that program holds no entry named ``git``
+    of any kind (``_discovery_witness_search_directory``); ``created`` and
+    ``changed`` take what shows that one came and went while Git was
+    asked (``_discovery_question_guard``).
+    """
+
+    effective_user = getattr(os, "geteuid", None)
+    if effective_user is None or effective_user() == 0 or not search_path:
+        raise _NoDiscoveryWitness
+    parts: list[object] = []
+    for directory in search_path.split(os.pathsep):
+        if not os.path.isabs(directory):
+            raise _NoDiscoveryWitness
+        candidate = os.path.join(directory, "git")
+        try:
+            metadata = os.lstat(candidate)
+        except FileNotFoundError:
+            parts.append(
+                _discovery_witness_search_directory(directory, created, changed)
+            )
+            continue
+        if not (
+            stat.S_ISREG(metadata.st_mode) and os.access(candidate, os.X_OK)
+        ):
+            raise _NoDiscoveryWitness
+        for prefix in _discovery_witness_prefixes(candidate):
+            entry = metadata if prefix == candidate else os.lstat(prefix)
+            if (
+                not (prefix == candidate or stat.S_ISDIR(entry.st_mode))
+                or entry.st_uid != 0
+                or entry.st_mode & 0o022
+            ):
+                raise _NoDiscoveryWitness
+            parts.append((
+                prefix,
+                entry.st_dev,
+                entry.st_ino,
+                entry.st_mode,
+                entry.st_uid,
+                entry.st_gid,
+            ))
+        parts.append((
+            candidate,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ))
+        return tuple(parts)
+    raise _NoDiscoveryWitness
+
+
+def _authority_discovery_witness(
+    authority: _WorkspaceMutationAuthority,
+) -> tuple[object, ...] | None:
+    """Witness everything that decides Git's discovery of a held checkout.
+
+    The discovery asks Git for the superproject chain and the common
+    directory.  With nothing repository-like above the checkout those answers
+    follow from the checkout's own Git administration, the environment and
+    the program, all of which the witness holds:
+
+    * no entry named ``.git`` or ``HEAD`` in any directory above the checkout
+      (nothing of another repository is ever read);
+    * no local config that may name an outside path
+      (``_DISCOVERY_WITNESS_OUTSIDE_WORDS``);
+    * the environment a Git child is given, by value, with no variable that
+      sends the program's loader to other files
+      (``_DISCOVERY_WITNESS_LOADER_PREFIXES``), and the Git program
+      (``_discovery_witness_program``);
+    * every directory component of the four held paths as a real directory,
+      by identity;
+    * the way to the Git directory as the checkout's ``.git`` entry spells
+      it, and the way to the common directory as ``commondir`` spells it,
+      over those directories only (``_discovery_witness_spelled_way``);
+    * the checkout's ``.git`` entry, ``HEAD``, ``commondir`` and
+      ``config.worktree`` of the held Git directory and ``config`` of the
+      held Git common directory: a file by identity, both times and bytes;
+      ``HEAD`` and ``config`` must exist;
+    * ``objects`` and ``refs`` of the held Git common directory as real
+      directories with their change time; both must exist;
+    * no witnessed change time inside ``_DISCOVERY_WITNESS_SETTLE_NS``.
+
+    The program is held by its stamp and the directories above it by
+    identity: they lie beyond the holder's reach.  What the program loads
+    besides itself is not held.  Some of what is held another layer of the
+    assertion proves at every call as well, such as the identity of the
+    four held directories and the checkout's ``.git`` entry; the witness
+    does not rest on that.
+
+    It only reads and starts no process.  ``None`` means the checkout has a
+    shape the witness does not cover, or it could not be read: Git is then
+    asked.  ``None`` is an answer, never a refusal.
+    """
+
+    observed = _authority_discovery_observation(authority)
+    return None if observed is None else observed[0]
+
+
+def _authority_discovery_observation(
+    authority: _WorkspaceMutationAuthority,
+) -> tuple[tuple[object, ...], tuple[object, ...] | None] | None:
+    """Take the witness of a held checkout and the guard of a Git question.
+
+    ``None`` where there is no witness.  The guard is ``None`` where there
+    is a witness and none can be taken (``_discovery_question_guard``).
+    """
+
+    try:
+        return _take_authority_discovery_witness(authority)
+    except (_NoDiscoveryWitness, OSError, ValueError):
+        return None
+
+
+def _take_authority_discovery_witness(
+    authority: _WorkspaceMutationAuthority,
+) -> tuple[tuple[object, ...], tuple[object, ...] | None]:
+    """Take the witness and the guard, or raise where there is no witness."""
+
+    begun = time.time_ns()
+    root = os.fspath(authority.root)
+    git_dir = os.fspath(authority.git_dir)
+    git_common_dir = os.fspath(authority.git_common_dir)
+    held = (root, os.fspath(authority.common_dir), git_common_dir, git_dir)
+    # Normalized, so that with every component a real directory the text of
+    # a held path above a directory names the directory it lies in.
+    if not all(
+        os.path.isabs(path) and os.path.normpath(path) == path
+        for path in held
+    ):
+        raise _NoDiscoveryWitness
+    for directory in _discovery_witness_prefixes(os.path.dirname(root)):
+        for name in (".git", "HEAD"):
+            above = os.path.join(directory, name)
+            if _discovery_witness_lstat(above) is not None:
+                raise _NoDiscoveryWitness
+    times: list[int] = []
+    # The local config is read next: after the look above the checkout, a
+    # word in it is the cheapest way to find that there is no witness.
+    worktree_config = _discovery_witness_file(
+        os.path.join(git_dir, "config.worktree"),
+        times,
+    )
+    config = _discovery_witness_file(
+        os.path.join(git_common_dir, "config"),
+        times,
+        required=True,
+    )
+    for control in (worktree_config, config):
+        if control is not None and any(
+            word in control[1].lower()
+            for word in _DISCOVERY_WITNESS_OUTSIDE_WORDS
+        ):
+            raise _NoDiscoveryWitness
+    environment = tuple(
+        item for item in os.environ.items()
+        if not item[0].startswith("GIT_")
+    )
+    if any(
+        name.startswith(_DISCOVERY_WITNESS_LOADER_PREFIXES)
+        for name, _value in environment
+    ):
+        raise _NoDiscoveryWitness
+    created: list[int] = []
+    changed: dict[str, int] = {}
+    parts: list[object] = [
+        environment,
+        _discovery_witness_program(os.environ.get("PATH"), created, changed),
+    ]
+    # A directory on a held path can be exchanged for another and put back
+    # while Git is asked once: its identity is then the same before and
+    # after, and only change times tell.  They go to the guard.
+    held_changed: dict[str, int] = {}
+    for target in held:
+        for prefix in _discovery_witness_prefixes(target):
+            if prefix not in held_changed:
+                parts.append((
+                    prefix,
+                    _discovery_witness_directory(prefix, changed=held_changed),
+                ))
+    changed.update(held_changed)
+    dot_git = os.path.join(root, ".git")
+    dot_git_metadata = _discovery_witness_lstat(dot_git)
+    if dot_git_metadata is not None and stat.S_ISDIR(dot_git_metadata.st_mode):
+        parts.append(_discovery_witness_directory(dot_git))
+        git_dir_way = b".git"
+    else:
+        git_file = _discovery_witness_file(dot_git, times, required=True)
+        if git_file is None or not git_file[1].startswith(b"gitdir: "):
+            raise _NoDiscoveryWitness
+        parts.append(git_file)
+        git_dir_way = git_file[1][len(b"gitdir: "):]
+    commondir = _discovery_witness_file(os.path.join(git_dir, "commondir"), times)
+    # The held paths are the resolved ones; Git walks the spelled ones.
+    _discovery_witness_spelled_way(git_dir_way, root, git_dir, held_changed)
+    _discovery_witness_spelled_way(
+        b"" if commondir is None else commondir[1],
+        git_dir,
+        git_common_dir,
+        held_changed,
+    )
+    parts.append((
+        _discovery_witness_file(
+            os.path.join(git_dir, "HEAD"),
+            times,
+            required=True,
+        ),
+        commondir,
+        worktree_config,
+        _discovery_witness_directory(
+            os.path.join(git_common_dir, "objects"),
+            times=times,
+        ),
+        _discovery_witness_directory(
+            os.path.join(git_common_dir, "refs"),
+            times=times,
+        ),
+        config,
+    ))
+    if times and max(times) > begun - _DISCOVERY_WITNESS_SETTLE_NS:
+        raise _NoDiscoveryWitness
+    return tuple(parts), _discovery_question_guard(created, changed, begun)
+
+
+def _authority_discovery(
+    authority: _WorkspaceMutationAuthority,
+    *,
+    reuse: bool,
+) -> Path:
+    """Return the common directory Git names for a held checkout.
+
+    Without ``reuse`` Git is asked, as ``_workspace_authority_common_dir``
+    asks it.  With ``reuse`` the held common directory is returned without
+    a Git process only while the witness taken now equals the one remembered
+    from the last time Git itself named that directory.
+
+    Why the remembered answer is not stale: it is dropped before every Git
+    question and kept again only when Git named the held directory and
+    the witness and the guard of the question are the same before and
+    after it, so nothing remembered survives a refusal, and no answer is
+    kept when a witnessed entry or a guarded directory moved while Git
+    read (``_discovery_question_guard``).  It is reused only for an
+    identical witness, taken at the call; ``_authority_discovery_witness``
+    says what it holds.  It belongs to one lock grant: a new grant starts
+    with none.  The config preflight runs at every reusing call, as it
+    runs before every question.
+
+    What neither sees is a change that is made and undone inside one Git
+    question and moves no identity, time, byte or presence they hold.  A
+    store through a shared mapping of ``HEAD`` or ``config`` is such a
+    change: it moves no stamp, so two stores can show Git a readable file
+    for the length of one question.  Git then answers for a state that is
+    gone, and that answer is reused by the calls that only read through a
+    held descriptor.  It is bounded by every place that asks Git whatever is
+    remembered: a call that begins, binds, settles, recovers or reaps, the
+    proof before each settlement record, each recovery stage and each
+    hand-over to nested journals (``_assert_git_discovered_authority``),
+    and the first write through a held descriptor after an answer from
+    memory (``_ask_git_before_held_write``).  Every Git command bound to
+    the held descriptors reads the checkout itself.  So such a state is
+    refused later than at the call that first met it, and before the
+    journal changes the checkout through a held descriptor or records a
+    settlement.
+
+    This function never refuses by itself and returns nothing of its own but
+    the held common directory.
+    """
+
+    if reuse:
+        _preflight_local_config_authority(authority.root)
+    observed = _authority_discovery_observation(authority)
+    before = None if observed is None else observed[0]
+    if reuse and before is not None and before == authority._discovery_witness:
+        object.__setattr__(authority, "_discovery_reused", True)
+        return authority.common_dir
+    object.__setattr__(authority, "_discovery_witness", None)
+    rediscovered = _workspace_authority_common_dir(
+        authority.root,
+        root_fd=authority.root_descriptor,
+    )
+    if rediscovered == authority.common_dir:
+        object.__setattr__(authority, "_discovery_reused", False)
+        if (
+            observed is not None
+            and observed[1] is not None
+            and _authority_discovery_observation(authority) == observed
+        ):
+            object.__setattr__(authority, "_discovery_witness", before)
+    return rediscovered
+
+
 def _assert_workspace_mutation_authority(
     cwd: str | Path,
+    *,
+    reuse_discovery: bool = False,
 ) -> _WorkspaceMutationAuthority:
-    """Prove the caller still targets its exact held checkout and lock."""
+    """Prove the caller still targets its exact held checkout and lock.
+
+    Every layer runs at every call.  ``reuse_discovery`` changes only how the
+    last one, Git's own rediscovery of the common directory, gets its answer:
+    by default Git is asked at every call.  The helpers that only hand out a
+    held descriptor pass ``reuse_discovery=True``; there Git is asked unless
+    the witness of what it reads equals the one under which it last named
+    the held common directory (``_authority_discovery``).  A call that
+    begins, binds, settles, recovers or reaps keeps the default.
+    """
 
     authority = _active_workspace_mutation_authority(cwd)
     if authority is None:
@@ -4131,10 +4770,7 @@ def _assert_workspace_mutation_authority(
         authority.lock_metadata,
     )
     _assert_bound_git_discovery(authority)
-    rediscovered = _workspace_authority_common_dir(
-        authority.root,
-        root_fd=authority.root_descriptor,
-    )
+    rediscovered = _authority_discovery(authority, reuse=reuse_discovery)
     if rediscovered != authority.common_dir:
         raise MutationJournalError(
             "workspace mutation authority changed after lock acquisition"
@@ -4170,6 +4806,74 @@ def _assert_workspace_mutation_authority(
     )
     _assert_bound_git_discovery(authority)
     return authority
+
+
+@contextmanager
+def _held_descriptor_handed_out(
+    authority: _WorkspaceMutationAuthority | None,
+) -> Iterator[None]:
+    """Name the held checkout whose descriptor a helper hands out.
+
+    ``_ask_git_before_held_write`` reads it.  A descriptor bound by captured
+    inode, with no held authority behind it, names nothing.
+    """
+
+    if authority is None:
+        yield
+        return
+    handed_out = getattr(_LOCK_STATE, "handed_out_authorities", None)
+    if handed_out is None:
+        handed_out = []
+        _LOCK_STATE.handed_out_authorities = handed_out
+    handed_out.append(authority)
+    try:
+        yield
+    finally:
+        for index in range(len(handed_out) - 1, -1, -1):
+            if handed_out[index] is authority:
+                del handed_out[index]
+                break
+
+
+def _held_authority_of_descriptor(
+    descriptor: int,
+) -> _WorkspaceMutationAuthority | None:
+    """Return the authority of this thread that holds ``descriptor``."""
+
+    for authority in _thread_workspace_authorities():
+        if descriptor in (
+            authority.root_descriptor,
+            authority.common_descriptor,
+            authority.git_common_descriptor,
+            authority.git_dir_descriptor,
+        ):
+            return authority
+    return None
+
+
+def _ask_git_before_held_write(
+    *through: _WorkspaceMutationAuthority | None,
+) -> None:
+    """Ask Git itself before a write through a held descriptor.
+
+    The helpers that hand out a held descriptor may take Git's discovery
+    answer from an unchanged witness (``_authority_discovery``).  That is
+    enough to read through the descriptor.  A write must not rest on it:
+    for every checkout whose descriptor is handed out on this thread, and
+    for every one named in ``through``, whose last answer came from memory,
+    the whole authority proof is repeated here with Git asked.  Where Git
+    was asked since the last answer from memory there is nothing to repeat,
+    so a run of writes costs one question and a checkout without a witness
+    none.  Setting the mode an entry already has is a write as well: it
+    moves the entry's change time.
+    """
+
+    for authority in (
+        *getattr(_LOCK_STATE, "handed_out_authorities", ()),
+        *through,
+    ):
+        if authority is not None and authority._discovery_reused:
+            _assert_workspace_mutation_authority(authority.root)
 
 
 def _workspace_lock_order_key(
@@ -5745,6 +6449,8 @@ def _make_real_directory_tree_owner_accessible(
         | os.O_DIRECTORY
         | os.O_NOFOLLOW
     )
+    # The held checkout that a descriptor path of ``root`` names, if any.
+    through_authority: _WorkspaceMutationAuthority | None = None
 
     def open_real_child_directory(
         parent_fd: int,
@@ -5799,6 +6505,7 @@ def _make_real_directory_tree_owner_accessible(
                 )
             requested = stat.S_IMODE(opened_path.st_mode) | 0o700
             if stat.S_IMODE(opened_path.st_mode) != requested:
+                _ask_git_before_held_write(through_authority)
                 try:
                     os.chmod(_authority_descriptor_cwd(path_fd), requested)
                 except (NotImplementedError, OSError, ValueError) as exc:
@@ -5880,6 +6587,7 @@ def _make_real_directory_tree_owner_accessible(
                 )
             requested = stat.S_IMODE(authority_metadata.st_mode) | 0o700
             if stat.S_IMODE(authority_metadata.st_mode) != requested:
+                _ask_git_before_held_write()
                 os.fchmod(root_fd, requested)
                 current_metadata = os.fstat(root_fd)
                 if (
@@ -5918,6 +6626,7 @@ def _make_real_directory_tree_owner_accessible(
             os.close(parent_fd)
     else:
         authority_fd, alias, relative = binding
+        through_authority = _held_authority_of_descriptor(authority_fd)
         try:
             root_fd = os.dup(authority_fd)
         except OSError as exc:
@@ -5938,6 +6647,7 @@ def _make_real_directory_tree_owner_accessible(
                 )
             requested = stat.S_IMODE(authority_metadata.st_mode) | 0o700
             if stat.S_IMODE(authority_metadata.st_mode) != requested:
+                _ask_git_before_held_write(through_authority)
                 os.fchmod(root_fd, requested)
                 current_metadata = os.fstat(root_fd)
                 if (
@@ -5976,6 +6686,7 @@ def _make_real_directory_tree_owner_accessible(
     if not recursive:
         try:
             if final_root_mode is not None:
+                _ask_git_before_held_write(through_authority)
                 os.fchmod(root_fd, final_root_mode)
                 finished = os.fstat(root_fd)
                 if (
@@ -6050,6 +6761,7 @@ def _make_real_directory_tree_owner_accessible(
                 raise
             os.close(directory_fd)
         if final_root_mode is not None:
+            _ask_git_before_held_write(through_authority)
             os.fchmod(root_fd, final_root_mode)
             finished = os.fstat(root_fd)
             if (
@@ -10778,7 +11490,10 @@ def _bound_workspace_restore_root(
             label="mutation restore workspace root",
         )
     else:
-        authority = _assert_workspace_mutation_authority(logical_root)
+        authority = _assert_workspace_mutation_authority(
+            logical_root,
+            reuse_discovery=True,
+        )
         try:
             descriptor = os.dup(authority.root_descriptor)
             opened = os.fstat(descriptor)
@@ -10804,7 +11519,8 @@ def _bound_workspace_restore_root(
             raise MutationJournalError(
                 "mutation restore root differs from journal authority"
             )
-        yield descriptor
+        with _held_descriptor_handed_out(authority):
+            yield descriptor
     except BaseException:
         body_failed = True
         raise
@@ -10818,7 +11534,10 @@ def _bound_workspace_restore_root(
                     label="mutation restore workspace root",
                 )
             else:
-                _assert_workspace_mutation_authority(logical_root)
+                _assert_workspace_mutation_authority(
+                    logical_root,
+                    reuse_discovery=True,
+                )
         except BaseException:
             if not body_failed:
                 raise
@@ -10866,6 +11585,7 @@ def _restore_bound_descriptor_xattrs(
             f"too many xattrs for exact rollback: {label}"
         )
     for name in set(names).difference(expected):
+        _ask_git_before_held_write()
         try:
             os.removexattr(descriptor, name)
         except OSError as exc:
@@ -10885,6 +11605,7 @@ def _restore_bound_descriptor_xattrs(
             raise MutationJournalError(
                 f"xattrs too large for exact rollback: {label}"
             )
+        _ask_git_before_held_write()
         try:
             os.setxattr(descriptor, name, value)
         except OSError as exc:
@@ -11254,6 +11975,7 @@ def _restore_bound_workspace_parent_metadata(
                     xattrs,
                     label=prefix,
                 )
+                _ask_git_before_held_write()
                 os.fchmod(directory_fd, mode)
                 _fsync_bound_directory(directory_fd)
                 current = os.stat(
@@ -11722,6 +12444,7 @@ def _remove_bound_empty_workspace_directory(
                 parent_fd,
                 prefix=".crucible-cleanup-directory-",
             )
+            _ask_git_before_held_write()
             os.mkdir(quarantine, mode=0o700, dir_fd=parent_fd)
             reservation_created = os.stat(
                 quarantine,
@@ -12055,6 +12778,7 @@ def _restore_bound_workspace_directory_metadata(
         if (held.st_dev, held.st_ino) != (expected.device, expected.inode):
             raise MutationJournalError("workspace root changed before metadata restore")
         _restore_bound_descriptor_xattrs(root_fd, xattrs, label=relative)
+        _ask_git_before_held_write()
         os.fchmod(root_fd, mode)
         _fsync_bound_directory(root_fd)
         return
@@ -12087,6 +12811,7 @@ def _restore_bound_workspace_directory_metadata(
                     f"{relative!r}"
                 )
             _restore_bound_descriptor_xattrs(directory_fd, xattrs, label=relative)
+            _ask_git_before_held_write()
             os.fchmod(directory_fd, mode)
             _fsync_bound_directory(directory_fd)
             current = os.stat(
@@ -12423,6 +13148,9 @@ def _remove_bound_workspace_entry(
                         "workspace restore directory changed during removal: "
                         f"{entry_label!r}"
                     )
+                # Asked before the identity check, which stays next to the
+                # removal: nothing behind the question reuses an answer.
+                _ask_git_before_held_write()
                 assert_child()
                 os.rmdir(entry_name, dir_fd=current_parent_fd)
                 _fsync_bound_directory(current_parent_fd)
@@ -12430,6 +13158,9 @@ def _remove_bound_workspace_entry(
                 os.close(child_fd)
             return
 
+        # Asked first, so that the identity check below stays next to the
+        # removal.
+        _ask_git_before_held_write()
         # unlink(2) never follows the final component.  Re-read the exact entry
         # after the root/top binding check so a replacement directory fails
         # closed instead of redirecting a recursive delete.
@@ -12561,6 +13292,7 @@ def _publish_bound_regular_noreplace(
         raise MutationJournalError(
             f"anonymous atomic file publication is unavailable for {label}"
         )
+    _ask_git_before_held_write()
     temporary_fd: int | None = None
     try:
         try:
@@ -12655,6 +13387,7 @@ def _claim_bound_workspace_file(
 ) -> int:
     """Atomically claim one absent final file name without replacement."""
 
+    _ask_git_before_held_write()
     return os.open(
         name,
         os.O_WRONLY
@@ -12847,6 +13580,9 @@ def _create_private_bound_workspace_directory(
 ) -> tuple[str, int, os.stat_result]:
     """Create and bind an unguessable staging directory in a held parent."""
 
+    # Before the creation watch below is armed, so that Git's processes do
+    # not run under it.
+    _ask_git_before_held_write()
     for _attempt in range(16):
         private_name = f".crucible-restore-dir-{secrets.token_hex(32)}"
         watch_fd: int | None = None
@@ -13475,6 +14211,7 @@ def _install_bound_workspace_entry(
                 raise MutationJournalError(
                     f"workspace restore symlink target is invalid: {relative!r}"
                 )
+            _ask_git_before_held_write()
             os.symlink(target, name, dir_fd=parent_fd)
             created = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if not stat.S_ISLNK(created.st_mode) or created.st_nlink != 1:
@@ -14468,25 +15205,56 @@ class WorkspaceMutationJournal:
             candidates.append(authority)
         return tuple({id(candidate): candidate for candidate in candidates}.values())
 
+    def _assert_git_discovered_authority(self) -> None:
+        """Ask Git itself about every held checkout this journal binds through.
+
+        The helpers that hand out held descriptors may take Git's discovery
+        answer from an unchanged witness.  This proof never reuses one: it
+        starts Git's discovery for every authority those helpers can select
+        for this journal.  It is the last call before a settlement state or
+        a stage of exact journal recovery is recorded, the first call behind
+        the guard of a rollback that turns a refusal into a forced full
+        rollback, the last call before a selective restore consumes its
+        latch and before it returns, and the last call before a journal
+        hands over to the settlement of its nested journals.  The writes a
+        rollback makes through held descriptors are proved where they are
+        made (``_ask_git_before_held_write``).  A journal driven without a
+        thread-held workspace lock binds by captured inode instead and has
+        no held authority to prove; an operation that takes the lock only
+        for its capture runs the proof before releasing it.
+        """
+
+        for authority in self._git_admin_workspace_authorities():
+            _assert_workspace_mutation_authority(authority.root)
+
     @contextmanager
     def _git_admin_authority_batch(
         self,
     ) -> Iterator[_GitAdminAuthorityBatch]:
-        """Authenticate Git discovery once around one complete admin tree.
+        """Authenticate held authorities once around one complete admin tree.
 
         Descriptor-relative entry inspection still reproves the selected
         directory, lock, process, thread, and journal token for every entry.
-        Full Git discovery is repeated at the successful end of the batch so
-        a clean result cannot survive a concurrent ``.git``/``commondir``
-        retarget.  This changes subprocess growth from O(entries) to
-        O(distinct held authorities per tree).
+        The full authority proof is repeated at the successful end of the
+        batch so a clean result cannot survive a concurrent
+        ``.git``/``commondir`` retarget.  Both proofs run every layer and
+        reuse Git's last discovery answer only while its witness is unchanged
+        (``_authority_discovery``).  A retarget rewrites a witnessed control
+        file or exchanges a held directory, and a control file that leads
+        over anything else has no witness, so Git is asked again.
+        Subprocess growth is at most O(distinct held authorities per tree)
+        instead of O(entries), and an unchanged checkout with a kept answer
+        needs no Git process.
         """
 
         authenticated: list[
             tuple[_WorkspaceMutationAuthority, _ExternalWorkspaceCoordination]
         ] = []
         for authority in self._git_admin_workspace_authorities():
-            proved = _assert_workspace_mutation_authority(authority.root)
+            proved = _assert_workspace_mutation_authority(
+                authority.root,
+                reuse_discovery=True,
+            )
             if proved is not authority:
                 raise MutationJournalError(
                     "Git-admin batch resolved different workspace authority"
@@ -14512,7 +15280,10 @@ class WorkspaceMutationJournal:
         try:
             yield batch
             for authority, _external in batch.authorities:
-                proved = _assert_workspace_mutation_authority(authority.root)
+                proved = _assert_workspace_mutation_authority(
+                    authority.root,
+                    reuse_discovery=True,
+                )
                 if proved is not authority:
                     raise MutationJournalError(
                         "Git-admin batch ended under different workspace authority"
@@ -14768,7 +15539,10 @@ class WorkspaceMutationJournal:
         ) = deepest[0]
         if selected_authority is not None:
             if authority_batch is None:
-                _assert_workspace_mutation_authority(selected_authority.root)
+                _assert_workspace_mutation_authority(
+                    selected_authority.root,
+                    reuse_discovery=True,
+                )
             else:
                 self._assert_git_admin_authority_batch(
                     authority_batch,
@@ -14789,7 +15563,8 @@ class WorkspaceMutationJournal:
                 )
         duplicate = os.dup(descriptor)
         try:
-            yield duplicate, relative_text, logical_root
+            with _held_descriptor_handed_out(selected_authority):
+                yield duplicate, relative_text, logical_root
         finally:
             os.close(duplicate)
             for owned in owned_descriptors:
@@ -15635,6 +16410,7 @@ class WorkspaceMutationJournal:
                     )
                     changed = True
                 if stat.S_IMODE(opened.st_mode) != mode:
+                    _ask_git_before_held_write()
                     os.fchmod(descriptor, mode)
                     changed = True
                 sealed = os.fstat(descriptor)
@@ -16120,6 +16896,7 @@ class WorkspaceMutationJournal:
                                 changed = True
                             requested_mode = int(cast(int, entry["mode"]))
                             if stat.S_IMODE(opened.st_mode) != requested_mode:
+                                _ask_git_before_held_write()
                                 os.fchmod(child_fd, requested_mode)
                                 changed = True
                             _fsync_bound_directory(child_fd)
@@ -16145,6 +16922,7 @@ class WorkspaceMutationJournal:
                 current_root = os.fstat(target_fd)
                 requested_root_mode = int(cast(int, mode))
                 if stat.S_IMODE(current_root.st_mode) != requested_root_mode:
+                    _ask_git_before_held_write()
                     os.fchmod(target_fd, requested_root_mode)
                     changed = True
                 sealed = os.fstat(target_fd)
@@ -19332,6 +20110,7 @@ class WorkspaceMutationJournal:
                             continue
                         working_mode = stat.S_IMODE(opened_path.st_mode) | 0o600
                         if stat.S_IMODE(opened_path.st_mode) != working_mode:
+                            _ask_git_before_held_write()
                             os.chmod(
                                 _authority_descriptor_cwd(path_fd),
                                 working_mode,
@@ -19367,6 +20146,7 @@ class WorkspaceMutationJournal:
                                 label=relative,
                             )
                         if stat.S_IMODE(os.fstat(file_fd).st_mode) != baseline_mode:
+                            _ask_git_before_held_write()
                             os.fchmod(file_fd, baseline_mode)
                         finished = os.fstat(file_fd)
                         current = os.stat(
@@ -19566,6 +20346,7 @@ class WorkspaceMutationJournal:
                                 label="workspace Git administration",
                             )
                         if stat.S_IMODE(opened.st_mode) != requested_mode:
+                            _ask_git_before_held_write()
                             os.fchmod(descriptor, requested_mode)
                         _assert_settlement_parent_binding(
                             root_fd,
@@ -25410,7 +26191,9 @@ class WorkspaceMutationJournal:
             )
         }
         current = set(self._manifest.get("scope_escapes", ()))
-        self._manifest["scope_escapes"] = sorted(current | escapes)
+        recorded = sorted(current | escapes)
+        self._assert_git_discovered_authority()
+        self._manifest["scope_escapes"] = recorded
         self._manifest["state"] = "scoped"
         self._write()
 
@@ -25426,7 +26209,9 @@ class WorkspaceMutationJournal:
             for path in paths
         }
         current = set(self._manifest.get("scope_escapes", ()))
-        self._manifest["scope_escapes"] = sorted(current | normalized)
+        recorded = sorted(current | normalized)
+        self._assert_git_discovered_authority()
+        self._manifest["scope_escapes"] = recorded
         self._manifest["state"] = "scoped"
         self._write()
 
@@ -25814,6 +26599,10 @@ class WorkspaceMutationJournal:
                 expected_postimage = self._lifecycle_settlement_operation(
                     implementation_refs=(record_ref,),
                 )
+                # This lock may be the operation's own.  The state below is
+                # then recorded after its release, with no held authority
+                # left to prove, so Git is asked here, behind the capture.
+                self._assert_git_discovered_authority()
             encoded_postimage = json.dumps(
                 expected_postimage,
                 sort_keys=True,
@@ -25825,9 +26614,7 @@ class WorkspaceMutationJournal:
                 raise MutationJournalError(
                     "Implementation postimage exceeds its size ceiling"
                 )
-        self._manifest["expected_lifecycle"] = None
-        self._manifest["expected_postimage"] = expected_postimage
-        self._manifest["expected_implementation"] = {
+        expected_implementation = {
             "record_ref": record_ref,
             "slice_id": impl.slice_id,
             "base_commit": impl.base_commit,
@@ -25835,6 +26622,10 @@ class WorkspaceMutationJournal:
             "transcript_ref": str(impl.transcript_ref),
             "classification": impl.classification,
         }
+        self._assert_git_discovered_authority()
+        self._manifest["expected_lifecycle"] = None
+        self._manifest["expected_postimage"] = expected_postimage
+        self._manifest["expected_implementation"] = expected_implementation
         self._manifest["state"] = (
             "prepared_keep" if keep else "prepared_rollback"
         )
@@ -25917,12 +26708,7 @@ class WorkspaceMutationJournal:
             raise MutationJournalError(
                 "accepted mutation transaction requires lifecycle reasons"
             )
-        # This transaction may previously have been prepared_rollback around a
-        # failed seed Implementation. Once a child lifecycle becomes the only
-        # acceptance proof, that attached failure must not satisfy recovery.
-        self._manifest["expected_implementation"] = None
-        self._manifest["expected_postimage"] = None
-        self._manifest["expected_lifecycle"] = {
+        expected_lifecycle = {
             "kind": kind,
             "reasons": list(accepted_reasons),
             "run_id": run_id,
@@ -25930,6 +26716,13 @@ class WorkspaceMutationJournal:
             "settlement_family": list(accepted_family),
             "settlement_family_parents": accepted_parents,
         }
+        self._assert_git_discovered_authority()
+        # This transaction may previously have been prepared_rollback around a
+        # failed seed Implementation. Once a child lifecycle becomes the only
+        # acceptance proof, that attached failure must not satisfy recovery.
+        self._manifest["expected_implementation"] = None
+        self._manifest["expected_postimage"] = None
+        self._manifest["expected_lifecycle"] = expected_lifecycle
         self._manifest["state"] = "prepared_keep"
         self._write()
 
@@ -26192,6 +26985,10 @@ class WorkspaceMutationJournal:
         nested_journals = self._nested_journals_for_restore()
         for nested in nested_journals:
             nested.assert_exact_baseline()
+        if nested_journals:
+            # A nested journal settles under the proof of its own checkout.
+            # Git is asked about this one before the first of them does.
+            self._assert_git_discovered_authority()
         for nested in reversed(nested_journals):
             nested.commit(
                 attached=attached,
@@ -26204,6 +27001,7 @@ class WorkspaceMutationJournal:
                 _settlement_family_locks_held=True,
             )
 
+        self._assert_git_discovered_authority()
         previous = self._manifest["state"]
         self._manifest["state"] = "committed"
         try:
@@ -27086,6 +27884,8 @@ class WorkspaceMutationJournal:
                 _DEFERRED_RECURSIVE_ATTRIBUTE_POLICY_KEY,
                 {},
             )
+            # Consuming the durable latch is this restore's last write.
+            self._assert_git_discovered_authority()
             self._manifest["pre_capture_attribute_changes"] = sorted(
                 pending_policy
             )
@@ -27121,6 +27921,9 @@ class WorkspaceMutationJournal:
                 directory_authority,
                 entry_authority,
             )
+        # The reproofs above may reuse a discovery answer.  A restore that
+        # returns has been proved against Git itself.
+        self._assert_git_discovered_authority()
 
     def _assert_workspace_baseline(
         self,
@@ -27222,6 +28025,10 @@ class WorkspaceMutationJournal:
             self._preflight_nested_restore()
             self._prepare_restore_access(writable=True)
             nested_journals = self._nested_journals_for_restore()
+            if nested_journals:
+                # A nested journal is rolled back under the proof of its own
+                # checkout.  Git is asked about this one before the first.
+                self._assert_git_discovered_authority()
             with ExitStack() as nested_authorities:
                 for nested in nested_journals:
                     nested_authorities.enter_context(
@@ -27341,6 +28148,7 @@ class WorkspaceMutationJournal:
                 workspace_directory_authority,
                 workspace_entry_authority,
             )
+            self._assert_git_discovered_authority()
             previous = self._manifest["state"]
             self._manifest["state"] = "rolled_back"
             try:
@@ -27584,6 +28392,10 @@ class WorkspaceMutationJournal:
             self._assert_no_failed_descendant(allow=nested_ids)
             self._prepare_restore_access(writable=True)
             nested_journals = self._nested_journals_for_restore()
+            if nested_journals:
+                # A nested journal is rolled back under the proof of its own
+                # checkout.  Git is asked about this one before the first.
+                self._assert_git_discovered_authority()
             with ExitStack() as nested_authorities:
                 for nested in nested_journals:
                     nested_authorities.enter_context(
@@ -27659,6 +28471,11 @@ class WorkspaceMutationJournal:
                 )
             except MutationJournalError:
                 repository_metadata_changed = True
+            # The guard above turns every refusal into a forced full rollback,
+            # a refusal of the held authority included.  Git itself is asked
+            # once here, behind that guard and before the restores that
+            # follow it.
+            self._assert_git_discovered_authority()
             current_head_changed = (
                 current_head != self._manifest["head"]
                 or (
@@ -27907,6 +28724,7 @@ class WorkspaceMutationJournal:
             self._manifest[
                 _DEFERRED_RECURSIVE_ATTRIBUTE_POLICY_KEY
             ] = {}
+            self._assert_git_discovered_authority()
             previous = self._manifest["state"]
             self._manifest["state"] = "rolled_back"
             try:
@@ -30663,6 +31481,11 @@ def _commit_prevalidated_lifecycle_family(
         journal.transaction_id: journal._manifest["state"]
         for journal in selected
     }
+    # The markers below are one record: nothing but manifest writes lies
+    # between them.  Ask Git itself for every member before the first, so a
+    # refusal leaves no member marked.
+    for journal in selected:
+        journal._assert_git_discovered_authority()
     try:
         # This is the family commit point. No journal/registry owner is removed
         # until every member has a durable terminal marker.

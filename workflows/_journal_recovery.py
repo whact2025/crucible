@@ -5341,6 +5341,9 @@ def _cleanup_verified(
     *,
     members_preinstalled: bool = False,
 ) -> ExternalRecoveryReport:
+    # The cleanup removes the registry markers and the journal: it starts
+    # only after Git itself confirmed the held checkout, also on a resume.
+    inspection.journal._assert_git_discovered_authority()
     family = inspection.family
     _prepare_external_writer_epoch_proof(inspection, event)
     rename_attestation: _PreinstalledWriterEpochAttestation | None = None
@@ -5415,6 +5418,7 @@ def _cleanup_verified(
                     / _TOMBSTONE_DIRECTORY
                     / inspection.journal.transaction_id
                 )
+                inspection.journal._assert_git_discovered_authority()
                 event["stage"] = "tombstone_prepared"
                 event["tombstone"] = str(logical_tombstone)
                 event["tombstone_identity"] = {
@@ -5640,6 +5644,7 @@ def _cleanup_verified(
         journal_metadata.st_mode
     ):
         raise MutationJournalError("journal directory changed before tombstoning")
+    inspection.journal._assert_git_discovered_authority()
     event["stage"] = "tombstone_prepared"
     event["tombstone"] = str(tombstone)
     event["tombstone_identity"] = {
@@ -7847,6 +7852,10 @@ def _inspect_external_recovery(
                     ] = ("file", str(record["sha256"]))
             finally:
                 journal.journal_dir = original_dir
+        # A recovery stage is durable authority for the next one: each of
+        # them is recorded only after Git itself confirmed the held
+        # checkout, here and at every later stage.
+        journal._assert_git_discovered_authority()
         _write_event(journal, event)
         journal._manifest["state"] = "external_recovery_prepared"
         journal._write()
@@ -7934,6 +7943,9 @@ def _inspect_external_recovery(
                     request.expected_diff_ref,
                 )
             _restore_source_only(journal)
+        # A resume does not restore the source again once this stage is
+        # recorded.
+        journal._assert_git_discovered_authority()
         event["stage"] = "source_restored"
         _write_event(journal, event)
         stage = "source_restored"
@@ -7961,6 +7973,10 @@ def _inspect_external_recovery(
                     inspection.accepted_ancestor
                 )
         _assert_registry_cleanup_safe(inspection.family, allow_missing=False)
+        # The source was restored through held descriptors, whose proofs may
+        # reuse a discovery answer.  Ask Git itself before the stage that
+        # authorizes cleanup becomes durable.
+        journal._assert_git_discovered_authority()
         event["stage"] = "verified"
         _write_event(journal, event)
         journal._manifest["state"] = "external_recovery_verified"
