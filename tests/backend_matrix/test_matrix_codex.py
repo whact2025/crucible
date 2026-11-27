@@ -1545,7 +1545,12 @@ def test_the_dialect_reads_the_session_and_answers_only_what_it_has_an_envelope_
         "S23a/Refuse(content_filter)",
         "S23b/Refuse(refusal_part)",
         "S05/Call(malformed)",
+        "S24/ServedAs",
     ]
+    # The wire names no model of a response, so a reply under another model
+    # cannot be sent: the dialect refuses the step and the inventory pins it.
+    with pytest.raises(MatrixSetupError, match="the wire names no served model"):
+        dialect.render(ServedAs(Call(READ_A)), seen, "call-1")
     with pytest.raises(NotImplementedError):
         codex_driver.CodexAppServerDialect().launch_problems({}, [], seen)
     assert dialect.envelope_names() == codex_driver.CodexLegacyDriver().envelopes
@@ -2332,6 +2337,227 @@ def test_a_turn_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
             driver=_EndsItsTurns(),
         )
     assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
+
+
+# -- a call without the sign-in record of the route ---------------------------------
+
+# The cell of the column on a route without its credential, and the record of
+# the ledger whose entry on that cell leans on the proof below.
+NO_SIGN_IN = ledger.cell_id(CODEX_LEGACY_KIND, "S28", "primary", "raw")
+NO_SIGN_IN_GAP = "R06"
+# What the proof below holds of a play, by the name it reports for each.
+TYPED_RESULT, RECORD_NAMED = "a typed result", "the record named"
+ITS_DIRECTORY, NOTHING_OF_ITS_NAME = "the directory", "nothing under the record's name"
+NO_REQUEST, NO_MODEL_TURN = "no request", "no model turn"
+
+
+def not_a_call_without_the_sign_in_record(execution: runner.Execution, root: Path) -> list[str]:
+    """What a play lacks of a call on a home whose sign-in directory holds no record.
+
+    Read from the play and from what it left under ``root``, where the
+    driver made the home of the cell: the result the call returned, what the
+    provider saw, the journal of the scripted tool, and the home itself. The
+    state of the home is read by listing the directory that should hold the
+    record, never by a question about the path of the record: a link to
+    nothing, a directory, a pipe or a socket of the record's name is in a
+    listing, and each of them answers such a question as nothing would.
+    Nothing is read of the retriable flag.
+    """
+
+    observation = execution.observation
+    holder = root / "codex-home" / ".codex"
+    record = holder / peer_program.LOGIN_FILE
+    lacking: list[str] = []
+    result = observation.result
+    if result is None or result.error is None:
+        lacking.append(TYPED_RESULT)
+    elif str(record) not in result.error.message:
+        lacking.append(RECORD_NAMED)
+    if holder.is_symlink() or not holder.is_dir():
+        lacking.append(ITS_DIRECTORY)
+    else:
+        try:
+            listing = os.listdir(holder)
+        except OSError:
+            lacking.append(ITS_DIRECTORY)  # a directory that cannot be listed shows nothing
+        else:
+            if peer_program.LOGIN_FILE in listing:
+                lacking.append(NOTHING_OF_ITS_NAME)
+    if observation.provider.request_count:
+        lacking.append(NO_REQUEST)
+    # The scripted tool takes a model turn only in the process that plays the
+    # app-server; its journal names the role of every process that started.
+    journal = root / "codex-peer" / "journal.jsonl"
+    started = (
+        [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line]
+        if journal.is_file()
+        else []
+    )
+    if any(item.get("role") == "app_server" for item in started):
+        lacking.append(NO_MODEL_TURN)
+    return lacking
+
+
+def test_a_call_without_the_sign_in_record_names_the_record_and_starts_no_model_turn(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because the one code of the cell does not show it.
+
+    The scenario plays the route without its credential: the driver makes
+    the directory that should hold the sign-in record of the vendor tool and
+    writes nothing into it under the name of that record. The route returns
+    a typed error, and the cell shows one code, the retriable flag of that
+    error where the scenario asks for a result that is not retried (known
+    gap R06). The route returns the same typed error, with the same flag,
+    for other refusals it makes before a request: an ambient tool home, a
+    record behind a link, a path component that is no directory, a record
+    the process may not open. The code tells none of them apart. This test
+    holds what the entry of the cell rests on, from the play alone and with
+    nothing of the product replaced: the text of the error names the sign-in
+    record of the route; the directory that should hold it is a directory
+    and its listing holds nothing of the record's name; the provider saw no
+    request; and the scripted tool was started for no model turn. It says
+    nothing of the flag, so it holds before and after the fix of that gap.
+    Its lying counterparts are the test below.
+    """
+
+    # The verifier requires this test by name: the entry of the record leans
+    # on it. No entry attributes a code to that record on another cell of
+    # this column.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_LEGACY_KIND]]
+    kind, scenario, role, lens = ledger.parse_cell_id(NO_SIGN_IN)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+    attributed = {
+        entry.cell
+        for entry in LEDGER.entries
+        if NO_SIGN_IN_GAP in entry.codes.values()
+        and ledger.parse_cell_id(entry.cell)[0] == CODEX_LEGACY_KIND
+    }
+    assert attributed <= {NO_SIGN_IN}
+
+    execution = _played(scenario, tmp_path, lens)
+
+    assert execution.report.seam_problems == ()
+    assert not_a_call_without_the_sign_in_record(execution, tmp_path) == []
+    # The tool was started for the version probe of the route and for
+    # nothing else.
+    (probe,) = codex_driver.Peer(
+        tmp_path / "codex-peer" / "codex",
+        tmp_path / "codex-peer" / "config.json",
+        tmp_path / "codex-peer" / "journal.jsonl",
+    ).records()
+    assert probe["role"] == "version"
+
+
+class AnotherHome:
+    """A play without the sign-in record whose home is brought into another state.
+
+    Mixed into the driver of a Codex column. The driver has made the home of
+    a route without its credential; ``arrange`` then changes it, before the
+    call, into a state the proof above is there to exclude, and ``restore``
+    undoes what would keep the directory of the test from being removed.
+    """
+
+    arrange: Any = None
+    restore: Any = None
+
+    @contextlib.contextmanager
+    def open(self, column: Column, **named: Any) -> Iterator[Any]:
+        with super().open(column, **named) as bound:  # type: ignore[misc]
+            home = Path(os.environ["HOME"])
+            type(self).arrange(home)
+            try:
+                yield bound
+            finally:
+                if type(self).restore is not None:
+                    type(self).restore(home)
+
+
+def a_home_whose_directory_is_a_file(home: Path) -> None:
+    holder = home / ".codex"
+    holder.rmdir()
+    holder.write_text("", encoding="utf-8")
+
+
+def _signed_in_under_an_ambient_tool_home(home: Path) -> None:
+    codex_driver.write_login(home)
+    ambient = home / "another-tool-home"
+    ambient.mkdir()
+    # The driver has cleared the variable for as long as the home stands;
+    # this play sets it itself. The driver puts back what it found.
+    os.environ["CODEX_HOME"] = str(ambient)
+
+
+def _a_link_at_the_path_of_the_record(home: Path) -> None:
+    holder = home / ".codex"
+    (holder / peer_program.LOGIN_FILE).symlink_to(holder / "nothing-there")
+
+
+def _a_closed_directory_with_a_record(home: Path) -> None:
+    codex_driver.write_login(home)
+    (home / ".codex").chmod(0o000)
+
+
+def _open_again(home: Path) -> None:
+    (home / ".codex").chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    ("arrange", "restore", "lacking"),
+    [
+        (_signed_in_under_an_ambient_tool_home, None, {RECORD_NAMED, NOTHING_OF_ITS_NAME}),
+        (_a_link_at_the_path_of_the_record, None, {NOTHING_OF_ITS_NAME}),
+        (a_home_whose_directory_is_a_file, None, {ITS_DIRECTORY}),
+        (_a_closed_directory_with_a_record, _open_again, {NOTHING_OF_ITS_NAME}),
+    ],
+    ids=["ambient-tool-home", "link-at-the-path", "directory-is-a-file", "closed-directory"],
+)
+def test_the_proof_of_the_missing_sign_in_record_fails_on_the_states_it_excludes(
+    arrange: Any, restore: Any, lacking: set[str], tmp_path: Path
+) -> None:
+    # The lying counterparts of the proof above: plays of its body, and of no
+    # generated cell, on four homes the route refuses before a request as it
+    # refuses a home without the record. The sign-in is there and an ambient
+    # tool home is set; a link stands at the path of the record; the
+    # directory that should hold the record is a regular file; that
+    # directory holds a record and is closed to the process. On each the
+    # body must name what it lacks, whatever the route returned.
+    kind, scenario, _role, lens = ledger.parse_cell_id(NO_SIGN_IN)
+
+    class _Driver(AnotherHome, codex_driver.CodexLegacyDriver):
+        pass
+
+    _Driver.arrange, _Driver.restore = staticmethod(arrange), (
+        None if restore is None else staticmethod(restore)
+    )
+    execution = _played(scenario, tmp_path, lens, driver=_Driver())
+    found = not_a_call_without_the_sign_in_record(execution, tmp_path)
+
+    assert kind == CODEX_LEGACY_KIND
+    assert lacking <= set(found), (found, execution.report.describe())
+    # No play of them reached the provider: the code set of a cell could not
+    # tell them from the home without the record.
+    assert execution.observation.provider.request_count == 0
+
+
+# -- the state of the served-model pin on the routes of the kind ----------------------
+
+
+def test_the_state_of_the_served_model_pin_is_read_from_every_routing_file() -> None:
+    # A reply under another model is judged by the state of the route extra
+    # that pins the served model, as routing states it: read here from the
+    # shipped files, on every role a cell builds and on both products. A
+    # change of this state changes what that scenario asks of the column.
+    extra = declarations.SERVED_MODEL_EXTRA
+    states = {
+        (column.id, product, role): declarations.route_state(column, role, extra, product)
+        for column in (COLUMN,)
+        for product, _path in column.routing
+        for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+    }
+
+    assert states and set(states.values()) == {declarations.NOT_ADMITTED}
+    assert len(states) == 6
 
 
 # -- the module ends with the canary check ----------------------------------------

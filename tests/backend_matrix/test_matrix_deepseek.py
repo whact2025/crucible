@@ -32,6 +32,7 @@ from typing import Any, Callable, Mapping, Sequence
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from assay import Usage
 from crucible.backends import deepseek as adapter
 from crucible.backends.features import FeatureAdmissionError
 
@@ -1188,6 +1189,157 @@ def test_a_stream_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
             driver=_with_dialect(_AnswersWhole),
         )
     assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
+
+
+# -- a route without its credential ---------------------------------------------------
+
+
+def test_a_play_without_the_credential_has_no_key_variable_while_its_backend_is_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variable = matrix_columns.ADAPTER_CREDENTIAL_ENV[DEEPSEEK_KIND]
+    role = matrix_columns.ROLE_BY_CAPABILITY["text"]
+    path = COLUMN.routing_path(matrix_columns.COLUMN_PRODUCT)
+
+    # The route names no key: the adapter reads the variable of the kind at
+    # each call, and routing never reads it.
+    assert declarations.credential_variable(path, role) is None
+    assert variable not in matrix_columns.SCRIPTED_ENV
+    # Whatever a machine holds under that name is taken away for the play
+    # and put back after it.
+    monkeypatch.setenv(variable, "a-key-of-this-machine")
+    with DRIVER.open(
+        COLUMN,
+        capability="text",
+        lens="raw",
+        script=ProviderScript(()),
+        tmp_path=tmp_path / "without",
+        without_credential=True,
+    ):
+        assert variable not in os.environ
+    assert os.environ[variable] == "a-key-of-this-machine"
+    with DRIVER.open(
+        COLUMN,
+        capability="text",
+        lens="raw",
+        script=ProviderScript(()),
+        tmp_path=tmp_path / "with",
+    ):
+        assert os.environ[variable] == matrix_columns.CANARY_CREDENTIAL
+
+
+# -- the state of the served-model pin on the routes of the kind ----------------------
+
+
+def test_the_state_of_the_served_model_pin_is_read_from_every_routing_file() -> None:
+    # A reply under another model is judged by the state of the route extra
+    # that pins the served model, as routing states it: read here from the
+    # shipped files, on every role a cell builds and on both products. A
+    # change of this state changes what that scenario asks of the column.
+    extra = declarations.SERVED_MODEL_EXTRA
+    states = {
+        (column.id, product, role): declarations.route_state(column, role, extra, product)
+        for column in (COLUMN,)
+        for product, _path in column.routing
+        for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+    }
+
+    assert states and set(states.values()) == {declarations.NOT_ADMITTED}
+    assert len(states) == 6
+
+
+# -- a reply under another model: what the entry of its cell does not show ------------
+
+# The record of the ledger whose cell the proof below plays, and the code of
+# that record that keeps the accounting clause from comparing the tokens.
+REFUSED_REPLY_GAP = "G25"
+_TOKENS_FLAGGED = "flag:token_usage_complete=False"
+_REFUSED_REPLY = Cell(COLUMN, cells.SERVED_UNDER_ANOTHER_MODEL, "raw").id
+
+
+def test_the_result_of_a_reply_refused_for_its_model_reports_the_tokens_the_provider_billed(
+    played: Callable[[str], runner.Execution], request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because no code of the cell shows it.
+
+    The adapter refuses a reply under another model than its route asked
+    for, types the refusal a transport error and flags the token usage of
+    the result incomplete: codes of the cell's entry (known gap G25). Of a
+    result that is flagged so, clause C6 takes any number below the bill
+    for honest, down to none: while the entry stands no clause compares
+    what the result reports, and a result that had lost the usage of the
+    billed reply would be the same expected failure. This test compares
+    it: the provider billed one reply, and the result reports its tokens.
+    It holds before and after a fix of the record, and goes with its lying
+    counterparts once no entry lists the flag.
+    """
+
+    # The verifier requires this test by name: the entry of the record on
+    # this scenario leans on it, and a run without it is refused. No entry
+    # attributes the flag to that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[DEEPSEEK_KIND]]
+    flagged = {
+        entry.cell
+        for entry in LEDGER.entries
+        if entry.codes.get(_TOKENS_FLAGGED) == REFUSED_REPLY_GAP
+    }
+    assert flagged <= {_REFUSED_REPLY}
+
+    execution = played(cells.SERVED_UNDER_ANOTHER_MODEL)
+    result = execution.observation.result
+
+    # The play is a refusal of the one reply: an error, the provider asked
+    # once, nothing dispatched.
+    assert execution.report.seam_problems == () and result is not None
+    for clause in ("C0", "C10"):
+        assert execution.report.outcomes[clause].status == "ok", clause
+    assert result.error is not None
+    assert runner.not_the_tokens_of_the_one_billed_reply(execution) == []
+
+
+def test_the_proof_of_the_refused_reply_fails_on_a_result_that_lost_its_usage(
+    played: Callable[[str], runner.Execution],
+) -> None:
+    # The lying counterparts of the proof above: the result of the cell with
+    # its usage made up. Dropped whole, halved, one token short: the result
+    # flags its token usage incomplete, so the contract judges each to the
+    # codes of the honest play and the comparator is handed the same, which
+    # makes the lying result the same expected failure; the proof names
+    # each. A provider that billed nothing, or two replies, is not the one
+    # billed reply the proof is about.
+    honest = played(cells.SERVED_UNDER_ANOTHER_MODEL)
+    result = honest.observation.result
+    assert result is not None and _TOKENS_FLAGGED in honest.report.codes, (
+        "the result no longer flags its token usage incomplete, so the cell compares "
+        "the tokens itself: these counterparts go with the entry"
+    )
+    usage = result.usage
+    assert runner.not_the_tokens_of_the_one_billed_reply(honest) == []
+    for lost in (
+        Usage(),
+        dataclasses.replace(
+            usage, input_tokens=usage.input_tokens // 2, output_tokens=usage.output_tokens // 2
+        ),
+        dataclasses.replace(usage, input_tokens=usage.input_tokens - 1),
+        dataclasses.replace(usage, output_tokens=usage.output_tokens - 1),
+    ):
+        lying = runner.judged_again(honest, usage=lost)
+        assert runner.handed_to_the_comparator(lying) == runner.handed_to_the_comparator(honest)
+        assert runner.not_the_tokens_of_the_one_billed_reply(lying) != []
+    (billed,) = honest.observation.provider.billed
+    for bill in ([], [billed, billed]):
+        provider = dataclasses.replace(honest.observation.provider, billed=bill)
+        other = dataclasses.replace(
+            honest, observation=dataclasses.replace(honest.observation, provider=provider)
+        )
+        assert runner.not_the_tokens_of_the_one_billed_reply(other) != []
+    # More than the bill is no lower bound: the cell itself names that,
+    # whatever the result flags.
+    more = runner.judged_again(
+        honest, usage=dataclasses.replace(usage, input_tokens=usage.input_tokens + 1)
+    )
+    assert more.report.codes == honest.report.codes | {"usage.input_tokens:gt"}
+    assert runner.not_the_tokens_of_the_one_billed_reply(more) != []
 
 
 # -- the module ends with the canary check --------------------------------------------

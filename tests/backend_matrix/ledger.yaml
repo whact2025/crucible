@@ -16,7 +16,14 @@
 #   cell stays pinned. `observed_under` and `closes_under` hold the governing
 #   declared values of the cell's scenario; they are equal unless the record
 #   names the `declaration_change` (field, from, to, citation) that is the
-#   gap's listed resolution. `predicted` holds the codes expected of the
+#   gap's listed resolution. Where the table of a scenario is keyed by a
+#   route extra (a served model that differs: the extra that pins the served
+#   model), the governing value is the state of that extra as routing states
+#   it for the route of the cell's role: `carried`, `admitted_not_carried`
+#   or `not_admitted`. It is no declared value and the declaration snapshot
+#   has no column for it; a fix that changes the state on a route is named
+#   in the record as a change of a declared value is, with its citation.
+#   `predicted` holds the codes expected of the
 #   cell before the first run of its column; the first run corrects them,
 #   except on a record that was closed before a cell saw it red, which keeps
 #   them as written.
@@ -109,7 +116,7 @@ schema_version: crucible.backend-matrix.ledger.v1
 ceilings:
   max_known_gaps:
     pack_a: 74
-    pack_b: 48
+    pack_b: 58
   frozen: [pack_a]
   max_declared_differences: 4
 
@@ -443,6 +450,13 @@ registry:
       - cell: deepseek/S06/primary/raw
         observed_under: {}
         closes_under: {}
+        predicted: ["digest.mismatch:tool_authority"]
+      # A reply under another model (S24) attaches the read fixture and
+      # returns a result: one more tool cell. Its table is keyed by the state
+      # of the route extra that pins a served model, which the cell records.
+      - cell: deepseek/S24/primary/raw
+        observed_under: {expected_served_model: not_admitted}
+        closes_under: {expected_served_model: not_admitted}
         predicted: ["digest.mismatch:tool_authority"]
 
   G28:
@@ -1016,7 +1030,7 @@ registry:
         closes_under: {tool_loop: sdk_owned}
 
   G10:
-    title: Kimi types a policy rejection delivered as an HTTP error as a transport error
+    title: Kimi types a policy rejection delivered as an HTTP error, and a reply under another model than its route asked for, as a transport error
     origin: gap list
     severity: medium
     closes_on_grade: documented
@@ -1036,6 +1050,25 @@ registry:
       - cell: kimi/S23c/secondary/raw
         observed_under: {}
         closes_under: {}
+      # The other half of the gap, as the gap list names it: a reply under
+      # another model than the route asked for (S24). The worker refuses a
+      # stream whose model is not the requested one, and the parent builds a
+      # transport error that is not retried with the stop reason of an
+      # error, where the scenario asks for incomplete evidence that names
+      # the model field and the stop reason of a model mismatch. That the
+      # result reports no token of the billed reply is another record, M29.
+      # That the result names no served model is the code
+      # of M11, as on every result built from an outcome of the worker's
+      # exception classifier. The cell is answered from the tool-call
+      # envelope of the dialect, which is documented. The table of the
+      # scenario is keyed by the state of the route extra that pins a
+      # served model: routing does not admit it on a route of this backend.
+      - cell: kimi/S24/primary/raw
+        observed_under: {expected_served_model: not_admitted}
+        closes_under: {expected_served_model: not_admitted}
+        predicted:
+          - "kind:transport!=incomplete_evidence"
+          - "stop:error!=model_mismatch"
 
   G35:
     title: The gateway adapter types a refusal as a transport error and an output-token cut as a turn limit
@@ -1365,6 +1398,15 @@ registry:
       - cell: kimi/S25/primary/raw
         observed_under: {}
         closes_under: {}
+      # A reply under another model (S24, first run on the primary column).
+      # The worker refuses the stream and classifies its own refusal as an
+      # outcome that names no model, although the stream named one: the
+      # served-model code of this record. The scenario does not ask the
+      # terminal flag, which the result flags false, and expects the cost
+      # flag false, so neither of the two other codes is asked there.
+      - cell: kimi/S24/primary/raw
+        observed_under: {expected_served_model: not_admitted}
+        closes_under: {expected_served_model: not_admitted}
 
   M12:
     title: A Kimi route under its cost policy reports a cost above the matrix rate card when one response overruns the budget (no fix is owed)
@@ -2389,6 +2431,254 @@ registry:
       - cell: codex:legacy/S44/primary/raw
         observed_under: {}
         closes_under: {}
+  # The records entered with the scenario of a route without its credential
+  # (S28).
+  G11:
+    title: Kimi raises out of invoke() where a typed result is owed (a missing credential among them)
+    origin: gap list
+    severity: medium
+    # The gap list names several raises of the adapter under this id. One
+    # has a cell: with the key variable of the route absent at the call, the
+    # check of the runtime credentials raises a qualification error before
+    # any worker is started, where the scenario asks for a typed transport
+    # error that is not retried and no provider request. The route names
+    # the variable, routing reads it whenever it loads the file and the
+    # adapter reads it again at each call, so the cell takes it away at the
+    # call and not before. The raise stands for the result clauses: no
+    # column-wide code of the kind is owed on the cell while its entry
+    # holds the raise. The fix that turns the raise into a result adds, in
+    # its own change, the rows of the inventory for the two flag codes of
+    # M06 on the cell, because the scenario does not ask the accounting
+    # flags.
+    cells:
+      - cell: kimi/S28/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["raise:KimiSDKQualificationError@before_request/crucible.backends.kimi"]
+  G21:
+    title: DeepSeek types nothing as retriable and keeps no HTTP status, and raises before dispatch when its key is absent
+    origin: gap list
+    severity: medium
+    closes_on_grade: documented
+    # Of this gap the matrix holds the raise: with the key variable of the
+    # kind absent the loop driver raises a RuntimeError at its head, before
+    # the first request event, where the scenario asks for a typed
+    # transport error that is not retried and no provider request. The
+    # route names no key and the adapter reads that variable at each call,
+    # so the cell plays with the variable absent for as long as its backend
+    # is open.
+    # The grade is for the other part of the gap, which is about what a
+    # provider sends: the body of a rate limit and of a server error. The
+    # cell of the raise is answered from no reply at all, so the grade
+    # holds nothing of it.
+    cells:
+      - cell: deepseek/S28/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["raise:RuntimeError@before_request/crucible.backends.deepseek"]
+  G38:
+    title: The local gateway route depends on the environment, and with no key anywhere the adapter sends its request under a placeholder
+    origin: gap list
+    severity: medium
+    # With no key in its route and none in either variable the adapter reads
+    # when it is built, the adapter holds a placeholder key and sends one
+    # request, where the scenario asks for a typed error and no request.
+    # The scripted provider answers a request that no script holds with a
+    # status the adapter types as retriable, so the retriable flag on this
+    # cell follows from that request and says nothing of its own about a
+    # missing credential. On every other cell of this column the adapter is
+    # built with the hub variable of the scripted environment as its key,
+    # and the dialect of the kind accepts any bearer; this cell is the only
+    # one on which the adapter holds its placeholder. Removing the fallback
+    # to the hub variable does not close this cell. It closes when a route
+    # of this kind states where its key comes from, or that its endpoint
+    # takes none, and a call on a route that states neither returns the
+    # typed error and sends nothing.
+    # The hub token that goes to a local endpoint is part of the same gap
+    # and is shown by no cell: every other cell of the column carries it
+    # unseen. The hosted gateway has no cell of the scenario and none in
+    # this record: its route binds its key while routing loads the file, an
+    # unset variable is refused there, and that refusal stays
+    # (inventory.yaml, not_expressible). Where the cell stands and what it
+    # was predicted to show were decided before the scenario was first
+    # played, by a decision panel on 2026-11-26 acting under a standing
+    # instruction of the release owner; not the owner's own answer, and the
+    # owner may overrule.
+    cells:
+      - cell: openai_compat:local/S28/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["request.extra", "retriable:True"]
+  R06:
+    title: Both Codex routes flag the typed error for a sign-in record that does not exist as retriable when the call allows one attempt
+    origin: reference
+    severity: low
+    # Predicted by run before the scenario was built, and seen at its first
+    # run on both columns. A known gap of the reference by the ruling of a
+    # decision panel, which is the `ruling` of every entry that names the
+    # record and not a field of the record: nothing is withdrawn.
+    # crucible/backends/codex.py: the reader of the sign-in record, and the
+    # presence check of the route that reads the tool home, raise before
+    # any provider process is started for a model turn and before any
+    # request; the attempt controller types what left the attempt by the
+    # classifier's default, a retriable transport error, and the flag is
+    # edited only where an attempt is left.
+    # crucible/backends/codex_official.py: the presence check at the head
+    # of the attempt, the same controller and classifier. From a retry
+    # budget of two the result is not retriable, by the accounting rule of
+    # the controller and not by what the adapter knows of the sign-in. The
+    # scenario plays the base policy, a retry budget of one, so its cell
+    # cannot tell "not retriable at every budget" from "at one".
+    # The one code of a cell says neither that the error is about the
+    # sign-in record nor that nothing was sent: both routes return the same
+    # typed error for other refusals they make before a request.
+    # test_a_call_without_the_sign_in_record_names_the_record_and_starts_no_model_turn,
+    # in the module of each kind and required by name by the verifier, ties
+    # the cell to the sign-in: the text names the record, the directory
+    # that should hold it is a directory whose listing holds nothing of the
+    # record's name, the provider saw no request and the tool was started
+    # for no model turn. Its lying counterparts are beside it.
+    # Severity: low. The result is typed, nothing is sent and nothing is
+    # spent. What the flag costs: a caller that reads it takes a missing
+    # sign-in for a failure worth another attempt, and where the call is
+    # bounded by the limit guard the next planning round is refused by an
+    # error the guard raises, so a missing sign-in ends the planning step
+    # with the guard's error and not with a typed status that names the
+    # sign-in (by reading, not run).
+    cells:
+      - cell: codex:legacy/S28/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["retriable:True"]
+      - cell: codex:official/S28/primary/raw
+        observed_under: {}
+        closes_under: {}
+        predicted: ["retriable:True"]
+  # The records entered with the scenario of a served model that differs
+  # (S24). Its table is keyed by the state of the route extra that pins a
+  # served model, as routing states it for the route of the cell's role: a
+  # record of an S24 cell carries that state under `observed_under` and
+  # under `closes_under`, and an entry under `observed_under`.
+  # The DeepSeek cell of the scenario is under G25, the record that also
+  # holds the empty completion.
+  M28:
+    title: The gateway adapter flags the token usage of a reply it refuses for the identity of the served model incomplete, although the reply was billed and reported
+    origin: matrix
+    severity: low
+    # Predicted before the scenario was first played, by reading; no record
+    # of the gap list names the code. Both gateway routes carry the pin on
+    # the served model, and the adapter refuses a reply under another id
+    # as the scenario asks: incomplete evidence that names the model field,
+    # the stop reason of a model mismatch, the id the provider named in the
+    # trace, nothing dispatched, the cost flagged incomplete. The cell fails
+    # closed. Its one code: the adapter writes both accounting flags of the
+    # result from one switch, whatever the provider reported, so the token
+    # usage is flagged incomplete although the result reports every token
+    # of the one reply the provider billed. The cell does not hold those
+    # tokens while its entry stands: of a result that is flagged so the
+    # accounting clause takes any number below the bill for honest. A proof
+    # of the gateway module, which the verifier requires by name on both
+    # kinds (cells.RECORD_PROOFS), plays each cell and holds what the result
+    # reports to the one reply the provider billed. The scenario excepts the
+    # cost flag alone. The gap closes when the adapter flags the token usage of
+    # such a result by what it accounted for, apart from the cost. Two
+    # tests of the product pin the flag false today
+    # (tests/test_backends_openai_compat.py:
+    # test_exact_served_model_contract_rejects_unproved_single_shot and
+    # test_exact_served_model_mismatch_prevents_tool_dispatch).
+    # The record names no closing grade: its gap is what the adapter writes
+    # whatever the provider reported, not what a provider sends. The
+    # tool-call replies of both kinds are constructed; no reply of another
+    # grade would show the adapter doing otherwise.
+    cells:
+      - cell: openai_compat:hosted/S24/primary/raw
+        observed_under: {expected_served_model: carried}
+        closes_under: {expected_served_model: carried}
+        predicted: ["flag:token_usage_complete=False"]
+      - cell: openai_compat:local/S24/primary/raw
+        observed_under: {expected_served_model: carried}
+        closes_under: {expected_served_model: carried}
+        predicted: ["flag:token_usage_complete=False"]
+  M29:
+    title: Kimi reports no token of a reply it refuses for the model that served it
+    origin: matrix
+    severity: medium
+    # Seen at the first play of the scenario on the column, beside the
+    # typing gap of G10; no record of the gap list names the loss. A record
+    # of its own by the decision of a panel on 2026-11-27, acting under a
+    # standing instruction of the release owner; not the owner's own
+    # answer, and the owner may overrule.
+    # The worker's stream converter refuses the stream after it has
+    # validated the usage of the final packet and before the status update
+    # that alone hands usage to the parent, so the result reports no token
+    # of a reply the provider billed; on this route, which opts into the
+    # cost upper bound, the tokens the scenario owes are owed exactly. Every
+    # refusal the converter raises after the validated final packet loses
+    # the usage the same way; the cell shows the one for the served model.
+    # The result flags its tokens incomplete (M06). The fix sketch of G10
+    # restores no usage; a change that hands on that usage deletes the
+    # codes of this record in the same change.
+    # The record names no closing grade: its gap is what the worker does
+    # with a usage it has validated, not what a provider sends.
+    cells:
+      - cell: kimi/S24/primary/raw
+        observed_under: {expected_served_model: not_admitted}
+        closes_under: {expected_served_model: not_admitted}
+        predicted: ["usage.input_tokens:lt", "usage.output_tokens:lt"]
+  R26:
+    title: The Claude session route dispatches a tool call of a turn served under another model before the adapter refuses the turn, and the refusal flags fully reported token usage incomplete (unconfirmed, reference emulated)
+    origin: reference
+    severity: medium
+    closes_on_grade: documented
+    # First play of the scenario on the column; not predicted. A known gap
+    # of the reference by the ruling of a decision panel, which is the
+    # `ruling` of the entry and not a field of the record: nothing is
+    # withdrawn.
+    # On the session route the adapter refuses a turn served under another
+    # model at the frame of that turn and ends the session, where the
+    # scenario asks that nothing is dispatched. The in-process tool bridge
+    # (crucible/tools/_mcp_bridge.py) dispatches a call when the SDK hands
+    # it the request, with no gate on the adapter's admission of the turn
+    # that makes it. In the emulated order, the tool request in hand with
+    # the frame, which the scripted peer plays on every cell of the kind,
+    # the dispatch precedes the refusal: the read of the refused turn
+    # reaches the ToolSet. The cell shows a read and nothing of a write.
+    # The token flag is the literal of the refusal branch
+    # (crucible/backends/claude.py, the result built for a model identity
+    # error): false, although the result reports every token the provider
+    # billed. The same branch writes the terminal flag false, which the
+    # scenario does not ask.
+    # What the two codes do not say: while the entry lists the token flag
+    # no clause compares the reported tokens, and the dispatch depends on
+    # the order in which the request of the vendor tool and the adapter's
+    # end of the session meet. That order is the emulation's; no source in
+    # reach states it of the vendor tool, and with the request held back
+    # the cell shows the flag code alone.
+    # test_a_refused_model_turn_shows_one_code_set_in_each_order_of_the_tool_request
+    # in the Claude module plays the cell in both orders, holds the code
+    # set of each and the reported tokens to the bill, and is required by
+    # name by the verifier in both; the entry leans on the item of the
+    # order every cell plays (cells.RECORD_PROOFS).
+    # The frames of the cell are constructed (the frame that opens a
+    # session and the frame of a tool call) and nothing was observed of the
+    # real tool, so the record closes on the grade documented. A gate in
+    # the bridge is a change of its own. One that holds a call until the
+    # adapter has judged the turn that makes it takes the dispatch code off
+    # the entry. One that answers the call with an error at once does not:
+    # the scripted tool then sends a second model request before the
+    # session ends (request.extra), another code set, which returns the
+    # cell to a panel (both by run with the bridge changed in memory,
+    # 2026-11-27). A fix alone cannot delete the whole entry while the cell
+    # is answered from constructed frames: a vendor source, a recording or
+    # a decision panel comes first.
+    # Severity: medium while unconfirmed. The result fails closed
+    # (incomplete evidence, not retried, the accounting flagged
+    # incomplete), and a tool call of a turn the route refuses is run all
+    # the same.
+    cells:
+      - cell: claude/S24/primary/raw
+        observed_under: {expected_served_model: not_admitted}
+        closes_under: {expected_served_model: not_admitted}
 
   R17:
     title: The official Codex route ends the call with a transport error and no usage when its worker reports the failed item of a tool call for a name no server lists (unconfirmed, reference emulated)
@@ -2527,7 +2817,7 @@ registry:
         closes_under: {response_token_limit: provider_stop}
 
   G25:
-    title: DeepSeek returns a completed response without output as a clean success
+    title: DeepSeek returns a completed response without output as a clean success, and types a reply under another model than its route asked for as a transport error
     origin: gap list
     severity: medium
     closes_on_grade: documented
@@ -2558,6 +2848,34 @@ registry:
       - cell: deepseek/S25/primary/raw
         observed_under: {}
         closes_under: {}
+      # The second clause of the gap: a reply under another model than the
+      # route asked for (S24).
+      # As predicted. The adapter compares the model the terminal of the
+      # stream names with its own and returns a transport error that is not
+      # retried, with the stop reason of an error, where the scenario asks
+      # for incomplete evidence that names the model field and the stop
+      # reason of a model mismatch. The same branch flags the token usage of
+      # the reply incomplete, although it reports every token the provider
+      # billed, and flags the trace incomplete, although the trace records
+      # the id the provider named and ends in its terminal event: the two
+      # flag codes are of this record. The cell does not hold the reported
+      # tokens while its entry lists the token flag: of a result that is
+      # flagged so the accounting clause takes any number below the bill for
+      # honest. A proof of the DeepSeek module, which the verifier requires
+      # by name (cells.RECORD_PROOFS), plays the cell and holds them to the
+      # one reply the provider billed. Nothing is dispatched and the cost is
+      # flagged incomplete, as the scenario asks. The cell is answered from
+      # the tool-call envelope of the dialect, which is documented. Routing
+      # does not admit a pin on the served model on a route of this backend,
+      # so the route is held to the base contract of the scenario.
+      - cell: deepseek/S24/primary/raw
+        observed_under: {expected_served_model: not_admitted}
+        closes_under: {expected_served_model: not_admitted}
+        predicted:
+          - "kind:transport!=incomplete_evidence"
+          - "stop:error!=model_mismatch"
+          - "flag:token_usage_complete=False"
+          - "flag:trace_complete=False"
 
   M20:
     title: DeepSeek refuses a conversation request with another exception type than the other routes that declare no continuity
@@ -4314,6 +4632,140 @@ known_gaps:
       on an observed or documented answer; it covers the codes from no other
       error type and nothing of the other two reference cells of the scenario.
 
+  # A route without its credential (S28), first run on the primary columns.
+  # Kimi and DeepSeek raise out of the call from the check of their
+  # credential. The local gateway has no such check and sends its request
+  # under a placeholder; the status the scripted provider gives a request
+  # that no script holds is one the adapter types as retriable. The Claude
+  # cell passes, and the hosted gateway has no cell.
+  - cell: kimi/S28/primary/raw
+    observed_under: {}
+    codes:
+      "raise:KimiSDKQualificationError@before_request/crucible.backends.kimi": G11
+  - cell: deepseek/S28/primary/raw
+    observed_under: {}
+    codes:
+      "raise:RuntimeError@before_request/crucible.backends.deepseek": G21
+  - cell: openai_compat:local/S28/primary/raw
+    observed_under: {}
+    codes:
+      "request.extra": G38
+      "retriable:True": G38
+  # The two Codex cells of the same scenario: each carries the ruling of a
+  # decision panel, not an answer of the owner in person.
+  - cell: codex:legacy/S28/primary/raw
+    observed_under: {}
+    codes:
+      "retriable:True": R06
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, before the missing-credential scenario
+      first ran: what to do if its cell on this Codex reference is red only
+      because the typed error the route returns for a sign-in record that
+      does not exist is flagged retriable when the call allows one attempt,
+      where the scenario asks for a result that is not retriable. Decided, 3
+      of 3: accepted as a known gap of the reference for this observation
+      and no other: this cell, this one code alone, a typed result at a
+      retry budget of one, no provider request, the error built from this
+      route's refusal of a sign-in record that does not exist and from no
+      other check or cause. From a retry budget of two the same result is
+      not retriable, by a rule on accounting and not by what the adapter
+      knows of the sign-in. The fix belongs to this adapter and is a change
+      of its own: a sign-in record that does not exist is typed not
+      retriable at every retry budget, where the sign-in is read; the change
+      does not alter how the adapter types an exception it has no rule for,
+      when it refuses a second attempt, or what its other refusals return;
+      it deletes this entry in the change in which this cell passes. The
+      acceptance covers no other code, cell, column or reference gap, no
+      other check the adapter makes before a request, and not the same code
+      on another scenario of this route.
+  - cell: codex:official/S28/primary/raw
+    observed_under: {}
+    codes:
+      "retriable:True": R06
+    ruling: >-
+      Decision panel, 2026-11-24, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Asked, before the missing-credential scenario
+      first ran: what to do if its cell on this Codex reference is red only
+      because the typed error the route returns for a sign-in record that
+      does not exist is flagged retriable when the call allows one attempt,
+      where the scenario asks for a result that is not retriable. Decided, 3
+      of 3: accepted as a known gap of the reference for this observation
+      and no other: this cell, this one code alone, a typed result at a
+      retry budget of one, no provider request, the error built from this
+      route's refusal of a sign-in record that does not exist and from no
+      other check or cause. From a retry budget of two the same result is
+      not retriable, by a rule on accounting and not by what the adapter
+      knows of the sign-in. The fix belongs to this adapter and is a change
+      of its own: a sign-in record that does not exist is typed not
+      retriable at every retry budget, where the sign-in is read; the change
+      does not alter how the adapter types an exception it has no rule for,
+      when it refuses a second attempt, or what its other refusals return;
+      it deletes this entry in the change in which this cell passes. The
+      acceptance covers no other code, cell, column or reference gap, no
+      other check the adapter makes before a request, and not the same code
+      on another scenario of this route.
+
+  # A reply under another model (S24), first run on the open-weight primary
+  # columns. Kimi and DeepSeek type the mismatch a transport error; the
+  # Kimi result also reports no token of the billed reply (a record of its
+  # own, M29) and names no served model, and the DeepSeek result flags its
+  # token usage and its trace incomplete. Both gateway kinds refuse the
+  # reply as the scenario asks and flag its token usage incomplete. Each
+  # entry records the state of the route extra that keys the scenario.
+  - cell: kimi/S24/primary/raw
+    observed_under: {expected_served_model: not_admitted}
+    codes:
+      "kind:transport!=incomplete_evidence": G10
+      "stop:error!=model_mismatch": G10
+      "usage.input_tokens:lt": M29
+      "usage.output_tokens:lt": M29
+      "digest.missing:served_model": M11
+  - cell: deepseek/S24/primary/raw
+    observed_under: {expected_served_model: not_admitted}
+    codes:
+      "kind:transport!=incomplete_evidence": G25
+      "stop:error!=model_mismatch": G25
+      "flag:token_usage_complete=False": G25
+      "flag:trace_complete=False": G25
+      "digest.mismatch:tool_authority": G24
+  - cell: openai_compat:hosted/S24/primary/raw
+    observed_under: {expected_served_model: carried}
+    codes:
+      "flag:token_usage_complete=False": M28
+  - cell: openai_compat:local/S24/primary/raw
+    observed_under: {expected_served_model: carried}
+    codes:
+      "flag:token_usage_complete=False": M28
+  # The Claude cell of the same scenario, in the order the scripted tool
+  # plays on every cell of the kind. It carries the ruling of a decision
+  # panel, not an answer of the owner in person.
+  - cell: claude/S24/primary/raw
+    observed_under: {expected_served_model: not_admitted}
+    codes:
+      "dispatch.extra:read_a": R26
+      "flag:token_usage_complete=False": R26
+    ruling: >-
+      Decision panel, 2026-11-27, acting under a standing instruction the
+      release owner gave on 2026-11-21; not the owner's own answer, and the
+      owner may overrule. Decided, 3 of 3: claude/S24/primary/raw is entered
+      as a known gap of the reference under R26 with these two codes and
+      nothing else, in the order the matrix peer plays for every Claude cell
+      (the tool request in hand with the frame). On the session route the
+      adapter refuses a turn served under another model at its frame and
+      flags the token usage incomplete although every billed token is
+      reported; the in-process tool bridge, which has no gate on the
+      adapter's admission of a turn, had already dispatched the turn's read.
+      The order is the emulation's and is not recorded of the vendor's tool;
+      with the request held back the cell shows the flag code alone. The
+      result also flags its terminal false, which the form of S24 does not
+      ask. Not covered: a write, another order, another code, another cell.
+      Another code set or a raise of the form of the flags returns the cell
+      to a panel; the entry may lose the dispatch code to a fix and never
+      grows.
+
 declared_differences:
   - id: D-STRUCT-UNQUALIFIED
     citation: >-
@@ -4404,6 +4856,7 @@ declared_differences:
       - codex:legacy/S40/primary/raw
       - codex:legacy/S26/primary/raw
       - codex:legacy/S27/primary/raw
+      - codex:legacy/S28/primary/raw
       - codex:legacy/S41/primary/raw
       - codex:legacy/S44/primary/raw
       - codex:legacy/S45/primary/raw
@@ -4430,6 +4883,7 @@ declared_differences:
       - codex:official/S40/primary/raw
       - codex:official/S26/primary/raw
       - codex:official/S27/primary/raw
+      - codex:official/S28/primary/raw
       - codex:official/S41/primary/raw
       - codex:official/S44/primary/raw
       - codex:official/S45/primary/raw

@@ -8,8 +8,11 @@ complete ``BackendPolicy``, never an adapter default), what the provider does,
 which ToolSet is attached, the lenses it runs in and the result every backend
 must return. Where backends may legitimately differ, a difference table keyed
 by the governing declared field selects ``BASE``, a named ``FALLBACK`` or
-``REFUSED``; the table is total over the field's vocabulary. No scenario asks
-which backend it runs on.
+``REFUSED``; the table is total over the field's vocabulary. One table is
+keyed by something that is no declared field: the state of a closed route
+extra as routing states it for the route of the cell's role, total over its
+three states (:mod:`.declarations`). No scenario asks which backend it runs
+on.
 
 A difference that no feature field expresses is a *declared difference* of
 the ledger: the scenario defines its alternative contract under the id of the
@@ -34,7 +37,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from assay import BackendPolicy, ConversationTransportRequest
+from assay import BackendExecutionTrace, BackendPolicy, ConversationTransportRequest
 
 from .contract import (
     ACCOUNTING_FLAGS,
@@ -46,7 +49,18 @@ from .contract import (
     Observation,
     Reference,
 )
-from .declarations import BASE, FALLBACK, REFUSED, Differences, Variant
+from .declarations import (
+    ADMITTED_NOT_CARRIED,
+    BASE,
+    CARRIED,
+    FALLBACK,
+    KEYING_EXTRAS,
+    NOT_ADMITTED,
+    REFUSED,
+    SERVED_MODEL_EXTRA,
+    Differences,
+    Variant,
+)
 from .drivers.base import LENSES, MatrixSetupError
 from .script import (
     READ_A,
@@ -63,6 +77,7 @@ from .script import (
     Reason,
     Refuse,
     Say,
+    ServedAs,
     TokenUsage,
 )
 from .toolsets import (
@@ -221,6 +236,12 @@ class Scenario:
     # can ask routing for and calls none. What routing does with each is
     # pinned per cell in the inventory, never derived from a declared value.
     admission: bool = False
+    # The cell is played on a route without its credential: the backend is
+    # built by routing from the shipped route, and the place the route of the
+    # cell's role takes its credential from holds none at the last moment at
+    # which the route reads it. A state of the route and no step of the
+    # script: the driver of the column builds it and says what the place is.
+    credential_unset: bool = False
 
     @property
     def capability(self) -> str:
@@ -1030,6 +1051,52 @@ def _reads_and_writes_in_turn() -> ProviderScript:
 # -- variant transformations ------------------------------------------------
 
 
+# The name the protocol gives the field of a trace that holds the model the
+# provider served: taken from the protocol's own type, from no adapter.
+SERVED_MODEL_FIELD = "served_model"
+
+
+def mismatch_names_the_model_field(obs: Observation, _ref: Reference) -> list[Deviation]:
+    """An error of incomplete evidence names the served-model field as what is missing.
+
+    Asked of a result whose error is of that kind: an entry of its
+    ``missing`` contains the name of the trace's field for the served model.
+    No spelling is asked around the name. A result of another kind is held
+    by the clause about the kind, and nothing is said of it here.
+    """
+
+    assert obs.result is not None
+    error = obs.result.error
+    if error is None or str(error.kind) != "incomplete_evidence":
+        return []
+    missing = tuple(str(entry) for entry in getattr(error, "missing", ()))
+    if any(SERVED_MODEL_FIELD in entry for entry in missing):
+        return []
+    return [
+        Deviation(
+            f"error.missing:{SERVED_MODEL_FIELD}",
+            f"the incomplete evidence names {list(missing)} as missing and not the "
+            "field of the trace for the model that was served",
+        )
+    ]
+
+
+def _observed_and_dispatched(plan: Plan) -> Plan:
+    """A route that admits a pin on the served model and leaves it out observes only.
+
+    The reply under another id is taken: its call is dispatched, and a
+    second reply under the same id ends the turn. A success, with the id the
+    provider named in the trace.
+    """
+
+    return replace(
+        plan,
+        script=ProviderScript((ServedAs(Call(READ_A)), ServedAs(Say(TEXT)))),
+        expect=replace(CLEAN, dispatch=(READ_A,)),
+        checks=(results_replayed, history_replayed),
+    )
+
+
 def _swap_check(plan: Plan, old: Check, new: Check | None) -> Plan:
     checks = tuple(check for check in plan.checks if check is not old)
     return replace(plan, checks=checks if new is None else (*checks, new))
@@ -1268,6 +1335,43 @@ _BROKEN_TURN = Expectation(
     stop_not=READ_STOP_REASONS,
     flags=("trace_complete",),
     flags_false=("terminal_complete",),
+)
+
+
+# A call on a route without its credential makes no provider request and
+# returns a transport error that is not retried. Its stop reason is none of
+# those a workflow reads as an outcome of its own; no spelling is asked. The
+# trace is the adapter's own record of what it did, so its flag is owed and
+# the trace ends in its one terminal event; no other event is asked, and a
+# request event that stands for the attempt is neither asked nor refused. No
+# turn was started and no usage record can have arrived: the terminal flag
+# and the two accounting flags are not asked, and none is expected false.
+# Clause C6 still holds what the result reports to what the provider billed,
+# which is nothing.
+_WITHOUT_A_REQUEST = Expectation(
+    kind="transport",
+    stop=(),
+    stop_not=READ_STOP_REASONS,
+    retriable=False,
+    flags=("trace_complete",),
+)
+
+
+# A reply answered under another model than the route asked for is no result
+# of the route. The error is incomplete evidence with the stop reason of a
+# model mismatch, and nothing of the reply is dispatched. The cost flag is
+# expected false: the price of the model that answered is not the route's.
+# The row excepts no other accounting flag: the one reply is billed and
+# reported, so the token usage flag is owed. The terminal flag is not
+# asked: the row names none, and no clause says whether a result that is
+# refused for the identity of the model that answered owns the terminal the
+# flag speaks of. The trace flag is owed. The retriable flag is not
+# asserted, and no event is asked beyond the terminal one.
+_SERVED_UNDER_ANOTHER_ID = Expectation(
+    kind="incomplete_evidence",
+    stop=("model_mismatch",),
+    flags=("token_usage_complete", "trace_complete"),
+    flags_false=("cost_complete",),
 )
 
 
@@ -1826,6 +1930,43 @@ _ALL: tuple[Scenario, ...] = (
             ),
         ),
     ),
+    # -- a reply under another model -----------------------------------------
+    Scenario(
+        id="S24",
+        set=PACK_B,
+        title="Served model differs",
+        # The read fixture, and a tool call as the one reply: "nothing is
+        # dispatched" is then an assertion. No model id stands here: the
+        # dialect derives the other id from the one the request names.
+        toolset=READ,
+        lenses=("raw",),
+        plan=lambda: Plan(
+            ProviderScript((ServedAs(Call(READ_A)),)),
+            expect=_SERVED_UNDER_ANOTHER_ID,
+            checks=(mismatch_names_the_model_field, history_replayed),
+        ),
+        # Keyed by the state of the route extra that pins the served model,
+        # as routing states it for the route of the cell's role. A route
+        # that carries the pin, and a route on which routing does not admit
+        # one, hold the base contract: the second can state no expected id
+        # of its own and cannot leave a pin out, so nothing in it asks less
+        # than a plain call does, and the product documents no observe-only
+        # behaviour for it. The fallback is left to a route on which routing
+        # admits the pin and which leaves it out.
+        differences={
+            SERVED_MODEL_EXTRA: {
+                CARRIED: BASE,
+                NOT_ADMITTED: BASE,
+                ADMITTED_NOT_CARRIED: FALLBACK(
+                    "observe_only",
+                    "crucible/backends/openai_compat.py:731-741 (the served-model "
+                    "check of the gateway adapter: generic operator routes retain "
+                    "their historical observe-only behavior)",
+                ),
+            }
+        },
+        fallbacks={"observe_only": _observed_and_dispatched},
+    ),
     # -- broken terminals ---------------------------------------------------
     Scenario(
         id="S26",
@@ -1863,6 +2004,19 @@ _ALL: tuple[Scenario, ...] = (
             expect=replace(_BROKEN_TURN, flags_false=EXPECTED_FALSE_FLAGS),
             checks=(cut_off_text_withheld,),
         ),
+    ),
+    # -- a route without its credential ----------------------------------------
+    Scenario(
+        id="S28",
+        set=PACK_B,
+        title="Missing credential",
+        toolset=None,
+        lenses=("raw",),
+        # Nothing is scripted: any request the provider sees is one too many.
+        # The base policy, a retry budget of one. The scenario carries no
+        # check of its own and no governing field.
+        plan=lambda: Plan(ProviderScript(()), expect=_WITHOUT_A_REQUEST),
+        credential_unset=True,
     ),
     Scenario(
         id="S41",
@@ -1999,12 +2153,31 @@ SCENARIOS: Mapping[str, Scenario] = {scenario.id: scenario for scenario in _ALL}
 
 
 def governing_fields(scenarios: Sequence[Scenario] = _ALL) -> tuple[str, ...]:
-    """Every declared field that governs a defined scenario, in first-use order."""
+    """Every declared field that governs a defined scenario, in first-use order.
+
+    A route extra that keys a table is no declared field and is not among
+    them (:func:`keying_extras`).
+    """
 
     fields: list[str] = []
     for scenario in scenarios:
-        fields.extend(name for name in scenario.governing if name not in fields)
+        fields.extend(
+            name
+            for name in scenario.governing
+            if name not in fields and name not in KEYING_EXTRAS
+        )
     return tuple(fields)
+
+
+def keying_extras(scenarios: Sequence[Scenario] = _ALL) -> tuple[str, ...]:
+    """Every route extra that keys the table of a defined scenario, in first-use order."""
+
+    extras: list[str] = []
+    for scenario in scenarios:
+        extras.extend(
+            name for name in scenario.governing if name in KEYING_EXTRAS and name not in extras
+        )
+    return tuple(extras)
 
 
 def difference_variants(scenarios: Sequence[Scenario] = _ALL) -> frozenset[str]:
@@ -2032,6 +2205,11 @@ def difference_alternatives(
 
 
 def _validate() -> None:
+    if SERVED_MODEL_FIELD not in BackendExecutionTrace.__dataclass_fields__:
+        raise MatrixSetupError(
+            f"the trace of the protocol has no field {SERVED_MODEL_FIELD!r}: the "
+            "scenario of a served model that differs names it"
+        )
     for scenario in _ALL:
         if scenario.set not in SETS or not set(scenario.lenses) <= set(LENSES):
             raise MatrixSetupError(f"scenario {scenario.id} names an unknown set or lens")

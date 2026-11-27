@@ -354,6 +354,7 @@ class CodexOfficialDriver:
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
+        without_credential: bool = False,
     ) -> Iterator[_Bound]:
         if column.kind != self.kind:
             raise MatrixSetupError(f"column {column.id} is not of kind {self.kind}")
@@ -363,7 +364,13 @@ class CodexOfficialDriver:
         journal.directory.mkdir()
         launcher = tmp_path / "codex-peer" / "codex"
         with contextlib.ExitStack() as stack:
-            stack.enter_context(private_home(tmp_path))
+            # The worker of the route needs the sign-in file of the vendor
+            # tool, as the head of its routing file says, and the adapter
+            # looks for that file at the head of each attempt, whatever
+            # source of the credential the routes of the file name. Without
+            # its credential the home of the cell has the directory of that
+            # file and no such file.
+            stack.enter_context(private_home(tmp_path, signed_in=not without_credential))
             dialect = self._dialect(journal, launcher)
             provider = stack.enter_context(
                 LoopbackProvider(script, credential=CANARY_CREDENTIAL, dialect=dialect)

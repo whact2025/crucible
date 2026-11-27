@@ -5,7 +5,8 @@
 
 JUnit says whether a cell passed, failed or was an expected failure. This
 report says why: the deviation codes, the gaps the ledger attributes them to,
-the variant each governing declared value selected, the declared differences
+the variant each governing value selected (a declared value, or the state of
+a route extra that keys a table), the declared differences
 in force, the outcome of every clause that applies, the grade of the weakest
 envelope the provider answered from, and what the driver of the kind bypasses,
 with the private names of the product that it and the required proofs of the
@@ -71,7 +72,7 @@ def note_cell(execution: Execution, known: ledger.Ledger) -> None:
     if _CELLS.get(cell.id, {}).get("outcome", NOT_JUDGED) != NOT_JUDGED:
         return  # the cell's own test item was judged; a later replay is not it
     scenario = SCENARIOS[cell.scenario]
-    selected = declarations.select(scenario.differences, execution.reference.routed)
+    selected = declarations.variants(scenario.differences, execution.current)
     codes = sorted(report.codes)
     _CELLS[cell.id] = {
         "kind": cell.column.kind,

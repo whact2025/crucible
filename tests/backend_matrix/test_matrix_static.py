@@ -347,8 +347,9 @@ def test_h03_ledger_and_oracle_integrity() -> None:
             # A static cell has no governing declared value.
             assert dict(entry.observed_under) == {}, entry.cell
         else:
-            # A behaviour entry is locked to the value of every declared field
-            # that governs its scenario, and to nothing else.
+            # A behaviour entry is locked to the value of every key that
+            # governs its scenario (a declared field, or the route extra
+            # that keys its table), and to nothing else.
             assert set(entry.observed_under) == set(SCENARIOS[scenario].governing), entry.cell
     # A column-wide entry names a code of a contract clause on a real kind.
     for scope in LEDGER.column_wide:
@@ -869,6 +870,76 @@ def test_rule_modules_import_only_the_public_contract_surface(module: str) -> No
     assert _import_problems(_tree(module)) == []
 
 
+_HOSTED, _LOCAL = matrix_columns.HOSTED_GATEWAY_KIND, matrix_columns.LOCAL_GATEWAY_KIND
+# The proof the row of the hosted kind rests on, as its module names it.
+_KEY_BOUND_AT_LOAD = "test_the_hosted_route_binds_its_key_while_routing_loads_the_file"
+
+
+def _gateway_pin_problems(
+    rows: Sequence[Mapping[str, str]], required: Mapping[str, Sequence[str]]
+) -> list[str]:
+    """Why the rows of the two gateway kinds are not the one row they may have.
+
+    The hosted kind pins the missing-credential scenario and nothing else,
+    the local kind nothing, and the proof that row rests on is required by
+    name for the routing file of every product. So a row put on the local
+    kind, and the row left behind once its proof is no longer required, are
+    both found here: no integrity rule knows the ground of a row.
+    """
+
+    problems: list[str] = []
+    pinned = sorted(
+        (row["kind"], row["scenario"]) for row in rows if row["kind"] in (_HOSTED, _LOCAL)
+    )
+    if pinned != [(_HOSTED, "S28")]:
+        problems.append(
+            f"the gateway kinds pin {pinned} not expressible; exactly {(_HOSTED, 'S28')} "
+            "may be pinned"
+        )
+    held = required.get(cells.MODULE_BY_KIND[_HOSTED], ())
+    missing = sorted(
+        product
+        for product in matrix_columns.PRODUCTS
+        if f"{_KEY_BOUND_AT_LOAD}[{product}]" not in held
+    )
+    if pinned and missing:
+        problems.append(
+            f"the verifier does not require {_KEY_BOUND_AT_LOAD} for the routing file of "
+            f"{missing}: a row of the gateway kinds rests on it"
+        )
+    return problems
+
+
+def test_a_row_on_the_local_gateway_or_one_without_its_proof_is_found() -> None:
+    # The two lying counterparts of the statement in the test below, each on
+    # an inventory held in memory: the row of the hosted kind copied to the
+    # local kind, and the shipped rows with the proof taken off the list of
+    # what the verifier requires.
+    rows = cells.load_inventory().not_expressible
+    (row,) = (item for item in rows if item["kind"] == _HOSTED)
+    module = cells.MODULE_BY_KIND[_HOSTED]
+    without_the_proof = {
+        name: tuple(item for item in items if not item.startswith(_KEY_BOUND_AT_LOAD))
+        for name, items in cells.REQUIRED_PROOFS.items()
+    }
+
+    assert _gateway_pin_problems(rows, cells.REQUIRED_PROOFS) == []
+    on_local = _gateway_pin_problems([*rows, {**row, "kind": _LOCAL}], cells.REQUIRED_PROOFS)
+    assert len(on_local) == 1 and "exactly" in on_local[0]
+    unproven = _gateway_pin_problems(rows, without_the_proof)
+    assert len(unproven) == 1 and "does not require" in unproven[0]
+    # That proof alone was taken off the list, for every product: the other
+    # proofs of the module are still required.
+    assert len(without_the_proof[module]) == len(cells.REQUIRED_PROOFS[module]) - len(
+        matrix_columns.PRODUCTS
+    )
+    # With no row at all the proof is not asked for; the row alone is.
+    no_row = [item for item in rows if item["kind"] != _HOSTED]
+    assert _gateway_pin_problems(no_row, without_the_proof) == [
+        f"the gateway kinds pin [] not expressible; exactly {(_HOSTED, 'S28')} may be pinned"
+    ]
+
+
 def test_gateway_drivers_patch_no_product_name() -> None:
     tree = _tree("drivers/openai_compat.py")
     imported = [
@@ -887,7 +958,14 @@ def test_gateway_drivers_patch_no_product_name() -> None:
     for kind in (matrix_columns.HOSTED_GATEWAY_KIND, matrix_columns.LOCAL_GATEWAY_KIND):
         driver = drivers.get(kind)
         assert driver.private_seams == () and driver.fidelity == "wire"
-        assert driver.bypassed_layers and driver.inexpressible == {}
+        assert driver.bypassed_layers
+    # What the two kinds pin not expressible, stated exactly: the hosted
+    # kind the one scenario whose subject is a state of its route, the local
+    # kind nothing; and the proof that row rests on is required by name.
+    inventory = cells.load_inventory()
+    assert _gateway_pin_problems(inventory.not_expressible, cells.REQUIRED_PROOFS) == []
+    assert [name.split("/", 1)[0] for name in drivers.get(_HOSTED).inexpressible] == ["S28"]
+    assert drivers.get(_LOCAL).inexpressible == {}
     # The redirect and the guard are loadable by path inside a worker later.
     for name, allowed in (("tap.py", {"httpx"}), ("netguard.py", set())):
         assert _import_problems(_tree(name)) == sorted(allowed)
@@ -1074,6 +1152,7 @@ _APP_SERVER_INEXPRESSIBLE = [
     "S23b/Refuse(refusal_part)",
     # On the session wire of both routes a tool call is a decoded object.
     "S05/Call(malformed)",
+    "S24/ServedAs",
 ]
 
 
@@ -1698,6 +1777,27 @@ def test_difference_tables_are_total_and_cite_their_fallbacks() -> None:
             for variant in table.values():
                 assert variant.kind in {"BASE", "FALLBACK", "REFUSED"}
                 assert variant.kind != "FALLBACK" or variant.citation
+    # A table keyed by the state of a route extra is total over the three
+    # states routing can state, named here; one table is keyed so.
+    assert declarations.EXTRA_STATES == ("carried", "admitted_not_carried", "not_admitted")
+    keyed = {
+        scenario.id: table
+        for scenario in SCENARIOS.values()
+        for name, table in scenario.differences.items()
+        if name in declarations.KEYING_EXTRAS
+    }
+    assert sorted(keyed) == ["S24"]
+    for table in keyed.values():
+        assert set(table) == set(declarations.EXTRA_STATES)
+        for state in declarations.EXTRA_STATES:
+            short = {name: variant for name, variant in table.items() if name != state}
+            assert declarations.totality_gaps({declarations.SERVED_MODEL_EXTRA: short}) == [
+                f"{declarations.SERVED_MODEL_EXTRA}={state} has no variant"
+            ]
+    # A governing key of every other kind is a declared field.
+    for scenario in SCENARIOS.values():
+        for name in scenario.governing:
+            assert (name in declarations.KEYING_EXTRAS) != (name in declarations.FEATURE_FIELDS)
 
 
 def test_every_scenario_passes_the_complete_base_policy() -> None:

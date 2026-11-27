@@ -17,14 +17,24 @@ the peer does not emulate fails a cell as a setup error. The peer is a program
 of its own: its journal keeps no value of the environment it was started in,
 and the network guard of the package runs inside it.
 
-What the cells of these columns show today is the ledger's business. One test
-is required by name by the verifier all the same, because it holds a known
-gap of the reference to its cause: on a write the trace binds a
-tool-authority digest that is not the shared one, the one code of the cell
-does not say why, and the test shows that the value is the digest of the same
-tools without a path scope and that nothing else stands behind the code. Its
-lying counterparts are beside it. It replaces one private name of the
-adapter in this process, which is listed beside the required proofs.
+What the cells of these columns show today is the ledger's business. Two tests
+are required by name by the verifier all the same. One holds a known gap of
+the reference to its cause: on a write the trace binds a tool-authority
+digest that is not the shared one, the one code of the cell does not say why,
+and the test shows that the value is the digest of the same tools without a
+path scope and that nothing else stands behind the code. Its lying
+counterparts are beside it. It replaces one private name of the adapter in
+this process, which is listed beside the required proofs. The other holds
+what the cell of a reply under another model shows to the order in which the
+scripted tool sends the request for the call of the refused turn: the
+adapter refuses the reply at the frame of the model turn, and the tool
+bridge dispatches a call when it is handed the request, whatever the
+adapter makes of the turn, so the cell shows the call at the ToolSet when
+the request is in hand with the frame and does not when the request is
+held. It plays both orders, which the peer states, and holds the tokens the
+result reports to the bill. The cell carries the two codes of the order
+every cell plays as a known gap of the reference, and its entry leans on
+the item of that order.
 """
 
 from __future__ import annotations
@@ -48,7 +58,7 @@ from claude_agent_sdk import types as sdk_types
 from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk._internal.transport import subprocess_cli as sdk_cli
 
-from assay import Invocation
+from assay import Invocation, Usage
 from crucible.backends.claude import ClaudeBackend
 from crucible.backends.config import load_routing
 from crucible.backends.tool_authority import (
@@ -1125,6 +1135,7 @@ def _peer(
     directory: Path,
     provider: str = "http://127.0.0.1:9/none",
     faults: tuple[str, ...] = (),
+    tool_request: str = peer_program.JOINED,
 ) -> claude_driver.Peer:
     return claude_driver.write_peer(
         directory,
@@ -1132,6 +1143,7 @@ def _peer(
         organisation={"orgId": "an-organisation", "orgName": "An Organisation"},
         cli_version="9.8.7",
         faults=faults,
+        tool_request=tool_request,
     )
 
 
@@ -1469,6 +1481,145 @@ def test_the_peer_passes_a_tool_error_on_to_the_next_model_turn(tmp_path: Path) 
     assert [block["content"][0]["text"] for block in echoed] == ["it failed", "no such"]
     assert (shown.extra, shown.unconsumed) == (0, 0) and written[-1]["result"] == "done"
     assert shown.requests[0].tools == (tool,)
+
+
+_HOSTED = json.dumps({"mcpServers": {"hosted": {"type": "sdk", "name": "hosted"}}})
+# What an SDK that hosts one tool server writes up to the first prompt, in
+# the order the peer reads it.
+_HOSTED_PROMPT: list[dict[str, Any]] = [
+    _PROMPT[0],
+    _answer(1, {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {"tools": {}}}}),
+    _answer(2, {"jsonrpc": "2.0", "result": {}}),
+    _answer(
+        3,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": toolsets.BINDINGS[READ_A].name}]},
+        },
+    ),
+    *_PROMPT[1:],
+]
+_TOOL_RESULT = _answer(
+    4, {"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "read"}]}}
+)
+
+
+class _ClientOfOneCall:
+    """The standard output of a session played in this process, and its client.
+
+    It keeps every write of the peer apart, which a pipe does not, and
+    answers the request for the one tool call when it arrives; then it
+    closes the input of the session, as a client that is done.
+    """
+
+    def __init__(self, input_end: int) -> None:
+        self.writes: list[list[dict[str, Any]]] = []
+        self._input: int | None = input_end
+
+    def write(self, data: bytes) -> int:
+        self.writes.append([json.loads(line) for line in bytes(data).splitlines()])
+        if self._input is not None and b'"tools/call"' in data:
+            os.write(self._input, json.dumps(_TOOL_RESULT).encode("utf-8") + b"\n")
+            os.close(self._input)
+            self._input = None
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+
+def _session_in_this_process(
+    directory: Path, provider: str, tool_request: str
+) -> list[list[dict[str, Any]]]:
+    """The writes of one session with one tool call, played by the peer's own class."""
+
+    config = json.loads(
+        _peer(directory, provider, tool_request=tool_request).config.read_text(encoding="utf-8")
+    )
+    read_end, write_end = os.pipe()
+    client = _ClientOfOneCall(write_end)
+    os.write(
+        write_end,
+        "".join(json.dumps(frame) + "\n" for frame in _HOSTED_PROMPT).encode("utf-8"),
+    )
+    argv = ["--mcp-config", _HOSTED, *_SESSION_ARGV]
+    with os.fdopen(read_end, "rb") as stdin:
+        code = peer_program.Session(argv, config, stdin, client).run()  # type: ignore[arg-type]
+    assert code == 0
+    return client.writes
+
+
+def test_the_peer_sends_the_request_for_a_tool_call_in_the_order_its_configuration_names(
+    tmp_path: Path,
+) -> None:
+    dialect = claude_driver.ClaudeCliDialect()
+    script = ProviderScript((Call(READ_A), Say("done")))
+
+    def kinds(write: list[dict[str, Any]]) -> list[str]:
+        return [str(frame["type"]) for frame in write]
+
+    def turn(writes: list[list[dict[str, Any]]]) -> int:
+        """The write that holds the frame of the model turn that makes the call."""
+
+        return next(index for index, write in enumerate(writes) if "assistant" in kinds(write))
+
+    def asks(frame: dict[str, Any]) -> bool:
+        return frame["type"] == "control_request" and (
+            frame["request"]["message"]["method"] == "tools/call"
+        )
+
+    # The client of the tool handles a frame and a control request side by
+    # side, so the peer states how the request for a tool call follows the
+    # frame of the model turn that makes it. Joined, which every cell
+    # plays: one write holds both, and the frame is the first of the two.
+    with LoopbackProvider(script, credential=CANARY_CREDENTIAL, dialect=dialect) as provider:
+        joined = _session_in_this_process(
+            tmp_path / "joined", provider.url + dialect.path, peer_program.JOINED
+        )
+        billed = provider.freeze()
+    at = turn(joined)
+    assert kinds(joined[at]) == ["assistant", "control_request"] and asks(joined[at][1])
+    assert (billed.request_count, billed.extra, billed.unconsumed) == (2, 0, 0)
+    # Held: the frame leaves alone, and the request in a write of its own
+    # after the stated time, here shortened, when the client has not ended
+    # the session.
+    with pytest.MonkeyPatch.context() as shortened, LoopbackProvider(
+        script, credential=CANARY_CREDENTIAL, dialect=dialect
+    ) as provider:
+        shortened.setattr(peer_program, "HOLD_SECONDS", 0.05)
+        held = _session_in_this_process(
+            tmp_path / "held", provider.url + dialect.path, peer_program.HELD
+        )
+        billed = provider.freeze()
+    at = turn(held)
+    assert kinds(held[at]) == ["assistant"]
+    assert kinds(held[at + 1]) == ["control_request"] and asks(held[at + 1][0])
+    assert (billed.request_count, billed.extra, billed.unconsumed) == (2, 0, 0)
+    # In both orders the session is the same frames in the same order.
+    assert [kinds([frame])[0] for write in joined for frame in write] == [
+        kinds([frame])[0] for write in held for frame in write
+    ]
+    # Held, and the client ends the session at the frame: the request never
+    # leaves, and the time is not waited out. Played by the program, whose
+    # input ends with the prompt.
+    assert peer_program.HOLD_SECONDS >= 30
+    with LoopbackProvider(script, credential=CANARY_CREDENTIAL, dialect=dialect) as provider:
+        peer = _peer(
+            tmp_path / "ended", provider.url + dialect.path, tool_request=peer_program.HELD
+        )
+        ended = _run(peer, ["--mcp-config", _HOSTED, *_SESSION_ARGV], _HOSTED_PROMPT)
+        shown = provider.freeze()
+    written = [json.loads(line) for line in ended.stdout.splitlines()]
+    assert (ended.returncode, ended.stderr, peer.failures()) == (0, b"", [])
+    assert kinds(written)[-1] == "assistant" and not any(asks(frame) for frame in written)
+    assert (shown.request_count, shown.unconsumed) == (1, 1)
+    # An order the peer does not state is not played.
+    odd = _peer(tmp_path / "odd", tool_request="when it likes")
+    refused = _run(odd, _SESSION_ARGV, _PROMPT[:2])
+    assert refused.returncode == peer_program.EXIT_UNSUPPORTED
+    (failure,) = odd.failures()
+    assert failure.startswith("unsupported: the configuration names the order 'when it likes'")
 
 
 def test_the_journal_names_the_environment_and_keeps_none_of_its_values(tmp_path: Path) -> None:
@@ -2140,6 +2291,211 @@ def test_a_session_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal
             driver=_with_dialect(_AnswersWhole),
         )
     assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
+
+
+# -- a route without its credential ---------------------------------------------------
+
+
+def test_a_play_without_the_credential_is_a_peer_that_reports_no_sign_in(tmp_path: Path) -> None:
+    column = _column()
+    configs: dict[bool, dict[str, Any]] = {}
+    for without in (False, True):
+        with claude_driver.ClaudeDriver().open(
+            column,
+            capability="text",
+            lens="raw",
+            script=ProviderScript(()),
+            tmp_path=tmp_path / f"without-{without}",
+            without_credential=without,
+        ) as bound:
+            configs[without] = json.loads(bound.peer.config.read_text(encoding="utf-8"))
+
+    # The route takes its credential from the session of the tool, and the
+    # adapter reads it through the sign-in probe: the peer of the play says
+    # that it is not signed in, and the rest of its answer, and of what it
+    # is configured with, is as on every other cell.
+    route = load_routing(config_path=column.routing_path(COLUMN_PRODUCT)).for_role(
+        matrix_columns.ROLE_BY_CAPABILITY["text"]
+    )
+    assert route.extra["credential_source"] == "claude_session"
+    assert configs[False]["auth_status"]["loggedIn"] is True
+    assert configs[True]["auth_status"]["loggedIn"] is False
+    for config in configs.values():
+        del config["auth_status"]["loggedIn"]
+        # Where the peer of a cell writes its journal and finds its provider.
+        del config["journal"], config["provider"]
+    assert configs[True] == configs[False]
+
+    execution = _played(column, "S28", tmp_path / "played")
+    peer = claude_driver.Peer(
+        tmp_path / "played" / "claude-peer" / "claude",
+        tmp_path / "played" / "claude-peer" / "config.json",
+        tmp_path / "played" / "claude-peer" / "journal.jsonl",
+    )
+
+    # The tool was started once, for the sign-in probe, and took no turn.
+    assert [record["role"] for record in peer.records()] == ["auth_status"]
+    assert execution.observation.provider.request_count == 0
+    assert execution.report.codes == frozenset()
+
+
+# -- a reply under another model: the order of the tool request ----------------------
+
+# The record of the ledger whose cell the proof below plays.
+REFUSED_TURN_GAP = "R26"
+# What the cell of a reply under another model shows in each order in which
+# the scripted tool sends the request for the call of the refused turn.
+_TOKENS_FLAGGED, _CALL_DISPATCHED = "flag:token_usage_complete=False", "dispatch.extra:read_a"
+SHOWN_IN_ORDER: Mapping[str, frozenset[str]] = {
+    peer_program.JOINED: frozenset({_CALL_DISPATCHED, _TOKENS_FLAGGED}),
+    peer_program.HELD: frozenset({_TOKENS_FLAGGED}),
+}
+# How often the proof plays the cell in each order.
+_PLAYS_IN_ORDER = 3
+
+
+def _in_order(order: str) -> claude_driver.ClaudeDriver:
+    """The driver of the kind with a peer that sends its tool request in ``order``."""
+
+    class _InOrder(claude_driver.ClaudeDriver):
+        tool_request = order
+
+    return _InOrder()
+
+
+def _refused_cell() -> Cell:
+    return Cell(_column(), cells.SERVED_UNDER_ANOTHER_MODEL, "raw")
+
+
+@pytest.mark.parametrize("order", peer_program.TOOL_REQUEST_FORMS)
+def test_a_refused_model_turn_shows_one_code_set_in_each_order_of_the_tool_request(
+    order: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because the cell plays one order and one play.
+
+    The route's tool owns the tool loop: it relays the frame of a model turn
+    and asks its tool server for the call of that turn. The adapter refuses
+    a reply under another model at that frame and ends the session; it does
+    nothing about a request the tool has already sent, and the pinned SDK
+    answers such a request in a task of its own. So whether the call of the
+    refused turn reaches the ToolSet is decided by when the tool asks, which
+    no source in reach states for the vendor tool. The scripted peer states
+    it. With the request in the same write as the frame, which every cell
+    plays, the adapter has it in hand when it refuses, and the call is
+    dispatched. With the request held, the session is over before it
+    leaves, and nothing is dispatched. Everything else of the result is the
+    same in both orders: incomplete evidence that names the model field,
+    the stop reason of a model mismatch, the served id in the trace, one
+    request, and the tokens of the billed reply reported in full under a
+    flag that calls them incomplete. This test plays both orders, more than
+    once, and holds each to its code set. Two writes with nothing stated
+    between them showed either set from play to play. The ledger carries
+    the two codes of the order every cell plays as a known gap of the
+    reference (R26): the in-process tool bridge dispatches a call when the
+    SDK hands it the request, with no gate on the adapter's admission of
+    the turn that makes it, so in that order the dispatch precedes the
+    refusal. The order is the emulation's and is not recorded of the
+    vendor tool.
+    """
+
+    # The verifier requires this test by name in both orders: a run without
+    # it is refused. The entry of the cell leans on the item of the order
+    # every cell plays, and no entry attributes a code to that record on a
+    # cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[PROOF_MODULE]
+    assert set(SHOWN_IN_ORDER) == set(peer_program.TOOL_REQUEST_FORMS)
+    assert claude_driver.ClaudeDriver.tool_request == peer_program.JOINED
+    cell = _refused_cell()
+    assert cells.proofs_leaned_on(REFUSED_TURN_GAP, cell.id) == (
+        (
+            PROOF_MODULE,
+            f"{cells.REFUSED_TURN_IN_EACH_ORDER}[{claude_driver.ClaudeDriver.tool_request}]",
+        ),
+    )
+    attributed = {
+        entry.cell for entry in LEDGER.entries if REFUSED_TURN_GAP in entry.codes.values()
+    }
+    assert attributed <= {cell.id}
+    read = toolsets.BINDINGS[READ_A].name
+
+    for index in range(_PLAYS_IN_ORDER):
+        root = tmp_path / f"play-{index}"
+        execution = runner.execute(
+            cell, root, driver=_in_order(order), differences=LEDGER.differences_for(cell.id)
+        )
+        result = execution.observation.result
+        config = json.loads((root / "claude-peer" / "config.json").read_text(encoding="utf-8"))
+
+        # The peer of the play sent its tool request in this order, and the
+        # play is the refusal the scenario asks for.
+        assert config["tool_request"] == order
+        assert execution.report.seam_problems == () and result is not None
+        for clause in ("C0", "C2", "C3", "C7"):
+            assert execution.report.outcomes[clause].status == "ok", clause
+        # No clause compares the tokens of a result that flags them
+        # incomplete: the reply was billed once and is reported in full.
+        assert runner.not_the_tokens_of_the_one_billed_reply(execution) == []
+        # What the cell shows in this order, in every play.
+        assert execution.report.codes == SHOWN_IN_ORDER[order], (order, index)
+        assert [item.name for item in execution.observation.toolset_log] == (
+            [read] if order == peer_program.JOINED else []
+        )
+
+
+def test_the_proof_of_the_refused_turn_fails_on_a_result_that_lost_its_usage(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of what the proof above holds of the tokens:
+    # the result of the cell with its usage made up. Dropped whole, halved,
+    # one token short: the result flags its token usage incomplete, so the
+    # contract judges each to the codes of the honest play and the
+    # comparator is handed the same; the proof names each.
+    cell = _refused_cell()
+    honest = runner.execute(cell, tmp_path, differences=LEDGER.differences_for(cell.id))
+    result = honest.observation.result
+    assert result is not None and _TOKENS_FLAGGED in honest.report.codes, (
+        "the result no longer flags its token usage incomplete, so the cell compares "
+        "the tokens itself: these counterparts go with whatever entry lists the flag"
+    )
+    usage = result.usage
+    assert runner.not_the_tokens_of_the_one_billed_reply(honest) == []
+    for lost in (
+        Usage(),
+        dataclasses.replace(
+            usage, input_tokens=usage.input_tokens // 2, output_tokens=usage.output_tokens // 2
+        ),
+        dataclasses.replace(usage, input_tokens=usage.input_tokens - 1),
+        dataclasses.replace(usage, output_tokens=usage.output_tokens - 1),
+    ):
+        lying = runner.judged_again(honest, usage=lost)
+        assert runner.handed_to_the_comparator(lying) == runner.handed_to_the_comparator(honest)
+        assert runner.not_the_tokens_of_the_one_billed_reply(lying) != []
+    # More than the bill is no lower bound: the cell itself names that.
+    more = dataclasses.replace(usage, input_tokens=usage.input_tokens + 1)
+    assert runner.judged_again(honest, usage=more).report.codes == honest.report.codes | {
+        "usage.input_tokens:gt"
+    }
+    assert runner.not_the_tokens_of_the_one_billed_reply(runner.judged_again(honest, usage=more))
+
+
+# -- the state of the served-model pin on the routes of the kind ----------------------
+
+
+def test_the_state_of_the_served_model_pin_is_read_from_every_routing_file() -> None:
+    # A reply under another model is judged by the state of the route extra
+    # that pins the served model, as routing states it: read here from the
+    # shipped files, on every role a cell builds and on both products. A
+    # change of this state changes what that scenario asks of the column.
+    extra = declarations.SERVED_MODEL_EXTRA
+    states = {
+        (column.id, product, role): declarations.route_state(column, role, extra, product)
+        for column in COLUMNS
+        for product, _path in column.routing
+        for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+    }
+
+    assert states and set(states.values()) == {declarations.NOT_ADMITTED}
+    assert len(states) == 12
 
 
 # -- the module ends with the canary check --------------------------------------------

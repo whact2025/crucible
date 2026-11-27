@@ -39,6 +39,7 @@ from .columns import REAL_KINDS, TOY_KIND, Column
 from .contract import ADMITTED, CLAUSES
 from .drivers import toy
 from .drivers.base import KeeperDriver, MatrixSetupError
+from .peers.claude_cli import JOINED, TOOL_REQUEST_FORMS
 from .scenarios import (
     D_CDX_SERVED,
     D_COST_BOUND_UNRANKED,
@@ -52,6 +53,7 @@ from .scenarios import (
     difference_alternatives,
     difference_variants,
     governing_fields,
+    keying_extras,
     plan_for,
 )
 
@@ -192,6 +194,17 @@ REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE: tuple[str, ...] = tuple(
     ledger.cell_id(matrix_columns.KIMI_KIND, scenario, "primary", "raw")
     for scenario in ("S06", "S05")
 )
+# The scenario whose one reply is served under another model than the route
+# asked for, and the proof each open-weight module holds on its cell.
+SERVED_UNDER_ANOTHER_MODEL = "S24"
+REFUSED_REPLY_REPORTS_ITS_TOKENS = (
+    "test_the_result_of_a_reply_refused_for_its_model_reports_the_tokens_the_provider_billed"
+)
+# The proof the Claude module holds on its cell of that scenario: one item
+# for each order in which the scripted tool sends its tool request.
+REFUSED_TURN_IN_EACH_ORDER = (
+    "test_a_refused_model_turn_shows_one_code_set_in_each_order_of_the_tool_request"
+)
 # Proofs a module holds beside its cells, which the verifier requires by name:
 # product behaviour that no clause states, so no cell's verdict shows when it
 # stops. The DeepSeek adapter revalidates the pin of its worker before every
@@ -264,14 +277,47 @@ REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE: tuple[str, ...] = tuple(
 # the reply or a bridge that is broken would show them too. Only the proof
 # holds each cell to its cause: one matched request, nothing dispatched, and
 # the text of the refusal.
+# Both Codex routes return, for a sign-in record that does not exist, a typed
+# error they flag retriable when the call allows one attempt (known gap
+# R06). They return the same error, with the same flag, for other refusals
+# they make before a request, so the one code of the two cells does not say
+# which: only a proof per kind shows that the text names the sign-in record,
+# that the directory which should hold it lists nothing under its name, and
+# that nothing was sent or started for a model turn.
+# The hosted gateway has no cell of the missing-credential scenario: the row
+# of the inventory that takes it away rests on three statements about the
+# shipped routes of the kind, the third of them about where the adapter
+# routing builds reads its key. No cell shows when one of them stops being
+# true, so a proof holds them on the routing file of each product.
+# Both gateway routes and the DeepSeek route flag the token usage of a reply
+# they refuse for the model that served it incomplete (known gaps M28, G25).
+# Of a result that is flagged so the accounting clause takes any number below
+# the bill for honest, down to none, so while the entries of those cells
+# stand no clause compares what the result reports, and a result that had
+# lost the usage of the billed reply would be the same expected failure:
+# only a proof per cell holds the reported tokens to the billed ones.
+# On the Claude route the adapter refuses such a reply at the frame of the
+# model turn, while the tool it drives has a call of that turn to make. What
+# the cell shows of that call follows from the order in which the scripted
+# tool sends its request, which the peer states; no cell shows the other
+# order, or that either is the same in every play. A proof plays the cell in
+# both orders, holds the code set of each and holds the tokens the result
+# reports to the bill. In the order every cell plays the call is dispatched
+# before the refusal and the result flags its tokens incomplete (known gap
+# R26): the entry of the cell leans on the item of that order, and the item
+# of the other order stays required beside it.
 REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
-    MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]: tuple(
-        "test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope"
-        f"[{cell}]"
-        for cell in WRITES_ON_THE_CLAUDE_COLUMNS
+    MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]: (
+        *(
+            "test_the_trace_of_a_write_binds_the_digest_of_the_same_tools_without_a_path_scope"
+            f"[{cell}]"
+            for cell in WRITES_ON_THE_CLAUDE_COLUMNS
+        ),
+        *(f"{REFUSED_TURN_IN_EACH_ORDER}[{order}]" for order in TOOL_REQUEST_FORMS),
     ),
     MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND]: (
         "test_the_probe_and_the_request_launch_run_under_the_harness",
+        REFUSED_REPLY_REPORTS_ITS_TOKENS,
     ),
     MODULE_BY_KIND[matrix_columns.KIMI_KIND]: (
         "test_the_strict_route_rejects_the_plain_reply_for_its_missing_cache_read_count",
@@ -289,6 +335,18 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
         "test_a_billed_turn_that_shows_no_message_ends_in_the_protocol_error_of_the_client"
         "_and_is_not_retried",
         "test_an_empty_completion_ends_in_the_protocol_error_of_the_client_and_is_not_retried",
+        "test_a_call_without_the_sign_in_record_names_the_record_and_starts_no_model_turn",
+    ),
+    # One module holds both gateway kinds.
+    MODULE_BY_KIND[matrix_columns.HOSTED_GATEWAY_KIND]: (
+        *(
+            f"test_the_hosted_route_binds_its_key_while_routing_loads_the_file[{product}]"
+            for product in sorted(matrix_columns.PRODUCTS)
+        ),
+        *(
+            f"{REFUSED_REPLY_REPORTS_ITS_TOKENS}[{kind}/primary]"
+            for kind in (matrix_columns.HOSTED_GATEWAY_KIND, matrix_columns.LOCAL_GATEWAY_KIND)
+        ),
     ),
     MODULE_BY_KIND[matrix_columns.CODEX_OFFICIAL_KIND]: (
         "test_a_turn_of_one_response_reports_the_tokens_the_provider_billed",
@@ -304,6 +362,7 @@ REQUIRED_PROOFS: Mapping[str, tuple[str, ...]] = {
         "test_the_result_of_a_dispatch_budget_denial_reports_no_usage_for_what_the_provider_billed",
         "test_a_call_for_a_tool_no_server_lists_ends_in_the_adapters_check_of_its_failed_item",
         "test_the_cells_of_a_refused_thread_rest_on_the_code_the_tool_is_emulated_to_answer_with",
+        "test_a_call_without_the_sign_in_record_names_the_record_and_starts_no_model_turn",
     ),
 }
 # The private names of the product that a required proof replaces in the test
@@ -330,6 +389,11 @@ class RecordProof:
     per: Literal["", "scenario", "column", "cell"] = ""
     # The lens of the entries that lean on it; every lens where none is named.
     lens: str | None = None
+    # The kind of the entries that lean on it; every kind where none is named.
+    kind: str | None = None
+    # The scenario of the entries that lean on it; every scenario where none
+    # is named.
+    scenario: str | None = None
 
     def item(self, cell: str | None) -> str | None:
         """The pytest item an entry on ``cell`` leans on, if it leans on this test.
@@ -339,9 +403,13 @@ class RecordProof:
         """
 
         if cell is None:
-            return None if self.per else self.test
+            return None if self.per or self.scenario is not None else self.test
         kind, scenario, role, lens = ledger.parse_cell_id(cell)
         if self.lens is not None and lens != self.lens:
+            return None
+        if self.kind is not None and kind != self.kind:
+            return None
+        if self.scenario is not None and scenario != self.scenario:
             return None
         if self.per == "scenario":
             return f"{self.test}[{scenario}]"
@@ -382,6 +450,19 @@ class RecordProof:
 # error, not which (M18). Nor do the codes of the call the official Codex
 # route ends for the failed item of a tool that no server lists say what
 # the worker handed over (R17).
+# The retriable flag of a call without the sign-in record says
+# neither that the error is about that record nor that nothing was sent
+# (R06): the proof of each Codex kind. The token flag of a reply refused for
+# the model that served it says nothing of the tokens the result reports,
+# and the accounting clause compares none while the flag is listed (M28 on
+# both gateway kinds, G25 on DeepSeek): the proof of the cell's own column.
+# G25 is a record of more than this scenario in the gap list, so its row
+# names the scenario and an entry of the record on another one leans on
+# nothing here. The two codes of a model turn the Claude route refuses for
+# the model that served it (R26) say neither what the result reports of the
+# bill, which no clause compares while the token flag is listed, nor that
+# the dispatch follows from the order in which the scripted tool sends its
+# request: the item of the proof that plays the order every cell plays.
 _CLAUDE_MODULE = MODULE_BY_KIND[matrix_columns.CLAUDE_KIND]
 _KIMI_MODULE = MODULE_BY_KIND[matrix_columns.KIMI_KIND]
 _APP_SERVER_MODULE = MODULE_BY_KIND[matrix_columns.CODEX_LEGACY_KIND]
@@ -455,6 +536,39 @@ RECORD_PROOFS: Mapping[str, tuple[RecordProof, ...]] = {
         RecordProof(
             _OFFICIAL_MODULE,
             "test_the_cells_of_a_refused_thread_rest_on_the_code_the_tool_is_emulated_to_answer_with",
+        ),
+    ),
+    "R06": (
+        RecordProof(
+            _APP_SERVER_MODULE,
+            "test_a_call_without_the_sign_in_record_names_the_record_and_starts_no_model_turn",
+            kind=matrix_columns.CODEX_LEGACY_KIND,
+        ),
+        RecordProof(
+            _OFFICIAL_MODULE,
+            "test_a_call_without_the_sign_in_record_names_the_record_and_starts_no_model_turn",
+            kind=matrix_columns.CODEX_OFFICIAL_KIND,
+        ),
+    ),
+    "M28": (
+        RecordProof(
+            MODULE_BY_KIND[matrix_columns.HOSTED_GATEWAY_KIND],
+            REFUSED_REPLY_REPORTS_ITS_TOKENS,
+            per="column",
+        ),
+    ),
+    "G25": (
+        RecordProof(
+            MODULE_BY_KIND[matrix_columns.DEEPSEEK_KIND],
+            REFUSED_REPLY_REPORTS_ITS_TOKENS,
+            scenario=SERVED_UNDER_ANOTHER_MODEL,
+        ),
+    ),
+    "R26": (
+        RecordProof(
+            _CLAUDE_MODULE,
+            f"{REFUSED_TURN_IN_EACH_ORDER}[{JOINED}]",
+            scenario=SERVED_UNDER_ANOTHER_MODEL,
         ),
     ),
 }
@@ -665,7 +779,7 @@ def generate(
             if not _in_role_scope(column, scenario):
                 continue
             if (column.kind, scenario.id) in pinned:
-                continue  # a dialect property; no declared value is consulted
+                continue  # pinned not expressible; no declared value is consulted
             cells.extend(Cell(column, scenario.id, lens) for lens in scenario.lenses)
     for kind in sorted(registered):
         if not any(cell.column.kind == kind for cell in cells):
@@ -681,7 +795,11 @@ def toy_columns() -> tuple[Column, ...]:
     """The toy columns, derived from the declaration snapshot."""
 
     snapshot = declarations.snapshot_profiles(declarations.load_snapshot())
-    derived = matrix_columns.toy_columns(snapshot, governing_fields())
+    derived = matrix_columns.with_route_states(
+        matrix_columns.toy_columns(snapshot, governing_fields()),
+        keying_extras(),
+        declarations.EXTRA_STATES,
+    )
     for column in derived:
         assert column.features is not None
         unsupported = toy.unsupported_values(column.features)
@@ -844,7 +962,12 @@ def answered_from(cell: str) -> tuple[str, ...]:
     columns = [item for item in all_columns() if (item.kind, item.role) == (kind, role)]
     if not columns:
         raise MatrixSetupError(f"cell {cell} names no column")
-    variants = declarations.select(defined.differences, declarations.routed(columns[0]))
+    states = declarations.route_states(
+        columns[0], matrix_columns.ROLE_BY_CAPABILITY[defined.capability], defined.governing
+    )
+    variants = declarations.select(
+        defined.differences, declarations.routed(columns[0]), states
+    )
     return envelopes_of(kind, plan_for(defined, variants))
 
 
@@ -1066,8 +1189,13 @@ def world() -> ledger.World:
 
     def current(cell: str) -> Mapping[str, str]:
         kind, scenario, role, _lens = ledger.parse_cell_id(cell)
-        profile = declarations.routed(columns[(kind, role)])
-        return declarations.governing_values(profile, SCENARIOS[scenario].governing)
+        column, defined = columns[(kind, role)], SCENARIOS[scenario]
+        states = declarations.route_states(
+            column, matrix_columns.ROLE_BY_CAPABILITY[defined.capability], defined.governing
+        )
+        return declarations.governing_values(
+            declarations.routed(column), defined.governing, states
+        )
 
     counts = {kind: 0 for kind in ENABLEMENT}
     for cell in cells:

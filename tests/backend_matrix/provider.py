@@ -97,6 +97,11 @@ class SeenRequest:
     # The cap on the tokens of the response that the request carries, where
     # the dialect reads one; ``None`` for a request without it.
     response_cap: int | None = None
+    # Whether the request carried the scripted credential as its bearer, read
+    # by the provider itself from the header as it arrived, whatever the
+    # dialect accepts as a credential (``credential_ok``): a dialect of a
+    # route without a key of its own accepts any bearer.
+    scripted_credential: bool = False
 
 
 @dataclass(frozen=True)
@@ -876,6 +881,11 @@ class LoopbackProvider:
             seen = self._dialect.parse(
                 method, path, headers, body, credential=self._credential
             )
+            bearer = next(
+                (value for name, value in headers.items() if name.lower() == "authorization"),
+                "",
+            )
+            seen = replace(seen, scripted_credential=bearer == f"Bearer {self._credential}")
             unscripted = Reply(
                 UNSCRIPTED_STATUS,
                 {"error": {"code": UNSCRIPTED_CODE, "message": "no scripted reply"}},

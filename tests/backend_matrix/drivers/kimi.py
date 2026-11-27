@@ -56,7 +56,7 @@ import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterator, Literal, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from crucible.backends import kimi as adapter
@@ -674,6 +674,9 @@ class _Bound:
     # cannot name it, so clause C9 looks for the canary credential alone.
     secrets: tuple[str, ...] = ()
     tool_path: Literal["function_call", "mcp_bridge", "control_channel"] = "mcp_bridge"
+    # What the driver left for the last moment before the call: on a play
+    # without the credential of the route, taking its variable away.
+    before_call: Callable[[], Any] | None = None
 
     def cancel_when(self, marker: str) -> None:
         raise MatrixSetupError(
@@ -834,6 +837,7 @@ class KimiDriver:
         lens: Lens,
         script: ProviderScript,
         tmp_path: Path,
+        without_credential: bool = False,
     ) -> Iterator[_Bound]:
         if column.kind != self.kind:
             raise MatrixSetupError(f"column {column.id} is not of kind {self.kind}")
@@ -868,6 +872,23 @@ class KimiDriver:
                 log_dir=log_dir,
                 **limits,
             )
+            before_call = None
+            if without_credential:
+                # The route names its key as a variable. Routing reads it
+                # whenever it loads the file, and the adapter reads it again
+                # at each call: that is the last moment, so the variable is
+                # taken away there and not before. The scripted environment
+                # puts it back when the backend is closed.
+                variable = declarations.credential_variable(
+                    column.routing_path(COLUMN_PRODUCT), role
+                )
+                if variable is None or variable not in os.environ:
+                    raise MatrixSetupError(
+                        f"column {column.id}: the route of role {role!r} names no "
+                        "variable for its key that is set while the backend is "
+                        "built: there is nothing to take away at the call"
+                    )
+                before_call = functools.partial(os.environ.pop, variable, None)
             try:
                 yield _Bound(
                     backend,
@@ -877,6 +898,7 @@ class KimiDriver:
                     # clause C9 reads both with the adapter's own records.
                     log_dirs=(log_dir, journal.directory, tmp_path / "limit-ledger"),
                     journal=journal,
+                    before_call=before_call,
                 )
             finally:
                 with contextlib.suppress(Exception):

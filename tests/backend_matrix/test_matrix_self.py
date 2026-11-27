@@ -60,6 +60,7 @@ from . import scenarios
 from . import report as matrix_report
 from . import write_host as host_program
 from . import columns as matrix_columns
+from . import scenarios as scenarios_module
 from . import envelopes as matrix_envelopes
 from . import verify as matrix_verify
 from .cells import Cell
@@ -92,6 +93,7 @@ from .provider import (
     whole_and_partial,
 )
 from .scenarios import (
+    BASE_POLICY,
     BUDGET_USD,
     D_CDX_SERVED,
     D_COST_BOUND_UNRANKED,
@@ -157,7 +159,14 @@ def test_cell(cell: Cell, tmp_path: Path, matrix_preflight: dict[str, str | None
 
 def _liar_cell(liar: toy.Liar) -> Cell:
     for column in cells.toy_columns():
-        if all(str(getattr(column.features, k)) == v for k, v in liar.needs.items()):
+        # What a liar needs of its column: a declared value, or the state of
+        # a route extra that the toy column states itself.
+        stated = dict(column.route_states)
+        if all(
+            (stated.get(k) if k in declarations.KEYING_EXTRAS else str(getattr(column.features, k)))
+            == v
+            for k, v in liar.needs.items()
+        ):
             return Cell(column, liar.scenario, liar.lens)
     raise MatrixSetupError(f"no toy column declares {dict(liar.needs)} for {liar.id}")
 
@@ -1876,7 +1885,12 @@ def test_a_stateless_dialect_states_what_a_request_replays_and_tool_scenarios_re
         assert (history_replayed in scenario.plan().checks) == (scenario.toolset is not None)
     for cell in TOY_CELLS:
         scenario = SCENARIOS[cell.scenario]
-        variants = declarations.select(scenario.differences, declarations.routed(cell.column))
+        states = declarations.route_states(
+            cell.column, matrix_columns.ROLE_BY_CAPABILITY[scenario.capability], scenario.governing
+        )
+        variants = declarations.select(
+            scenario.differences, declarations.routed(cell.column), states
+        )
         for differences in ((), tuple(scenario.alternatives)):
             plan = plan_for(scenario, variants, differences)
             asserted = scenario.toolset is not None and plan.expect.outcome == "result"
@@ -3074,6 +3088,7 @@ def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
         "M07",
         "R04",
         "R05",
+        "R06",
         "R07",
         "R08",
         "R09",
@@ -3088,6 +3103,7 @@ def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
         "R19",
         "R20",
         "R21",
+        "R26",
     }
     # With a cell of the record withdrawn the ruling is what H03 asks for.
     # Either the cell is pinned not expressible ...
@@ -3411,10 +3427,11 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
     # record of origin ``reference`` or of the matrix.
     counted = {
         "G09": 1,
-        "G10": 2,
+        "G10": 3,
         "G13": 1,
         "G18": 3,
-        "G25": 1,
+        "G21": 1,
+        "G25": 2,
         "G27": 1,
         "G34": 2,
         "G35": 11,
@@ -3429,11 +3446,24 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
         "R17": 1,
         "R20": 1,
         "R21": 1,
+        "R26": 1,
     }
     assert graded == set(counted)
     assert {gap: len(LEDGER.registry[gap].cells) for gap in counted} == counted
     references = {gap for gap in graded if LEDGER.registry[gap].origin == "reference"}
-    assert references == {"R07", "R08", "R09", "R10", "R11", "R14", "R16", "R17", "R20", "R21"}
+    assert references == {
+        "R07",
+        "R08",
+        "R09",
+        "R10",
+        "R11",
+        "R14",
+        "R16",
+        "R17",
+        "R20",
+        "R21",
+        "R26",
+    }
     # What the record of each says its cells are answered from today. A
     # cell of a reference may be answered from several frames; its grade is
     # that of the weakest, and each of these is constructed. A change that
@@ -3480,6 +3510,7 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
         # A refused resume: the one envelope of the refusal, which no model
         # turn follows.
         "R21": {"codex_app_server/app_server.resume_rejected"},
+        "R26": {"claude_cli/cli.init", "claude_cli/cli.assistant_tool_use"},
     }
     assert set(answered) == references
     for gap, frames in answered.items():
@@ -3946,9 +3977,12 @@ def test_h03_refuses_an_entry_that_outlives_a_proof_it_leans_on() -> None:
     # entries lean on one are named here, so that a row of the table cannot
     # go with its proof while an entry still names the record.
     assert set(cells.RECORD_PROOFS) == {
+        "G25",
         "M18",
+        "M28",
         "R04",
         "R05",
+        "R06",
         "R08",
         "R09",
         "R13",
@@ -3956,7 +3990,43 @@ def test_h03_refuses_an_entry_that_outlives_a_proof_it_leans_on() -> None:
         "R17",
         "R20",
         "R21",
+        "R26",
     }
+    # Where a record has a proof for each kind of its cells, an entry leans
+    # on the proof of its own kind and on no other.
+    legacy, official = cells.RECORD_PROOFS["R06"]
+    assert (legacy.kind, official.kind) == (
+        matrix_columns.CODEX_LEGACY_KIND,
+        matrix_columns.CODEX_OFFICIAL_KIND,
+    )
+    assert legacy.item("codex:legacy/S28/primary/raw") == legacy.test
+    assert legacy.item("codex:official/S28/primary/raw") is None
+    assert official.item("codex:legacy/S28/primary/raw") is None
+    # Where a record has cells of more than one scenario in the gap list and
+    # its proof plays one, an entry of the record on another scenario leans
+    # on nothing, and so does a column-wide entry.
+    (refused,) = cells.RECORD_PROOFS["G25"]
+    assert refused.scenario == cells.SERVED_UNDER_ANOTHER_MODEL
+    assert refused.item("deepseek/S24/primary/raw") == refused.test
+    assert refused.item("deepseek/S01/primary/raw") is None and refused.item(None) is None
+    # A proof with one item for every column plays the cell of the entry's
+    # own column.
+    (on_column,) = cells.RECORD_PROOFS["M28"]
+    assert on_column.item("openai_compat:local/S24/primary/raw") == (
+        f"{on_column.test}[openai_compat:local/primary]"
+    )
+    # A proof with one item for each order of the scripted tool's request:
+    # the entry leans on the item of the order its cell plays, and the item
+    # of the other order is required beside it.
+    (in_order,) = cells.RECORD_PROOFS["R26"]
+    assert in_order.item("claude/S24/primary/raw") == (
+        f"{cells.REFUSED_TURN_IN_EACH_ORDER}[joined]"
+    )
+    assert in_order.item("claude/S04/primary/raw") is None and in_order.item(None) is None
+    assert {
+        (in_order.module, f"{cells.REFUSED_TURN_IN_EACH_ORDER}[{order}]")
+        for order in ("joined", "held")
+    } <= required
     assert set(cells.RECORD_PROOFS) <= set(LEDGER.registry)
     # Each of them is named by an entry today, and every proof those entries
     # lean on is one the verifier requires by name.
@@ -5985,6 +6055,378 @@ def test_a_handle_is_asked_of_the_tool_that_keeps_the_conversations(tmp_path: Pa
         assert _judge(stale, provider=dataclasses.replace(kept, refused_handles=others)) == {
             "conversation:unasked"
         }
+
+
+# -- a table keyed by the state of a route extra ------------------------------------
+
+_PIN = declarations.SERVED_MODEL_EXTRA
+_CARRIED, _LEFT_OUT, _REFUSED = declarations.EXTRA_STATES
+
+
+def _real(kind: str, role: str = "primary") -> Column:
+    return next(
+        item for item in matrix_columns.real_columns() if (item.kind, item.role) == (kind, role)
+    )
+
+
+def _routing_document(kind: str) -> dict[str, Any]:
+    path = _real(kind).routing_path(matrix_columns.COLUMN_PRODUCT)
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _state(document: dict[str, Any], role: str) -> str:
+    return declarations.extra_state(
+        yaml.safe_dump(document, sort_keys=False).encode("utf-8"), role, _PIN
+    )
+
+
+def test_the_state_of_a_route_extra_is_what_routing_states_and_is_never_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text, reader = (matrix_columns.ROLE_BY_CAPABILITY[name] for name in ("text", "read_only"))
+    hosted = _routing_document(matrix_columns.HOSTED_GATEWAY_KIND)
+    claude = _routing_document(matrix_columns.CLAUDE_KIND)
+
+    # The three states, on documents held in memory. The shipped gateway
+    # file carries the pin, set to the route's own model. Without the pin
+    # routing still admits it there. A backend whose routes do not take the
+    # extra is refused for exactly that extra.
+    assert _state(hosted, reader) == _CARRIED
+    without = copy.deepcopy(hosted)
+    del without["default"]["extra"][_PIN]
+    assert _state(without, reader) == _LEFT_OUT
+    assert _state(claude, reader) == _REFUSED
+    # A role of another backend family than its default reads the state of
+    # its own route.
+    mixed = copy.deepcopy(hosted)
+    mixed["roles"][text] = {**claude["default"], **claude["roles"].get(text, {})}
+    assert (_state(mixed, text), _state(mixed, reader)) == (_REFUSED, _CARRIED)
+    # A route pinned to another id is not played; a document routing refuses
+    # as it stands is no document.
+    elsewhere = copy.deepcopy(hosted)
+    elsewhere["default"]["extra"][_PIN] = "another-model-id"
+    with pytest.raises(MatrixSetupError, match="pinned to another id"):
+        _state(elsewhere, reader)
+    broken = copy.deepcopy(hosted)
+    broken["default"]["extra"]["no_such_extra"] = True
+    with pytest.raises(MatrixSetupError, match="routing refuses the routing document as it stands"):
+        _state(broken, reader)
+
+    # An answer of routing that is neither an acceptance nor its refusal of
+    # exactly the one extra on that route is an error, never a state.
+    lint, calls = declarations.lint_routing_config, []
+
+    def answering(sentence: str) -> Any:
+        def linted(document: bytes) -> Any:
+            calls.append(document)
+            if len(calls) % 2 == 0:  # the second validation: the extra is added
+                raise ValueError(sentence)
+            return lint(document)
+
+        return linted
+
+    refusal = f"{reader} config has unsupported 'claude' extra fields ['{_PIN}']; allowed fields are []"
+    for sentence, state in (
+        (refusal, _REFUSED),
+        (refusal.replace(reader, "default"), None),
+        (refusal.replace(f"['{_PIN}']", f"['{_PIN}', 'another']"), None),
+        ("the route config must declare a model", None),
+    ):
+        calls.clear()
+        monkeypatch.setattr(declarations, "lint_routing_config", answering(sentence))
+        if state is None:
+            with pytest.raises(MatrixSetupError, match="neither with an acceptance nor"):
+                _state(without, reader)
+        else:
+            assert _state(without, reader) == state
+    monkeypatch.setattr(declarations, "lint_routing_config", lint)
+
+    # Selection cannot be typed: a column with a routing file that states a
+    # state itself is an error, and so is a column without one that states
+    # none. A real column on which routing admits the pin and which leaves
+    # it out is not played: no ruling names one.
+    column = _real(matrix_columns.CLAUDE_KIND)
+    assert declarations.route_state(column, reader, _PIN) == _REFUSED
+    typed = dataclasses.replace(column, route_states=((_PIN, _LEFT_OUT),))
+    with pytest.raises(MatrixSetupError, match="never typed"):
+        declarations.route_state(typed, reader, _PIN)
+    toy_column = cells.toy_columns()[0]
+    with pytest.raises(MatrixSetupError, match="states no state"):
+        declarations.route_state(dataclasses.replace(toy_column, route_states=()), reader, _PIN)
+    with pytest.raises(MatrixSetupError, match="no route extra that keys"):
+        declarations.route_state(column, reader, matrix_columns.COST_BOUND_EXTRA)
+    monkeypatch.setattr(declarations, "extra_state", lambda *_arguments: _LEFT_OUT)
+    with pytest.raises(MatrixSetupError, match="No ruling names a real column"):
+        declarations.route_state(column, reader, _PIN)
+
+
+def test_a_table_keyed_by_a_route_extra_is_total_and_selects_from_the_state() -> None:
+    table = SCENARIOS["S24"].differences
+    profile = cells.toy_columns()[0].features
+    assert profile is not None
+
+    assert SCENARIOS["S24"].governing == (_PIN,) and declarations.totality_gaps(table) == []
+    # A state left out, and a state that is none.
+    short = {_PIN: {_CARRIED: declarations.BASE, _REFUSED: declarations.BASE}}
+    assert declarations.totality_gaps(short) == [f"{_PIN}={_LEFT_OUT} has no variant"]
+    invented = {_PIN: {**table[_PIN], "pinned_elsewhere": declarations.BASE}}
+    assert declarations.totality_gaps(invented) == [f"{_PIN}=pinned_elsewhere is not a value"]
+    with pytest.raises(MatrixSetupError, match="has no variant for 'pinned_elsewhere'"):
+        declarations.variants(table, {_PIN: "pinned_elsewhere"})
+    # The variant follows the state and nothing of the profile; without the
+    # state nothing is selected.
+    kinds = {
+        state: declarations.select(table, profile, {_PIN: state})[_PIN].kind
+        for state in declarations.EXTRA_STATES
+    }
+    assert kinds == {_CARRIED: "BASE", _LEFT_OUT: "FALLBACK", _REFUSED: "BASE"}
+    with pytest.raises(MatrixSetupError, match="its state on the route was not read"):
+        declarations.select(table, profile)
+    # The key is no declared field: the toy columns stay derived from the
+    # declared fields, and the snapshot has no column for it.
+    assert _PIN not in governing_fields() and _PIN not in declarations.FEATURE_FIELDS
+    assert scenarios_module.keying_extras() == (_PIN,)
+
+
+def test_every_state_of_the_route_extra_has_an_honest_toy_pass(tmp_path: Path) -> None:
+    columns = cells.toy_columns()
+    stated = [dict(column.route_states) for column in columns]
+
+    # Every toy column states its state itself, and every state is stated.
+    assert all(set(item) == {_PIN} for item in stated)
+    assert {item[_PIN] for item in stated} == set(declarations.EXTRA_STATES)
+    world = cells.world()
+    for state in declarations.EXTRA_STATES:
+        column = next(item for item in columns if dict(item.route_states)[_PIN] == state)
+        cell = Cell(column, "S24", "raw")
+        execution = runner.execute(cell, tmp_path / state)
+        result, trace = _result_and_trace(execution)
+        provider = execution.observation.provider
+
+        assert execution.report.codes == frozenset(), (state, execution.report.describe())
+        # The current values of the cell are its state, and of a cell of
+        # another scenario on the same column they hold no such key.
+        assert execution.current == {_PIN: state} == dict(world.current(cell.id))
+        assert _PIN not in world.current(Cell(column, "S01", "raw").id)
+        assert trace.served_model == provider.served_models[-1] != trace.requested_model
+        if state == _LEFT_OUT:
+            # The fallback: the reply is taken, its call dispatched, and a
+            # second reply under the same id ends the turn.
+            assert result.error is None and provider.request_count == 2
+            assert [item.name for item in execution.observation.toolset_log] == [
+                BINDINGS[READ_A].name
+            ]
+        else:
+            # The base contract: incomplete evidence that names the field,
+            # nothing dispatched, the cost not complete and the tokens kept.
+            assert result.error is not None and result.error.kind == "incomplete_evidence"
+            assert result.stop_reason == "model_mismatch" and provider.request_count == 1
+            assert execution.observation.toolset_log == ()
+            flags = result.completeness
+            assert (flags.token_usage_complete, flags.cost_complete) == (True, False)
+            billed = provider.billed_total()
+            assert (result.usage.input_tokens, result.usage.output_tokens) == (
+                billed.input_tokens,
+                billed.output_tokens,
+            )
+            # The terminal flag is not asked: either value passes.
+            for value in (True, False):
+                assert _judge(
+                    execution,
+                    completeness=dataclasses.replace(flags, terminal_complete=value),
+                ) == frozenset()
+
+
+def test_an_entry_and_a_record_of_a_served_model_cell_are_locked_to_the_state() -> None:
+    world = cells.world()
+    listed = [
+        (record.id, item)
+        for record in LEDGER.registry.values()
+        for item in record.cells
+        if ledger.parse_cell_id(item.cell)[1] == "S24"
+    ]
+
+    # A record is permanent, so the cells it lists stay to be read here.
+    assert listed
+    for _gap, item in listed:
+        current = dict(world.current(item.cell))
+        assert set(current) == {_PIN} and current[_PIN] in declarations.EXTRA_STATES
+        assert dict(item.observed_under) == dict(item.closes_under) == current
+    gap, item = listed[0]
+    state = dict(world.current(item.cell))[_PIN]
+    other = next(name for name in declarations.EXTRA_STATES if name != state)
+    # The comparator holds an entry to the state it was observed under: a
+    # cell whose route changed state fails with the name of the key, never
+    # with "gap fixed", whatever it then shows.
+    known = ledger.parse(
+        {
+            "schema_version": ledger.LEDGER_SCHEMA,
+            "ceilings": {"max_known_gaps": {"pack_b": 1}, "max_declared_differences": 0},
+            "registry": {
+                "M99": {
+                    "title": "a known gap",
+                    "origin": "matrix",
+                    "severity": "medium",
+                    "cells": [
+                        {
+                            "cell": item.cell,
+                            "observed_under": {_PIN: state},
+                            "closes_under": {_PIN: state},
+                        }
+                    ],
+                }
+            },
+            "known_gaps": [
+                {
+                    "cell": item.cell,
+                    "observed_under": {_PIN: state},
+                    "codes": {"kind:transport!=incomplete_evidence": "M99"},
+                }
+            ],
+            "declared_differences": [],
+        }
+    )
+    codes = {"kind:transport!=incomplete_evidence"}
+    with pytest.raises(XFAILED):
+        ledger.compare(known, item.cell, codes, current={_PIN: state})
+    for shown in (codes, set()):
+        with pytest.raises(ledger.LedgerMismatch, match=f"decl.changed:{_PIN}"):
+            ledger.compare(known, item.cell, shown, current={_PIN: other})
+    # H03 holds a listed cell that has no entry to its closes_under: as the
+    # fix of the gap leaves the ledger, the record is clean while it names
+    # the state the cell runs under, and not once it names another.
+    fixed = _document()
+    fixed["known_gaps"] = [entry for entry in fixed["known_gaps"] if entry.get("cell") != item.cell]
+    locks = {"static:registry_closes_under", "static:registry_closes_mismatch"}
+    assert not locks & _problem_codes(fixed)
+    _registry_cell(fixed, gap, item.cell)["closes_under"] = {_PIN: other}
+    assert "static:registry_closes_under" in _problem_codes(fixed)
+    fixed["registry"][gap]["declaration_change"] = {
+        "field": _PIN,
+        "from": state,
+        "to": other,
+        "citation": "a ruling that names the route",
+    }
+    named = _problem_codes(fixed)
+    assert "static:registry_closes_mismatch" in named
+    assert "static:registry_closes_under" not in named
+
+
+# -- a route without its credential --------------------------------------------------
+
+
+def test_a_call_without_a_credential_asks_one_typed_error_no_request_and_the_trace_flag(
+    tmp_path: Path,
+) -> None:
+    cell = Cell(cells.toy_columns()[0], "S28", "raw")
+    scenario = SCENARIOS[cell.scenario]
+
+    def played(name: str, *faults: str) -> runner.Execution:
+        return runner.execute(cell, tmp_path / name, driver=toy.ToyDriver(frozenset(faults)))
+
+    honest = _honest(tmp_path / "honest", "S28")
+    result, trace = _result_and_trace(honest)
+
+    # The state is the scenario's, said once and without a kind: nothing is
+    # scripted, no check of its own, no governing field, the base policy.
+    assert scenario.credential_unset and scenario.plan().script == ProviderScript(())
+    assert scenario.plan().checks == () and scenario.governing == ()
+    assert scenario.policy == BASE_POLICY and scenario.lenses == ("raw",)
+    assert [item.id for item in SCENARIOS.values() if item.credential_unset] == ["S28"]
+    # The honest toy: a transport error that is not retried, a stop reason
+    # no workflow reads as an outcome, nothing sent, and a complete trace
+    # that ends in its one terminal event.
+    assert result.error is not None and result.error.kind == "transport"
+    assert result.error.retriable is False and result.stop_reason == "error"
+    assert honest.observation.provider.request_count == 0
+    assert [(event.kind, event.name) for event in trace.events] == [
+        ("request", None),
+        ("terminal", "error"),
+    ]
+    flags = result.completeness
+    assert (flags.token_usage_complete, flags.cost_complete, flags.terminal_complete) == (
+        False,
+        False,
+        False,
+    )
+    # The three flags are not asked, and none is expected false: a result
+    # that accounts for the nothing it sent and claims its terminal passes
+    # as the one that flags all three false does.
+    claimed = played("claimed", toy.ACCOUNT_FOR_NOTHING, toy.CLAIM_TERMINAL_OF_A_BROKEN_TURN)
+    claims = _result_and_trace(claimed)[0].completeness
+    assert all(getattr(claims, name) for name in contract.FLAGS)
+    assert claimed.report.codes == frozenset()
+    # The request event of the attempt is neither asked nor refused.
+    silent = played("silent", toy.NO_REQUEST_EVENT)
+    assert [event.kind for event in _result_and_trace(silent)[1].events] == ["terminal"]
+    assert silent.report.codes == frozenset()
+    # The trace flag is owed, and what such a result reports is still held
+    # to what the provider billed, which is nothing.
+    assert _judge(
+        honest, completeness=dataclasses.replace(flags, trace_complete=False)
+    ) == {"flag:trace_complete=False"}
+    assert _judge(
+        honest, usage=dataclasses.replace(result.usage, input_tokens=7)
+    ) == {"usage.input_tokens:gt"}
+    # A stop reason a workflow reads as an outcome of its own deviates; no
+    # spelling is asked beyond that.
+    assert _judge(honest, stop_reason="end_turn") == {
+        "stop:end_turn!=other",
+        "event.terminal:error!=end_turn",
+    }
+    assert _judge(honest, stop_reason="missing_credential") == {
+        "event.terminal:error!=missing_credential"
+    }
+
+
+class _BuiltWithTheCredentialAllTheSame(toy.ToyDriver):
+    """A driver that builds the backend with the credential, whatever it is asked for."""
+
+    def route_credential(self, without_credential: bool) -> str:
+        return matrix_columns.CANARY_CREDENTIAL
+
+
+def test_a_play_without_the_credential_that_sent_the_scripted_one_is_an_error_of_the_matrix(
+    tmp_path: Path,
+) -> None:
+    cell = Cell(cells.toy_columns()[0], "S28", "raw")
+
+    # The toy reads its credential when it is built. A backend that was
+    # built with it sends its one request under the scripted credential:
+    # the codes of the cell would be those of an adapter that sends a
+    # placeholder, so the provider's own record of the bearer decides.
+    with pytest.raises(MatrixSetupError, match="carried the scripted credential"):
+        runner.execute(cell, tmp_path / "built", driver=_BuiltWithTheCredentialAllTheSame())
+    # The placeholder of the lying toy is no scripted credential: that play
+    # is an observation, with its code.
+    liar = runner.execute(
+        cell, tmp_path / "liar", driver=toy.ToyDriver(frozenset({toy.SEND_PLACEHOLDER_KEY}))
+    )
+    (sent,) = liar.observation.provider.requests
+    assert liar.report.codes == {"request.extra"}
+    assert not sent.scripted_credential and not sent.credential_ok
+    # On every other cell the request carries it, and the provider says so
+    # whatever the dialect accepts.
+    (plain,) = _honest(tmp_path / "plain", "S01").observation.provider.requests
+    assert plain.scripted_credential and plain.credential_ok
+
+
+def test_a_driver_may_leave_one_step_for_the_last_moment_before_the_call(tmp_path: Path) -> None:
+    cell = Cell(cells.toy_columns()[0], "S01", "raw")
+    moments: list[int] = []
+
+    class _Late(toy.ToyDriver):
+        @contextlib.contextmanager
+        def open(self, column: Column, **arguments: Any) -> Iterator[Any]:
+            with super().open(column, **arguments) as bound:
+                # The step sees the backend built and nothing sent yet.
+                bound.before_call = lambda: moments.append(bound.provider.request_count)  # type: ignore[attr-defined]
+                yield bound
+
+    execution = runner.execute(cell, tmp_path, driver=_Late())
+
+    assert moments == [0] and execution.observation.provider.request_count == 1
+    assert execution.report.codes == frozenset()
 
 
 # -- the module ends with the canary check --------------------------------------

@@ -76,9 +76,14 @@ from .peers import launch, worker_harness
 from .scenarios import D_CDX_SERVED, SCENARIOS, STALE_HANDLE, SYSTEM, USER
 from .script import READ_A, READ_B, Call, Malformed, ProviderScript, Reason, Refuse, Say
 from .test_matrix_codex import (
+    ITS_DIRECTORY,
+    NOTHING_OF_ITS_NAME,
     REFUSED_RESUME,
+    AnotherHome,
     AnswersWhole,
     LastAsTheTurnSoFar,
+    a_home_whose_directory_is_a_file,
+    not_a_call_without_the_sign_in_record,
     presenting_a_served_model,
 )
 
@@ -1356,6 +1361,114 @@ def test_a_turn_that_ends_on_its_terminal_fails_the_cell_of_a_broken_terminal(
             driver=_EndsItsTurns(),
         )
     assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
+
+
+# -- a call without the sign-in record of the route ---------------------------------
+
+# The cell of the column on a route without its credential, and the record of
+# the ledger whose entry on that cell leans on the proof below.
+NO_SIGN_IN = ledger.cell_id(CODEX_OFFICIAL_KIND, "S28", "primary", "raw")
+NO_SIGN_IN_GAP = "R06"
+
+
+def test_a_call_without_the_sign_in_record_names_the_record_and_starts_no_model_turn(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because the one code of the cell does not show it.
+
+    The scenario plays the route without its credential: the driver makes
+    the directory that should hold the sign-in record of the vendor tool and
+    writes nothing into it under the name of that record. The adapter looks
+    for the record at the head of each attempt and returns a typed error,
+    and the cell shows one code, the retriable flag of that error where the
+    scenario asks for a result that is not retried (known gap R06). The same
+    text and the same flag answer for other states of the path: a directory
+    of the record's name, a link to nothing, a path component that is no
+    directory. The code tells none of them apart. This test holds what the
+    entry of the cell rests on, from the play alone and with nothing of the
+    product replaced: the text of the error names the sign-in record; the
+    directory that should hold it is a directory and its listing holds
+    nothing of the record's name; the provider saw no request; no worker was
+    started and none was staged to start the bundled runtime, so the tool
+    was started for no model turn. It says nothing of the flag, so it holds
+    before and after the fix of that gap. Its lying counterparts are the
+    test below; the body is the one of the app-server column.
+    """
+
+    # The verifier requires this test by name: the entry of the record leans
+    # on it. No entry attributes a code to that record on another cell of
+    # this column.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_OFFICIAL_KIND]]
+    kind, scenario, role, lens = ledger.parse_cell_id(NO_SIGN_IN)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+    attributed = {
+        entry.cell
+        for entry in LEDGER.entries
+        if NO_SIGN_IN_GAP in entry.codes.values()
+        and ledger.parse_cell_id(entry.cell)[0] == CODEX_OFFICIAL_KIND
+    }
+    assert attributed <= {NO_SIGN_IN}
+
+    execution = _played(scenario, tmp_path, lens)
+    journal = launch.Journal(tmp_path / "worker-harness")
+
+    assert execution.report.seam_problems == ()
+    assert not_a_call_without_the_sign_in_record(execution, tmp_path) == []
+    assert journal.launches() == [] and codex_official.staged(journal) == []
+
+
+def _a_directory_at_the_path_of_the_record(home: Path) -> None:
+    (home / ".codex" / peer_program.LOGIN_FILE).mkdir()
+
+
+@pytest.mark.parametrize(
+    ("arrange", "lacking"),
+    [
+        (_a_directory_at_the_path_of_the_record, NOTHING_OF_ITS_NAME),
+        (a_home_whose_directory_is_a_file, ITS_DIRECTORY),
+    ],
+    ids=["directory-at-the-path", "directory-is-a-file"],
+)
+def test_the_proof_of_the_missing_sign_in_record_fails_on_the_states_it_excludes(
+    arrange: Any, lacking: str, tmp_path: Path
+) -> None:
+    # The lying counterparts of the proof above: plays of its body, and of no
+    # generated cell, on two homes for which the presence check of the route
+    # gives the text it gives for a home without the record. A directory
+    # stands at the path of the record; the directory that should hold the
+    # record is a regular file. On each the body must name what it lacks.
+    kind, scenario, _role, lens = ledger.parse_cell_id(NO_SIGN_IN)
+
+    class _Driver(AnotherHome, codex_official.CodexOfficialDriver):
+        pass
+
+    _Driver.arrange = staticmethod(arrange)
+    execution = _played(scenario, tmp_path, lens, driver=_Driver())
+    found = not_a_call_without_the_sign_in_record(execution, tmp_path)
+
+    assert kind == CODEX_OFFICIAL_KIND
+    assert lacking in found, (found, execution.report.describe())
+    assert execution.observation.provider.request_count == 0
+
+
+# -- the state of the served-model pin on the routes of the kind ----------------------
+
+
+def test_the_state_of_the_served_model_pin_is_read_from_every_routing_file() -> None:
+    # A reply under another model is judged by the state of the route extra
+    # that pins the served model, as routing states it: read here from the
+    # shipped files, on every role a cell builds and on both products. A
+    # change of this state changes what that scenario asks of the column.
+    extra = declarations.SERVED_MODEL_EXTRA
+    states = {
+        (column.id, product, role): declarations.route_state(column, role, extra, product)
+        for column in (COLUMN,)
+        for product, _path in column.routing
+        for role in matrix_columns.ROLE_BY_CAPABILITY.values()
+    }
+
+    assert states and set(states.values()) == {declarations.NOT_ADMITTED}
+    assert len(states) == 6
 
 
 # -- the module ends with the canary check ----------------------------------------
