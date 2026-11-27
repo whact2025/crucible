@@ -73,10 +73,18 @@ from ..script import (
     Refuse,
     Say,
     ServedAs,
+    Stall,
     Step,
 )
 from ..toolsets import BINDINGS
-from .base import GUARD_POLICY, Lens, MatrixSetupError, register
+from .base import (
+    GUARD_POLICY,
+    Cancellation,
+    Lens,
+    MatrixSetupError,
+    close_when,
+    register,
+)
 from .openai_compat import (
     EMPTY_COMPLETION,
     MALFORMED,
@@ -310,6 +318,11 @@ class DeepSeekResponsesDialect:
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
+        if isinstance(step, Stall):
+            # The request is taken and never answered: not a byte travels,
+            # nothing is billed and no model is named. No envelope stands
+            # behind it, because there is no reply.
+            return Reply(200, None, held=True, marker=step.marker)
         if isinstance(step, Malformed):
             # A stream that ends without its terminal: every event of a plain
             # answer arrives but the terminal, then the body ends in order.
@@ -586,11 +599,8 @@ class _Bound:
     secrets: tuple[str, ...] = ()
     tool_path: Literal["function_call", "mcp_bridge", "control_channel"] = "function_call"
 
-    def cancel_when(self, marker: str) -> None:
-        raise MatrixSetupError(
-            f"the DeepSeek driver has no marker {marker!r}: cancellation "
-            "scenarios add it with their liars"
-        )
+    def cancel_when(self, marker: str) -> Cancellation:
+        return close_when(self.provider, self.backend, marker)
 
     def children(self) -> tuple[int, ...]:
         return self.journal.pids()  # every worker process of the cell
@@ -611,6 +621,11 @@ class DeepSeekDriver:
     )
     # Patched through the launch interposer for as long as a backend is open.
     private_seams: tuple[str, ...] = (f"{adapter.__name__}.{_SEAM}",)
+    # A locked worker interpreter is started for every provider request, and
+    # its pin is revalidated before each start: the request of a plain call
+    # is on the wire about five seconds after the call on an idle machine.
+    # Between four and five times that, for a busy one.
+    startup_seconds: float = 23.0
 
     @property
     def inexpressible(self) -> Mapping[str, str]:

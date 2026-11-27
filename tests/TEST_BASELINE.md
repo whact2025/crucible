@@ -449,6 +449,105 @@ name as well, holds what their one code does not say: that the error names
 the sign-in record, that the directory which should hold it lists nothing
 under its name, and that nothing was sent or started for a model turn.
 
+Five forms of pack B play a deadline or a cancellation, and in them a cell
+does something beside its call (`Conduct` in `backend_matrix/scenarios.py`,
+conducted by `backend_matrix/runner.py`). `S15` is a request the provider
+takes and never answers: the scripted provider reads it and keeps the
+connection open without a byte until the cell is over, and on the two
+session wires the scripted peer keeps its session open and says nothing more.
+`S16a` is a tool handler that blocks past the deadline, a read: the cell
+holds the first call of the tool at its entry
+(`Hold` in `backend_matrix/toolsets.py`), before anything of the tool has
+run. The writer form of that scenario, a write handler that blocks past the
+deadline, is not in the tree and lands as a change of its own. `S30a` and
+`S30b` close the backend from another thread when the
+provider has taken a request it never answers, once for each value of
+`on_cancellation`, and `S30c` closes it when a held read handler has been
+entered. No clock of the provider or of the fixture ends a stall or lets a
+handler go: the cell does. The deadline of the two deadline forms is two
+seconds; that of the three cancellation forms lies three seconds, the time
+of a cut, beyond it. To either the runner adds what the driver of the
+column states as the time its seam needs before a request can reach the
+provider (`startup_seconds`: none on the toy, which starts nothing inside a
+call, a few seconds where the client lives in the test process or a
+scripted tool is started, more where a locked worker interpreter is started
+first), so that on every kind the request is on the wire and the handler
+entered before the deadline, on a busy machine too. Where they are not (the
+provider took the first request of the cell, or the held handler was
+entered, only after the deadline the cell was called with) the scenario was
+not played: the cell fails with its times, as for a missed bound, and no
+ledger entry is asked. That deadline is what bounds the time of such a
+cell.
+
+What the call owes: at a deadline a transport error that is not retriable,
+with the stop reason `timeout` and a `limit` event named `deadline`; after
+`close()` an error of the kind `cancellation` with the stop reason
+`cancelled` and a cancellation event, and under `on_cancellation="raise"`
+the raise of a `CancelledError` after the one request, the one raise clause
+C1 allows after a request (a result in its place is
+`kind:<kind>!=raised`). The token, the cost and the terminal flag are
+expected false on every form that returns a result: the turn did not reach
+its terminal. Read so for the form of a blocked handler and for the
+cancellation during one by a decision panel under a standing instruction of
+the release owner, who may overrule. When the call returns goes by the
+declared `cancellation` of the route. A route that can cut a call
+(`process_kill`, `interruptible`) returns while the handler is still held;
+the cell then lets the handler go, waits until it has left and a moment
+longer, in which a provider request counts as a late request, and only then
+closes the backend. A route that stops only between two steps
+(`boundary_only`) is asked for the same result once the handler has left:
+the cell lets it go while the call still runs, a second after the
+`close()`, or after the deadline, the allowance of the driver once more and
+a second. An adapter may count its deadline from a moment of its own inside
+that allowance (the start of its worker), and a handler that is let go
+before the deadline as the adapter counts it did not block past it.
+
+Two things are asserted of the moment a call returns, each with a code of
+the scenario contract. After the `close()` of a cancellation form a route
+that declares that it can cut a call returns, or raises, within three
+seconds; a later return is `return:not_cut`, whatever the call then
+returned. The deadline of these forms lies two seconds beyond the end of
+that time for a `close()` that came within the allowance, so a call that
+ran on to its deadline is never taken for one that was cut; a `close()`
+that came too late to tell the two apart was not played, and the cell fails
+with its times. And a call that nothing but its deadline ends (the deadline
+forms, and a cancellation form on a route that declares no cancellation)
+returns no result more than half a second before the deadline it was made
+with: an earlier result is `return:early`, the adapter's own clock where
+the policy's is owed. On a route that stops only between two steps the
+form of a blocked handler cannot show such a clock: the call returns there
+only once the cell has let the handler go, which is after the deadline, so
+on such a route the stalled request of `S15` alone holds the deadline from
+below. From above a call is held only to a wide bound, for a
+call that hangs: fifteen seconds after its deadline, or after the release
+of the held handler where the route returns only then. A call that ends
+within it is in time, so a deadline that an adapter counts late by less
+than that is asserted by no cell; the cell report keeps how late it was. A
+call that misses that bound fails its cell with the times of the play; that
+has no code, so no ledger entry can expect it. Some seconds later the cell
+itself lets go what it holds, then ends the processes of the driver, so
+that a call that hangs is over before the suite's limit; a play in which
+that last resort acted fails and says so. The cell report keeps what the
+cell was called with and asked, where the handler was held, what let it go,
+whether the call returned while it was held, and, under one key that
+differs from run to run, the moments of the play.
+
+What the cell holds in `S16a` and `S30c` is a thread of the test
+process: the one on which the adapter, its bridge or its tool server
+dispatched the call. No adapter can end it. The cells do not assert that no
+handler is still running when
+the call has returned ("host and bridge stopped" is read as no child
+process and no listener), and they do not say what an adapter owes that
+finds a dispatch thread it cannot settle: one that leaves it behind without
+a word passes, and one that reports it by a raise out of the call, or out
+of the `close()` of `S30c`, deviates. Which the contract wants is owed a
+ruling. Ruled on 2026-11-27 by a decision panel under a standing instruction
+of the release owner, who may overrule: the scenarios stand as stated, so
+the typed result is owed and either raise is a deviation of the adapter, on
+a reference column as on any other. What an adapter owes beside that result
+for a thread it could not settle, and what `close()` owes while one still
+runs, is left a question.
+
 Two static cells run on the toy columns only: `P01` (the protocol surface)
 and `P02` (the profile binding). So on a real column no cell asserts that the
 backend instance declares the profile routing computes for its route, or that

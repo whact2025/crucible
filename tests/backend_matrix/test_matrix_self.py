@@ -28,6 +28,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,6 +76,7 @@ from .contract import (
     SecondCall,
 )
 from .drivers import MatrixSetupError, registered_kinds, toy
+from .drivers.base import close_when
 from .provider import (
     UNSCRIPTED_STATUS,
     CacheCountingDialect,
@@ -98,12 +100,16 @@ from .scenarios import (
     D_CDX_SERVED,
     D_COST_BOUND_UNRANKED,
     D_OAI_SCHEMA_FINAL,
+    CUT_SECONDS,
     D_STRUCT_UNQUALIFIED,
+    DEADLINE_SECONDS,
     DEADLINE_SLACK_SECONDS,
+    EARLY_SECONDS,
     GUARDED,
     MALFORMED_ARGUMENT_TEXTS,
     PACK_A,
     PACK_B,
+    RELEASE_AFTER_SECONDS,
     SCENARIOS,
     SCHEMA_ANSWER,
     SCHEMA_FINAL_ANSWER,
@@ -120,6 +126,7 @@ from .scenarios import (
 )
 from .script import (
     READ_A,
+    READ_B,
     WRITE,
     Call,
     Cut,
@@ -131,6 +138,7 @@ from .script import (
     Refuse,
     Say,
     ServedAs,
+    Stall,
     Step,
     TokenUsage,
 )
@@ -191,13 +199,17 @@ def test_liar_yields_exactly_its_codes(liar: toy.Liar, tmp_path: Path) -> None:
         assert {contract.clause_of(item.code) for item in outcome.deviations} <= {clause}
     if execution.observation.raised is not None:
         # A raise stands for the result clauses: its code, and no outcome of
-        # theirs. Where the selected variant expects a refusal, those
+        # theirs. Where the cell expects no result (the selected variant
+        # expects a refusal, or the cancellation is to be raised), those
         # clauses are no part of the cell at all.
-        if execution.plan.expect.outcome == "result":
-            for clause in RESULT_CLAUSES:
+        expects_result = execution.plan.expect.outcome == "result"
+        for clause in RESULT_CLAUSES:
+            assert (clause in report.outcomes) == expects_result
+            if expects_result:
                 assert report.outcomes[clause].status == "stood_for"
-        else:
-            assert not set(RESULT_CLAUSES) & set(report.outcomes)
+    # A liar yields codes, never a missed wall-time bound: that has no code.
+    conducted = execution.observation.conducted
+    assert conducted is None or not conducted.problems, conducted
     if not SCENARIOS[liar.scenario].canary:
         assert report.not_evaluated() == frozenset()
     # As a test item the liar's cell fails: it has no ledger entry.
@@ -3104,6 +3116,12 @@ def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
         "R20",
         "R21",
         "R26",
+        # The deadline and the cancellation forms on the reference columns.
+        "R03",
+        "R18",
+        "R22",
+        "R23",
+        "R24",
     }
     # With a cell of the record withdrawn the ruling is what H03 asks for.
     # Either the cell is pinned not expressible ...
@@ -4669,6 +4687,8 @@ def test_toy_columns_are_derived_from_the_snapshot_not_typed() -> None:
         "usd_limit",
         "tool_loop",
         "response_token_limit",
+        "deadline",
+        "cancellation",
         "session_continuity",
     )
     combinations = {tuple(str(getattr(row, name)) for name in fields) for row in snapshot.values()}
@@ -6427,6 +6447,340 @@ def test_a_driver_may_leave_one_step_for_the_last_moment_before_the_call(tmp_pat
 
     assert moments == [0] and execution.observation.provider.request_count == 1
     assert execution.report.codes == frozenset()
+
+
+# -- deadlines and cancellation: what a cell does beside the call --------------
+
+
+def _toy_cell(scenario: str, **declared: str) -> Cell:
+    """The cell of ``scenario`` on the first toy column that declares ``declared``."""
+
+    for column in cells.toy_columns():
+        if all(str(getattr(column.features, name)) == value for name, value in declared.items()):
+            return Cell(column, scenario, "raw")
+    raise MatrixSetupError(f"no toy column declares {declared}")
+
+
+def test_every_declared_class_of_deadline_and_cancellation_has_its_honest_pass() -> None:
+    # The values the snapshot holds, each on a toy column of its own name:
+    # the honest cells of this module play the deadline and the cancellation
+    # scenarios on every one of them.
+    snapshot = declarations.snapshot_profiles(declarations.load_snapshot())
+    profiles = [column.features for column in cells.toy_columns()]
+    played = {
+        (str(profile.deadline), str(profile.cancellation))
+        for profile in profiles
+        if profile is not None
+    }
+    assert None not in profiles
+    assert played == {(str(row.deadline), str(row.cancellation)) for row in snapshot.values()}
+    assert {deadline for deadline, _ in played} == {"request_only", "hard_invocation"}
+    assert {cancellation for _, cancellation in played} == {"process_kill", "boundary_only"}
+    # A declared deadline whose contract names the limit guard is not stated
+    # for the raw lens: a column that declared one could not run the cell.
+    for scenario in ("S15", "S16a"):
+        table = SCENARIOS[scenario].differences["deadline"]
+        assert set(table) == {"hard_invocation", "request_only", "post_hoc", "unsupported"}
+        for value in ("post_hoc", "unsupported"):
+            variant = table[value]
+            assert variant.kind == "FALLBACK"
+            with pytest.raises(MatrixSetupError, match="is not stated for the raw lens"):
+                SCENARIOS[scenario].fallbacks[variant.name](SCENARIOS[scenario].plan())
+
+
+@pytest.mark.parametrize("cancellation", ["process_kill", "boundary_only"])
+def test_a_call_is_cut_or_ends_at_a_boundary_as_its_route_declares(
+    cancellation: str, tmp_path: Path
+) -> None:
+    # What the first-run notes of a real column read off a cell: when the
+    # handler was entered and let go, when the call returned, and whether it
+    # returned while the handler was still held.
+    read = runner.execute(_toy_cell("S16a", cancellation=cancellation), tmp_path / "read")
+    seen = read.observation.conducted
+    assert read.report.codes == frozenset() and seen is not None and not seen.problems
+    assert seen.entered_at is not None and seen.released_at is not None
+    assert seen.invoked_at < seen.entered_at < seen.invoked_at + seen.deadline_seconds
+    assert seen.where == toolsets.IN_TOOLSET
+    cut = cancellation == "process_kill"
+    assert seen.returned_while_held is cut
+    assert (seen.returned_at < seen.released_at) is cut
+    # Nothing but the deadline ends this call: its result does not come
+    # before it. And the handler is let go by the cell once the call has
+    # returned, or by the plan of the variant while it still runs.
+    deadline = seen.invoked_at + seen.deadline_seconds
+    assert seen.early_seconds == EARLY_SECONDS and seen.cut_seconds is None
+    assert seen.returned_at >= deadline
+    assert seen.released_by == ("return" if cut else "plan") and seen.last_resort == ()
+    assert seen.first_request_at is not None
+    assert seen.invoked_at < seen.first_request_at < seen.entered_at
+    if not cut:
+        # Let go a stated time after the deadline, while the call still ran.
+        assert seen.released_at >= deadline + RELEASE_AFTER_SECONDS
+    # The cancellation while the read is held: the close of the cell comes
+    # when the handler has been entered, and the call returns the result of
+    # a cancellation, cut or at its next boundary.
+    closed = runner.execute(_toy_cell("S30c", cancellation=cancellation), tmp_path / "closed")
+    conducted = closed.observation.conducted
+    assert closed.report.codes == frozenset() and conducted is not None
+    assert conducted.closed_at is not None and conducted.entered_at is not None
+    assert conducted.entered_at <= conducted.closed_at <= conducted.returned_at
+    assert conducted.returned_while_held is cut
+    # A route that declares that it can cut a call is held to it: the call
+    # is back within the time of a cut, and its deadline lies well beyond
+    # that, so a call that ran on to its deadline could not pass for one.
+    # Of a route that stops only between two steps no cut is asked.
+    assert not conducted.problems and conducted.early_seconds is None
+    assert conducted.cut_seconds == (CUT_SECONDS if cut else None)
+    assert conducted.deadline_seconds == DEADLINE_SECONDS + CUT_SECONDS
+    if cut:
+        assert conducted.returned_at - conducted.closed_at < CUT_SECONDS / 2
+        stalled = runner.execute(_toy_cell("S30a", cancellation=cancellation), tmp_path / "stalled")
+        ended = stalled.observation.conducted
+        assert stalled.report.codes == frozenset() and ended is not None and not ended.problems
+        assert ended.closed_at is not None and ended.cut_seconds == CUT_SECONDS
+        assert ended.returned_at - ended.closed_at < CUT_SECONDS / 2
+        assert ended.returned_at < ended.invoked_at + ended.deadline_seconds - DEADLINE_SECONDS
+
+
+def test_a_call_that_misses_its_wall_time_bound_fails_its_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The toy that binds its request to no deadline: the stalled request is
+    # never ended by a clock of the provider, so the call hangs until the
+    # conductor of the cell ends what the cell holds, and the cell fails
+    # with its times. The bound has no code: no entry could expect it.
+    monkeypatch.setattr(runner, "GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(runner, "_LAST_RESORT_SECONDS", 0.5)
+    cell = _toy_cell("S15")
+    driver = toy.ToyDriver(frozenset({toy.IGNORE_DEADLINE}))
+    began = time.monotonic()
+    execution = runner.execute(cell, tmp_path / "late", driver=driver)
+    conducted = execution.observation.conducted
+    assert conducted is not None and len(conducted.problems) == 2
+    assert "more than the grace" in conducted.problems[0]
+    # The call came back only because the last resort of the cell let the
+    # stalled request go: the cell says so, and what it then shows is not
+    # the scenario's.
+    assert "last resort" in conducted.problems[1]
+    assert conducted.last_resort == ("let_go",)
+    assert conducted.returned_at - conducted.invoked_at > conducted.deadline_seconds + 1.0
+    assert time.monotonic() - began < 30.0
+    # As a test item the cell fails for the bound, whatever its codes are and
+    # whatever a ledger says of the cell.
+    with pytest.raises(pytest.fail.Exception, match="more than the grace"):
+        runner.run_cell(
+            cell, tmp_path / "item", preflight={TOY_KIND: None}, known=LEDGER, driver=driver
+        )
+    # The honest toy on the same cell, under the same narrow bound, is in
+    # time: the bound is not what fails a cell that keeps its deadline.
+    honest = runner.execute(cell, tmp_path / "honest")
+    assert honest.observation.conducted is not None
+    assert honest.observation.conducted.problems == () and honest.report.codes == frozenset()
+
+
+def test_a_hold_stops_the_first_call_of_its_tool_and_no_other(tmp_path: Path) -> None:
+    hold = toolsets.Hold(READ_A)
+    fixture = toolsets.build(toolsets.READ, tmp_path / toolsets.WORKSPACE, hold=hold)
+    name, arguments = BINDINGS[READ_A].name, dict(BINDINGS[READ_A].arguments)
+    other = BINDINGS[READ_B].name
+    said: list[str] = []
+    hold.on_entered(lambda: said.append("entered"))
+    answers: list[str] = []
+    thread = threading.Thread(
+        target=lambda: answers.append(fixture.toolset.dispatch(name, arguments)), daemon=True
+    )
+    thread.start()
+    assert hold.entered.wait(10.0) and said == ["entered"]
+    # Held at its entry: nothing of the tool has run, and no clock lets it go.
+    assert fixture.log == [] and not hold.left.is_set() and hold.where == toolsets.IN_TOOLSET
+    thread.join(0.3)
+    assert thread.is_alive() and hold.released_at is None
+    # Another tool passes while the first is held, and so does a second call
+    # of the held tool once the first has been let go.
+    assert fixture.toolset.dispatch(other, dict(BINDINGS[READ_B].arguments))
+    assert [item.name for item in fixture.log] == [other]
+    hold.release()
+    thread.join(10.0)
+    assert not thread.is_alive() and hold.left.is_set() and len(answers) == 1
+    assert hold.released_at is not None and hold.entered_at is not None
+    assert hold.entered_at <= hold.released_at
+    assert fixture.toolset.dispatch(name, arguments) == answers[0]
+    assert [item.name for item in fixture.log] == [other, name, name]
+
+
+def test_a_close_is_armed_for_a_moment_of_the_cell_and_disarmed_when_the_call_is_over() -> None:
+    script = ProviderScript((Say("unused"),))
+
+    class Backend:
+        closes = 0
+
+        def close(self) -> None:
+            self.closes += 1
+            raise RuntimeError("the close of the cell raised")
+
+    with LoopbackProvider(script, credential="c") as provider:
+        # The moment comes: one close, at that moment, and what it raised is kept.
+        backend = Backend()
+        armed = close_when(provider, backend, "moment")
+        time.sleep(0.1)
+        assert backend.closes == 0 and armed.closed_at is None
+        before = time.monotonic()
+        provider.reach("moment")
+        assert armed.settled(10.0) and backend.closes == 1
+        assert armed.closed_at is not None and armed.closed_at >= before
+        assert isinstance(armed.raised, RuntimeError)
+        assert provider.reached_at("moment") is not None
+        assert provider.reached_at("moment") <= armed.closed_at
+        # The call is over before the moment came: nothing is closed, then or later.
+        idle = Backend()
+        never = close_when(provider, idle, "another moment")
+        never.disarm()
+        assert never.settled(10.0)
+        provider.reach("another moment")
+        time.sleep(0.1)
+        assert idle.closes == 0 and never.closed_at is None and never.raised is None
+
+
+def test_a_stalled_request_is_held_without_a_byte_until_the_cell_lets_it_go() -> None:
+    script = ProviderScript((Stall("taken"),))
+    with LoopbackProvider(script, credential="c") as provider:
+        connection = http.client.HTTPConnection("127.0.0.1", provider.port, timeout=0.5)
+        body = json.dumps({"model": matrix_columns.TOY_MODEL, "messages": []})
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer c",
+            "User-Agent": ToyDialect.user_agent,
+        }
+        connection.request("POST", ToyDialect.path, body=body, headers=headers)
+        # The provider has taken the request and noted the moment; nothing
+        # comes back, however long the other side waits.
+        assert provider.reached("taken").wait(10.0)
+        with pytest.raises(TimeoutError):
+            connection.getresponse()
+        connection.close()
+        assert provider.request_count == 1 and provider.freeze().billed == []
+    # Let go, a held request ends without a reply: the connection closes.
+    with LoopbackProvider(script, credential="c") as provider:
+        waiting = http.client.HTTPConnection("127.0.0.1", provider.port, timeout=10.0)
+        waiting.request("POST", ToyDialect.path, body=body, headers=headers)
+        assert provider.reached("taken").wait(10.0)
+        provider.release()
+        with pytest.raises((http.client.HTTPException, ConnectionError)):
+            waiting.getresponse()
+        waiting.close()
+
+
+def test_a_held_handler_is_let_go_at_the_time_its_variant_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A route that stops only between two steps, on a kind whose driver
+    # states an allowance: the handler is let go a stated time after the
+    # deadline and the allowance once more. That time lies beyond the
+    # deadline and a narrow grace, and it is still the plan of the cell that
+    # lets the handler go there, not the last resort of the conductor, which
+    # is for a call that hangs.
+    monkeypatch.setattr(runner, "GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(runner, "_LAST_RESORT_SECONDS", 0.25)
+    driver = toy.ToyDriver()
+    driver.startup_seconds = 1.0
+    cell = _toy_cell("S16a", cancellation="boundary_only")
+    execution = runner.execute(cell, tmp_path, driver=driver)
+    seen = execution.observation.conducted
+    assert seen is not None and seen.released_at is not None
+    assert seen.deadline_seconds == DEADLINE_SECONDS + 1.0
+    stated = seen.deadline_seconds + 1.0 + RELEASE_AFTER_SECONDS
+    assert stated <= seen.released_at - seen.invoked_at < stated + 0.5
+    assert seen.released_by == "plan" and seen.last_resort == ()
+    assert seen.problems == () and execution.report.codes == frozenset()
+    # The same cell with the plan taken away: the call hangs on the held
+    # handler, the last resort lets it go, and the cell says so and fails.
+    monkeypatch.setattr(runner._Conductor, "_let_go_at", lambda self: None)
+    hung = runner.execute(cell, tmp_path / "hung", driver=driver).observation.conducted
+    assert hung is not None and hung.released_by == "last_resort"
+    assert hung.last_resort == ("let_go",)
+    assert any("last resort" in problem for problem in hung.problems), hung.problems
+
+
+def test_a_cell_whose_scenario_was_not_played_in_time_fails_with_its_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A seam that needs longer than the cell was given: the adapter sends
+    # its first request only after the deadline the cell was called with
+    # (and counts its own deadline from there, so the call comes back with
+    # the result the scenario asks). What such a play shows is not the
+    # scenario: the cell fails with its times, as for a missed bound, and
+    # is judged by no ledger entry.
+    original = toy.HonestBackend._invoke
+    slept: list[float] = []
+
+    def late(self: Any, invocation: Any) -> Any:
+        time.sleep(slept[0])
+        return original(self, invocation)
+
+    monkeypatch.setattr(toy.HonestBackend, "_invoke", late)
+
+    def said(scenario: str, wait: float) -> str:
+        """What the test item of the cell fails with: the problems, then the report."""
+
+        slept[:] = [wait]
+        cell = _toy_cell(scenario, cancellation="process_kill")
+        with pytest.raises(pytest.fail.Exception, match="was not played") as failed:
+            # With a driver of its own, as every replay of a self-test: the
+            # cell report keeps the play of the cell's own item only.
+            runner.run_cell(
+                cell,
+                tmp_path / scenario,
+                preflight={TOY_KIND: None},
+                known=LEDGER,
+                driver=toy.ToyDriver(),
+            )
+        text = str(failed.value)
+        # The call itself came back with what the scenario asks.
+        assert text.rstrip().endswith("no deviation"), text
+        return text
+
+    # The stalled request was taken after the deadline.
+    stall = said("S15", DEADLINE_SECONDS + 0.5)
+    assert stall.count("was not played") == 1 and "took the first request" in stall
+    # The held handler was entered after the deadline.
+    assert "the held handler was entered" in said("S16a", DEADLINE_SECONDS + 0.5)
+    # The close of the cell came so late that a call that is cut could not
+    # be told from one that ran on to its deadline.
+    closed = said("S30a", DEADLINE_SECONDS + 0.5)
+    assert closed.count("was not played") == 1 and "too late to tell" in closed
+    # In time, the same cell has no problem (and so have the honest cells of
+    # this module, each of them).
+    slept[:] = [0.0]
+    in_time = runner.execute(_toy_cell("S30a", cancellation="process_kill"), tmp_path / "in-time")
+    assert in_time.observation.conducted is not None
+    assert in_time.observation.conducted.problems == ()
+
+
+def test_a_deadline_that_is_counted_late_is_in_time_and_is_only_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # What the deadline forms do not assert, said by a test so that nobody
+    # reads it into them: an adapter that counts its deadline from a moment
+    # of its own, later than the call, returns the result of a deadline
+    # that much later. From above a call is held only to the wide bound for
+    # a call that hangs, so the cell has no code and no problem, and what
+    # is left of the late count is the moment the cell keeps.
+    original = toy.HonestBackend._invoke
+    late = 1.0
+
+    def counts_late(self: Any, invocation: Any) -> Any:
+        time.sleep(late)
+        return original(self, invocation)
+
+    monkeypatch.setattr(toy.HonestBackend, "_invoke", counts_late)
+    execution = runner.execute(_toy_cell("S15"), tmp_path)
+    seen = execution.observation.conducted
+    assert execution.report.codes == frozenset()
+    assert seen is not None and seen.problems == ()
+    assert late <= seen.returned_at - seen.invoked_at - seen.deadline_seconds < late + 1.0
+    # From below it is held: the same adapter with a deadline of its own
+    # that is shorter than the policy's is a liar of this module.
+    assert any(toy.OWN_DEADLINE in liar.faults for liar in toy.LIARS)
 
 
 # -- the module ends with the canary check --------------------------------------

@@ -35,7 +35,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from assay import BackendExecutionTrace, BackendPolicy, ConversationTransportRequest
 
@@ -78,6 +78,7 @@ from .script import (
     Refuse,
     Say,
     ServedAs,
+    Stall,
     TokenUsage,
 )
 from .toolsets import (
@@ -190,6 +191,71 @@ CONVERSATION = ConversationTransportRequest(
 # conversation request with, before transport.
 CONTINUITY_REFUSAL = NotImplementedError.__name__
 
+# The deadline of the scenarios that play one (a stall of the provider, a
+# tool handler that blocks, a cancellation that a route can honour only at
+# its next step), in seconds from the call. The runner adds what the driver
+# of the column states as the time its seam needs before a first request can
+# reach the provider (``Driver.startup_seconds``): the deadline counts from
+# the call, and a kind that starts a tool or an interpreter for a provider
+# request has spent seconds of it before its request is on the wire. So the
+# request is on the wire, and the handler entered, well before the deadline
+# on every kind, on a busy machine too. Where it is not (the provider took
+# the first request, or the held handler was entered, only after the
+# deadline the cell was called with) the scenario was not played: the cell
+# fails with its times and is not judged. The deadline is what ends such a
+# call and so what bounds the time its cell takes: nothing of the provider
+# or of the fixture ends a stall or lets a handler go by a clock of its own.
+DEADLINE_SECONDS = 2
+# How much later than the moment that bounds it a call may return. Wide: a
+# backend that ends a session or a worker at that moment closes streams and
+# reaps processes first, and the machine may be busy. A call that returns
+# later fails its cell; that is no deviation and never an expected failure.
+# The bound is there for a call that hangs. It is no measure of a deadline:
+# a call that ends this much later than the deadline it was given is in
+# time, and how late it was is kept in the cell report and asserted by no
+# cell.
+GRACE_SECONDS = 15.0
+# How much earlier than the deadline it was called with a call that nothing
+# but its deadline ends may return a result. A result that comes earlier is
+# a deviation of the scenario (``return:early``): the adapter ended the
+# call at a time of its own, not at the one the policy states.
+EARLY_SECONDS = 0.5
+# On a route that declares that it can cut a call: how long after the
+# ``close()`` of the cell the call may take to return or to raise. A later
+# return is a deviation of the scenario (``return:not_cut``): the call was
+# not cut, it ran on, whatever it then returned. The cancellation scenarios
+# pass a deadline that lies this far beyond the deadline of the others, so
+# that after a ``close()`` that came within the allowance of the driver the
+# call has this time to return and its deadline lies
+# :data:`DEADLINE_SECONDS` beyond that: a call that ran on to its deadline
+# is never taken for one that was cut.
+CUT_SECONDS = 3.0
+# How long before the deadline of the call that time must end for a cell to
+# tell the two apart. A ``close()`` that came later was not played: the
+# cell fails with its times.
+CUT_CLEARANCE_SECONDS = 1.0
+# Where a route can stop a call only between two steps, how long after the
+# deadline (after ``close()``, where the cell closes the backend while a
+# handler blocks) the held handler is let go, while the call still runs.
+# After a deadline the runner adds the allowance of the driver once more: an
+# adapter may count its deadline from a moment of its own inside that
+# allowance (the start of its worker), and a handler that is let go before
+# the deadline as the adapter counts it did not block past it.
+RELEASE_AFTER_SECONDS = 1.0
+# How long a cell waits, once the held handler has left, before it closes
+# the backend: a provider request in that time is a request after the call.
+SETTLE_SECONDS = 0.5
+# How long a handler that was let go may take to leave.
+LEAVE_SECONDS = 10.0
+# What the provider notes when a stalled request has been taken, and what the
+# runner notes when the held handler has been entered.
+STALL_MARKER = "stall"
+HOLD_MARKER = "hold"
+# The scenarios whose plan holds a conduct. Said here, so that what a cell
+# is called with can be read without building a plan; the runner refuses a
+# conduct on any other scenario.
+CONDUCTED: frozenset[str] = frozenset({"S15", "S16a", "S30a", "S30b", "S30c"})
+
 # The base policy. No scenario relies on an adapter default: they differ.
 BASE_POLICY = BackendPolicy(
     retry_budget=1,
@@ -199,6 +265,44 @@ BASE_POLICY = BackendPolicy(
 )
 
 CLEAN = Expectation(final_text=TEXT)
+
+Bound = Literal["deadline", "release"]
+
+
+@dataclass(frozen=True)
+class Conduct:
+    """What a cell does beside the call, and what bounds the return of the call.
+
+    ``hold`` names the slot whose handler the cell holds at its entry.
+    ``close_at`` says when the cell closes the backend from another thread:
+    when the provider has taken the stalled request, or when the held
+    handler has been entered. ``release`` says when the held handler is let
+    go: once the call has returned (a call that can be cut returns while the
+    handler still blocks), or :data:`RELEASE_AFTER_SECONDS` after the
+    deadline (and the allowance of the driver) or after ``close()``, while
+    the call still runs (a route that stops only between two steps returns
+    once the handler has left).
+    ``bounds`` are the moments the return is held to, each plus
+    :data:`GRACE_SECONDS`: the deadline of the call, the release of the held
+    handler. A call that misses them hangs: its cell fails, and that has no
+    code. The clock of a bound never lets a stall or a handler go; the cell
+    does.
+
+    Two things more are asked of the moment the call returns, and each is a
+    deviation of the scenario with a code. ``cut_seconds``: the route
+    declares that it can cut a call, so the call returns or raises within
+    that time of the ``close()`` of the cell (``return:not_cut`` otherwise).
+    ``not_before_deadline``: nothing but its deadline ends the call, so a
+    result does not come more than :data:`EARLY_SECONDS` before the deadline
+    the call was made with (``return:early`` otherwise).
+    """
+
+    hold: str | None = None
+    close_at: Literal["stall", "hold"] | None = None
+    release: Literal["after_return", "after_deadline", "after_close"] = "after_return"
+    bounds: tuple[Bound, ...] = ("deadline",)
+    cut_seconds: float | None = None
+    not_before_deadline: bool = False
 
 
 @dataclass(frozen=True)
@@ -215,6 +319,8 @@ class Plan:
     # The conversation the invocation asks to continue; ``None`` for a call
     # that asks for none.
     conversation: ConversationTransportRequest | None = None
+    # What the cell does beside the call; ``None`` where it only calls.
+    conduct: Conduct | None = None
 
 
 @dataclass(frozen=True)
@@ -1201,6 +1307,90 @@ def _complete_reply(plan: Plan) -> Plan:
     )
 
 
+def _statement_owed(value: str, words: str) -> Callable[[Plan], Plan]:
+    """The plan of a declared deadline whose contract is not stated yet.
+
+    The row of the stall gives two values of ``deadline`` a variant that
+    names the limit guard, which the raw lens does not bind, and no column
+    declares either. The table is total, so each has its entry; a column
+    that came to declare one could not run the cell before the statement of
+    what the variant asserts exists.
+    """
+
+    def owed(_plan: Plan) -> Plan:
+        raise MatrixSetupError(
+            f"a route that declares deadline={value!r} is owed the variant "
+            f"{words!r} of the deadline scenarios, which names the limit guard "
+            "and is not stated for the raw lens yet: state what it asserts, and "
+            "in which lens, before a column that declares the value runs the cell"
+        )
+
+    return owed
+
+
+def _at_a_boundary_after_release(plan: Plan) -> Plan:
+    """The route stops only between two steps: it returns once the handler has left.
+
+    The cell lets the held handler go a stated time after the deadline,
+    while the call still runs, and holds the return to that release.
+    """
+
+    assert plan.conduct is not None
+    return replace(
+        plan, conduct=replace(plan.conduct, release="after_deadline", bounds=("release",))
+    )
+
+
+def _at_the_next_boundary(plan: Plan) -> Plan:
+    """The stalled request is not cut: the cancellation is returned by the deadline."""
+
+    assert plan.conduct is not None
+    return replace(plan, conduct=replace(plan.conduct, cut_seconds=None))
+
+
+def _at_a_boundary_after_close(plan: Plan) -> Plan:
+    """The held handler is let go a stated time after ``close()``; then the call returns."""
+
+    assert plan.conduct is not None
+    return replace(
+        plan,
+        conduct=replace(
+            plan.conduct,
+            release="after_close",
+            bounds=("release", "deadline"),
+            cut_seconds=None,
+        ),
+    )
+
+
+def _ends_at_its_deadline_as_the_stall(plan: Plan) -> Plan:
+    """No cancellation: ``close()`` changes nothing and the call ends as the stall does."""
+
+    assert plan.conduct is not None
+    return replace(
+        plan,
+        expect=_TIMED_OUT,
+        conduct=replace(plan.conduct, cut_seconds=None, not_before_deadline=True),
+    )
+
+
+def _ends_at_its_deadline_as_the_blocked_read(plan: Plan) -> Plan:
+    """No cancellation: the call ends as the deadline during a read does on such a route."""
+
+    assert plan.conduct is not None
+    return replace(
+        plan,
+        expect=replace(_TIMED_OUT, dispatch=(READ_A,)),
+        conduct=replace(
+            plan.conduct,
+            release="after_deadline",
+            bounds=("release",),
+            cut_seconds=None,
+            not_before_deadline=True,
+        ),
+    )
+
+
 # Declared differences (the ledger holds their citation, owner and scope).
 D_STRUCT_UNQUALIFIED = "D-STRUCT-UNQUALIFIED"
 D_OAI_SCHEMA_FINAL = "D-OAI-SCHEMA-FINAL"
@@ -1373,6 +1563,159 @@ _SERVED_UNDER_ANOTHER_ID = Expectation(
     flags=("token_usage_complete", "trace_complete"),
     flags_false=("cost_complete",),
 )
+
+
+# A call that ends at its deadline: a transport error that is not retried,
+# with the stop reason of a deadline and its limit event. Nothing ended the
+# turn, so the token, the cost and the terminal flag are each expected false.
+_TIMED_OUT = Expectation(
+    kind="transport",
+    stop=("timeout",),
+    retriable=False,
+    flags=("trace_complete",),
+    flags_false=EXPECTED_FALSE_FLAGS,
+    events=("limit/deadline",),
+)
+# A call that ``close()`` ended: the cancellation, with an event of that kind
+# under any name. Whether it may be retried is not asserted: the consumers
+# read the kind. The three flags are expected false as at a deadline.
+_CANCELLED = Expectation(
+    kind="cancellation",
+    stop=("cancelled",),
+    flags=("trace_complete",),
+    flags_false=EXPECTED_FALSE_FLAGS,
+    events=("cancellation/-",),
+)
+_LIMITS_MODULE = (
+    "crucible/backends/limits.py:1366-1382 (the limit module refuses a "
+    "diagnostic invocation on this deadline before transport: it binds "
+    "hard_invocation and request_only only)"
+)
+_CANCELLATION_VOCABULARY = (
+    "assay/src/assay/backend/features.py:35-37 (the values of cancellation: a "
+    "route of this value stops a call between two of its steps, if at all)"
+)
+# The table of ``deadline``, for the stall and for the deadline during a
+# tool call.
+_BY_DEADLINE: Mapping[str, Any] = {
+    "hard_invocation": BASE,
+    "request_only": BASE,
+    "post_hoc": FALLBACK("guard_converts_late_result", _LIMITS_MODULE),
+    "unsupported": FALLBACK("guard_refuses_route", _LIMITS_MODULE),
+}
+_DEADLINE_FALLBACKS: Mapping[str, Callable[[Plan], Plan]] = {
+    "guard_converts_late_result": _statement_owed(
+        "post_hoc", "the guard converts a late result"
+    ),
+    "guard_refuses_route": _statement_owed("unsupported", "the guard refuses the route"),
+}
+_DEADLINE_POLICY = replace(BASE_POLICY, timeout_seconds=DEADLINE_SECONDS)
+# The cancellation scenarios: the deadline lies the time of a cut beyond the
+# deadline of the others (see :data:`CUT_SECONDS`).
+_CANCELLATION_POLICY = replace(
+    BASE_POLICY, timeout_seconds=DEADLINE_SECONDS + CUT_SECONDS
+)
+
+
+def _blocked_handler(letter: str, title: str, toolset: ToolsetSpec, plan: Plan) -> Scenario:
+    """A form of the deadline during a tool call: one request, one call, a held handler.
+
+    The token, cost and terminal flags are expected false here as on the
+    stall: the turn did not reach its terminal. It was cut at the deadline
+    or by close(), or, on a route that can stop only at a boundary, ended by
+    the adapter at its first boundary after the handler was released. On a
+    route whose vendor tool owns the loop nothing shows that usage relayed
+    before the terminal is final, and the budget ledgers decide on the two
+    accounting flags alone. Read so by a decision panel under a standing
+    instruction of the release owner, who may overrule. Whether a route
+    whose adapter owns the loop may flag the reply it received complete, as
+    it does where it ends a turn at its dispatch budget (S12), is owed a
+    ruling.
+
+    What the cell holds is a thread: the one on which the adapter, its
+    bridge or its tool server dispatched the call in the test process. No
+    adapter can end it. The cell asserts of that thread only that the call
+    does not wait for it where the route declares that it can cut a call.
+    It does not assert that no handler is still running when the call has
+    returned ("host and bridge stopped" is read as: no child process, no
+    listener), and it does not say what an adapter owes that finds a
+    dispatch thread it cannot settle. So an adapter that leaves the thread
+    behind without a word passes, and one that reports it by a raise out of
+    the call deviates (clause C1). Which of the two the contract wants is
+    not stated: it is owed a ruling, with the same question on the
+    cancellation while a read handler is held.
+
+    Ruled on 2026-11-27 by a decision panel under a standing instruction of
+    the release owner, who may overrule: the form stands as stated. The call
+    owes the typed result of the deadline, and a raise out of the call is a
+    deviation of the adapter, on a reference column as on any other; the
+    fixture is not changed for it. What an adapter owes beside that result
+    for a dispatch thread it could not settle is left a question.
+    """
+
+    return Scenario(
+        id=f"S16{letter}",
+        set=PACK_B,
+        title=title,
+        toolset=toolset,
+        lenses=("raw",),
+        policy=_DEADLINE_POLICY,
+        plan=lambda: plan,
+        differences={
+            "deadline": _BY_DEADLINE,
+            "cancellation": {
+                "process_kill": BASE,
+                "interruptible": BASE,
+                "boundary_only": FALLBACK(
+                    "at_a_boundary_after_release", _CANCELLATION_VOCABULARY
+                ),
+                "unsupported": FALLBACK(
+                    "at_a_boundary_after_release", _CANCELLATION_VOCABULARY
+                ),
+            },
+        },
+        fallbacks={
+            **_DEADLINE_FALLBACKS,
+            "at_a_boundary_after_release": _at_a_boundary_after_release,
+        },
+    )
+
+
+def _cancelled_stall(letter: str, on_cancellation: str, expect: Expectation) -> Scenario:
+    """A form of the cancellation of a stalled request, by the policy's value."""
+
+    return Scenario(
+        id=f"S30{letter}",
+        set=PACK_B,
+        title=f"Cancellation by close(), on_cancellation={on_cancellation}",
+        toolset=None,
+        lenses=("raw",),
+        policy=replace(_CANCELLATION_POLICY, on_cancellation=on_cancellation),  # type: ignore[arg-type]
+        # The provider takes the one request and never answers it, in every
+        # variant; the cell closes the backend from another thread when the
+        # request has been taken. A route that declares that it can cut a
+        # call returns within the time of a cut; the deadline of the call
+        # lies well beyond it, so a call that ran on to its deadline shows.
+        plan=lambda: Plan(
+            ProviderScript((Stall(STALL_MARKER),)),
+            expect=expect,
+            conduct=Conduct(close_at="stall", cut_seconds=CUT_SECONDS),
+        ),
+        differences={
+            "cancellation": {
+                "process_kill": BASE,
+                "interruptible": BASE,
+                "boundary_only": FALLBACK("at_the_next_boundary", _CANCELLATION_VOCABULARY),
+                "unsupported": FALLBACK(
+                    "ends_at_its_deadline_as_the_stall", _CANCELLATION_VOCABULARY
+                ),
+            }
+        },
+        fallbacks={
+            "at_the_next_boundary": _at_the_next_boundary,
+            "ends_at_its_deadline_as_the_stall": _ends_at_its_deadline_as_the_stall,
+        },
+    )
 
 
 def _refusal(form: str, letter: str, *, billed: bool) -> Scenario:
@@ -1967,6 +2310,37 @@ _ALL: tuple[Scenario, ...] = (
         },
         fallbacks={"observe_only": _observed_and_dispatched},
     ),
+    # -- deadlines ----------------------------------------------------------
+    Scenario(
+        id="S15",
+        set=PACK_B,
+        title="Deadline while the provider stalls",
+        toolset=None,
+        lenses=("raw",),
+        policy=_DEADLINE_POLICY,
+        # The provider takes the one request and never answers it. Nothing
+        # was reported and no terminal was received, so a result that flags
+        # its tokens, its cost or its terminal complete states what it
+        # cannot know.
+        plan=lambda: Plan(
+            ProviderScript((Stall(STALL_MARKER),)),
+            expect=_TIMED_OUT,
+            conduct=Conduct(not_before_deadline=True),
+        ),
+        differences={"deadline": _BY_DEADLINE},
+        fallbacks=_DEADLINE_FALLBACKS,
+    ),
+    _blocked_handler(
+        "a",
+        "Deadline during a tool call (a read handler blocks)",
+        READ,
+        Plan(
+            ProviderScript((Call(READ_A),)),
+            expect=replace(_TIMED_OUT, dispatch=(READ_A,)),
+            checks=(history_replayed,),
+            conduct=Conduct(hold=READ_A, not_before_deadline=True),
+        ),
+    ),
     # -- broken terminals ---------------------------------------------------
     Scenario(
         id="S26",
@@ -2017,6 +2391,57 @@ _ALL: tuple[Scenario, ...] = (
         # check of its own and no governing field.
         plan=lambda: Plan(ProviderScript(()), expect=_WITHOUT_A_REQUEST),
         credential_unset=True,
+    ),
+    # -- cancellation -------------------------------------------------------
+    # The request was never answered, so the three flags are expected false
+    # as on the stall. Where the policy asks for the raise, the call raises
+    # its cancellation after the one request and no result clause applies.
+    _cancelled_stall("a", "convert_to_backend_error", _CANCELLED),
+    _cancelled_stall("b", "raise", Expectation(outcome="cancelled")),
+    Scenario(
+        id="S30c",
+        set=PACK_B,
+        title="Cancellation by close() while a read handler blocks",
+        toolset=READ,
+        lenses=("raw",),
+        policy=_CANCELLATION_POLICY,
+        # One request, answered with the read; the cell closes the backend
+        # from another thread when the handler has been entered. The flags
+        # are those of the deadline during a tool call, for the same ground
+        # (see there): the reply was answered and the turn did not reach
+        # its terminal. The backend is closed while the cell holds the
+        # thread on which the read was dispatched, which no adapter can
+        # end: what a close() owes that finds such a thread is not stated
+        # (see the deadline during a tool call), and a raise of that close()
+        # is a raise of close() like any other (clause C8). Ruled on
+        # 2026-11-27 by a decision panel under a standing instruction of the
+        # release owner, who may overrule: that raise is a deviation of the
+        # cell, as stated here; what close() owes while a handler it cannot
+        # end still runs is left a question.
+        plan=lambda: Plan(
+            ProviderScript((Call(READ_A),)),
+            expect=replace(_CANCELLED, dispatch=(READ_A,)),
+            checks=(history_replayed,),
+            conduct=Conduct(hold=READ_A, close_at="hold", cut_seconds=CUT_SECONDS),
+        ),
+        differences={
+            "cancellation": {
+                "process_kill": BASE,
+                "interruptible": BASE,
+                "boundary_only": FALLBACK(
+                    "at_a_boundary_after_close", _CANCELLATION_VOCABULARY
+                ),
+                "unsupported": FALLBACK(
+                    "ends_at_its_deadline_as_the_blocked_read", _CANCELLATION_VOCABULARY
+                ),
+            }
+        },
+        fallbacks={
+            "at_a_boundary_after_close": _at_a_boundary_after_close,
+            "ends_at_its_deadline_as_the_blocked_read": (
+                _ends_at_its_deadline_as_the_blocked_read
+            ),
+        },
     ),
     Scenario(
         id="S41",

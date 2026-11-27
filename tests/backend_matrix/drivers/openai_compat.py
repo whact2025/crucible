@@ -65,13 +65,16 @@ from ..script import (
     Refuse,
     Say,
     ServedAs,
+    Stall,
     Step,
 )
 from ..toolsets import BINDINGS
 from .base import (
     GUARD_POLICY,
+    Cancellation,
     Lens,
     MatrixSetupError,
+    close_when,
     refuse_the_scripted_credential,
     register,
 )
@@ -293,6 +296,11 @@ class OpenAIChatDialect:
         if isinstance(step, ServedAs):
             served = seen.model + step.suffix
             step = step.step
+        if isinstance(step, Stall):
+            # The request is taken and never answered: not a byte travels,
+            # nothing is billed and no model is named. No envelope stands
+            # behind it, because there is no reply.
+            return Reply(200, None, held=True, marker=step.marker)
         if isinstance(step, Malformed):
             # The wire carries one document per reply, so a reply that is no
             # terminal is a complete document without a turn: a 200 whose
@@ -570,11 +578,8 @@ class _Bound:
     secrets: tuple[str, ...] = ()
     tool_path: Literal["function_call", "mcp_bridge", "control_channel"] = "function_call"
 
-    def cancel_when(self, marker: str) -> None:
-        raise MatrixSetupError(
-            f"the gateway drivers have no marker {marker!r}: cancellation "
-            "scenarios add it with their liars"
-        )
+    def cancel_when(self, marker: str) -> Cancellation:
+        return close_when(self.provider, self.backend, marker)
 
     def children(self) -> tuple[int, ...]:
         return ()  # the adapter runs in this process
@@ -590,6 +595,10 @@ class _GatewayDriver:
     fidelity: Literal["wire", "worker_protocol"] = "wire"
     # The origin redirect patches httpx's transports, not a product name.
     private_seams: tuple[str, ...] = ()
+    # The client of the route lives in the test process and nothing is
+    # started for a call: some tens of milliseconds on an idle machine, and
+    # a second or two for the first call of a busy process.
+    startup_seconds: float = 5.0
 
     @property
     def inexpressible(self) -> Mapping[str, str]:

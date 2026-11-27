@@ -98,6 +98,36 @@ def note_cell(execution: Execution, known: ledger.Ledger) -> None:
         "envelopes": sorted(set(execution.observation.provider.envelopes)),
         "seam_problems": list(report.seam_problems),
     }
+    conducted = execution.observation.conducted
+    if conducted is not None:
+        # What a cell that plays a deadline or a cancellation did beside the
+        # call. ``moments`` holds each moment in seconds from the call, to
+        # one decimal: they are of the wall clock and differ from run to
+        # run, so a comparison of two runs leaves that one key out. The
+        # rest says what was played: what the call was made with, what was
+        # asked of the moment it returned, where the handler was held, what
+        # let it go, and whether the last resort of the cell acted.
+        def since(moment: float | None) -> float | None:
+            return None if moment is None else round(moment - conducted.invoked_at, 1)
+
+        _CELLS[cell.id]["conducted"] = {
+            "deadline_seconds": conducted.deadline_seconds,
+            "cut_seconds": conducted.cut_seconds,
+            "early_seconds": conducted.early_seconds,
+            "moments": {
+                "first_request": since(conducted.first_request_at),
+                "stalled": since(conducted.stalled_at),
+                "entered": since(conducted.entered_at),
+                "released": since(conducted.released_at),
+                "closed": since(conducted.closed_at),
+                "returned": since(conducted.returned_at),
+            },
+            "held_where": conducted.where,
+            "released_by": conducted.released_by,
+            "last_resort": list(conducted.last_resort),
+            "returned_while_held": conducted.returned_while_held,
+            "problems": list(conducted.problems),
+        }
 
 
 def note_static(cell: str, problems: Sequence[Deviation], known: ledger.Ledger) -> None:

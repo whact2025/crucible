@@ -32,7 +32,11 @@ fails the cell as a setup error. And it goes away where a reply says so
 (``gone``): after the frames of the reply it writes the leading part of a
 line the reply names, without a line end, and then either ends its output and
 exits with status 0, as a tool whose stream ends without its terminal frame,
-or kills itself, as a tool that is gone in the middle of a turn. And it
+or kills itself, as a tool that is gone in the middle of a turn. And it stalls
+where a reply says so (``stall``): after the frames of the reply it says
+nothing more of the turn, as a tool whose request the provider never answers.
+It keeps reading its input meanwhile, answers the control requests it plays,
+and leaves when the input is closed or it is killed. And it
 refuses to continue a session it holds no conversation for: the tool keeps
 its conversations in its home, the home of a cell is new, and a command line
 that names a session id which no earlier process of the cell opened is
@@ -565,6 +569,18 @@ class Session:
         for name in self._spent:
             self._spent[name] += int(usage.get(name, 0) or 0)
 
+    def _stall(self) -> None:
+        """The provider never answers the turn: nothing more is said of it.
+
+        The session stays open and silent. The control channel is still
+        served, and the end of the input ends the session as it always does.
+        """
+
+        while True:
+            frame = self._read()
+            if frame.get("type") == "control_request":
+                self._serve(frame)
+
     def _play(self, prompt: dict[str, Any]) -> int:
         """Answer one prompt: model turns and tool calls until the session ends."""
 
@@ -600,6 +616,8 @@ class Session:
                 self._emit(frame, with_next=joined and index == len(frames) - 1)
             if isinstance(gone, dict):
                 raise _Gone(str(gone.get("partial", "")), bool(gone.get("killed")))
+            if reply.get("stall"):
+                self._stall()
             if call is None:
                 return int(reply.get("exit", 0) or 0)
             if self._tool_request == HELD:

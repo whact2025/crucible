@@ -79,10 +79,18 @@ from ..script import (
     Refuse,
     Say,
     ServedAs,
+    Stall,
     Step,
 )
 from ..toolsets import BINDINGS
-from .base import GUARD_POLICY, Lens, MatrixSetupError, register
+from .base import (
+    GUARD_POLICY,
+    Cancellation,
+    Lens,
+    MatrixSetupError,
+    close_when,
+    register,
+)
 
 _SDK = "claude-agent-sdk"
 _SDK_MODULE = "claude_agent_sdk"
@@ -348,7 +356,7 @@ class ClaudeCliDialect:
                 f"{step.form!r}: a message the tool relays has no refusal part, so "
                 "the cell is pinned not expressible in the inventory"
             )
-        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop, Empty)):
+        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop, Empty, Stall)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
                 "the scenario that needs it adds the envelope with its liar"
@@ -411,6 +419,19 @@ class ClaudeCliDialect:
                 call_id=str(item.get("tool_use_id", "")),
                 tool_result=str(item.get("content", "")),
                 tool_is_error=bool(item.get("is_error")),
+            )
+        if isinstance(step, Stall):
+            # The provider takes the request of the turn and never answers
+            # it. The tool has said what it says before a turn (the frame
+            # that opens the session, the results of the tools it ran) and
+            # says nothing more: the reply tells the peer to keep the
+            # session open and silent. Nothing is billed and no model is
+            # named.
+            return Reply(
+                200,
+                {"frames": frames, "call": None, "stall": True},
+                envelopes=tuple(used),
+                marker=step.marker,
             )
         usage = step.usage
         turn_slots = {
@@ -721,11 +742,8 @@ class _Bound:
     secrets: tuple[str, ...] = ()
     tool_path: Literal["function_call", "mcp_bridge", "control_channel"] = "control_channel"
 
-    def cancel_when(self, marker: str) -> None:
-        raise MatrixSetupError(
-            f"the Claude driver has no marker {marker!r}: cancellation "
-            "scenarios add it with their liars"
-        )
+    def cancel_when(self, marker: str) -> Cancellation:
+        return close_when(self.provider, self.backend, marker)
 
     def children(self) -> tuple[int, ...]:
         return self.peer.pids()  # every process the SDK started for the cell
@@ -748,6 +766,10 @@ class ClaudeDriver:
         "crucible.backends._claude_session_transport."
         "CLAUDE_SESSION_REVIEWED_CLI_VERSIONS_BY_MODEL",
     )
+    # One scripted tool is started for the call and opens its session before
+    # the request of the turn: some tenths of a second on an idle machine,
+    # two seconds where the test shares one hardware thread with busy loops.
+    startup_seconds: float = 5.0
     faults: tuple[str, ...] = ()
     # How the peer of a cell sends the request for a tool call after the
     # frame of the model turn that makes it. Every cell plays the tool that

@@ -80,10 +80,18 @@ from ..script import (
     Reason,
     Refuse,
     Say,
+    Stall,
     Step,
 )
 from ..toolsets import BINDINGS
-from .base import GUARD_POLICY, Lens, MatrixSetupError, register
+from .base import (
+    GUARD_POLICY,
+    Cancellation,
+    Lens,
+    MatrixSetupError,
+    close_when,
+    register,
+)
 
 _SDK_MODULE = "codex_app_server_sdk"
 _OVERLAY_FIELD = "extra.cli_path"
@@ -389,7 +397,7 @@ class CodexAppServerDialect:
                 "response and no refusal part of a message, so the cell is pinned "
                 "not expressible in the inventory"
             )
-        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop, Empty)):
+        if not isinstance(step, (Say, Call, Refuse, Reason, Malformed, Drop, Empty, Stall)):
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__}: the "
                 "wire names no served model, and every other step lands with the "
@@ -438,6 +446,18 @@ class CodexAppServerDialect:
                 tool_name=str(item.get("name", "")),
                 tool_input=item.get("arguments"),
                 tool_result=item.get("content"),
+            )
+        if isinstance(step, Stall):
+            # The provider takes the request of the response and never
+            # answers it. The tool has said what it says before a response
+            # (the results of the tools it ran) and says nothing more: the
+            # reply tells the peer to keep the turn open and silent. Nothing
+            # is billed.
+            return Reply(
+                200,
+                {"frames": frames, "call": None, "stall": True},
+                envelopes=tuple(used),
+                marker=step.marker,
             )
         if isinstance(step, Refuse):
             # The provider refused the request for its policy: the turn fails
@@ -762,11 +782,8 @@ class _Bound:
     secrets: tuple[str, ...] = (LOGIN_WORD,)
     tool_path: Literal["function_call", "mcp_bridge", "control_channel"] = "mcp_bridge"
 
-    def cancel_when(self, marker: str) -> None:
-        raise MatrixSetupError(
-            f"the Codex driver has no marker {marker!r}: cancellation scenarios add "
-            "it with their liars"
-        )
+    def cancel_when(self, marker: str) -> Cancellation:
+        return close_when(self.provider, self.backend, marker)
 
     def children(self) -> tuple[int, ...]:
         return self.peer.pids()  # every process the route started for the cell
@@ -791,6 +808,10 @@ class CodexLegacyDriver:
         f"{adapter.__name__}._is_native_codex_binary",
         f"{adapter.__name__}._CODEX_CHATGPT_SESSION_CLI_VERSIONS_BY_MODEL",
     )
+    # One scripted tool is started for the call and opens its session before
+    # the request of the turn: some tenths of a second on an idle machine,
+    # two seconds where the test shares one hardware thread with busy loops.
+    startup_seconds: float = 5.0
     faults: tuple[str, ...] = ()
 
     @property
