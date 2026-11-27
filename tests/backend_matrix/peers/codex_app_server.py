@@ -31,9 +31,15 @@ of that notification, so what the notification says of one response is the
 provider's statement alone. It emits
 the exact per-response usage notification only to a client that asked for it,
 as the app-server does: ``experimentalApi`` in ``initialize`` and
-``experimentalRawEvents`` in ``thread/start``. And it goes away where a reply
-says so (``gone``): after the notifications of the reply it writes the
-leading part of a line the reply names, without a line end, and then either
+``experimentalRawEvents`` in ``thread/start``. It answers a ``thread/resume``
+of a thread that no session of the cell started with an error object and goes
+on serving: the tool keeps its threads in its home, and the home of a cell is
+new. That answer of the tool is emulated, not observed, and the error object
+is not in this file: the peer asks the provider side for it, which renders it
+from an envelope that says what it rests on. Resuming the thread of an earlier
+session of the cell is not played. And it goes away where a reply says so
+(``gone``): after the notifications of the reply it writes the leading part
+of a line the reply names, without a line end, and then either
 ends its output and exits with status 0, as a tool whose stream ends without
 the notification that ends the turn, or kills itself, as a tool that is gone
 in the middle of a response.
@@ -113,6 +119,16 @@ LOGIN_FILE = "auth.json"
 SANDBOX_POLICIES = {"read-only": {"type": "readOnly"}}
 PROVIDER_LABEL = "openai"
 
+# Where the peer asks the provider side what the app-server answers a request
+# to resume a thread it finds no rollout for: the origin of the scripted
+# provider, this path. The answer is rendered from an envelope; what the real
+# tool answers was not observed.
+RESUME_PATH = "/codex-app-server/v1/resume"
+# A lying counterpart for the matrix's own tests: the same rejection under
+# the code of invalid parameters, which a client may type otherwise.
+INVALID_PARAMS = -32602
+REJECT_AS_INVALID_PARAMS = "reject_as_invalid_params"
+
 EXIT_PROVIDER_FAILED = 1
 EXIT_UNSUPPORTED = 3
 EXIT_CRASHED = 4
@@ -120,6 +136,14 @@ EXIT_CRASHED = 4
 
 class _InputClosed(Exception):
     """The client closed the peer's standard input."""
+
+
+class _Rejected(Exception):
+    """The app-server answers a request with an error object and goes on."""
+
+    def __init__(self, error: dict[str, Any]) -> None:
+        super().__init__(str(error.get("message", "")))
+        self.error = error
 
 
 class _Unsupported(Exception):
@@ -247,6 +271,28 @@ def started_as(argv: list[str], config: dict[str, Any]) -> dict[str, Any]:
 def append_journal(config: dict[str, Any], record: dict[str, Any]) -> None:
     with open(config["journal"], "a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def note_thread(config: dict[str, Any], thread_id: str) -> None:
+    """Keep the id of a thread a session started, beside the journal of the cell.
+
+    The tool keeps a rollout of every thread in its home. The peer keeps the
+    ids, one a line, in a file of their own: the journal holds one record
+    for every process, and a thread is none.
+    """
+
+    with open(str(config["journal"]) + ".threads", "a", encoding="utf-8") as stream:
+        stream.write(thread_id + "\n")
+
+
+def started_threads(config: dict[str, Any]) -> set[str]:
+    """The ids of the threads that sessions of the cell have started so far."""
+
+    try:
+        with open(str(config["journal"]) + ".threads", encoding="utf-8") as stream:
+            return {line.strip() for line in stream if line.strip()}
+    except FileNotFoundError:
+        return set()
 
 
 def read_journal(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -395,11 +441,15 @@ class AppServer:
         config: dict[str, Any],
         stdin: BinaryIO,
         stdout: BinaryIO,
+        started: dict[str, Any] | None = None,
     ) -> None:
         self._command = command
         self._config = config
         self._stdin = stdin
         self._stdout = stdout
+        # What the journal says of how this process was started; a record
+        # the session adds later repeats it.
+        self._started = dict(started or {})
         self._requests: list[dict[str, Any]] = []
         self._servers: dict[str, ToolServer] = {}
         self._experimental = False
@@ -499,14 +549,54 @@ class AppServer:
             },
         }
         self._thread["described"]["thread"]["id"] = self._thread["id"]
+        note_thread(self._config, self._thread["id"])
         return dict(self._thread["described"])
 
     def _resume_thread(self, params: dict[str, Any]) -> dict[str, Any]:
-        """A client asks again for the thread this session holds."""
+        """A client asks for a thread again: the one this session holds, or one it does not.
 
-        if self._thread is None or params.get("threadId") != self._thread["id"]:
-            raise _Unsupported("the resumption of a thread this session did not start")
-        return dict(self._thread["described"])
+        The tool keeps its threads in its home, and the home of a cell is
+        new: it holds a thread only if a session of the cell started it.
+        Resuming the thread of an earlier session of the cell is not played.
+        For any other id the tool finds no rollout and answers the request
+        with an error object; the session goes on.
+        """
+
+        wanted = params.get("threadId")
+        if self._thread is not None and wanted == self._thread["id"]:
+            return dict(self._thread["described"])
+        if wanted in started_threads(self._config):
+            raise _Unsupported(
+                "the resumption of a thread that an earlier session of the cell started"
+            )
+        append_journal(
+            self._config, {**self._started, "role": "resume_rejected", "thread": str(wanted)}
+        )
+        error = self._rejection(str(wanted))
+        if REJECT_AS_INVALID_PARAMS in self._config.get("faults", ()):
+            error = {**error, "code": INVALID_PARAMS}
+        raise _Rejected(error)
+
+    def _rejection(self, thread: str) -> dict[str, Any]:
+        """The error object the tool answers a thread it finds no rollout for.
+
+        Asked of the provider side, which renders it from an envelope: no
+        code and no sentence of the tool lives in this file.
+        """
+
+        status, payload = self._post({"pid": os.getpid(), "thread": thread}, RESUME_PATH)
+        said = json.loads(payload) if status == 200 else None
+        error = said.get("error") if isinstance(said, dict) else None
+        if (
+            not isinstance(error, dict)
+            or type(error.get("code")) is not int
+            or not isinstance(error.get("message"), str)
+        ):
+            raise _Unsupported(
+                "the provider side does not say what the tool answers a thread it "
+                "finds no rollout for"
+            )
+        return error
 
     def _start_turn(self, params: dict[str, Any]) -> dict[str, Any]:
         import uuid  # noqa: PLC0415
@@ -547,7 +637,12 @@ class AppServer:
 
     # -- the model side --------------------------------------------------------
 
-    def _ask_provider(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, body: dict[str, Any], path: str | None = None) -> tuple[int, bytes]:
+        """Send one JSON document to the scripted provider; the status and the answer.
+
+        To the address of the configuration, or to ``path`` at its origin.
+        """
+
         import http.client  # noqa: PLC0415 - the probe never needs it
         from urllib.parse import urlsplit  # noqa: PLC0415
 
@@ -560,7 +655,7 @@ class AppServer:
         try:
             connection.request(
                 "POST",
-                target.path,
+                target.path if path is None else path,
                 body=json.dumps(body).encode("utf-8"),
                 headers={"Content-Type": "application/json", "User-Agent": CLIENT_NAME},
             )
@@ -568,8 +663,12 @@ class AppServer:
             payload = response.read()
         finally:
             connection.close()
-        if response.status != 200:
-            sys.stderr.write(f"scripted peer: the provider answered HTTP {response.status}\n")
+        return response.status, payload
+
+    def _ask_provider(self, body: dict[str, Any]) -> dict[str, Any]:
+        status, payload = self._post(body)
+        if status != 200:
+            sys.stderr.write(f"scripted peer: the provider answered HTTP {status}\n")
             raise SystemExit(EXIT_PROVIDER_FAILED)
         reply = json.loads(payload)
         if not isinstance(reply, dict):
@@ -671,7 +770,12 @@ class AppServer:
                 elif method == "thread/start":
                     self._emit({"id": message["id"], "result": self._start_thread(params)})
                 elif method == "thread/resume":
-                    self._emit({"id": message["id"], "result": self._resume_thread(params)})
+                    try:
+                        resumed = self._resume_thread(params)
+                    except _Rejected as rejected:
+                        self._emit({"id": message["id"], "error": rejected.error})
+                    else:
+                        self._emit({"id": message["id"], "result": resumed})
                 elif method == "turn/start":
                     self._emit({"id": message["id"], "result": self._start_turn(params)})
                     self._play()
@@ -700,7 +804,9 @@ def main(argv: list[str], config: dict[str, Any]) -> int:
         ):
             raise _Unsupported(f"the command line {record['argv'][:3]} ...")
         append_journal(config, {**record, "role": "app_server", "login": login_state()})
-        return AppServer(command, config, sys.stdin.buffer, sys.stdout.buffer).run()
+        return AppServer(
+            command, config, sys.stdin.buffer, sys.stdout.buffer, started=record
+        ).run()
     except _Gone as gone:
         return go_away(gone, sys.stdout.buffer)
     except _Unsupported as exc:

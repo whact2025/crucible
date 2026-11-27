@@ -23,9 +23,8 @@ provenance:
     of the vendor and the item the required fields of McpToolCallThreadItem
     with its result, whose one required field is the content list. The
     content is the list the tool server returned for the call, passed on as
-    it came. How the real tool reports a call that its server answered with
-    an error is not known and has no envelope: the dialect refuses to render
-    one.
+    it came. A call that its server answered with an error is reported from
+    an envelope of its own (app_server.tool_call_failed).
 
 status: 200
 

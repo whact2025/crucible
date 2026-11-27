@@ -44,6 +44,7 @@ from .provider import (
     ConversationDialect,
     LoopbackProvider,
     Reply,
+    ResponseCapDialect,
     SeenRequest,
     SentCall,
     StatelessDialect,
@@ -59,7 +60,9 @@ from .script import (
     READ_A,
     READ_B,
     Call,
+    Cut,
     Drop,
+    Empty,
     Malformed,
     ProviderScript,
     Refuse,
@@ -180,6 +183,11 @@ def test_canary_fails_when_the_request_did_not_come_through_the_redirect(
         )
 
 
+# The guard is asked for by name. Nothing but the guard stands between this
+# call and the production endpoint of the route, so the test must not run
+# where the fixtures of the package are not in force: there the fixture is
+# not found, and the test ends as a setup error before any request.
+@pytest.mark.usefixtures("_matrix_network_guard")
 def test_a_hosted_cell_without_the_redirect_is_stopped_by_the_network_guard(
     tmp_path: Path,
 ) -> None:
@@ -738,6 +746,18 @@ def test_envelopes_parse_through_the_installed_sdk(provider: str) -> None:
     tool_calls = tool_turn.choices[0].message.tool_calls
     assert tool_calls is not None and [item.id for item in tool_calls] == ["call-2"]
     assert tool_turn.choices[0].finish_reason == "tool_calls"
+    assert not called.call_malformed
+    # The arguments of a call travel as text in a string, so a text that is
+    # no JSON object travels too, through the same envelope and the same type
+    # of the SDK; the reply says that the call names no arguments.
+    cut = dialect.render(Call(READ_A, malformed='{"file_path": "notes'), asked, "call-3")
+    rewritten = ChatCompletion.model_validate(cut.body).choices[0].message.tool_calls
+    assert rewritten is not None and len(rewritten) == 1
+    written = rewritten[0]
+    assert written.function.arguments == '{"file_path": "notes'  # type: ignore[union-attr]
+    assert written.function.name == tool_calls[0].function.name  # type: ignore[union-attr]
+    assert cut.call_malformed and cut.call is not None and cut.call[2] == {}
+    assert cut.envelope == called.envelope
     assert called.call is not None and called.call[1] == "call-2"
 
 
@@ -1124,6 +1144,119 @@ def test_a_reply_that_arrives_whole_fails_the_cell_of_a_broken_terminal(
             driver=_with_dialect(_AnswersWhole),
         )
     assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
+
+
+# -- a reply cut at the cap on its tokens, and a reply without output ----------------
+
+
+@pytest.mark.parametrize("provider", ["gateway", "local"])
+def test_a_reply_cut_at_the_cap_and_a_reply_without_output_are_what_the_wire_carries(
+    provider: str,
+) -> None:
+    dialect = gateway.OpenAIChatDialect(provider, host=None, route_credential=False)
+    asked = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
+    text = "an answer the cap ended"
+
+    cut = dialect.render(Cut(text), asked, "call-1")
+    silent = dialect.render(Empty(), asked, "call-2")
+    ended, nothing = (ChatCompletion.model_validate(reply.body) for reply in (cut, silent))
+
+    # A reply the provider ended at the cap is a whole document of the SDK's
+    # completion type: the text that was produced, the cap as the finish
+    # reason of its one choice, and its usage, which is billed.
+    assert cut.envelope == f"openai_chat/{provider}.{gateway.OUTPUT_CUT}"
+    billed = Cut(text).usage
+    assert (cut.status, cut.usage, cut.served_model, cut.cut) == (200, billed, "asked", None)
+    assert (ended.choices[0].finish_reason, ended.choices[0].message.content) == ("length", text)
+    assert ended.usage is not None and ended.usage.completion_tokens == billed.output_tokens
+    # A reply in which nothing was produced ends on an ordinary finish, with
+    # the empty string as its content and a usage without a completion
+    # token; the input it read is billed.
+    assert silent.envelope == f"openai_chat/{provider}.{gateway.EMPTY_COMPLETION}"
+    assert (silent.status, silent.usage, silent.served_model) == (200, Empty().usage, "asked")
+    assert (nothing.choices[0].finish_reason, nothing.choices[0].message.content) == ("stop", "")
+    assert nothing.usage is not None
+    assert (nothing.usage.prompt_tokens, nothing.usage.completion_tokens) == (
+        Empty().usage.input_tokens,
+        0,
+    )
+    # Neither reply was observed or is documented: both are constructed.
+    for behaviour in (gateway.OUTPUT_CUT, gateway.EMPTY_COMPLETION):
+        assert envelopes.load(f"openai_chat/{provider}.{behaviour}").grade == "constructed"
+    # The wire has a field for the cap on the tokens of a response, under
+    # two spellings; the dialect reads either and says so of its wire.
+    assert isinstance(dialect, ResponseCapDialect) and dialect.response_cap_field
+
+    def cap(body: bytes) -> int | None:
+        return dialect.parse("POST", dialect.path, {}, body, credential="").response_cap
+
+    assert cap(b'{"model": "m", "max_tokens": 7}') == 7
+    assert cap(b'{"model": "m", "max_completion_tokens": 9}') == 9
+    assert cap(b'{"model": "m", "max_completion_tokens": 9, "max_tokens": 7}') == 9
+    assert cap(b'{"model": "m"}') is None and cap(b'{"model": "m", "max_tokens": "7"}') is None
+
+
+class _SeesNoCap(gateway.OpenAIChatDialect):
+    """Reads every request as one without a cap on the tokens of its response."""
+
+    def parse(self, *args: Any, **kwargs: Any) -> SeenRequest:
+        return dataclasses.replace(super().parse(*args, **kwargs), response_cap=None)
+
+
+class _AnswersInFull(gateway.OpenAIChatDialect):
+    """Answers a reply that was cut, or that produced nothing, with a plain answer."""
+
+    def render(self, step: Step, seen: SeenRequest, call_id: str) -> Reply:
+        if isinstance(step, (Cut, Empty)):
+            step = Say("an answer in full")
+        return super().render(step, seen, call_id)
+
+
+@pytest.mark.parametrize("scenario", ["S17", "S25"])
+def test_a_plain_answer_fails_the_cell_of_a_cut_reply_and_of_a_reply_without_output(
+    scenario: str, tmp_path: Path
+) -> None:
+    cell = Cell(_column(HOSTED_GATEWAY_KIND), scenario, "raw")
+    honest = _played(cell.column, scenario, tmp_path / "honest")
+    provider = honest.observation.provider
+    behaviour = gateway.OUTPUT_CUT if scenario == "S17" else gateway.EMPTY_COMPLETION
+
+    # The honest cell is answered from the one reply of its scenario, through
+    # the SDK and a real socket; the reply states its usage, which is billed,
+    # and the request carried the cap of the route.
+    assert (provider.request_count, provider.extra, len(provider.billed)) == (1, 0, 1)
+    assert provider.envelopes == [f"openai_chat/gateway.{behaviour}"]
+    assert provider.response_cap_field and all(
+        request.response_cap for request in provider.requests
+    )
+    # A provider side that answers in full yields a clean finish: the cell
+    # fails, whatever the ledger holds for it.
+    with pytest.raises(ledger.LedgerMismatch) as refused:
+        runner.run_cell(
+            cell,
+            tmp_path / "lying",
+            preflight={HOSTED_GATEWAY_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_AnswersInFull),
+        )
+    assert "'kind:none!=transport'" in str(refused.value).splitlines()[0]
+
+
+def test_a_request_without_the_cap_of_the_route_fails_the_cell_of_the_cut(tmp_path: Path) -> None:
+    cell = Cell(_column(HOSTED_GATEWAY_KIND), "S17", "raw")
+
+    # The route declares that its cap is enforced where the provider is, and
+    # its wire has a field for it: a request that is read without the cap is
+    # one more code on the cell, which its entry does not hold.
+    with pytest.raises(ledger.LedgerMismatch, match="different deviation") as refused:
+        runner.run_cell(
+            cell,
+            tmp_path,
+            preflight={HOSTED_GATEWAY_KIND: None},
+            known=LEDGER,
+            driver=_with_dialect(_SeesNoCap),
+        )
+    assert "'request.content:response_cap'" in str(refused.value).splitlines()[0]
 
 
 # -- the module ends with the canary check --------------------------------------------

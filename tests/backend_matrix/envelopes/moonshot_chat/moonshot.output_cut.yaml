@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A streamed chat completion that the provider ended at the cap on the tokens
+# of the response, in the dialect of the Moonshot route: the reasoning and
+# the text that was produced before the cap arrive, the finish chunk names
+# the cap as the finish reason, and the stream ends in order with its usage.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: moonshot_chat
+provider: moonshot
+behaviour: output_cut
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletionChunk objects whose finish chunk has the
+    finish_reason "length", a value of the closed vocabulary of
+    openai.types.chat.chat_completion_chunk.Choice.finish_reason
+  sdk_version: openai 2.14.0
+  notes: >-
+    The chunks are those of the completion envelope of this dialect, whose
+    shape was observed live and is documented by the vendor, with one value
+    changed: the finish reason, which is the one the pinned SDK types for a
+    reply that reached the maximum number of tokens of its request. One
+    thing is known of a capped reply of the route and does not make this
+    envelope more than constructed: in the adapter-level live check of
+    2026-11-19 (the second check of the model update, a response cap of 16
+    tokens on a text role) the shipped adapter ended with its terminal for a
+    cut and reported 130 input and 16 output tokens. So the route ends a
+    capped reply with a mark that the pinned stack reads as a cut, and the
+    reply states its usage. Which field carried the mark, and whether the
+    stream had a statistics chunk and a closing message as a plain one has,
+    was not noted, and no body was stored. So this envelope proves that such
+    a stream parses through the pinned SDK, not that the route sends it. The
+    reasoning text is a slot. The last entry is the closing message of the
+    stream, which is no JSON document.
+
+status: 200
+body:
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          role: assistant
+          reasoning_content: {slot: reasoning_text}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta:
+          content: {slot: text}
+        finish_reason: null
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices:
+      - index: 0
+        delta: {}
+        finish_reason: length
+        usage:
+          prompt_tokens: {slot: input_tokens}
+          completion_tokens: {slot: output_tokens}
+          total_tokens: {slot: total_tokens}
+          prompt_tokens_details:
+            cache_write_tokens: 0
+          completion_tokens_details:
+            reasoning_tokens: {slot: reasoning_tokens}
+  - id: {slot: response_id}
+    object: chat.completion.chunk
+    created: {slot: created}
+    model: {slot: served_model}
+    choices: []
+    usage:
+      prompt_tokens: {slot: input_tokens}
+      completion_tokens: {slot: output_tokens}
+      total_tokens: {slot: total_tokens}
+      prompt_tokens_details:
+        cache_write_tokens: 0
+      completion_tokens_details:
+        reasoning_tokens: {slot: reasoning_tokens}
+  - "[DONE]"

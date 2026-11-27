@@ -31,6 +31,12 @@ provenance:
     the command line (crucible/backends/claude.py, where the names of the
     server's tools are built), so the name is written to the adapter. The
     input is the decoded argument object, as ToolUseBlock.input is typed.
+    A tool that no configured server lists is written under the first
+    server, and the scripted tool then asks that server for it, which
+    refuses the name. What the real tool does with a model's call for a
+    name it never listed (it may answer the model itself and ask no server)
+    is stated by no source in reach: that the call is forwarded is a choice
+    of this dialect, and what an adapter sees of such a call rests on it.
 
 status: 200
 

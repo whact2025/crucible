@@ -13,6 +13,7 @@ P04 rules on synthetic ledgers and inventories.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
 import dataclasses
@@ -55,6 +56,7 @@ from crucible.backends.features import FeatureAdmissionError
 from crucible.backends.pricing import ModelPricing
 
 from . import cells, contract, declarations, ledger, mutation, netguard, runner, toolsets
+from . import scenarios
 from . import report as matrix_report
 from . import write_host as host_program
 from . import columns as matrix_columns
@@ -76,9 +78,11 @@ from .provider import (
     UNSCRIPTED_STATUS,
     CacheCountingDialect,
     CacheCounts,
+    KeeperDialect,
     LoopbackProvider,
     ProviderLedger,
     Reply,
+    ResponseCapDialect,
     SeenRequest,
     StatelessDialect,
     ToyDialect,
@@ -95,6 +99,7 @@ from .scenarios import (
     D_STRUCT_UNQUALIFIED,
     DEADLINE_SLACK_SECONDS,
     GUARDED,
+    MALFORMED_ARGUMENT_TEXTS,
     PACK_A,
     PACK_B,
     SCENARIOS,
@@ -115,7 +120,9 @@ from .script import (
     READ_A,
     WRITE,
     Call,
+    Cut,
     Drop,
+    Empty,
     Loop,
     Malformed,
     ProviderScript,
@@ -125,7 +132,7 @@ from .script import (
     Step,
     TokenUsage,
 )
-from .toolsets import BINDINGS, WRITER
+from .toolsets import BINDINGS, NOTES_FILE, WRITER
 
 LEDGER = ledger.load()
 TOY_CELLS = cells.cells_of((TOY_KIND,))
@@ -174,9 +181,14 @@ def test_liar_yields_exactly_its_codes(liar: toy.Liar, tmp_path: Path) -> None:
     for clause, outcome in report.outcomes.items():
         assert {contract.clause_of(item.code) for item in outcome.deviations} <= {clause}
     if execution.observation.raised is not None:
-        # A raise stands for the result clauses: its code, and no outcome of theirs.
-        for clause in RESULT_CLAUSES:
-            assert report.outcomes[clause].status == "stood_for"
+        # A raise stands for the result clauses: its code, and no outcome of
+        # theirs. Where the selected variant expects a refusal, those
+        # clauses are no part of the cell at all.
+        if execution.plan.expect.outcome == "result":
+            for clause in RESULT_CLAUSES:
+                assert report.outcomes[clause].status == "stood_for"
+        else:
+            assert not set(RESULT_CLAUSES) & set(report.outcomes)
     if not SCENARIOS[liar.scenario].canary:
         assert report.not_evaluated() == frozenset()
     # As a test item the liar's cell fails: it has no ledger entry.
@@ -424,23 +436,47 @@ def _reference() -> contract.Reference:
 
 def test_refused_variant_accepts_only_its_refusal_before_transport() -> None:
     expect = Expectation(outcome="refused", refused_type="FeatureAdmissionError")
+    adapter = "crucible.backends.an_adapter"
 
-    def codes(observation: contract.Observation) -> frozenset[str]:
+    def codes(observation: contract.Observation, built: str = adapter) -> frozenset[str]:
         report = contract.evaluate(
-            observation, expect, _reference(), lens="raw", toolset=False
+            dataclasses.replace(observation, backend_module=built),
+            expect,
+            _reference(),
+            lens="raw",
+            toolset=False,
         )
         assert not set(RESULT_CLAUSES) & set(report.outcomes)
         return report.codes
 
-    refusal = Raised("FeatureAdmissionError", "before_request", "crucible.backends.config")
-    other = Raised("ValueError", "before_request", "crucible.backends.config")
-    late = Raised("FeatureAdmissionError", "after_request", "crucible.backends.config")
+    refusal = Raised("FeatureAdmissionError", "before_request", adapter, left_invoke=True)
+    other = Raised("ValueError", "before_request", adapter, left_invoke=True)
+    late = Raised("FeatureAdmissionError", "after_request", adapter, left_invoke=True)
     result = InvocationResult("", (), Usage(), "end_turn")
 
     assert codes(_observation(raised=refusal)) == frozenset()
     assert codes(_observation(raised=other)) == {other.code}
     assert codes(_observation(raised=late)) == {late.code}
     assert codes(_observation(result=result)) == {"kind:none!=refused"}
+    # The type alone is no refusal of the route. The agreed type that never
+    # left invoke (the driver or routing raised it while the backend was
+    # built), the agreed type that left invoke out of another module than
+    # the one of the backend, and any raise of a cell that built no backend
+    # keep their code: a cell passes on a refusal only where the backend it
+    # built raised it out of the call.
+    at_build = dataclasses.replace(refusal, left_invoke=False)
+    elsewhere = dataclasses.replace(refusal, module="crucible.backends.config")
+    assert at_build.code == refusal.code != elsewhere.code
+    assert codes(_observation(raised=at_build)) == {at_build.code}
+    assert codes(_observation(raised=elsewhere)) == {elsewhere.code}
+    assert codes(_observation(raised=refusal), built="") == {refusal.code}
+    assert codes(_observation(raised=refusal), built=elsewhere.module) == {refusal.code}
+    assert not Raised("FeatureAdmissionError", "before_request", adapter).left_invoke
+    # A result where a refusal is expected is what the scenario contract
+    # says of the cell: no clause about a result is part of it, so the code
+    # is booked under none of them.
+    assert contract.clause_of("kind:none!=refused") == contract.SCENARIO
+    assert contract.clause_of("kind:none!=transport") == "C2"
 
 
 def test_refused_variant_plans_zero_requests_and_a_table_must_be_total() -> None:
@@ -2885,6 +2921,51 @@ def test_skip_and_xfail_markers_are_a_collection_error(tmp_path: Path) -> None:
     assert "passed" not in output and "skipped" not in output.split("refuses")[0]
 
 
+def test_an_item_of_the_package_without_its_fixtures_refuses_the_run() -> None:
+    package = Path(__file__).resolve().parent
+    fixtures = ("_matrix_network_guard", "_matrix_environment")
+
+    def item(path: Path, *names: str) -> SimpleNamespace:
+        return SimpleNamespace(nodeid=f"{path.name}::test_it", path=path, fixturenames=names)
+
+    whole = item(package / "test_matrix_static.py", "tmp_path", *fixtures)
+    # The fixtures are in force for every item of the package: nothing is said.
+    cells.refuse_items_without_fixtures([whole], package, fixtures)
+    # An item outside the package is not the package's to judge.
+    cells.refuse_items_without_fixtures(
+        [whole, item(package.parent / "test_other.py", "tmp_path")], package, fixtures
+    )
+    # The lying run: pytest collected a module of the package after it had
+    # left the directory, and the items of that module carry neither fixture
+    # of the package, or one of the two. The run is refused before any test,
+    # with the count, the first such item and how the package is called.
+    for names in ((), fixtures[:1], fixtures[1:]):
+        lost = item(package / "test_matrix_launch.py", "tmp_path", *names)
+        with pytest.raises(pytest.UsageError, match="side by side") as refused:
+            cells.refuse_items_without_fixtures([whole, lost, lost], package, fixtures)
+        assert "2 item(s)" in str(refused.value) and lost.nodeid in str(refused.value)
+        assert whole.nodeid not in str(refused.value)
+    # An item that states no fixtures at all is refused as well.
+    bare = SimpleNamespace(nodeid="test_matrix_self.py::bare", path=package / "test_matrix_self.py")
+    with pytest.raises(pytest.UsageError, match="side by side"):
+        cells.refuse_items_without_fixtures([bare], package, fixtures)
+    # The conftest of the package asks for every fixture it applies to all
+    # tests: one it gained and did not name here would be lost in silence.
+    conftest = ast.parse((package / "conftest.py").read_text(encoding="utf-8"))
+    applied = {
+        node.name
+        for node in conftest.body
+        if isinstance(node, ast.FunctionDef)
+        and any("autouse=True" in ast.unparse(decorator) for decorator in node.decorator_list)
+    }
+    (named,) = (
+        ast.literal_eval(node.value)
+        for node in conftest.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "_IN_FORCE"
+    )
+    assert applied == set(named) == set(fixtures)
+
+
 # -- H03 and P04 on synthetic ledgers and inventories ----------------------------
 
 
@@ -3003,6 +3084,10 @@ def test_h03_refuses_a_ruling_on_a_record_that_withdraws_no_cell() -> None:
         "R14",
         "R15",
         "R16",
+        "R17",
+        "R19",
+        "R20",
+        "R21",
     }
     # With a cell of the record withdrawn the ruling is what H03 asks for.
     # Either the cell is pinned not expressible ...
@@ -3327,9 +3412,12 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
     counted = {
         "G09": 1,
         "G10": 2,
+        "G13": 1,
         "G18": 3,
+        "G25": 1,
+        "G27": 1,
         "G34": 2,
-        "G35": 9,
+        "G35": 11,
         "M10": 2,
         "R07": 2,
         "R08": 1,
@@ -3338,11 +3426,14 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
         "R11": 2,
         "R14": 1,
         "R16": 1,
+        "R17": 1,
+        "R20": 1,
+        "R21": 1,
     }
     assert graded == set(counted)
     assert {gap: len(LEDGER.registry[gap].cells) for gap in counted} == counted
     references = {gap for gap in graded if LEDGER.registry[gap].origin == "reference"}
-    assert references == {"R07", "R08", "R09", "R10", "R11", "R14", "R16"}
+    assert references == {"R07", "R08", "R09", "R10", "R11", "R14", "R16", "R17", "R20", "R21"}
     # What the record of each says its cells are answered from today. A
     # cell of a reference may be answered from several frames; its grade is
     # that of the weakest, and each of these is constructed. A change that
@@ -3372,6 +3463,23 @@ def test_h03_refuses_to_close_a_provider_fact_gap_on_a_reply_below_its_grade() -
             "codex_app_server/app_server.reasoning",
             "codex_app_server/app_server.turn_completed",
         },
+        # The general frames of a tool call and of an answered turn. The
+        # failed item of a call for a name no server lists, which the grade
+        # of the record is about, is rendered from what the tool server
+        # answered and is read here for no cell.
+        "R17": tool_call
+        | {
+            "codex_app_server/app_server.agent_message",
+            "codex_app_server/app_server.turn_completed",
+        },
+        # An empty completion: the usage notification and the completed turn.
+        "R20": {
+            "codex_app_server/app_server.token_usage_updated",
+            "codex_app_server/app_server.turn_completed",
+        },
+        # A refused resume: the one envelope of the refusal, which no model
+        # turn follows.
+        "R21": {"codex_app_server/app_server.resume_rejected"},
     }
     assert set(answered) == references
     for gap, frames in answered.items():
@@ -3538,6 +3646,82 @@ def test_the_grade_h03_reads_is_that_of_the_replies_the_dialect_answers_a_cell_f
     # A toy cell is answered from no envelope, and a static cell from nothing.
     assert world.grade(TOY_CELLS[0].id) is None
     assert world.grade("all/H03/-/static") is None
+
+
+# The cells that no model answers. Their invocation asks to continue a
+# conversation, their route answers the request, and a tool beside the
+# adapter keeps the conversations of their wire: each is answered from what
+# that tool says of a handle it does not hold, an envelope that says of
+# itself that it is emulated and was not observed.
+_REFUSED_BY_A_KEEPER = {
+    "claude/S50/primary/raw": "claude_cli/cli.resume_rejected",
+    "codex:legacy/S50/primary/raw": "codex_app_server/app_server.resume_rejected",
+    "codex:official/S50/primary/raw": "codex_app_server/app_server.resume_rejected",
+}
+
+
+def test_h03_reads_what_the_keeper_of_a_conversation_says_as_what_a_cell_is_answered_from() -> (
+    None
+):
+    world = cells.world()
+    # The lying counterpart: the verdict of such a cell is held as emulated
+    # until the tool is observed, in the form the ledger has for that, a
+    # record that closes on a documented reply. Then the codes of the record
+    # go from the cell, or were never there because the cell was green. The
+    # script of the cell is empty, so a reading that renders the steps of the
+    # script finds no envelope, the cell has no grade, and the record closes
+    # on the emulation.
+    for cell, envelope in _REFUSED_BY_A_KEEPER.items():
+        current = dict(world.current(cell))
+        closed = _document()
+        closed["registry"]["emulated"] = {
+            "title": "A verdict that rests on what a vendor tool is emulated to say",
+            "origin": "reference",
+            "severity": "medium",
+            "closes_on_grade": "documented",
+            "cells": [{"cell": cell, "observed_under": current, "closes_under": current}],
+        }
+        assert _problem_codes(closed) == {"static:registry_closed_below_grade"}, cell
+        (held,) = _closed_below_grade(closed, world)
+        assert cell in held and "of grade constructed" in held
+        # The same ledger is a fix once a reply of the named grade answers
+        # the cell.
+        assert _problem_codes(closed, grade=lambda _cell: "documented") == set(), cell
+        # What is read without a play: the one envelope, and the grade it
+        # states of itself.
+        assert cells.answered_from(cell) == (envelope,)
+        assert world.grade(cell) == matrix_envelopes.load(envelope).grade == "constructed"
+    # No other cell is answered from such an envelope. A route that refuses
+    # the request before transport asks nobody: its cell is answered from
+    # nothing and has no grade.
+    refusals = set(_REFUSED_BY_A_KEEPER.values())
+    asked = {
+        cell.id
+        for cell in cells.behaviour_cells()
+        if cell.column.kind != TOY_KIND and refusals & set(cells.answered_from(cell.id))
+    }
+    assert asked == set(_REFUSED_BY_A_KEEPER)
+    for kind in sorted(matrix_columns.OPEN_WEIGHT_KINDS):
+        refused = f"{kind}/S50/primary/raw"
+        assert cells.answered_from(refused) == () and world.grade(refused) is None
+    # The reading follows the plan and not the kind. On a wire with such a
+    # tool a route that refused the request before transport would ask
+    # nobody, and neither does a call that asks to continue no conversation;
+    # on a wire without one there is nobody but the adapter to ask.
+    scenario = SCENARIOS["S50"]
+    answering = scenario.plan()
+    refusing = plan_for(
+        scenario, {"session_continuity": scenario.differences["session_continuity"]["none"]}
+    )
+    assert answering.conversation is not None and refusing.conversation is not None
+    assert (answering.expect.outcome, refusing.expect.outcome) == ("result", "refused")
+    for cell, envelope in _REFUSED_BY_A_KEEPER.items():
+        kind = ledger.parse_cell_id(cell)[0]
+        assert cells.envelopes_of(kind, answering) == (envelope,)
+        assert cells.envelopes_of(kind, refusing) == ()
+        assert cells.envelopes_of(kind, dataclasses.replace(answering, conversation=None)) == ()
+    for kind in sorted(matrix_columns.OPEN_WEIGHT_KINDS):
+        assert cells.envelopes_of(kind, answering) == ()
 
 
 def test_h03_entry_rules() -> None:
@@ -3761,7 +3945,18 @@ def test_h03_refuses_an_entry_that_outlives_a_proof_it_leans_on() -> None:
     # A proof holds what the codes of an entry do not say. The records whose
     # entries lean on one are named here, so that a row of the table cannot
     # go with its proof while an entry still names the record.
-    assert set(cells.RECORD_PROOFS) == {"R04", "R05", "R08", "R09", "R13", "R16"}
+    assert set(cells.RECORD_PROOFS) == {
+        "M18",
+        "R04",
+        "R05",
+        "R08",
+        "R09",
+        "R13",
+        "R16",
+        "R17",
+        "R20",
+        "R21",
+    }
     assert set(cells.RECORD_PROOFS) <= set(LEDGER.registry)
     # Each of them is named by an entry today, and every proof those entries
     # lean on is one the verifier requires by name.
@@ -4397,7 +4592,15 @@ def test_a_route_whose_roles_resolve_to_different_profiles_is_a_setup_error(
 def test_toy_columns_are_derived_from_the_snapshot_not_typed() -> None:
     snapshot = declarations.snapshot_profiles(declarations.load_snapshot())
     fields = governing_fields()
-    assert fields == ("event_detail", "structured_output", "turn_limit", "usd_limit")
+    assert fields == (
+        "event_detail",
+        "structured_output",
+        "turn_limit",
+        "usd_limit",
+        "tool_loop",
+        "response_token_limit",
+        "session_continuity",
+    )
     combinations = {tuple(str(getattr(row, name)) for name in fields) for row in snapshot.values()}
 
     derived = cells.toy_columns()
@@ -5225,6 +5428,563 @@ def test_a_write_is_judged_by_the_last_text_its_script_puts_on_disk(tmp_path: Pa
     ((write_id, written),) = third.tool_results
     assert written.startswith("OK") and all(item.name != BINDINGS[WRITE].name for item in returned)
     assert with_request(2, tool_results=((write_id, written + " And a word."),)) == frozenset()
+
+
+# -- limits inside a tool loop, and tool calls that must not be dispatched ----------
+
+
+def test_a_loop_that_requires_nothing_is_never_owed_and_counts_its_own_requests() -> None:
+    tools = {"tools": [BINDINGS[READ_A].name]}
+
+    def answer(call_id: str) -> dict[str, Any]:
+        return {**tools, "tool_results": [{"id": call_id, "text": "result"}]}
+
+    script = ProviderScript(
+        (Loop(Call(READ_A), limit=3, at_least=2), Loop(Say("answer"), limit=1, at_least=0))
+    )
+    assert runner._required_steps(script) == 1
+
+    # The call ends after the rounds the first loop requires: nothing is owed.
+    with LoopbackProvider(script, credential="c") as provider:
+        (call,) = _ask(provider, tools)[1]["calls"]
+        assert _ask(provider, answer(call["id"]))[1]["type"] == "tool_calls"
+        seen = provider.freeze()
+    assert (seen.extra, seen.unconsumed, seen.request_count) == (0, 0, 2)
+    # One round short of them: the first loop is owed, the second never.
+    with LoopbackProvider(script, credential="c") as provider:
+        _ask(provider, tools)
+        seen = provider.freeze()
+    assert (seen.extra, seen.unconsumed) == (0, 1)
+    with LoopbackProvider(script, credential="c") as provider:
+        seen = provider.freeze()
+    assert (seen.extra, seen.unconsumed) == (0, 1)
+    # Asked on: the rounds up to the limit of the first loop, then the answer
+    # of the second, which counts its own requests, once; then nothing.
+    with LoopbackProvider(script, credential="c") as provider:
+        (call,) = _ask(provider, tools)[1]["calls"]
+        for _ in range(2):
+            (call,) = _ask(provider, answer(call["id"]))[1]["calls"]
+        assert _ask(provider, answer(call["id"]))[1]["text"] == "answer"
+        assert _ask(provider, tools)[0] == UNSCRIPTED_STATUS
+        seen = provider.freeze()
+    assert (seen.extra, seen.unconsumed, seen.request_count) == (1, 0, 5)
+    # A loop that requires a request is owed where it was never reached.
+    owed = ProviderScript((Loop(Call(READ_A), limit=1), Loop(Say("answer"), limit=1)))
+    with LoopbackProvider(owed, credential="c") as provider:
+        _ask(provider, tools)
+        seen = provider.freeze()
+    assert (seen.extra, seen.unconsumed) == (0, 1)
+
+
+def test_a_call_that_names_no_arguments_or_no_attached_tool_allows_no_dispatch(
+    tmp_path: Path,
+) -> None:
+    read = BINDINGS[READ_A]
+    malformed = _honest(tmp_path / "malformed", "S05")
+    # Three calls, none with a JSON object for its arguments: a text that is
+    # no JSON document, a document that says "nothing", a list that is not
+    # empty. Each was answered, and none reached the ToolSet.
+    texts = MALFORMED_ARGUMENT_TEXTS
+    decoded = [json.loads(text) for text in texts[1:]]
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(texts[0])
+    assert decoded == [None, [NOTES_FILE]] and len(texts) == 3
+    calls = malformed.observation.provider.sent_calls
+    assert len(calls) == len(texts) and malformed.observation.provider.request_count == 4
+    assert all(call.malformed and call.arguments == {} for call in calls)
+    assert malformed.observation.toolset_log == ()
+    sent = calls[0]
+    # Whatever reaches the ToolSet for the call is a dispatch the script never
+    # asked for: the tool with an empty object, with the arguments of its
+    # binding, or with anything else.
+    for arguments in ({}, dict(read.arguments), {"file_path": "another.txt"}):
+        reached = (toolsets.Dispatch(read.name, arguments, "a result"),)
+        assert _judge(malformed, toolset_log=reached) == {f"dispatch.extra:{READ_A}"}
+    # So is what a ToolSet was handed in the place of an argument object:
+    # the text as the model wrote it, or the value a text decodes to.
+    for handed in (*texts, *decoded, 0):
+        reached = (toolsets.Dispatch(read.name, {}, "an answer", not_a_mapping=(handed,)),)
+        assert _judge(malformed, toolset_log=reached) == {f"dispatch.extra:{READ_A}"}
+    # The same call with arguments is one the script asked for; where the
+    # scenario allows no dispatch of it, it still must not run.
+    plain = dataclasses.replace(sent, malformed=False, arguments=dict(read.arguments))
+    asked = dataclasses.replace(malformed.observation.provider, sent_calls=[plain])
+    reached = (toolsets.Dispatch(read.name, dict(read.arguments), "a result"),)
+    assert _judge(malformed, provider=asked, toolset_log=reached) == {
+        f"dispatch.extra:{READ_A}"
+    }
+    allowed = dataclasses.replace(malformed.plan.expect, dispatch=(READ_A,))
+    assert _judge(malformed, provider=asked, toolset_log=reached, expect=allowed) == frozenset()
+    # A call that names no arguments is the dispatch of nothing, whatever a
+    # scenario requires of it.
+    assert _judge(malformed, toolset_log=reached, expect=allowed) == {
+        f"dispatch.extra:{READ_A}",
+        f"dispatch.missing:{READ_A}",
+    }
+    # And a ToolSet that was handed nothing is not the dispatch of a call
+    # whose arguments are an empty object: "no arguments" is not "{}".
+    empty = dataclasses.replace(sent, malformed=False, arguments={})
+    asked_empty = dataclasses.replace(malformed.observation.provider, sent_calls=[empty])
+    as_object = (toolsets.Dispatch(read.name, {}, "a result"),)
+    assert _judge(malformed, provider=asked_empty, toolset_log=as_object, expect=allowed) == (
+        frozenset()
+    )
+    for handed in (None, []):
+        nothing = (toolsets.Dispatch(read.name, {}, "a result", not_a_mapping=(handed,)),)
+        assert _judge(
+            malformed, provider=asked_empty, toolset_log=nothing, expect=allowed
+        ) == {f"dispatch.extra:{READ_A}", f"dispatch.missing:{READ_A}"}
+
+    unattached = _honest(tmp_path / "unattached", "S06")
+    (sent,) = unattached.observation.provider.sent_calls
+    slot = sent.slot
+    name = BINDINGS[slot].name
+    assert name == toolsets.UNATTACHED_TOOL and not sent.malformed
+    assert name not in unattached.reference.attached_tools
+    assert unattached.observation.toolset_log == ()
+    # The name itself must not reach the ToolSet, and no attached tool in its
+    # place.
+    handed_on = (toolsets.Dispatch(name, dict(sent.arguments), "ERROR: unknown tool"),)
+    assert _judge(unattached, toolset_log=handed_on) == {f"dispatch.extra:{slot}"}
+    in_its_place = (toolsets.Dispatch(read.name, dict(sent.arguments), "a result"),)
+    assert _judge(unattached, toolset_log=in_its_place) == {f"dispatch.extra:{READ_A}"}
+    # No fixture of the matrix attaches the name.
+    for spec in (toolsets.READ, toolsets.READ_BOUNDED(1), WRITER(2)):
+        fixture = toolsets.build(spec, tmp_path / f"fixture-{spec.label}")
+        assert name not in {str(item["name"]) for item in fixture.toolset.to_anthropic_tools()}
+
+
+def test_the_recorder_keeps_what_a_toolset_was_handed_and_passes_its_answer_on(
+    tmp_path: Path,
+) -> None:
+    read = BINDINGS[READ_A]
+    # What an adapter can hand a ToolSet in the place of an argument object:
+    # a list, the text the model wrote, any other text, nothing, an empty
+    # list, a number. The ToolSet of the product answers each of them; the
+    # recorder must not fail where it answers, and must not lose the call.
+    for number, handed in enumerate(
+        ([NOTES_FILE], MALFORMED_ARGUMENT_TEXTS[0], NOTES_FILE, None, [], 0)
+    ):
+        fixture = toolsets.build(toolsets.READ, tmp_path / f"fixture-{number}")
+        # The method of the product's class, past the recorder of the instance.
+        unrecorded = type(fixture.toolset).dispatch(fixture.toolset, read.name, handed)
+        assert fixture.log == []
+        answer = fixture.toolset.dispatch(read.name, handed)
+        # The caller gets the ToolSet's own answer, and the call is on record
+        # with what was handed over, as it came.
+        assert answer == unrecorded and answer.startswith("ERROR")
+        assert fixture.log == [toolsets.Dispatch(read.name, {}, answer, (handed,))]
+        assert fixture.returned is fixture.log
+        (logged,) = fixture.log
+        assert logged.not_a_mapping[0] is handed or logged.not_a_mapping[0] == handed
+
+    # A mapping is recorded as the arguments of the call, as before.
+    fixture = toolsets.build(toolsets.READ, tmp_path / "fixture-mapping")
+    for arguments in (dict(read.arguments), {}):
+        answer = fixture.toolset.dispatch(read.name, arguments)
+        assert fixture.log[-1] == toolsets.Dispatch(read.name, arguments, answer)
+        assert fixture.log[-1].not_a_mapping == ()
+    assert [item.result.startswith("ERROR") for item in fixture.log] == [False, True]
+
+
+def test_only_a_wire_of_function_calls_carries_a_call_without_arguments() -> None:
+    script = SCENARIOS["S05"].plan().script
+    pinned = {
+        row["kind"]: row["step"]
+        for row in cells.load_inventory().not_expressible
+        if row["scenario"] == "S05"
+    }
+    carried: set[str] = set()
+    for kind in sorted(registered_kinds() - {TOY_KIND}):
+        try:
+            answered = cells.drivers.get(kind).answers(script)
+        except MatrixSetupError as exc:
+            assert "decoded object" in str(exc) and "not expressible" in str(exc)
+        else:
+            assert answered
+            carried.add(kind)
+
+    # The rows are exactly the kinds whose dialect refuses the step, and the
+    # scenario has a cell on every other kind. The three are the kinds whose
+    # scripted wire is a session of the vendor's tool, all references: every
+    # open-weight kind plays the scenario.
+    assert set(pinned.values()) == {"Call(malformed)"} and len(pinned) == 3
+    assert set(pinned) <= set(matrix_columns.REFERENCE_KINDS)
+    assert carried == set(matrix_columns.REAL_KINDS) - set(pinned)
+    assert set(matrix_columns.OPEN_WEIGHT_KINDS) <= carried
+    generated = {
+        cell.column.kind for cell in cells.behaviour_cells() if cell.scenario == "S05"
+    }
+    assert generated == carried | {TOY_KIND}
+    # The call for a tool that is not attached travels on every wire.
+    unattached = SCENARIOS["S06"].plan().script
+    for kind in sorted(registered_kinds() - {TOY_KIND}):
+        assert cells.drivers.get(kind).answers(unattached)
+
+
+def test_the_budget_inside_a_tool_loop_goes_by_whose_the_loop_is() -> None:
+    scenario = SCENARIOS["S14"]
+    assert scenario.governing == ("tool_loop",)
+    assert declarations.totality_gaps(scenario.differences) == []
+
+    def plan(value: str) -> Any:
+        profile = dataclasses.replace(CONSERVATIVE_BACKEND_FEATURES, tool_loop=value)  # type: ignore[arg-type]
+        return plan_for(scenario, declarations.select(scenario.differences, profile))
+
+    own, vendors = plan("adapter_owned"), plan("sdk_owned")
+    # A loop of the adapter's own: exactly the two rounds, no third request.
+    (rounds,) = own.script.steps
+    assert isinstance(rounds, Loop) and (rounds.limit, rounds.at_least) == (2, 2)
+    # A loop of a vendor's tool: two to four rounds, and an answer that is
+    # never required.
+    rounds, answer = vendors.script.steps
+    assert isinstance(rounds, Loop) and (rounds.limit, rounds.at_least) == (4, 2)
+    assert isinstance(answer, Loop) and isinstance(answer.step, Say) and answer.at_least == 0
+    assert runner._required_steps(vendors.script) == runner._required_steps(own.script) == 1
+    assert len(vendors.expect.dispatch_optional) == 3 and len(own.expect.dispatch_optional) == 1
+    for played in (own, vendors):
+        assert played.expect.kind == "budget_exhausted" and played.expect.retriable is False
+        assert played.expect.dispatch == (READ_A,) and played.budget_usd == BUDGET_USD
+        # One round costs less than the budget and two cost more.
+        assert isinstance(rounds.step, Call)
+        usage = rounds.step.usage
+        cost = matrix_columns.MATRIX_RATE.compute_cost(
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens
+        )
+        assert cost < BUDGET_USD < 2 * cost
+    # Nothing is stated for a route that runs no tool loop: such a column
+    # cannot play the cell.
+    with pytest.raises(MatrixSetupError, match="states nothing for tool_loop='none'"):
+        plan("none")
+
+
+def test_the_turn_limit_without_an_error_keeps_what_the_model_had_written(
+    tmp_path: Path,
+) -> None:
+    scenario = SCENARIOS["S10b"]
+    assert scenario.policy.on_max_turns == "continue_with_warning"
+    assert scenario.governing == ("turn_limit",) and scenario.lenses == ("raw",)
+    assert declarations.totality_gaps(scenario.differences) == []
+    kept = scenario.plan().checks[0]
+
+    def column(value: str) -> Column:
+        return next(
+            item
+            for item in cells.toy_columns()
+            if item.features is not None and item.features.turn_limit == value
+        )
+
+    # Where the model is never asked again it had written nothing.
+    at_limit = runner.execute(Cell(column("hard"), "S10b", "raw"), tmp_path / "hard")
+    assert at_limit.report.codes == frozenset(), at_limit.report.describe()
+    result = at_limit.observation.result
+    assert result is not None and result.error is None and result.stop_reason == "max_turns"
+    assert result.final_message == "" and not at_limit.observation.provider.tail_served
+    assert _judge(at_limit, final_message="a warning") == {"text:mismatch"}
+    # Where one further request without tools was answered, that answer is
+    # the partial answer.
+    asked_on = runner.execute(Cell(column("round_boundary"), "S10b", "raw"), tmp_path / "rb")
+    assert asked_on.report.codes == frozenset(), asked_on.report.describe()
+    tail = asked_on.plan.script.tail
+    assert tail is not None and asked_on.observation.provider.tail_served
+    result = asked_on.observation.result
+    assert result is not None and result.final_message == tail.text != ""
+    assert _judge(asked_on, final_message="") == {"text:mismatch"}
+    # An error result promises no answer: the kind is what deviates.
+    failed = TransportError(message="x", retriable=False)
+    assert _judge(asked_on, error=failed, final_message="") == {"kind:transport!=none"}
+
+    def plan(value: str) -> Any:
+        profile = dataclasses.replace(CONSERVATIVE_BACKEND_FEATURES, turn_limit=value)  # type: ignore[arg-type]
+        return plan_for(scenario, declarations.select(scenario.differences, profile))
+
+    # The limit noted after more rounds: the answer the model gave is kept.
+    late = plan("post_hoc")
+    answer = late.script.steps[-1]
+    assert isinstance(answer, Say) and late.expect.final_text == answer.text
+    assert late.expect.stop == ("max_turns",) and late.expect.kind == "none"
+    assert kept not in late.checks and len(late.expect.dispatch) == 3
+    # No turn limit claimed: the finite script ends with its answer.
+    unlimited = plan("unsupported")
+    assert unlimited.expect.stop == ("end_turn",) and kept not in unlimited.checks
+    assert unlimited.expect.final_text and len(unlimited.expect.dispatch) == 3
+
+
+# -- schema without tools, a reply cut at the cap, a reply without output, a
+# -- conversation request ---------------------------------------------------------
+
+
+def _toy_column(**declared: str) -> Column:
+    for column in cells.toy_columns():
+        if all(str(getattr(column.features, name)) == value for name, value in declared.items()):
+            return column
+    raise MatrixSetupError(f"no toy column declares {declared}")
+
+
+def test_the_schema_scenario_without_tools_has_the_table_of_the_planner_shape() -> None:
+    plain, planner = SCENARIOS["S02"], SCENARIOS["S04"]
+
+    # One table for both: where the schema travels follows the declaration,
+    # with or without tools.
+    assert plain.differences == planner.differences
+    assert set(plain.fallbacks) == set(planner.fallbacks)
+    assert (plain.toolset, plain.lenses, plain.policy) == (None, ("raw",), scenarios.BASE_POLICY)
+    placed = {
+        value: plan_for(plain, {"structured_output": variant}).checks
+        for value, variant in plain.differences["structured_output"].items()
+    }
+    assert placed == {
+        "native": (scenarios.schema_answer_returned, scenarios.schema_in_field),
+        "prompt_only": (scenarios.schema_answer_returned, scenarios.schema_in_prompt),
+        "unsupported": (scenarios.schema_answer_returned,),
+    }
+    # Without a ToolSet there is no tool loop to finalise: the declared
+    # difference of a schema finalisation has no alternative here, and a
+    # cell that listed it would be a setup error.
+    assert D_OAI_SCHEMA_FINAL in planner.alternatives
+    assert D_OAI_SCHEMA_FINAL not in plain.alternatives
+    with pytest.raises(MatrixSetupError, match="defines no alternative"):
+        plan_for(plain, {}, [D_OAI_SCHEMA_FINAL])
+
+
+def test_a_reply_cut_at_the_cap_and_a_reply_without_output_on_the_toy_wire(
+    tmp_path: Path,
+) -> None:
+    dialect = ToyDialect()
+    asked = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
+    cut = dialect.render(Cut("what was produced"), asked, "call-1")
+    silent = dialect.render(Empty(), asked, "call-2")
+
+    # Both are complete replies of the wire that state their usage: the mark
+    # of a cut, or an ordinary finish over nothing at all.
+    assert (cut.body["finish"], cut.body["text"], cut.usage) == (
+        "length",
+        "what was produced",
+        Cut("what was produced").usage,
+    )
+    assert (silent.body["finish"], silent.body["text"]) == ("stop", "")
+    assert silent.usage == Empty().usage and silent.usage.output_tokens == 0
+    # A reply that produced nothing bills no output token, by its definition.
+    with pytest.raises(ValueError, match="bills no output token"):
+        Empty(TokenUsage(120, 1))
+
+    # The honest toy: the cut is the general kind, not retriable, with its
+    # own stop reason and limit event, and its usage is the bill ...
+    capped = runner.execute(
+        Cell(_toy_column(response_token_limit="provider_stop"), "S17", "raw"), tmp_path / "cut"
+    )
+    result, trace = _result_and_trace(capped)
+    assert capped.report.codes == frozenset() and result.error is not None
+    assert (result.error.kind, result.error.retriable, result.stop_reason) == (
+        "transport",
+        False,
+        "max_tokens",
+    )
+    assert [event.name for event in trace.events if event.kind == "limit"] == ["response_tokens"]
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (120, 30)
+    assert result.final_message == "" and all(dataclasses.asdict(result.completeness).values())
+    # ... and where the route claims no cap the reply is complete, the
+    # finish the clean one of the plain text scenario, and no cap is sent.
+    uncapped = runner.execute(
+        Cell(_toy_column(response_token_limit="unsupported"), "S17", "raw"), tmp_path / "whole"
+    )
+    assert uncapped.report.codes == frozenset()
+    assert uncapped.plan.script == SCENARIOS["S01"].plan().script
+    assert uncapped.plan.expect == SCENARIOS["S01"].plan().expect
+    assert set(SCENARIOS["S01"].plan().checks) < set(uncapped.plan.checks)
+    assert [request.response_cap for request in uncapped.observation.provider.requests] == [None]
+    # A reply without output: a transport error a caller may retry, named
+    # after no stop reason a workflow reads, with the input tokens billed.
+    nothing = _honest(tmp_path / "silent", "S25")
+    result, _trace = _result_and_trace(nothing)
+    assert result.error is not None and (result.error.kind, result.error.retriable) == (
+        "transport",
+        True,
+    )
+    assert result.stop_reason not in contract.READ_STOP_REASONS
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (120, 0)
+    assert all(dataclasses.asdict(result.completeness).values())
+
+
+def test_the_cap_of_a_response_is_asked_only_where_the_wire_has_a_field_for_it(
+    tmp_path: Path,
+) -> None:
+    capped = runner.execute(
+        Cell(_toy_column(response_token_limit="provider_stop"), "S17", "raw"), tmp_path
+    )
+    provider = capped.observation.provider
+    (request,) = provider.requests
+
+    # The toy wire has the field, the dialect says so, and the request of a
+    # route that declares an enforced cap carried one.
+    assert isinstance(ToyDialect(), ResponseCapDialect) and provider.response_cap_field
+    assert request.response_cap is not None and request.response_cap >= 1
+    assert scenarios.response_cap_in_request in capped.plan.checks
+    # Read without the cap, the request is one code on a wire that has the
+    # field, and none on a wire that has no field for it: there no adapter
+    # could have sent one.
+    untold = dataclasses.replace(
+        provider, requests=[dataclasses.replace(request, response_cap=None)]
+    )
+    assert _judge(capped, provider=untold) == {"request.content:response_cap"}
+    assert _judge(capped, provider=dataclasses.replace(untold, response_cap_field=False)) == (
+        frozenset()
+    )
+    # A cap that is no positive count is none.
+    zero = dataclasses.replace(provider, requests=[dataclasses.replace(request, response_cap=0)])
+    assert _judge(capped, provider=zero) == {"request.content:response_cap"}
+    # Every value of the field has its variant: an enforced cap is asked in
+    # the request, a route that counts between rounds or afterwards is not
+    # asked, and a route that claims none plays the complete reply.
+    table = SCENARIOS["S17"].differences["response_token_limit"]
+    assert {value: variant.name for value, variant in table.items()} == {
+        "hard": "cap_in_request",
+        "provider_stop": "cap_in_request",
+        "round_boundary": "",
+        "post_hoc": "",
+        "unsupported": "complete_reply",
+    }
+    assert declarations.totality_gaps(SCENARIOS["S17"].differences) == []
+
+
+def test_a_conversation_request_is_answered_by_declaration(tmp_path: Path) -> None:
+    scenario = SCENARIOS["S50"]
+    table = scenario.differences["session_continuity"]
+    request = scenarios.CONVERSATION
+
+    # The request of the scenario asks to continue a conversation, and the
+    # table is total: a route that declares continuity for a workflow
+    # answers, every other one refuses with the one agreed type.
+    assert (request.mode, request.action, request.opaque_id) == (
+        "workflow_bound",
+        "reuse",
+        scenarios.STALE_HANDLE,
+    )
+    assert declarations.totality_gaps(scenario.differences) == []
+    assert {value: (variant.kind, variant.name) for value, variant in table.items()} == {
+        "workflow_bound": ("BASE", ""),
+        "retry_only": ("REFUSED", "NotImplementedError"),
+        "none": ("REFUSED", "NotImplementedError"),
+    }
+    # Where it is refused nothing is sent, and the plan still carries the
+    # request: the refusal is of the conversation, not of a plain call.
+    refused = runner.execute(
+        Cell(_toy_column(session_continuity="none"), "S50", "raw"), tmp_path / "refused"
+    )
+    raised = refused.observation.raised
+    assert refused.report.codes == frozenset() and refused.observation.result is None
+    assert raised is not None and (raised.type, raised.phase) == (
+        "NotImplementedError",
+        "before_request",
+    )
+    # The refusal is the route's own: it left the call, and the frame that
+    # raised it is in the module of the backend the cell built.
+    assert raised.left_invoke
+    assert raised.module == refused.observation.backend_module == toy.__name__
+    assert refused.plan.conversation is scenarios.CONVERSATION
+    assert refused.plan.script == ProviderScript(())
+    assert refused.observation.provider.request_count == 0
+    assert not set(RESULT_CLAUSES) & set(refused.report.outcomes)
+    # Where it is answered and nobody holds the handle: the typed stale
+    # conversation, with an outcome that names no handle and is bound to
+    # the request; no request was made and no usage is claimed.
+    stale = runner.execute(
+        Cell(_toy_column(session_continuity="workflow_bound"), "S50", "raw"), tmp_path / "stale"
+    )
+    result, _trace = _result_and_trace(stale)
+    outcome = result.conversation
+    assert stale.report.codes == frozenset() and result.error is not None
+    assert (result.error.kind, result.stop_reason) == ("stale_conversation", "stale_conversation")
+    # The same handle is refused again: no error a caller may try again.
+    assert stale.plan.expect.retriable is False and result.error.retriable is False
+    again = dataclasses.replace(result.error, retriable=True)
+    assert _judge(stale, error=again) == {"retriable:True"}
+    assert outcome is not None
+    assert (outcome.state, outcome.opaque_id) == ("stale", None)
+    assert (outcome.identity_fingerprint, outcome.operation_digest) == (
+        request.identity_fingerprint,
+        request.operation_digest,
+    )
+    assert stale.observation.provider.request_count == 0
+    # The three flags a scenario may waive are not asked of such a result.
+    assert stale.plan.expect.flags == ("trace_complete",)
+    assert {"flag:token_usage_complete=False", "flag:cost_complete=False"} <= set(
+        stale.report.unasked
+    )
+    # Each fact of the outcome has its code.
+    untyped = TransportError(message="no such conversation", retriable=False)
+    assert _judge(stale, conversation=None, error=untyped) == {
+        "kind:transport!=stale_conversation",
+        "conversation:missing",
+    }
+    other = dataclasses.replace(outcome, operation_digest=request.identity_fingerprint)
+    assert _judge(stale, conversation=other) == {"conversation:unbound"}
+    # A plain call carries no conversation request: only the scenario about
+    # continuity plans one, and the guarded lens's second call never does.
+    assert [name for name, item in SCENARIOS.items() if item.plan().conversation] == ["S50"]
+
+
+class _KeepsConversations(ToyDialect):
+    """The toy wire with a tool beside the adapter that keeps the conversations."""
+
+    resume_path = "/toy/v1/resume"
+
+    def refuse_resume(self, body: bytes) -> tuple[str, Reply]:
+        handle = str(json.loads(body)["handle"])
+        return handle, Reply(200, {"type": "no_conversation", "handle": handle})
+
+
+def test_a_handle_is_asked_of_the_tool_that_keeps_the_conversations(tmp_path: Path) -> None:
+    kept_by_a_tool = _KeepsConversations()
+    asked_for = {"handle": "a-handle"}
+
+    # On a wire where a tool beside the adapter keeps the conversations the
+    # provider side answers for that tool. The exchange is no model request:
+    # the ledger keeps the handle apart from the requests of the script.
+    assert isinstance(kept_by_a_tool, KeeperDialect)
+    assert not isinstance(ToyDialect(), KeeperDialect)
+    with LoopbackProvider(
+        ProviderScript(()), credential="c", dialect=kept_by_a_tool
+    ) as provider:
+        answered = _ask(provider, asked_for, path=kept_by_a_tool.resume_path)
+        seen = provider.freeze()
+    assert answered == (200, {"type": "no_conversation", "handle": "a-handle"})
+    assert seen.conversation_keeper and seen.refused_handles == ["a-handle"]
+    assert (seen.request_count, seen.extra, seen.unconsumed) == (0, 0, 0)
+    # Where the adapter keeps them itself there is nobody to ask: the same
+    # request is one the script does not have.
+    with LoopbackProvider(ProviderScript(()), credential="c") as provider:
+        assert _ask(provider, asked_for, path=kept_by_a_tool.resume_path)[0] == UNSCRIPTED_STATUS
+        plain = provider.freeze()
+    assert not plain.conversation_keeper and plain.refused_handles == []
+    assert (plain.request_count, plain.extra) == (1, 1)
+
+    # The toy keeps its conversations itself, so its stale result asks
+    # nobody and the cell asks nothing of that.
+    stale = runner.execute(
+        Cell(_toy_column(session_continuity="workflow_bound"), "S50", "raw"), tmp_path
+    )
+    own = stale.observation.provider
+    assert stale.report.codes == frozenset()
+    assert not own.conversation_keeper and own.refused_handles == []
+    # The same result on a wire where a tool keeps them is an adapter that
+    # called the handle stale without asking whoever holds the conversations ...
+    kept = dataclasses.replace(own, conversation_keeper=True)
+    assert _judge(stale, provider=kept) == {"conversation:unasked"}
+    assert contract.clause_of("conversation:unasked") == contract.SCENARIO
+    # ... unless the tool was asked for the handle of the request, and for
+    # no other one.
+    handle = scenarios.STALE_HANDLE
+    assert _judge(stale, provider=dataclasses.replace(kept, refused_handles=[handle])) == (
+        frozenset()
+    )
+    assert _judge(stale, provider=dataclasses.replace(kept, refused_handles=[handle] * 2)) == (
+        frozenset()
+    )
+    for others in (["another-handle"], [handle, "another-handle"]):
+        assert _judge(stale, provider=dataclasses.replace(kept, refused_handles=others)) == {
+            "conversation:unasked"
+        }
 
 
 # -- the module ends with the canary check --------------------------------------

@@ -79,7 +79,19 @@ from ..provider import (
     cut_after,
     require_cut_in_body,
 )
-from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
+from ..script import (
+    Call,
+    Cut,
+    Drop,
+    Empty,
+    Malformed,
+    ProviderScript,
+    Reason,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+)
 from ..toolsets import BINDINGS
 from . import openai_compat as chat
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
@@ -168,6 +180,8 @@ class MoonshotChatDialect:
 
     name = "moonshot_chat"
     provider = "moonshot"
+    # ``max_completion_tokens``, or ``max_tokens``, in the body of a request.
+    response_cap_field = True
 
     def __init__(
         self,
@@ -198,6 +212,8 @@ class MoonshotChatDialect:
                 chat.REASONING_ONLY,
                 *chat.REFUSALS.values(),
                 chat.MALFORMED,
+                chat.OUTPUT_CUT,
+                chat.EMPTY_COMPLETION,
             )
         )
 
@@ -269,6 +285,7 @@ class MoonshotChatDialect:
                 "messages": [_shape(item) for item in messages],
                 "launches": [] if self._journal is None else self._journal.launches(),
             },
+            response_cap=chat.response_cap(payload),
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -441,15 +458,31 @@ class MoonshotChatDialect:
         elif isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
+            if step.malformed is not None:
+                arguments = {}
             behaviour, call = _TOOL_CALL, (step.slot, call_id, arguments)
             slots = {
                 "call_id": call_id,
                 "tool_name": binding.name,
-                # The wire carries the arguments as a JSON document in a string.
-                "tool_arguments": json.dumps(arguments, sort_keys=True),
+                # The wire carries the arguments as a JSON document in a
+                # string, so it also carries a text that is none. The reply
+                # is read by the vendor's SDK in the worker; what reaches
+                # the adapter of such a call is what that SDK makes of it.
+                "tool_arguments": (
+                    json.dumps(arguments, sort_keys=True)
+                    if step.malformed is None
+                    else step.malformed
+                ),
             }
         elif isinstance(step, Refuse):
             behaviour, call, slots = chat.REFUSALS[step.form], None, {}
+        elif isinstance(step, Cut):
+            # The stream of an answer that ends at the cap: the reasoning and
+            # the text that was produced, then the cap as the finish reason.
+            behaviour, call, slots = chat.OUTPUT_CUT, None, {"text": step.text}
+        elif isinstance(step, Empty):
+            # The stream of an answer in which nothing was produced.
+            behaviour, call, slots = chat.EMPTY_COMPLETION, None, {}
         else:
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
@@ -471,10 +504,11 @@ class MoonshotChatDialect:
             output_tokens=usage.output_tokens,
             total_tokens=usage.input_tokens + usage.output_tokens,
         )
-        if not isinstance(step, Refuse):
+        if not isinstance(step, (Refuse, Empty)):
             # A reply that answers or calls a tool reasons first; reasoning
             # is part of the completion tokens the provider bills.
             # Where the reply shows no text, every one of them is reasoning.
+            # A reply in which nothing was produced did not reason either.
             slots.update(
                 reasoning_text=REASONING_TEXT,
                 reasoning_tokens=(
@@ -493,6 +527,7 @@ class MoonshotChatDialect:
             envelope.name,
             raw=server_sent_events(chunks),
             content_type="text/event-stream",
+            call_malformed=isinstance(step, Call) and step.malformed is not None,
         )
 
 

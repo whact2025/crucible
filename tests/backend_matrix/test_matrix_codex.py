@@ -19,7 +19,7 @@ none. The peer is a program of its own: its journal keeps no value of the
 environment it was started in, and the network guard of the package runs
 inside it.
 
-Two tests are held by name for the verifier, because no code of their cells
+Three tests are held by name for the verifier, because no code of their cells
 shows what they hold. The result of a dispatch-budget denial reports every
 response the provider billed: that result flags its accounting incomplete,
 which the ledger carries as a known gap, and while it does no clause compares
@@ -27,7 +27,9 @@ what it reports. And a billed final turn that shows no message ends in the
 protocol error the client library of the route raises for it, which the
 adapter types not retriable: its cell shows the two codes of any error that
 ends a turn after its accounting, which the ledger carries as a known gap of
-its own. The lying counterparts of each test are beside it.
+its own. An empty completion ends in the same protocol error: its cell shows
+that the error is not retriable and not why, a third known gap. The lying
+counterparts of each test are beside it.
 
 Two lying counterparts are shared with the module of the official-SDK column,
 which plays them on its own driver: :class:`LastAsTheTurnSoFar` and
@@ -61,7 +63,7 @@ from assay import Usage
 from crucible.backends import codex as adapter
 from crucible.backends.config import load_routing
 
-from . import cells, contract, declarations, ledger, runner, toolsets
+from . import cells, contract, declarations, envelopes, ledger, runner, toolsets
 from . import columns as matrix_columns
 from .cells import Cell
 from .columns import CANARY_CREDENTIAL, CODEX_LEGACY_KIND, COLUMN_PRODUCT, Column
@@ -70,13 +72,14 @@ from .drivers import codex_legacy as codex_driver
 from .peers import codex_app_server as peer_program
 from .peers import codex_worker as stage
 from .peers import launch, worker_harness
-from .provider import LoopbackProvider, Reply, SeenRequest
-from .scenarios import D_CDX_SERVED, SCENARIOS, SYSTEM, USER
+from .provider import LoopbackProvider, Reply, ResponseCapDialect, SeenRequest
+from .scenarios import D_CDX_SERVED, SCENARIOS, STALE_HANDLE, SYSTEM, USER
 from .script import (
     READ_A,
     READ_B,
     Call,
     Drop,
+    Empty,
     Malformed,
     ProviderScript,
     Refuse,
@@ -91,6 +94,10 @@ KINDS = (CODEX_LEGACY_KIND,)
 # The envelope of the one refusal the notifications of the app-server carry.
 _REFUSED_TURN = "codex_app_server/app_server.turn_failed_policy"
 _REASONING_ITEM = "codex_app_server/app_server.reasoning"
+_FAILED_CALL = "codex_app_server/app_server.tool_call_failed"
+# What the app-server answers a request to resume a thread it finds no
+# rollout for: emulated, not observed.
+REFUSED_RESUME = "codex_app_server/app_server.resume_rejected"
 CELLS = cells.cells_of(KINDS)
 (COLUMN,) = (column for column in matrix_columns.real_columns() if column.kind in KINDS)
 # The product's loopback tool server logs under its module name.
@@ -462,11 +469,13 @@ def test_tool_calls_travel_to_the_tool_server_of_the_route(tmp_path: Path) -> No
     assert len({request.evidence["turn_id"] for request in requests}) == 1
     assert execution.observation.result is not None
     # Every notification of the cell was rendered from an envelope: all of
-    # them but the terminal of a turn the provider refused and the item of a
-    # response that reasons and writes no message.
+    # them but the terminal of a turn the provider refused, the item of a
+    # response that reasons and writes no message and the item of a call
+    # that its tool server answered with an error. The answer to a request
+    # to resume a thread is no notification of a turn.
     assert set(execution.observation.provider.envelopes) == set(
         codex_driver.CodexLegacyDriver().envelopes
-    ) - {_REFUSED_TURN, _REASONING_ITEM}
+    ) - {_REFUSED_TURN, _REASONING_ITEM, _FAILED_CALL, REFUSED_RESUME}
     assert execution.grade == "constructed"
 
 
@@ -1136,6 +1145,212 @@ def test_the_proof_of_the_billed_turn_without_a_message_fails_on_another_error_a
         assert lacking(dataclasses.replace(honest, observation=unwritten)) == [WRITE_ON_DISK], state
 
 
+EMPTY_COMPLETION = cells.EMPTY_COMPLETION_ON_THE_APP_SERVER_CODEX_ROUTE
+# The record of the ledger whose cell the proof below plays.
+EMPTY_COMPLETION_GAP = "R20"
+# What the proof below holds of a play, beside the error and the flags the
+# proof of the billed turn names.
+ONE_BILLED_RESPONSE, ONE_REQUEST = "the bill", "one request"
+
+
+def _not_the_empty_completion_the_client_refused(execution: runner.Execution) -> list[str]:
+    """What a play lacks of an empty completion that the client library refused for its text.
+
+    Read from the play alone: the result the call returned and what the
+    provider saw and billed. Where the adapter first built the result is not
+    in a play and is not read here.
+    """
+
+    observation = execution.observation
+    result = observation.result
+    if result is None or result.error is None:
+        return ["no result with an error"]
+    error, provider = result.error, observation.provider
+    lacking: list[str] = []
+    if error.kind != "transport" or error.retriable is not False:
+        lacking.append(NOT_RETRIED)
+    if NO_FINAL_MESSAGE not in error.message:
+        lacking.append(SENTENCE)
+    if not all(getattr(result.completeness, name) for name in contract.FLAGS):
+        lacking.append(FOUR_FLAGS)
+    billed = provider.billed
+    if (
+        len(billed) != 1
+        or not billed[0].input_tokens
+        or billed[0].output_tokens
+        or (result.usage.input_tokens, result.usage.output_tokens) != (billed[0].input_tokens, 0)
+    ):
+        lacking.append(ONE_BILLED_RESPONSE)
+    if provider.request_count != 1 or provider.extra or provider.unconsumed:
+        lacking.append(ONE_REQUEST)
+    return lacking
+
+
+def test_an_empty_completion_ends_in_the_protocol_error_of_the_client_and_is_not_retried(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because the one code of the cell does not show it.
+
+    The one model response of the turn completes with no text, no reasoning
+    and no output token; the provider billed its input. The adapter waits
+    for the turn with the buffered call of the client library of the route,
+    which raises a protocol error for a completed turn in which it finds no
+    agent message with text, and the adapter types that error of the client
+    library a transport error that is not retriable: the raise and the
+    typing of the billed turn that shows no message (the proof above), on a
+    turn that produced nothing. The scenario asks for a transport error a
+    caller may retry, so the cell shows one code, the error that is not
+    retriable (known gap R20). That is the code of any error the adapter
+    types so: a protocol error of another text shows it too. This test
+    holds what the code does not say, from the play alone and with nothing
+    of the product replaced: the error carries the sentence of the client
+    library; all four completeness flags are true; the provider billed one
+    response, for its input and for no output token, and the result reports
+    it; one request, none extra and none left unasked. The adapter's own
+    guard for an empty completion, which returns a retriable error, is not
+    reached: the raise comes first. A green cell would not show the cause
+    either: an error the adapter types retriable passes the scenario with
+    no code, whatever its text. This test and its lying counterparts go
+    with the entry of the cell, and a change of the pinned release of the
+    client library plays the cell and this test before it lands.
+    """
+
+    # The verifier requires this test by name: the entry of the record leans
+    # on it, and a run without it is refused. No entry attributes a code to
+    # that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_LEGACY_KIND]]
+    kind, scenario, role, lens = ledger.parse_cell_id(EMPTY_COMPLETION)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+    attributed = {
+        entry.cell for entry in LEDGER.entries if EMPTY_COMPLETION_GAP in entry.codes.values()
+    }
+    assert attributed <= {EMPTY_COMPLETION}
+
+    execution = _played(scenario, tmp_path, lens)
+
+    assert execution.report.seam_problems == ()
+    assert _not_the_empty_completion_the_client_refused(execution) == []
+
+
+def test_the_proof_of_the_empty_completion_fails_on_another_error_and_on_a_lost_fact(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the proof above. Two are plays: the same
+    # empty completion, with another failure where the client library raises
+    # for a turn without a final assistant message. In one the read-back of
+    # the thread is refused, a protocol error of another text. The cell does
+    # not see it: the error is not retriable either, so the comparator is
+    # handed the same for both plays and says of the lying one what it says
+    # of the honest one. In the other the library fails with an error of a
+    # class the adapter has no rule for, which it types retriable: that
+    # cell shows no code at all, so a green cell says nothing of the cause.
+    # The others are the honest play with one thing made up, for each thing
+    # the proof holds: the same error typed retriable; the text of another
+    # protocol error; a flag false; a token more or less than the bill, an
+    # output token on the bill, a response more or none; a request more
+    # than scripted, or a step never asked.
+    from codex_app_server_sdk import (  # noqa: PLC0415 - preflight reports its absence
+        CodexClient,
+        CodexProtocolError,
+    )
+
+    kind, scenario, role, lens = ledger.parse_cell_id(EMPTY_COMPLETION)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+
+    async def refused(self: Any, *, thread_id: str, turn_id: Any) -> Any:
+        raise CodexProtocolError("thread not found", code=-32000)
+
+    async def unknown(self: Any, *, thread_id: str, turn_id: Any) -> Any:
+        raise NotImplementedError("a failure of another kind")
+
+    def lacking(execution: runner.Execution) -> list[str]:
+        return _not_the_empty_completion_the_client_refused(execution)
+
+    honest = _played(scenario, tmp_path / "honest", lens)
+    plays: dict[str, runner.Execution] = {}
+    for name, read_back in (("refused", refused), ("unknown", unknown)):
+        with pytest.MonkeyPatch.context() as patched:
+            # A private method of the client library, in this counterpart
+            # only; the proof itself replaces nothing.
+            patched.setattr(CodexClient, "_read_turn_agent_message", read_back)
+            plays[name] = _played(scenario, tmp_path / name, lens)
+    result = honest.observation.result
+    assert result is not None and result.error is not None
+
+    assert honest.report.seam_problems == ()
+    assert honest.report.codes == {"retriable:False"}
+    assert lacking(honest) == []
+    for lying in plays.values():
+        assert lying.report.seam_problems == () and lying.observation.result is not None
+        assert lying.observation.provider.billed == honest.observation.provider.billed
+    # The protocol error of another text: the cell shows the same, and the
+    # proof names it.
+    assert _handed_to_the_comparator(plays["refused"]) == _handed_to_the_comparator(honest)
+    assert lacking(plays["refused"]) == [SENTENCE]
+    # The error typed retriable: the cell is green, and the proof names it.
+    assert plays["unknown"].report.codes == frozenset()
+    assert lacking(plays["unknown"]) == [NOT_RETRIED, SENTENCE]
+
+    def with_result(**changed: Any) -> runner.Execution:
+        observation = dataclasses.replace(
+            honest.observation, result=dataclasses.replace(result, **changed)
+        )
+        return dataclasses.replace(honest, observation=observation)
+
+    def with_provider(**changed: Any) -> runner.Execution:
+        provider = dataclasses.replace(honest.observation.provider, **changed)
+        return dataclasses.replace(
+            honest, observation=dataclasses.replace(honest.observation, provider=provider)
+        )
+
+    # The same error typed retriable, or as rejected content; the text of
+    # another protocol error; no error.
+    error = result.error
+    assert lacking(with_result(error=dataclasses.replace(error, retriable=True))) == [NOT_RETRIED]
+    assert lacking(with_result(error=dataclasses.replace(error, kind="content_rejected"))) == [
+        NOT_RETRIED
+    ]
+    other = dataclasses.replace(error, message="CodexProtocolError (code=-32000): thread not found")
+    assert lacking(with_result(error=other)) == [SENTENCE]
+    assert lacking(with_result(error=None)) == ["no result with an error"]
+    # A flag false, each of the four. A result that flags its token usage or
+    # its cost incomplete carries no complete pricing evidence.
+    for name in contract.FLAGS:
+        flags = dataclasses.replace(result.completeness, **{name: False})
+        accounting = name in contract.ACCOUNTING_FLAGS
+        changed = with_result(
+            completeness=flags, **({"pricing_evidence": None} if accounting else {})
+        )
+        assert lacking(changed) == [FOUR_FLAGS], name
+    # The bill: one response, for its input and for no output token, and
+    # the result reports it. A token more or less in the result; an output
+    # token on the bill; a response more on the bill, or none.
+    usage, billed = result.usage, list(honest.observation.provider.billed)
+    assert len(billed) == 1 and (usage.input_tokens, usage.output_tokens) == (
+        billed[0].input_tokens,
+        0,
+    )
+    for step in (-1, 1):
+        off = dataclasses.replace(usage, input_tokens=usage.input_tokens + step)
+        assert lacking(with_result(usage=off, pricing_evidence=None)) == [ONE_BILLED_RESPONSE]
+    spoke = dataclasses.replace(usage, output_tokens=1)
+    assert lacking(with_result(usage=spoke, pricing_evidence=None)) == [ONE_BILLED_RESPONSE]
+    one_more = dataclasses.replace(billed[0], output_tokens=1)
+    assert lacking(with_provider(billed=[one_more])) == [ONE_BILLED_RESPONSE]
+    assert lacking(with_provider(billed=[*billed, billed[0]])) == [ONE_BILLED_RESPONSE]
+    assert lacking(with_provider(billed=[])) == [ONE_BILLED_RESPONSE]
+    # The requests: one more than scripted, a step never asked, none seen
+    # and two seen. As for the billed turn, the count holds the play to its
+    # script and does not tell an error that is retriable from one that is
+    # not: the base policy allows one attempt whatever an error is typed.
+    requests = list(honest.observation.provider.requests)
+    assert len(requests) == 1
+    assert lacking(with_provider(extra=1)) == [ONE_REQUEST]
+    assert lacking(with_provider(unconsumed=1)) == [ONE_REQUEST]
+    assert lacking(with_provider(requests=[])) == [ONE_REQUEST]
+    assert lacking(with_provider(requests=[*requests, requests[0]])) == [ONE_REQUEST]
+
+
 def presenting_a_served_model(driver: type[Any]) -> Any:
     """A driver like ``driver`` whose backend presents the requested model as the served one.
 
@@ -1293,11 +1508,20 @@ def test_the_dialect_reads_the_session_and_answers_only_what_it_has_an_envelope_
     # A client that did not ask for the exact usage gets none.
     quiet = dialect.render(Say("done"), _parsed(dialect, _evidence(raw_events=False)), "call-1")
     assert _frames(quiet, RAW_USAGE) == [] and len(_frames(quiet, THREAD_USAGE)) == 1
-    # What has no envelope is refused, never improvised: a failed tool call,
-    # a served model on a wire that names none, any other step.
+    # A call that its tool server answered with an error is reported as a
+    # failed item that carries the text of the answer and no result.
     answered["tool_results"][0]["is_error"] = True
     failed = dialect.render(Say("done"), _parsed(dialect, answered), "call-2")
-    assert failed.body["frames"] == [] and "has no envelope" in failed.body["unsupported"]
+    assert "unsupported" not in failed.body
+    refused_item = failed.body["frames"][0]["params"]["item"]
+    assert (refused_item["status"], refused_item["error"]) == ("failed", {"message": "found"})
+    assert "result" not in refused_item and refused_item["id"] == "call-1"
+    assert failed.envelopes[0] == "codex_app_server/app_server.tool_call_failed"
+    assert [frame["method"] for frame in failed.body["frames"]] == [
+        frame["method"] for frame in final.body["frames"]
+    ]
+    # What has no envelope is refused, never improvised: a served model on a
+    # wire that names none, any other step.
     with pytest.raises(MatrixSetupError, match="does not render"):
         dialect.render(ServedAs(Say("x"), "-other"), seen, "call-1")
     # The notifications carry one form of refusal: a failed turn whose error
@@ -1315,9 +1539,12 @@ def test_the_dialect_reads_the_session_and_answers_only_what_it_has_an_envelope_
     for form in ("content_filter", "refusal_part"):
         with pytest.raises(MatrixSetupError, match="cannot render a refusal of the form"):
             dialect.render(Refuse(form), seen, "call-1")  # type: ignore[arg-type]
+    with pytest.raises(MatrixSetupError, match="reaches the adapter as a decoded object"):
+        dialect.render(Call(READ_A, malformed="{"), seen, "call-1")
     assert list(codex_driver.CodexLegacyDriver().inexpressible) == [
         "S23a/Refuse(content_filter)",
         "S23b/Refuse(refusal_part)",
+        "S05/Call(malformed)",
     ]
     with pytest.raises(NotImplementedError):
         codex_driver.CodexAppServerDialect().launch_problems({}, [], seen)
@@ -1331,6 +1558,80 @@ class _AnswersWhereItShouldRefuse(codex_driver.LegacyDialect):
         if isinstance(step, Refuse):
             step = Say("an answer where the script refuses")
         return super().render(step, seen, call_id)
+
+
+def test_a_response_without_output_completes_the_turn_without_an_item_and_a_cap_is_read() -> (
+    None
+):
+    dialect = codex_driver.LegacyDialect(client="c/1")
+    seen = _parsed(dialect, _evidence())
+
+    # A response in which nothing was produced has no item of an agent
+    # message: the usage of the response, without an output token, and the
+    # notification that completes the turn. The input is billed.
+    silent = dialect.render(Empty(), seen, "call-1")
+    assert [frame["method"] for frame in silent.body["frames"]] == [
+        RAW_USAGE,
+        THREAD_USAGE,
+        "turn/completed",
+    ]
+    last = _frames(silent, THREAD_USAGE)[0]["params"]["tokenUsage"]["last"]
+    assert (last["inputTokens"], last["outputTokens"]) == (Empty().usage.input_tokens, 0)
+    assert silent.usage == Empty().usage and silent.served_model is None
+    assert silent.body["call"] is None and silent.call is None
+    # The protocol has no field for a cap on the output tokens of a response
+    # and the dialect does not say that its wire has one. A cap the client
+    # states anyway is read, under any spelling of a maximum of output
+    # tokens: in the request that opens the thread or the turn, in the
+    # configuration either carries, and in a setting on the command line.
+    assert seen.response_cap is None and not isinstance(dialect, ResponseCapDialect)
+    for place in ("thread", "turn", "config", "argv"):
+        capped = _evidence()
+        if place == "thread":
+            capped["requests"][1]["params"]["maxOutputTokens"] = 64
+        elif place == "turn":
+            capped["requests"][2]["params"]["max_output_tokens"] = 64
+        elif place == "config":
+            capped["requests"][1]["params"]["config"] = {"model_max_output_tokens": 64}
+        else:
+            capped["journal"][0]["argv"] = ["-c", "model_max_output_tokens=64", "app-server"]
+        assert _parsed(dialect, capped).response_cap == 64, place
+
+
+def test_a_thread_nobody_holds_is_refused_by_the_tool_before_a_model_response(
+    tmp_path: Path,
+) -> None:
+    execution = _played("S50", tmp_path)
+    observation = execution.observation
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "codex-peer" / "journal.jsonl").read_text("utf-8").splitlines()
+    ]
+
+    # The session route ran its probe and started the app-server; the client
+    # asked it to resume the handle of the request as a thread; the tool
+    # found no rollout for it and no model was asked. The result is the
+    # typed stale conversation, bound to the request, and the cell is green.
+    assert [record["role"] for record in journal] == ["version", "app_server", "resume_rejected"]
+    assert journal[-1]["thread"] == STALE_HANDLE
+    assert observation.provider.request_count == 0 and execution.report.codes == frozenset()
+    result = observation.result
+    assert result is not None and result.error is not None and result.conversation is not None
+    assert (result.error.kind, result.error.retriable) == ("stale_conversation", False)
+    assert (result.conversation.state, result.conversation.opaque_id) == ("stale", None)
+    assert execution.current == {"session_continuity": "workflow_bound"}
+    # The tool keeps the threads of this wire, and the cell holds that it
+    # was asked for the handle of the request and for no other. What it
+    # answered is emulated: the cell is answered from that envelope and
+    # carries its grade.
+    assert observation.provider.conversation_keeper
+    assert observation.provider.refused_handles == [STALE_HANDLE]
+    assert observation.provider.envelopes == [REFUSED_RESUME]
+    assert execution.grade == "constructed"
+    # What static cell H03 reads of the cell without playing it is what the
+    # play was answered from, and its grade.
+    assert cells.answered_from(execution.cell.id) == tuple(observation.provider.envelopes)
+    assert cells.grade_of(execution.cell.id) == execution.grade == "constructed"
 
 
 def test_a_refused_turn_is_typed_as_rejected_content_and_a_turn_that_is_not_refused_fails(
@@ -1530,6 +1831,8 @@ def test_the_peer_plays_a_session_against_the_scripted_provider_on_loopback_only
 
         status, with_raw = _dialogue(peer, raw=True)
         quiet_status, without_raw = _dialogue(peer, raw=False)
+        # A session that is asked to resume a thread nobody started.
+        foreign = _run(peer, "app-server", lines=_opening(thread="another-thread"))
         ledger_ = provider.freeze()
 
     assert (status, quiet_status) == (0, 0)
@@ -1558,10 +1861,69 @@ def test_the_peer_plays_a_session_against_the_scripted_provider_on_loopback_only
     assert any("version probe" in problem for problem in ledger_.seam_problems)
     assert any("sign-in file" in problem for problem in ledger_.seam_problems)
 
-    # A thread the session does not hold, a request it does not play and a
-    # provider that is not on loopback end the session as unsupported.
-    foreign = _run(peer, "app-server", lines=_opening(thread="another-thread"))
-    assert foreign.returncode == peer_program.EXIT_UNSUPPORTED
+    # A thread that no session of the cell started is one the tool holds no
+    # rollout for: the request to resume it is answered with an error object
+    # and the session goes on. The journal says so, and no failure is noted.
+    answered = [json.loads(line) for line in foreign.stdout.splitlines()]
+    assert foreign.returncode == 0 and [item["id"] for item in answered] == [1, 2, 3]
+    emulated = envelopes.load(REFUSED_RESUME)
+    error = emulated.fill({"thread_id": "another-thread"})["error"]
+    assert answered[2] == {
+        "id": 3,
+        "error": {"code": error["code"], "message": "".join(error["message"])},
+    }
+    rejected = [item for item in peer.records() if item["role"] == "resume_rejected"]
+    assert [(item["thread"], item["forbidden_seen"]) for item in rejected] == [
+        ("another-thread", False)
+    ]
+    assert peer.failures() == []
+    # What the tool answers there is emulated, not observed. It is no code
+    # and no sentence of the peer: the provider side renders the error
+    # object from an envelope that says so, and the ledger keeps the thread
+    # the tool was asked for and that envelope. No model was asked: the
+    # exchange is no request of the script (the two counts above).
+    assert emulated.grade == "constructed"
+    assert emulated.provenance["reason"].startswith("Emulated, not observed.")
+    source = Path(peer_program.__file__).read_text("utf-8")
+    assert error["message"][0].strip() not in source and str(error["code"]) not in source
+    assert ledger_.conversation_keeper and ledger_.refused_handles == ["another-thread"]
+    assert REFUSED_RESUME in ledger_.envelopes and ledger_.request_count == 2
+    # A lying counterpart answers the same under the code of invalid
+    # parameters, and a provider side that does not answer for the tool
+    # leaves the peer without an answer of its own: the session is not
+    # played.
+    with LoopbackProvider(
+        ProviderScript(()), credential=CANARY_CREDENTIAL, dialect=dialect
+    ) as other:
+        lying = codex_driver.write_peer(
+            tmp_path / "other-code",
+            provider=other.url + dialect.path,
+            cli_version="9.9.9",
+            faults=[peer_program.REJECT_AS_INVALID_PARAMS],
+        )
+        recoded = _run(lying, "app-server", lines=_opening(thread="another-thread"))
+    assert json.loads(recoded.stdout.splitlines()[-1]) == {
+        "id": 3,
+        "error": {"code": peer_program.INVALID_PARAMS, "message": "".join(error["message"])},
+    }
+    assert peer_program.INVALID_PARAMS != error["code"] and lying.failures() == []
+    with LoopbackProvider(ProviderScript(()), credential=CANARY_CREDENTIAL) as silent:
+        alone = codex_driver.write_peer(
+            tmp_path / "alone", provider=silent.url + dialect.path, cli_version="9.9.9"
+        )
+        unanswered = _run(alone, "app-server", lines=_opening(thread="another-thread"))
+    assert unanswered.returncode == peer_program.EXIT_UNSUPPORTED
+    assert alone.failures() == [
+        "unsupported: the provider side does not say what the tool answers a thread it "
+        "finds no rollout for"
+    ]
+    # Every session notes the thread it starts, as the tool keeps a rollout
+    # of it. Resuming the thread of an earlier session of the cell, a
+    # request the peer does not play and a provider that is not on loopback
+    # end the session as unsupported.
+    assert thread in peer_program.started_threads({"journal": str(peer.journal)})
+    earlier = _run(peer, "app-server", lines=_opening(thread=thread))
+    assert earlier.returncode == peer_program.EXIT_UNSUPPORTED
     interrupt = _run(
         peer, "app-server", lines=[*_opening(), {"id": 9, "method": "turn/interrupt", "params": {}}]
     )

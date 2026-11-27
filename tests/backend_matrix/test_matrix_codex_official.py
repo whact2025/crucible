@@ -37,8 +37,13 @@ the limit guard replaces the result and its codes do not say what it missed.
 One more test is required by name and does hold a known gap, because no code
 of its cell names it: the result of a dispatch-budget denial reports no usage
 for the responses the provider billed. The fix of that gap turns the test
-into the opposite assertion. The lying counterparts of the twin and of that
-test are beside them.
+into the opposite assertion. A second one holds the cause of a known gap
+whose codes name none: the adapter ends a completed turn for the failed item
+of a tool call whose name no tool server lists. The lying counterparts of
+the twin and of those two tests are beside them.
+The test of a refused thread is required by name as well, as it was written:
+the ledger's record of that cell leans on it, and it has no lying counterpart
+beside it, because it plays the cell under the other error code itself.
 
 The two lying counterparts it shares with the app-server column are defined
 in that column's module.
@@ -51,25 +56,31 @@ import dataclasses
 import json
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import pytest
 
 from assay import Usage
+from crucible.backends import codex_official as official_adapter
 from crucible.backends import codex_official_worker as worker_client
 
 from . import cells, contract, declarations, envelopes, ledger, runner, toolsets
 from . import columns as matrix_columns
 from .cells import Cell
-from .columns import CANARY_CREDENTIAL, CODEX_OFFICIAL_KIND
+from .columns import CANARY_CREDENTIAL, CODEX_LEGACY_KIND, CODEX_OFFICIAL_KIND
 from .drivers import MatrixSetupError
 from .drivers import codex_legacy, codex_official
 from .peers import codex_app_server as peer_program
 from .peers import codex_worker as stage
 from .peers import launch, worker_harness
-from .scenarios import D_CDX_SERVED, SCENARIOS, SYSTEM, USER
+from .scenarios import D_CDX_SERVED, SCENARIOS, STALE_HANDLE, SYSTEM, USER
 from .script import READ_A, READ_B, Call, Malformed, ProviderScript, Reason, Refuse, Say
-from .test_matrix_codex import AnswersWhole, LastAsTheTurnSoFar, presenting_a_served_model
+from .test_matrix_codex import (
+    REFUSED_RESUME,
+    AnswersWhole,
+    LastAsTheTurnSoFar,
+    presenting_a_served_model,
+)
 
 pytestmark = pytest.mark.matrix_worker
 
@@ -500,11 +511,39 @@ def test_what_a_turn_of_several_responses_reports_rests_on_the_reading_of_last(
     assert _tokens(turn) == (whole.input_tokens, whole.output_tokens)
     assert not {code for code in turn.report.codes if code.startswith("usage.")}
     # Nothing else moves with the reading: the codes of the column that are
-    # not about the size of the usage are the same under both.
+    # not about the size of the usage are the same under both. The one
+    # exception is a scenario whose budget is crossed inside the turn: the
+    # adapter compares the budget with the cost it reports, so under the
+    # reading of one response the turn ends as a clean finish below a budget
+    # that the provider's bill has passed, and under the other the stop is
+    # typed.
     assert turn.report.codes <= one.report.codes
-    assert all(code.startswith("usage.") for code in one.report.codes - turn.report.codes)
+    moved = one.report.codes - turn.report.codes
+    budget = one.plan.budget_usd
+    assert {code for code in moved if not code.startswith("usage.")} == (
+        frozenset() if budget is None else _A_BUDGET_THAT_IS_NOT_TYPED
+    )
+    if budget is not None:
+        assert one.plan.expect.kind == "budget_exhausted"
+        reported, whole_turn = (
+            execution.observation.result.usage.cost_usd  # type: ignore[union-attr]
+            for execution in (one, turn)
+        )
+        assert reported < budget < whole_turn
+        assert turn.observation.result.error.kind == "budget_exhausted"  # type: ignore[union-attr]
+        assert one.observation.result.error is None  # type: ignore[union-attr]
 
 
+# What the cell of a scenario whose USD budget is crossed by a response
+# inside the turn shows beside the usage code, while the route reports the
+# last response alone: a budget that is not typed.
+_A_BUDGET_THAT_IS_NOT_TYPED = frozenset(
+    {
+        "kind:none!=budget_exhausted",
+        "stop:end_turn!=budget_exhausted",
+        "event.missing:limit/budget_usd",
+    }
+)
 GUARD_CODES = frozenset({"guard:limit_evidence_incomplete", "guard:revoked"})
 # The evidence the limit guard names as missing on a result that flags its
 # token usage incomplete and nothing else.
@@ -794,6 +833,243 @@ def test_the_proof_of_the_denied_turn_fails_on_a_result_that_carries_usage(
     assert _usage_of_a_denied_turn(dataclasses.replace(honest, observation=unbilled)) != []
 
 
+# -- a call for a tool no server lists: a known gap whose codes name no cause ------
+
+UNLISTED_CALL = cells.UNLISTED_TOOL_CALL_ON_THE_OFFICIAL_CODEX_ROUTE
+# The record of the ledger whose cell the proof below plays.
+UNLISTED_CALL_GAP = "R17"
+# What the adapter's check of the tool items of a turn says of an item whose
+# name is not among the attached tools.
+OUTSIDE_THE_AUTHORITY = "official Codex worker reported a tool outside the attached authority"
+# What the proof below holds of a play, by the name it reports for each.
+NOT_RETRIED, SENTENCE = "not retriable", "the sentence"
+COMPLETED_TURN, ONE_FAILED_ITEM = "a completed turn", "one failed item of the unlisted name"
+NO_USAGE, TWO_REQUESTS, NO_DISPATCH = "no usage", "two requests", "nothing at the ToolSet"
+
+
+def _handed_over(
+    scenario: str,
+    tmp_path: Path,
+    lens: str,
+    change: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> tuple[runner.Execution, list[dict[str, Any]]]:
+    """A play of the cell, and what the worker handed the adapter in it.
+
+    The function through which the adapter receives the payload of its worker
+    is wrapped for the play and passes the payload on as it came. ``change``
+    is for the lying counterparts: the adapter is handed what it returns.
+    """
+
+    handed: list[dict[str, Any]] = []
+    run_worker = official_adapter.run_official_worker
+
+    async def recording(request: Any, **named: Any) -> Any:
+        payload = await run_worker(request, **named)
+        if change is not None:
+            payload = change(copy.deepcopy(dict(payload)))
+        handed.append(copy.deepcopy(dict(payload)))
+        return payload
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(official_adapter, "run_official_worker", recording)
+        execution = _played(scenario, tmp_path, lens)
+    return execution, handed
+
+
+def _not_the_failed_item_of_an_unlisted_tool(
+    execution: runner.Execution, handed: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """What a play lacks of a completed turn the adapter ended for one failed tool item.
+
+    Read from the play (the result the call returned, what the provider saw
+    and billed, what reached the ToolSet) and from what the worker handed the
+    adapter in it.
+    """
+
+    observation = execution.observation
+    result = observation.result
+    if result is None or result.error is None:
+        return ["no result with an error"]
+    error, provider = result.error, observation.provider
+    lacking: list[str] = []
+    if error.kind != "transport" or error.retriable is not False:
+        lacking.append(NOT_RETRIED)
+    if error.message != OUTSIDE_THE_AUTHORITY:
+        lacking.append(SENTENCE)
+    if [payload.get("status") for payload in handed] != ["completed"]:
+        lacking.append(COMPLETED_TURN)
+    items = [(item["tool"], item["status"]) for payload in handed for item in payload["tool_items"]]
+    if items != [(toolsets.UNATTACHED_TOOL, "failed")]:
+        lacking.append(ONE_FAILED_ITEM)
+    billed = provider.billed
+    if (
+        len(billed) != 2
+        or not all(item.input_tokens and item.output_tokens for item in billed)
+        or (result.usage.input_tokens, result.usage.output_tokens) != (0, 0)
+    ):
+        lacking.append(NO_USAGE)
+    if (
+        provider.request_count != 2
+        or provider.extra
+        or provider.unconsumed
+        or not all(item.matched for item in provider.requests)
+    ):
+        lacking.append(TWO_REQUESTS)
+    if observation.toolset_log:
+        lacking.append(NO_DISPATCH)
+    return lacking
+
+
+def test_a_call_for_a_tool_no_server_lists_ends_in_the_adapters_check_of_its_failed_item(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Held here by name, because the codes of the cell do not name its cause.
+
+    The model calls a tool that no tool server lists. The scripted tool asks
+    its tool server for the name, is refused and reports the call as a failed
+    item; the turn completes with the model's answer, and the worker hands
+    the adapter that completed turn with the one failed item. The adapter's
+    check of the item names then ends the call: a transport error that is not
+    retriable, and no usage for the two responses the provider billed (known
+    gap R17). The cell shows a transport error where none is expected, the
+    stop reason of an error and both accounting flags false. Those are the
+    codes of any error of the route that reports no usage: a turn the tool
+    reports as failed shows them, and so does a tool outside the attached set
+    that ran. This test holds what they do not say: the error is not
+    retriable and carries the sentence of that check; the worker handed over
+    one completed turn with exactly one tool item, reported as failed, for
+    the unlisted name; the result reports no token of two billed responses;
+    two requests, both matched, none extra and none left unasked; nothing
+    reached the ToolSet. The one name of the product it wraps is the public
+    function through which the adapter receives the worker's payload, which
+    it passes on as it came. The reply is constructed: what the vendor's tool
+    does with such a call is not known, and this test says nothing of it.
+    """
+
+    # The verifier requires this test by name: the entry of the record leans
+    # on it, and a run without it is refused. No entry attributes a code to
+    # that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[CODEX_OFFICIAL_KIND]]
+    kind, scenario, role, lens = ledger.parse_cell_id(UNLISTED_CALL)
+    assert (kind, role) == (COLUMN.kind, COLUMN.role)
+    attributed = {
+        entry.cell for entry in LEDGER.entries if UNLISTED_CALL_GAP in entry.codes.values()
+    }
+    assert attributed <= {UNLISTED_CALL}
+
+    execution, handed = _handed_over(scenario, tmp_path, lens)
+
+    assert execution.report.seam_problems == ()
+    assert _not_the_failed_item_of_an_unlisted_tool(execution, handed) == []
+
+
+def _a_failed_turn(payload: dict[str, Any]) -> dict[str, Any]:
+    """The hand-over of a turn the tool reports as failed: no usage and no tool item."""
+
+    return {
+        **payload,
+        "status": "failed",
+        "error": {**(payload.get("error") or {}), "message": "the turn failed at the provider"},
+        "usage": None,
+        "final_response": "",
+        "tool_items": [],
+    }
+
+
+def _the_item_completed(payload: dict[str, Any]) -> dict[str, Any]:
+    """The same hand-over with the item of the unlisted name reported as completed."""
+
+    return {
+        **payload,
+        "tool_items": [{**item, "status": "completed"} for item in payload["tool_items"]],
+    }
+
+
+def test_the_proof_of_the_unlisted_tool_call_fails_on_a_failed_turn_and_on_a_tool_that_ran(
+    tmp_path: Path,
+) -> None:
+    # The lying counterparts of the proof above. Two are plays in which the
+    # worker hands the adapter something else for the same exchange: a turn
+    # the tool reports as failed, with no usage and no tool item, which ends
+    # in the adapter's branch for a failed turn; and the item of the unlisted
+    # name reported as completed, a tool outside the attached set that ran.
+    # The cell does not see either: both show its four codes. The others are
+    # the honest play with one thing made up, for each thing the proof holds.
+    _kind, scenario, _role, lens = ledger.parse_cell_id(UNLISTED_CALL)
+    honest, handed = _handed_over(scenario, tmp_path / "honest", lens)
+    failed, handed_failed = _handed_over(scenario, tmp_path / "failed", lens, _a_failed_turn)
+    ran, handed_ran = _handed_over(scenario, tmp_path / "ran", lens, _the_item_completed)
+    result = honest.observation.result
+    assert result is not None and result.error is not None
+
+    def lacking(
+        execution: runner.Execution = honest, handed: Sequence[Mapping[str, Any]] = handed
+    ) -> list[str]:
+        return _not_the_failed_item_of_an_unlisted_tool(execution, handed)
+
+    assert honest.report.seam_problems == ()
+    assert honest.report.codes == {
+        "kind:transport!=none",
+        "stop:error!=end_turn",
+        "flag:cost_complete=False",
+        "flag:token_usage_complete=False",
+    }
+    assert lacking() == []
+    # The two plays: the cell shows the same, and the proof names each.
+    for lying in (failed, ran):
+        assert lying.report.seam_problems == ()
+        assert lying.report.codes == honest.report.codes
+        assert lying.observation.provider.billed == honest.observation.provider.billed
+    assert lacking(failed, handed_failed) == [SENTENCE, COMPLETED_TURN, ONE_FAILED_ITEM]
+    assert lacking(ran, handed_ran) == [ONE_FAILED_ITEM]
+
+    def with_result(**changed: Any) -> runner.Execution:
+        observation = dataclasses.replace(
+            honest.observation, result=dataclasses.replace(result, **changed)
+        )
+        return dataclasses.replace(honest, observation=observation)
+
+    def with_provider(**changed: Any) -> runner.Execution:
+        provider = dataclasses.replace(honest.observation.provider, **changed)
+        return dataclasses.replace(
+            honest, observation=dataclasses.replace(honest.observation, provider=provider)
+        )
+
+    # The same error typed retriable; the text of another error; no error.
+    error = result.error
+    assert lacking(with_result(error=dataclasses.replace(error, retriable=True))) == [NOT_RETRIED]
+    other = dataclasses.replace(error, message="the turn failed at the provider")
+    assert lacking(with_result(error=other)) == [SENTENCE]
+    assert lacking(with_result(error=None)) == ["no result with an error"]
+    # The hand-over: no turn or two, an interrupted turn; no item, a second
+    # item, an item of an attached name.
+    (payload,) = handed
+    (item,) = payload["tool_items"]
+    assert lacking(handed=[]) == [COMPLETED_TURN, ONE_FAILED_ITEM]
+    assert lacking(handed=[payload, {**payload, "tool_items": []}]) == [COMPLETED_TURN]
+    assert lacking(handed=[{**payload, "status": "interrupted"}]) == [COMPLETED_TURN]
+    assert lacking(handed=[{**payload, "tool_items": []}]) == [ONE_FAILED_ITEM]
+    assert lacking(handed=[{**payload, "tool_items": [item, item]}]) == [ONE_FAILED_ITEM]
+    attached = {**item, "tool": toolsets.BINDINGS[READ_A].name}
+    assert lacking(handed=[{**payload, "tool_items": [attached]}]) == [ONE_FAILED_ITEM]
+    # The usage: a token in the result; one response on the provider's bill.
+    billed = list(honest.observation.provider.billed)
+    for name in ("input_tokens", "output_tokens"):
+        some = dataclasses.replace(result.usage, **{name: 1})
+        assert lacking(with_result(usage=some)) == [NO_USAGE], name
+    assert lacking(with_provider(billed=billed[:1])) == [NO_USAGE]
+    # The requests: one more than scripted, a step never asked, one seen.
+    requests = list(honest.observation.provider.requests)
+    assert lacking(with_provider(extra=1)) == [TWO_REQUESTS]
+    assert lacking(with_provider(unconsumed=1)) == [TWO_REQUESTS]
+    assert lacking(with_provider(requests=requests[:1])) == [TWO_REQUESTS]
+    # A call that reached the ToolSet: the log of a play that dispatched one.
+    dispatched = _played("S03", tmp_path / "dispatched").observation.toolset_log
+    assert dispatched
+    reached = dataclasses.replace(honest.observation, toolset_log=dispatched)
+    assert lacking(dataclasses.replace(honest, observation=reached)) == [NO_DISPATCH]
+
+
 # -- the served model: the wire names none ----------------------------------------
 
 
@@ -891,10 +1167,17 @@ def test_the_notifications_validate_against_the_vendor_types_in_the_locked_inter
         ],
     }
     seen = dialect.parse("POST", dialect.path, {}, json.dumps(evidence).encode(), credential="")
+    # The same exchange where the tool server answered the call with an error.
+    refused = json.loads(json.dumps(evidence))
+    refused["tool_results"][0]["is_error"] = True
+    seen_refused = dialect.parse(
+        "POST", dialect.path, {}, json.dumps(refused).encode(), credential=""
+    )
     frames: dict[str, Any] = {}
     replies = (
         dialect.render(Call(READ_A), seen, "call-2"),
         dialect.render(Say("x"), seen, "c"),
+        dialect.render(Say("x"), seen_refused, "c"),
         # A response that reasons and writes no message.
         dialect.render(Reason(), seen, "c"),
         # The terminal of a turn the provider refused for its policy.
@@ -903,7 +1186,9 @@ def test_the_notifications_validate_against_the_vendor_types_in_the_locked_inter
     for reply in replies:
         for name, frame in zip(reply.envelopes, reply.body["frames"], strict=True):
             frames[name] = frame
-    assert set(frames) == set(driver.envelopes)
+    # Every envelope of the kind but one: the answer to a request to resume
+    # a thread is an error object of the protocol and no notification.
+    assert set(frames) == set(driver.envelopes) - {REFUSED_RESUME}
 
     # Full validation, not the SDK's lenient construction, by the pinned SDK
     # in the locked interpreter, which runs under the harness of the suite.
@@ -931,6 +1216,77 @@ def test_the_notifications_validate_against_the_vendor_types_in_the_locked_inter
     )
     assert locked_worker_launch.journal is not None
     assert locked_worker_launch.violations() == []
+
+
+class _RejectsAsInvalidParams(codex_official.CodexOfficialDriver):
+    """Its peer rejects a resume under the code of invalid parameters."""
+
+    faults = (peer_program.REJECT_AS_INVALID_PARAMS,)
+
+
+class _LegacyRejectsAsInvalidParams(codex_legacy.CodexLegacyDriver):
+    """The same lying peer on the app-server route."""
+
+    faults = (peer_program.REJECT_AS_INVALID_PARAMS,)
+
+
+def test_the_cells_of_a_refused_thread_rest_on_the_code_the_tool_is_emulated_to_answer_with(
+    tmp_path: Path,
+) -> None:
+    (legacy,) = (
+        column for column in matrix_columns.real_columns() if column.kind == CODEX_LEGACY_KIND
+    )
+
+    def play(column: Any, name: str, driver: Any = None) -> runner.Execution:
+        cell = Cell(column, "S50", "raw")
+        return runner.execute(
+            cell, tmp_path / name, driver=driver, differences=LEDGER.differences_for(cell.id)
+        )
+
+    emulated = play(COLUMN, "official")
+    recoded = play(COLUMN, "official-other-code", _RejectsAsInvalidParams())
+    legacy_emulated = play(legacy, "legacy")
+    legacy_recoded = play(legacy, "legacy-other-code", _LegacyRejectsAsInvalidParams())
+
+    # In every play the client asked the tool to resume the handle of the
+    # request as a thread, the tool found no rollout for it and no model was
+    # asked. What the tool answered is emulated, not observed: every cell is
+    # answered from that one envelope and carries its grade.
+    for execution in (emulated, recoded, legacy_emulated, legacy_recoded):
+        provider = execution.observation.provider
+        assert provider.conversation_keeper and provider.refused_handles == [STALE_HANDLE]
+        assert provider.request_count == 0 and provider.envelopes == [REFUSED_RESUME]
+        assert execution.grade == envelopes.load(REFUSED_RESUME).grade == "constructed"
+        # What static cell H03 reads of the cell without playing it is
+        # what the play was answered from, and its grade.
+        assert cells.answered_from(execution.cell.id) == (REFUSED_RESUME,)
+        assert cells.grade_of(execution.cell.id) == execution.grade == "constructed"
+        assert execution.report.seam_problems == ()
+    # The code of the error object decides the cell of the official route.
+    # Under the code the envelope emulates, that of an invalid request, the
+    # SDK raises a type the adapter does not name as a rejected resume: a
+    # transport error a caller may retry, whose outcome still calls the
+    # handle active.
+    assert emulated.report.codes == {
+        "kind:transport!=stale_conversation",
+        "retriable:True",
+        "conversation:state",
+    }
+    result = emulated.observation.result
+    assert result is not None and result.error is not None and result.conversation is not None
+    assert "InvalidRequestError" in str(result.error.message)
+    assert (result.conversation.state, result.conversation.opaque_id) == ("active", STALE_HANDLE)
+    # Under the code of invalid parameters the same rejection is the typed
+    # stale conversation, and the cell is green.
+    assert recoded.report.codes == frozenset()
+    stale = recoded.observation.result
+    assert stale is not None and stale.error is not None and stale.conversation is not None
+    assert (stale.error.kind, stale.error.retriable) == ("stale_conversation", False)
+    assert (stale.conversation.state, stale.conversation.opaque_id) == ("stale", None)
+    # The app-server route types any error object alike: green under either.
+    assert legacy_emulated.report.codes == legacy_recoded.report.codes == frozenset()
+    # So the verdict of the official cell is one about a code nobody
+    # observed: it holds exactly as far as the real tool answers with it.
 
 
 def test_a_missing_worker_environment_is_an_error_that_names_the_install_command(

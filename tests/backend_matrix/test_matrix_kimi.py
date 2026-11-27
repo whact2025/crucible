@@ -65,8 +65,11 @@ from .provider import CacheCounts, LoopbackProvider, Reply, SeenRequest, SentCal
 from .scenarios import D_COST_BOUND_UNRANKED, SCENARIOS, history_replayed
 from .script import (
     READ_A,
+    UNATTACHED,
     Call,
+    Cut,
     Drop,
+    Empty,
     Malformed,
     ProviderScript,
     Refuse,
@@ -1295,7 +1298,102 @@ def test_the_verifier_requires_the_two_proofs_of_the_strict_route_by_name() -> N
         test_a_route_with_the_cost_bound_gets_its_budget_and_its_policy.__name__,
         test_a_cache_read_count_in_the_reply_leaves_the_guarded_result_diagnostic.__name__,
         test_the_bounds_of_an_honest_interval_are_the_shipped_price_of_what_was_billed.__name__,
+        # And no cell shows why the route ended a call after a tool call it
+        # will not run: its codes are those of any error of the worker.
+        *(
+            f"{test_the_call_ends_where_the_route_refuses_a_tool_call_it_will_not_run.__name__}"
+            f"[{cell}]"
+            for cell in cells.REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE
+        ),
     }
+
+
+# -- a tool call the route will not run: why the call ends ------------------------------
+
+# What ends the call on each cell, by scenario: the call the provider sent
+# (its slot, and whether its argument text was no JSON object), the text of
+# the error, and the tool events of the trace. A tool that is not attached
+# is refused by the worker before any tool event. A call whose arguments are
+# no JSON object is reported by the worker as a tool call; the vendor's SDK
+# answers it itself, the worker refuses that answer because it approved no
+# such call, and the adapter then refuses the trace of a call without a
+# result.
+_WHY_THE_CALL_ENDS: Mapping[str, tuple[tuple[str, bool], str, list[str]]] = {
+    "S06": (
+        (UNATTACHED, False),
+        "WorkerQualificationError: Kimi requested a tool outside the attached ToolSet",
+        [],
+    ),
+    "S05": (
+        (READ_A, True),
+        "Kimi worker emitted an invalid per-attempt tool event sequence",
+        ["tool_call"],
+    ),
+}
+
+
+@pytest.mark.parametrize("cell_id", cells.REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE)
+def test_the_call_ends_where_the_route_refuses_a_tool_call_it_will_not_run(
+    cell_id: str, played: Callable[..., runner.Execution], request: pytest.FixtureRequest
+) -> None:
+    """The cause of the codes that the ledger books under M18.
+
+    The codes say that the call ended in a transport error after its first
+    reply and that the script was not played to its end. Any error of the
+    worker after that reply shows them. What the record names is one cause
+    per cell, and this test holds the cell to it.
+    """
+
+    # The verifier requires this test by name on each cell: the record of the
+    # ledger leans on it, and a run without it is refused. No entry attributes
+    # a code to that record on a cell this test does not play.
+    assert request.node.name in cells.REQUIRED_PROOFS[cells.MODULE_BY_KIND[KIMI_KIND]]
+    attributed = {entry.cell for entry in LEDGER.entries if "M18" in entry.codes.values()}
+    assert attributed == set(cells.REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE)
+    kind, scenario, role, lens = ledger.parse_cell_id(cell_id)
+    assert (kind, role, lens) == (KIMI_KIND, PRIMARY.role, "raw")
+    entry = LEDGER.entry(cell_id)
+    assert entry is not None
+    sent, text, tool_events = _WHY_THE_CALL_ENDS[scenario]
+
+    execution = played(scenario)
+
+    # The expected failure the ledger records for the cell ...
+    assert execution.report.seam_problems == ()
+    assert execution.report.codes == set(entry.codes) | WIDE
+    # ... after exactly one request, which the provider matched, answered
+    # with the scripted tool call and billed. Nothing reached the ToolSet,
+    # and the model was not asked again.
+    provider = execution.observation.provider
+    assert provider.request_count == 1 and provider.extra == 0
+    assert [item.matched for item in provider.requests] == [True]
+    assert [(call.slot, call.malformed) for call in provider.sent_calls] == [sent]
+    assert len(provider.billed) == 1 and provider.unconsumed >= 1
+    assert execution.observation.toolset_log == ()
+    # ... for the cause the record names: the refusal, in the text of an
+    # error that is not retriable, and the tool events the trace holds.
+    assert _rejection(execution) == text
+    result = execution.observation.result
+    assert result is not None and result.execution_trace is not None
+    assert [
+        event.kind for event in result.execution_trace.events if event.kind.startswith("tool_")
+    ] == tool_events
+
+    # The lying counterpart: the same result with the error of a worker
+    # that went away on the reply. The contract judges it exactly as it
+    # judges the cell, so the entry would stand over it: the codes name no
+    # cause, and only the text held above tells the two apart.
+    assert result.error is not None
+    gone = dataclasses.replace(result.error, message="Kimi worker exited without an outcome")
+    assert _rejudged(
+        execution, result=dataclasses.replace(result, error=gone)
+    ) == execution.report.codes
+    # Nor do the codes tell the two cells apart: those of the call for a
+    # tool that is not attached are all among those of the other cell.
+    first, second = (
+        LEDGER.entry(cell) for cell in cells.REFUSED_TOOL_CALLS_ON_THE_KIMI_ROUTE
+    )
+    assert first is not None and second is not None and set(first.codes) < set(second.codes)
 
 
 # -- the dialect ------------------------------------------------------------------
@@ -1517,6 +1615,23 @@ def test_the_dialect_reads_a_chat_request_and_renders_only_from_envelopes() -> N
     # The stream is the envelope's chunks with their slots filled, in the
     # server-sent-event form, and its closing message is no JSON document.
     reply = dialect.render(Call(READ_A), seen, "call-7")
+    assert not reply.call_malformed
+    # The arguments of a call travel as text in a string, so a text that is
+    # no JSON object travels too, through the same envelope: the stream is
+    # the provider's, and the worker reads it. The reply says that the call
+    # names no arguments.
+    for text in ('{"file_path": "notes', "null", '["notes.txt"]'):
+        cut = dialect.render(Call(READ_A, malformed=text), seen, "call-8")
+        carried = [
+            call["function"]["arguments"]
+            for chunk in cut.body
+            if isinstance(chunk, dict)
+            for choice in chunk["choices"]
+            for call in choice["delta"].get("tool_calls", ())
+        ]
+        assert carried == [text]
+        assert cut.call_malformed and cut.call is not None and cut.call[2] == {}
+        assert cut.envelope == reply.envelope
     assert reply.content_type == "text/event-stream" and reply.raw is not None
     frames = reply.raw.decode("utf-8").split("\n\n")
     assert frames[-1] == "" and len(frames) == len(reply.body) + 1
@@ -1833,12 +1948,16 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
     dialect = driver.MoonshotChatDialect()
     blank = dialect.parse("POST", dialect.path, {}, b'{"model": "asked"}', credential="")
 
-    # The two replies of the tool loop, and the two refusals that are streams.
+    # The two replies of the tool loop, the two refusals that are streams,
+    # a reply the route ended at the cap on its tokens and a reply in which
+    # nothing was produced.
     steps: tuple[Step, ...] = (
         Say("the answer"),
         Call(READ_A),
         Refuse("content_filter"),
         Refuse("refusal_part"),
+        Cut("what the cap left"),
+        Empty(),
     )
     for step in steps:
         chunks = dialect.render(step, blank, "call-1").body
@@ -1881,6 +2000,29 @@ def test_the_envelopes_validate_against_the_pinned_sdk_in_the_locked_interpreter
     for reply in (filtered, declined):
         assert reply.usage is not None and reply.served_model == "asked"
         assert dialect.cache_counts(reply) == CacheCounts(None, 0)
+    # The mark of a cut is the finish reason of the chunk that ends the
+    # choice: the one the pinned SDK types for a reply that reached its cap.
+    # The text that was produced travels before it and the usage after it.
+    # A reply in which nothing was produced ends on an ordinary finish, with
+    # an empty content, no reasoning and no completion token.
+    cut = dialect.render(Cut("what the cap left"), blank, "call-1")
+    silent = dialect.render(Empty(), blank, "call-1")
+
+    def finishes(reply: Reply) -> list[str | None]:
+        return [
+            choice["finish_reason"] for chunk in reply.body[:-1] for choice in chunk["choices"]
+        ]
+
+    assert finishes(cut) == [None, None, "length"]
+    assert cut.body[1]["choices"][0]["delta"] == {"content": "what the cap left"}
+    assert cut.envelope == f"moonshot_chat/moonshot.{chat.OUTPUT_CUT}"
+    assert cut.usage == Cut("what the cap left").usage
+    assert finishes(silent) == [None, "stop"]
+    assert silent.body[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    assert not any("reasoning_content" in str(chunk) for chunk in silent.body)
+    assert silent.envelope == f"moonshot_chat/moonshot.{chat.EMPTY_COMPLETION}"
+    assert silent.usage == Empty().usage and silent.usage.output_tokens == 0
+    assert silent.body[-2]["usage"]["completion_tokens"] == 0
     # The third refusal is no stream: a rejected request is answered with an
     # error object of the SDK's four fields, bills nothing and names no model.
     rejected = dialect.render(Refuse("http_policy"), blank, "call-1")
@@ -1932,7 +2074,9 @@ def test_every_cell_of_the_columns_is_graded_by_the_envelopes_it_used(
     loop = {"moonshot_chat/moonshot.completion", "moonshot_chat/moonshot.tool_call"}
     reasoning = {"moonshot_chat/moonshot.reasoning_only"}
     unended = f"moonshot_chat/moonshot.{chat.MALFORMED}"
-    refusals = set(DRIVER.envelopes) - loop - reasoning - {unended}
+    cut = f"moonshot_chat/moonshot.{chat.OUTPUT_CUT}"
+    silent = f"moonshot_chat/moonshot.{chat.EMPTY_COMPLETION}"
+    refusals = set(DRIVER.envelopes) - loop - reasoning - {unended, cut, silent}
     assert set(text.observation.provider.envelopes) == {"moonshot_chat/moonshot.completion"}
     assert set(tools.observation.provider.envelopes) == loop
     assert set(DRIVER.envelopes) == {
@@ -1953,6 +2097,10 @@ def test_every_cell_of_the_columns_is_graded_by_the_envelopes_it_used(
     # That a stream of the route ends in order before its terminal is stated
     # by no source either: the envelope of that reply is constructed.
     assert envelopes.load(unended).grade == "constructed"
+    # A reply the route ended at the cap on its tokens was seen once through
+    # the adapter and no field of its stream was noted; a reply without
+    # output was never seen. Both envelopes are constructed.
+    assert {envelopes.load(name).grade for name in (cut, silent)} == {"constructed"}
     # The schema answer of the planner shape travels in the prompt, once, and
     # in no provider field: what the route declares.
     assert SCENARIOS["S04"].governing == ("structured_output",)

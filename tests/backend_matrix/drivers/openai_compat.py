@@ -51,8 +51,21 @@ from ..provider import (
     answered_from,
     cut_inside,
     require_cut_in_body,
+    stated_cap,
 )
-from ..script import Call, Drop, Malformed, ProviderScript, Reason, Refuse, Say, ServedAs, Step
+from ..script import (
+    Call,
+    Cut,
+    Drop,
+    Empty,
+    Malformed,
+    ProviderScript,
+    Reason,
+    Refuse,
+    Say,
+    ServedAs,
+    Step,
+)
 from ..toolsets import BINDINGS
 from .base import GUARD_POLICY, Lens, MatrixSetupError, register
 
@@ -70,6 +83,23 @@ REASONING_ONLY = "reasoning_only"
 REASONING_TEXT = "matrix reasoning that is never shown [canary-reasoning-5c1d]"
 # The behaviour class of a reply that is no terminal of its wire.
 MALFORMED = "malformed_terminal"
+# The behaviour classes of a reply the provider ended at the cap on the
+# tokens of the response, and of a clean stop that produced nothing.
+OUTPUT_CUT = "output_cut"
+EMPTY_COMPLETION = "empty_completion"
+# The two spellings of the cap on the tokens of a response in a
+# chat-completions request: the one the SDK types as current, then its
+# older alias.
+RESPONSE_CAP_FIELDS = ("max_completion_tokens", "max_tokens")
+
+
+def response_cap(payload: Mapping[str, Any]) -> int | None:
+    """The cap on the tokens of the response a chat-completions request carries."""
+
+    for name in RESPONSE_CAP_FIELDS:
+        if name in payload:
+            return stated_cap(payload[name])
+    return None
 
 
 def _text(content: Any) -> str:
@@ -109,6 +139,8 @@ class OpenAIChatDialect:
 
     name = "openai_chat"
     path = "/v1/chat/completions"
+    # ``max_completion_tokens``, or ``max_tokens``, in the body of a request.
+    response_cap_field = True
 
     def __init__(self, provider: str, *, host: str | None, route_credential: bool) -> None:
         self._provider = provider
@@ -132,6 +164,8 @@ class OpenAIChatDialect:
                 REASONING_ONLY,
                 *REFUSALS.values(),
                 MALFORMED,
+                OUTPUT_CUT,
+                EMPTY_COMPLETION,
             )
         )
 
@@ -199,6 +233,7 @@ class OpenAIChatDialect:
             # The shape of the conversation the request carries: roles and
             # call ids, no text.
             evidence={"messages": [_shape(item) for item in messages]},
+            response_cap=response_cap(payload),
         )
 
     def seam_problems(self, seen: SeenRequest) -> list[str]:
@@ -277,15 +312,29 @@ class OpenAIChatDialect:
         elif isinstance(step, Call):
             binding = BINDINGS[step.slot]
             arguments = dict(binding.arguments if step.args is None else step.args)
+            if step.malformed is not None:
+                arguments = {}
             behaviour, call = "tool_call", (step.slot, call_id, arguments)
             slots = {
                 "call_id": call_id,
                 "tool_name": binding.name,
-                # The wire carries the arguments as a JSON document in a string.
-                "tool_arguments": json.dumps(arguments, sort_keys=True),
+                # The wire carries the arguments as a JSON document in a
+                # string, so it also carries a text that is none.
+                "tool_arguments": (
+                    json.dumps(arguments, sort_keys=True)
+                    if step.malformed is None
+                    else step.malformed
+                ),
             }
         elif isinstance(step, Refuse):
             behaviour, call, slots = REFUSALS[step.form], None, {}
+        elif isinstance(step, Cut):
+            # The document of an answer that ends at the cap: the text that
+            # was produced, the cap as the finish reason, and its usage.
+            behaviour, call, slots = OUTPUT_CUT, None, {"text": step.text}
+        elif isinstance(step, Empty):
+            # The document of an answer in which nothing was produced.
+            behaviour, call, slots = EMPTY_COMPLETION, None, {}
         else:
             raise MatrixSetupError(
                 f"the {self.name} dialect does not render {type(step).__name__} yet; "
@@ -308,7 +357,13 @@ class OpenAIChatDialect:
             total_tokens=usage.input_tokens + usage.output_tokens,
         )
         return Reply(
-            envelope.status, envelope.fill(slots), usage, served, call, envelope.name
+            envelope.status,
+            envelope.fill(slots),
+            usage,
+            served,
+            call,
+            envelope.name,
+            call_malformed=isinstance(step, Call) and step.malformed is not None,
         )
 
     def _dropped(

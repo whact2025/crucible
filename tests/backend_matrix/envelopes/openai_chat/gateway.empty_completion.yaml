@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Whact Inc.
+# SPDX-License-Identifier: MIT
+
+# A chat completion that ends cleanly and produced nothing: an ordinary
+# finish reason, a message whose content is the empty string and a usage
+# without a completion token, in the hosted gateway's dialect.
+
+schema_version: crucible.backend-matrix.envelope.v1
+dialect: openai_chat
+provider: gateway
+behaviour: empty_completion
+
+provenance:
+  grade: constructed
+  sdk_type: >-
+    openai.types.chat.ChatCompletion whose one choice has the finish_reason
+    "stop" and a message whose content is the empty string, a value of the
+    type of openai.types.chat.ChatCompletionMessage.content
+  sdk_version: openai 2.44.0
+  notes: >-
+    Nothing was observed and nothing is documented in reach: no reply of the
+    gateway without output was seen, and no source read for it states that
+    it sends one or in which shape. The document is the one of the plain
+    completion of this dialect with nothing in its text; that the content
+    is the empty string and not null, and that the usage block is present
+    with no completion token, are choices of this envelope. The renderer
+    fills the counters, and the scripted step allows no output token. So
+    this envelope proves that such a reply parses through the SDK, not that
+    the gateway sends it.
+
+status: 200
+body:
+  id: {slot: response_id}
+  object: chat.completion
+  created: {slot: created}
+  model: {slot: served_model}
+  choices:
+    - index: 0
+      message:
+        role: assistant
+        content: ""
+      finish_reason: stop
+  usage:
+    prompt_tokens: {slot: input_tokens}
+    completion_tokens: {slot: output_tokens}
+    total_tokens: {slot: total_tokens}
