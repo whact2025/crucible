@@ -111,6 +111,7 @@ from crucible.common.runners.observations import (
 )
 from crucible.common.runners.parameters import (
     for_language,
+    for_slice,
     resolve_project_working_dir,
 )
 from crucible.tools import ToolMutationIndeterminate
@@ -2960,6 +2961,58 @@ def _touched_files_from_diff(
     return tuple(dict.fromkeys(paths))
 
 
+_SDK_ANCESTOR_SETTINGS = frozenset({
+    "directory.build.props", "directory.build.rsp", "directory.build.targets",
+    "directory.packages.props", "directory.solution.props", "directory.solution.targets",
+    "global.json", "nuget.config",
+})
+
+
+def _sdk_scope_contains_candidate(spec, parameters: Mapping, paths: Sequence[str]) -> bool:
+    """Check SDK-owned paths and settings inherited from their ancestors."""
+    candidates = []
+    for value in paths:
+        path = PurePosixPath(str(value).replace("\\", "/").lower())
+        if (path.suffix in {
+            ".cs", ".csproj", ".csx", ".cshtml", ".razor", ".sln",
+            ".slnx", ".slnf", ".props", ".targets", ".runsettings",
+        } or path.name in _SDK_ANCESTOR_SETTINGS or path.name in {
+            "packages.lock.json", "packages.config", "dotnet-tools.json",
+        }):
+            candidates.append(path)
+    if not candidates:
+        return False
+
+    roots: set[PurePosixPath] = set()
+    targets: set[PurePosixPath] = set()
+    dag = getattr(spec, "tier_dag", None)
+    sdk_slices = [
+        item.id for tier in (dag.tiers if dag else ()) for item in tier.slices
+        if "dotnet" in _build_verify._resolve_languages(spec, item.directive)
+    ]
+    for slice_id in sdk_slices or (None,):
+        options = for_language(for_slice(parameters, slice_id), "dotnet")
+        directory = PurePosixPath(str(options.get("project_subdir") or ".").replace("\\", "/").lower())
+        if directory != PurePosixPath("."):
+            roots.add(directory)
+        for key in ("project", "test_project"):
+            name = options.get(key)
+            if isinstance(name, str) and name:
+                target = directory / name.replace("\\", "/").lower()
+                targets.add(target)
+                roots.add(target.parent)
+        if directory == PurePosixPath(".") and not (options.get("project") or options.get("test_project")):
+            roots.add(directory)
+    if any(path.is_absolute() or ".." in path.parts or ":" in str(path) for path in roots | targets):
+        return True  # An unconfined project selector cannot disambiguate a candidate SDK file.
+    for path in candidates:
+        if path in targets or any(path.is_relative_to(root) for root in roots):
+            return True
+        if path.name in _SDK_ANCESTOR_SETTINGS and any(root.is_relative_to(path.parent) for root in roots):
+            return True
+    return False
+
+
 def _breach_language_for_run(
     deepswe_metadata: "dict | None",
     spec,
@@ -2997,16 +3050,8 @@ def _breach_language_for_run(
         or "crucible.common.runners.lang.dotnet" in runners.values()
         or "dotnet" in (parameters.get("per_language") or {})
     )
-    if dotnet_product:
-        for path in map(PurePosixPath, paths):
-            if path.suffix.lower() in {
-                ".cs", ".csproj", ".csx", ".cshtml", ".razor", ".sln",
-                ".slnx", ".slnf", ".props", ".targets", ".runsettings",
-            } or path.name.lower() in {
-                "global.json", "packages.lock.json", "packages.config", "nuget.config",
-                "directory.build.rsp", "dotnet-tools.json",
-            }:
-                return "dotnet"
+    if dotnet_product and _sdk_scope_contains_candidate(spec, parameters, paths):
+        return "dotnet"
     return languages[0] if languages else "python"
 
 

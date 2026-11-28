@@ -149,6 +149,27 @@ def test_candidate_paths_are_interpreted_against_declared_sdk_contract(candidate
     ) == "python"
 
 
+@pytest.mark.parametrize(("path", "expected"), [
+    ("python/deploy/global.json", "python"),
+    ("python/tests/fixtures/template.props", "python"),
+    ("python/tests/fixtures/example.cs", "python"),
+    ("services/dotnet/App/Rules.cs", "dotnet"),
+    ("services/dotnet/Config/template.props", "dotnet"),
+    ("services/dotnet/Rules.slnx", "dotnet"),
+    ("services/Directory.Packages.props", "dotnet"),
+    ("global.json", "dotnet"),
+    ("Directory.Build.props", "dotnet"),
+])
+def test_sibling_sdk_only_owns_its_subtree_and_inherited_settings(path, expected):
+    spec = replace(_spec({"per_language": {"dotnet": {
+        "project_subdir": "services/dotnet", "test_project": "App/Rules.csproj",
+    }}}), constraints=(LanguagesConstraint(languages=("python", "dotnet")),))
+    directive = _slice("py", ["python"], "python").directive
+    assert breach._breach_language_for_run(
+        None, spec, directives=(directive,), diff_files=(path,),
+    ) == expected
+
+
 def test_homogeneous_tier_binds_only_its_project_at_all_gates(candidate):
     repo, corpus_dir, patch = candidate
     corpus = Corpus(corpus_dir)
