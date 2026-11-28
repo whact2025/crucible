@@ -1512,7 +1512,7 @@ class BreachAuthority:
 def _validate_authority_canonical_tier(
     authority: BreachAuthority,
     spec,
-) -> None:
+) -> tuple[ImplementationDirective, ...]:
     """Reject directive authority that differs from the persisted TierDAG.
 
     ``_load_breach_authority`` separately binds ``issue_text`` to the trusted
@@ -1538,6 +1538,10 @@ def _validate_authority_canonical_tier(
     # dataclasses, tuples, and frozen mappings. Compare canonical JSON rather
     # than Python containers so every field and JSON scalar type is bound
     # without mistaking tuple-versus-list representation for tampering.
+    canonical_slices = canonical.slices
+    if authority.authority_kind == "selected_slices":
+        selected_ids = {item.slice_id for item in authority.slices}
+        canonical_slices = tuple(item for item in canonical_slices if item.id in selected_ids)
     expected = tuple(
         (
             item.id,
@@ -1548,7 +1552,7 @@ def _validate_authority_canonical_tier(
                 separators=(",", ":"),
             ),
         )
-        for item in canonical.slices
+        for item in canonical_slices
     )
     observed = tuple(
         (
@@ -1562,69 +1566,55 @@ def _validate_authority_canonical_tier(
         )
         for item in authority.slices
     )
-    if authority.authority_kind == "selected_slices":
-        selected_ids = {item.slice_id for item in authority.slices}
-        expected = tuple(
-            item for item in expected if item[0] in selected_ids
-        )
     if observed != expected:
         raise ValueError(
             "breach authority directive payload does not match the "
             "canonical active tier selection"
         )
+    return tuple(item.directive for item in canonical_slices)
 
 
-def _single_authority_execution_binding(
-    authority: BreachAuthority | None,
-    spec,
+def scope_execution_binding(
+    directives: tuple[ImplementationDirective, ...], spec=None,
 ) -> tuple[str, ImplementationDirective] | None:
-    """Preserve canonical runner routing for a one-slice breach authority.
-
-    Breach uses synthetic gate names for lifecycle evidence.  Those names are
-    not canonical TierDAG slice IDs, so feeding them to ``build_and_verify``
-    loses both the slice language constraint and any ``runner_parameters``
-    ``per_slice`` overlay.  A one-slice authority has an unambiguous canonical
-    execution binding; retain it for every deterministic breach gate while the
-    surrounding journal continues to use its synthetic checkpoint names.
-
-    Multi-slice authority still requires a separately modelled aggregate gate
-    and deliberately keeps the existing conservative Spec-wide behavior.
-    """
-
-    if authority is None or len(authority.slices) != 1:
+    """Select the canonical runner settings for a scoped acceptance gate."""
+    if not directives:
         return None
-    dag = getattr(spec, "tier_dag", None)
-    if dag is None:
-        raise ValueError("breach authority requires a canonical TierDAG")
-    canonical_tier = next(
-        (
-            tier for tier in dag.topo_order()
-            if tier.tier_id == authority.tier_id
-        ),
-        None,
-    )
-    if canonical_tier is None:
-        raise ValueError("breach authority tier is absent from the canonical DAG")
-    selected_id = authority.slices[0].slice_id
-    canonical_slice = next(
-        (slice_ for slice_ in canonical_tier.slices if slice_.id == selected_id),
-        None,
-    )
-    if canonical_slice is None:
-        raise ValueError(
-            "breach authority slice is absent from the canonical active tier"
-        )
+    if len(directives) > 1:
+        # Existing aggregate gates use the whole Spec. When that would add
+        # .NET outside the selected scope, prove the selected slices name
+        # the same executable suite before using one as their representative.
+        if spec is None or "dotnet" not in _build_verify._resolve_languages(spec):
+            return None
+        selections = [_build_verify._resolve_languages(spec, item) for item in directives]
+        if any("dotnet" in languages for languages in selections):
+            return None
+        first = selections[0]
+        if first not in {("python",), ("rust",)} or any(langs != first for langs in selections):
+            raise ValueError(
+                "different observation languages require separate scoped handoffs or tiers"
+            )
+        baseline = None
+        for directive in directives:
+            parameters = _build_verify.runner_parameters(spec, slice_id=directive.slice_id)
+            mode = "tests" if directive.verify_mode in {"skip", "build_only"} else directive.verify_mode
+            effective = (for_language(parameters, first[0]), mode)
+            if baseline is not None and effective != baseline:
+                raise ValueError(
+                    "different selected runner settings require separate scoped handoffs or tiers"
+                )
+            baseline = effective
     # Breach acceptance gates are shipping proofs, not the phase-local
     # implementation gate. Preserve canonical runner routing while overriding
     # an authored ``skip``/``build_only`` suppression so every accepted
     # candidate executes its verification suite.
-    gate_directive = canonical_slice.directive
+    gate_directive = directives[0]
     if gate_directive.verify_mode in {"skip", "build_only"}:
         gate_directive = dataclasses.replace(
             gate_directive,
             verify_mode="tests",
         )
-    return canonical_slice.id, gate_directive
+    return gate_directive.slice_id, gate_directive
 
 
 def _apply_requirement_completion_ownership(
@@ -2136,6 +2126,15 @@ def _scope_contains(scope_path: str, candidate: str) -> bool:
     return candidate == scope_path or candidate.startswith(scope_path.rstrip("/") + "/")
 
 
+def _require_diff_coverage(label: str, scope: Sequence[str], diff_files: Sequence[str]) -> None:
+    uncovered = [
+        path for path in diff_files
+        if not any(_scope_contains(root, path) for root in scope)
+    ]
+    if uncovered:
+        raise ValueError(f"{label} does not cover diff paths: {uncovered!r}")
+
+
 def _load_breach_authority(
     *,
     authority_file: Path | None,
@@ -2178,15 +2177,7 @@ def _load_breach_authority(
         path for slice_authority in authority.slices
         for path in slice_authority.scope
     )
-    uncovered = tuple(
-        path for path in diff_files
-        if not any(_scope_contains(scope, path) for scope in authority_scope)
-    )
-    if uncovered:
-        raise ValueError(
-            "hash-bound authority does not cover diff paths: "
-            f"{list(uncovered)!r}"
-        )
+    _require_diff_coverage("hash-bound authority", authority_scope, diff_files)
     return authority
 
 
@@ -2332,10 +2323,10 @@ class _RustRunnerSelection:
         return merged
 
 
-def _rust_runner_selection(spec) -> _RustRunnerSelection:
+def _rust_runner_selection(spec, slice_id: str | None = None) -> _RustRunnerSelection:
     """Parse only the Rust adapter's view of generic Spec parameters."""
 
-    parameters = _build_verify.runner_parameters(spec)
+    parameters = _build_verify.runner_parameters(spec, slice_id=slice_id)
     layer = dict(parameters)
     per_language = parameters.get("per_language")
     if isinstance(per_language, dict):
@@ -2434,6 +2425,8 @@ def validate_breach_observation_runner(
     runner = runners.get(role) or (
         runners.get("test") if role == "verify" else None
     )
+    if runner == "crucible.common.runners.lang.dotnet":
+        raise ValueError("breach has no exact per-test observation adapter for 'dotnet'")
     if language == "python":
         if (
             not trusted_runner_has_capability(
@@ -2707,6 +2700,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "must also pass --authority-digest.",
     )
     p.add_argument(
+        "--observation-tier",
+        help="Select a canonical plan tier for native test routing. Its "
+             "directives must cover the candidate diff. An authority packet "
+             "already supplies its own selection.",
+    )
+    p.add_argument(
         "--authority-digest", default=None,
         help="Exact sha256:<hex> digest returned by "
              "encode_breach_authority(). The workflow rejects a missing "
@@ -2961,65 +2960,59 @@ def _touched_files_from_diff(
     return tuple(dict.fromkeys(paths))
 
 
-def _resolve_breach_language(spec) -> str:
-    """Pick the language the breach tests should be written in.
+def _breach_language_for_run(
+    deepswe_metadata: "dict | None",
+    spec,
+    *,
+    directives: Sequence[ImplementationDirective | None] = (),
+    diff_files: Sequence[str] = (),
+) -> str:
+    """Route native observations using the selected scope, or the whole Spec.
 
-    Reads ``LanguagesConstraint`` off the spec; falls back to ``python``
-    only when no language is declared. For multi-language specs we pick
-    the FIRST declared language — the diff is expected to be scoped to
-    that language, and the project's verify runner runs all declared
-    languages anyway.
-
-    This matters because the project's verify runner (cargo test for
-    Rust, pytest for Python, etc.) decides what tests actually execute.
-    Breach tests written in the wrong language are dead code — never
-    invoked, never blocking the Judge — so the entire Breaker→Defender
-    loop becomes a no-op even when attacks would otherwise land.
+    The exact-test adapters generate tests in one language. A scope containing
+    .NET cannot be attested by a supported sibling. A C# source/project path
+    also identifies this boundary when a declaration is absent or incomplete.
+    Benchmark containers retain their task-specific language routing.
     """
-    try:
-        from crucible.constraints import LanguagesConstraint  # type: ignore
-    except Exception:  # noqa: BLE001
-        LanguagesConstraint = None  # type: ignore[assignment]
-    for c in spec.constraints or ():
-        if LanguagesConstraint is not None and isinstance(c, LanguagesConstraint):
-            langs = list(getattr(c, "languages", ()) or ())
-            if langs:
-                return str(langs[0]).lower()
-        if getattr(c, "kind", None) == "languages":
-            langs = list(getattr(c, "languages", ()) or ())
-            if langs:
-                return str(langs[0]).lower()
-    return "python"
-
-
-def _breach_language_for_run(deepswe_metadata: "dict | None", spec) -> str:
-    """Resolve the language the breach tests must be written in.
-
-    DeepSWE threads the per-task language through ``deepswe_metadata`` (its
-    starter spec carries no ``LanguagesConstraint`` — same reason the
-    dev_verify gate reads the language from metadata). So
-    ``_resolve_breach_language(spec)`` alone would fall back to ``python``
-    for EVERY DeepSWE task, making the polyglot test path + Defender
-    framing inert for go/ts/rust/js (the Defender would write a
-    ``tests/test_breach.py`` the project's runner never discovers). Prefer
-    the metadata language when present; fall back to the spec constraint
-    (benchmark suites declare it there), then python."""
     meta_lang = str((deepswe_metadata or {}).get("language") or "").strip().lower()
-    return meta_lang or _resolve_breach_language(spec)
+    if deepswe_metadata is not None:
+        spec_languages = _build_verify._resolve_languages(spec)
+        return meta_lang or (spec_languages[0].lower() if spec_languages else "python")
+    languages = []
+    paths = list(diff_files)
+    for directive in directives or (None,):
+        languages.extend(
+            lang.lower() for lang in _build_verify._resolve_languages(spec, directive)
+        )
+        if directive is not None:
+            paths.extend(getattr(directive, "files_in_scope", ()))
+            paths.extend(getattr(directive, "creates_paths", ()))
+    if "dotnet" in languages:
+        return "dotnet"
+    project = getattr(spec, "project_context", None)
+    runners = getattr(project, "runners", {}) or {}
+    parameters = getattr(project, "runner_parameters", {}) or {}
+    dotnet_product = (
+        "dotnet" in _build_verify._resolve_languages(spec)
+        or "crucible.common.runners.lang.dotnet" in runners.values()
+        or "dotnet" in (parameters.get("per_language") or {})
+    )
+    if dotnet_product:
+        for path in map(PurePosixPath, paths):
+            if path.suffix.lower() in {
+                ".cs", ".csproj", ".csx", ".cshtml", ".razor", ".sln",
+                ".slnx", ".slnf", ".props", ".targets", ".runsettings",
+            } or path.name.lower() in {
+                "global.json", "packages.lock.json", "packages.config", "nuget.config",
+                "directory.build.rsp", "dotnet-tools.json",
+            }:
+                return "dotnet"
+    return languages[0] if languages else "python"
 
 
 def resolve_breach_observation_language(spec, directive=None) -> str:
-    """Resolve the canonical first language for one selected slice."""
-
-    blast_radius = getattr(directive, "blast_radius", None)
-    languages = (
-        blast_radius.get("languages")
-        if isinstance(blast_radius, Mapping)
-        else None
-    )
-    if isinstance(languages, (list, tuple)) and languages:
-        return str(languages[0]).lower()
-    return _resolve_breach_language(spec)
+    """Return the observation language for the selected Handoff slice."""
+    return _breach_language_for_run(None, spec, directives=(directive,))
 
 
 _JS_TS_TEST_RE = re.compile(r"(?P<sep>\.test|\.spec|_test|_tests)\.(?P<ext>tsx?|jsx?|mjs|cjs)$")
@@ -3117,6 +3110,8 @@ def _resolve_test_file(
     For go/ts/js, when the diff has no source file of that language we
     fall back to a repo-root / ``tests/`` path (best-effort).
     """
+    if language == "dotnet":
+        raise ValueError("breach has no exact per-test observation adapter for 'dotnet'")
     if breach_tests_arg is not None:
         if breach_tests_arg.is_absolute():
             return breach_tests_arg
@@ -3195,6 +3190,7 @@ def resolve_breach_test_target(
     diff_bytes: bytes,
     base_treeish: str = "HEAD",
     breach_tests: Path | None = None,
+    directive: ImplementationDirective | None = None,
 ) -> str:
     """Predict the exact repo-relative generated-test target for a child.
 
@@ -3209,9 +3205,11 @@ def resolve_breach_test_target(
         cwd=cwd,
         base_treeish=base_treeish,
     )
-    language = _breach_language_for_run(None, spec)
+    language = _breach_language_for_run(
+        None, spec, directives=(directive,), diff_files=diff_files,
+    )
     rust_selection = (
-        _rust_runner_selection(spec)
+        _rust_runner_selection(spec, directive.slice_id if directive is not None else None)
         if language == "rust"
         else _RustRunnerSelection()
     )
@@ -3507,12 +3505,13 @@ class _BreachPreflight:
 
     deepswe_metadata: dict | None
     swebench_metadata: dict | None
-    diff_bytes: bytes
     diff_files: tuple[str, ...]
     language: str
     test_file: Path
     test_file_relative: str
     rust_selection: _RustRunnerSelection
+    authority: BreachAuthority | None
+    execution_binding: tuple[str, ImplementationDirective] | None
 
 
 def _prepare_breach_execution(
@@ -3543,9 +3542,45 @@ def _prepare_breach_execution(
         cwd=cwd,
         base_treeish=base_treeish,
     )
-    breach_language = _breach_language_for_run(deepswe_metadata, spec)
+    if not diff_bytes or not diff_files:
+        raise ValueError(
+            "breach requires a non-empty candidate diff with at least one touched path"
+        )
+    authority = _load_breach_authority(
+        authority_file=args.authority_file,
+        authority_digest_value=args.authority_digest,
+        issue_text=args.issue_text,
+        diff_files=diff_files,
+    )
+    directives: tuple[ImplementationDirective, ...] = ()
+    if args.observation_tier is not None:
+        if authority is not None or deepswe_metadata is not None or swebench_metadata is not None:
+            raise ValueError("--observation-tier requires a native candidate without an authority packet")
+        tiers = spec.tier_dag.topo_order() if spec.tier_dag is not None else ()
+        tier = next((item for item in tiers if item.tier_id == args.observation_tier), None)
+        if tier is None:
+            raise ValueError("observation tier is absent from the canonical DAG")
+        directives = tuple(item.directive for item in tier.slices)
+        scope = tuple(
+            path for directive in directives
+            for path in (*directive.files_in_scope, *directive.creates_paths)
+        )
+        _require_diff_coverage("observation tier", scope, diff_files)
+    elif authority is not None:
+        directives = _validate_authority_canonical_tier(authority, spec)
+    # Both benchmark products retain their metadata / Spec-wide language route.
+    benchmark = deepswe_metadata if deepswe_metadata is not None else swebench_metadata
+    breach_language = _breach_language_for_run(
+        benchmark, spec, directives=directives, diff_files=diff_files,
+    )
+    execution_binding = scope_execution_binding(
+        directives, spec if benchmark is None else None,
+    )
     rust_selection = (
-        _rust_runner_selection(spec)
+        _rust_runner_selection(
+            spec,
+            execution_binding[0] if execution_binding and benchmark is None else None,
+        )
         if breach_language == "rust"
         else _RustRunnerSelection()
     )
@@ -3604,11 +3639,12 @@ def _prepare_breach_execution(
     return _BreachPreflight(
         deepswe_metadata=deepswe_metadata,
         swebench_metadata=swebench_metadata,
-        diff_bytes=diff_bytes,
         diff_files=diff_files,
         language=breach_language,
         test_file=test_file,
         test_file_relative=test_file_rel,
+        authority=authority,
+        execution_binding=execution_binding,
         rust_selection=_RustRunnerSelection(
             crate=breach_verify_crate,
             features=rust_selection.features,
@@ -8271,31 +8307,17 @@ def _main(
                 spec=spec,
                 base_treeish=diff_base_treeish,
             )
-            if not preflight.diff_bytes or not preflight.diff_files:
-                raise ValueError(
-                    "breach requires a non-empty candidate diff with at "
-                    "least one touched path"
-                )
             if fresh_lineage and preflight.deepswe_metadata is None:
                 raise ValueError(
                     "fresh_lineage breach authority requires DeepSWE metadata"
                 )
-            authority = _load_breach_authority(
-                authority_file=args.authority_file,
-                authority_digest_value=args.authority_digest,
-                issue_text=args.issue_text,
-                diff_files=preflight.diff_files,
-            )
+            authority = preflight.authority
             if authority is not None:
-                _validate_authority_canonical_tier(authority, spec)
                 authority = _apply_requirement_completion_ownership(
                     authority,
                     spec,
                 )
-            authority_execution_binding = _single_authority_execution_binding(
-                authority,
-                spec,
-            )
+            authority_execution_binding = preflight.execution_binding
             observation_gate = (
                 "dev_verify"
                 if (

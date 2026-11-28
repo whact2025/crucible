@@ -48,7 +48,7 @@ language parameters merge over the base ``parameters`` with the
     }
 
 The aggregated ``values`` keep each language's namespaced metrics
-(``python_*``, ``rust_*``, ``cpp_*``) plus a top-level
+(``python_*``, ``rust_*``, ``cpp_*``, ``dotnet_*``) plus a top-level
 ``tests_passed`` / ``tests_failed`` that SUM across languages. This
 mirrors the behavior ``_build_verify``'s classification logic expects
 (read ``values["tests_failed"]`` to detect partial test failures).
@@ -86,6 +86,7 @@ _SUPPORTED_LANGUAGES: dict[str, str] = {
     "python": "crucible.common.runners.lang.python",
     "rust":   "crucible.common.runners.lang.rust",
     "cpp":    "crucible.common.runners.lang.cpp",
+    "dotnet": "crucible.common.runners.lang.dotnet",
 }
 
 
@@ -257,6 +258,13 @@ def _main(verb: str) -> int:
                 f"PolyglotRunner ({verb}): unknown languages {unknown!r}. "
                 f"Supported: {sorted(_SUPPORTED_LANGUAGES)}"
             ),
+        }))
+        return 2
+
+    if requested_mode == "bench" and "dotnet" in languages:
+        sys.stdout.write(json.dumps({
+            "values": {},
+            "raw_output": "The dotnet adapter does not support benchmark verification.",
         }))
         return 2
 
