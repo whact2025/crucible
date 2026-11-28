@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from crucible.common.runners.lang import dotnet
+from crucible.common.runners.parameters import for_slice
 
 
 def invoke(params):
@@ -170,6 +171,63 @@ def test_attributable_project_and_framework_with_private_results(module, monkeyp
     assert payload["values"]["tests_passed"] == payload["values"]["dotnet_tests_passed"] == 1
     assert payload["values"]["tests_skipped"] == 1
     assert len(commands) == 2 and not directories[0].exists()
+
+
+@pytest.mark.parametrize("second_evidence", ["failed test", "first project's passing report"])
+def test_each_claimed_project_and_framework_needs_its_own_passing_run(tmp_path, monkeypatch, second_evidence):
+    # This is the same slice projection used by workflow runner_parameters.
+    pairs = {"receive": ("Receiving", "net8.0"), "ship": ("Shipping", "net10.0")}
+    per_slice = {}
+    assemblies = {}
+    for slice_id, (suite, framework) in pairs.items():
+        project = tmp_path / suite / f"{suite}.Tests.csproj"
+        assembly = project.parent / "bin" / "Debug" / framework / "Rules.dll"
+        assembly.parent.mkdir(parents=True)
+        assembly.touch()
+        project.touch()
+        assemblies[project] = assembly
+        per_slice[slice_id] = {"per_language": {"dotnet": {
+            "project_subdir": suite, "test_project": project.name, "target_framework": framework,
+        }}}
+    selections = {"per_slice": per_slice}
+    observed = []
+    first_assembly = assemblies[tmp_path / "Receiving" / "Receiving.Tests.csproj"]
+
+    def sdk(argv, cwd, env):
+        project = Path(argv[2])
+        assembly = assemblies[project]
+        assert cwd == project.parent
+        if argv[1] == "msbuild":
+            assert f"-property:TargetFramework={assembly.parent.name}" in argv
+            return SimpleNamespace(returncode=0, stdout=str(assembly), stderr="")
+        assert argv[1] == "test"
+        framework = argv[argv.index("--framework") + 1]
+        observed.append((project.name, framework))
+        assert framework == assembly.parent.name
+        outcome = "Passed"
+        if project.parent.name == "Shipping":
+            if second_evidence == "failed test":
+                outcome = "Failed"
+            else:
+                assembly = first_assembly
+        folder = Path(argv[argv.index("--results-directory") + 1])
+        ET.ElementTree(trx(assembly, [outcome])).write(folder / "suite.trx")
+        return SimpleNamespace(returncode=int(outcome == "Failed"), stdout="", stderr="")
+
+    monkeypatch.setattr(dotnet, "_run", sdk)
+    def verify(slice_id):
+        return invoke({**for_slice(selections, slice_id), "working_dir": str(tmp_path)})
+
+    assert verify(None)[0] != 0
+    first_rc, first = verify("receive")
+    second_rc, second = verify("ship")
+    assert first_rc == 0 and first["values"]["dotnet_tests_passed"] == 1
+    assert second_rc != 0 and second["values"].get("dotnet_tests_passed", 0) == 0
+    if second_evidence == "failed test":
+        assert second["values"]["dotnet_tests_failed"] == 1
+    else:
+        assert "expected project/framework assembly" in second["raw_output"]
+    assert observed == [("Receiving.Tests.csproj", "net8.0"), ("Shipping.Tests.csproj", "net10.0")]
 
 
 @pytest.mark.parametrize("problem", [
