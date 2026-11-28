@@ -88,41 +88,70 @@ def _assembly(project: Path, framework: str, root: Path, env: dict) -> Path:
     return output
 
 
+def _optional_child(parent: ET.Element, name: str) -> ET.Element | None:
+    children = parent.findall(_TRX + name)
+    if len(children) > 1:
+        raise ValueError(f"Duplicate TRX {name} elements")
+    return children[0] if children else None
+
+
+def _required_child(parent: ET.Element, name: str) -> ET.Element:
+    child = _optional_child(parent, name)
+    if child is None:
+        raise ValueError(f"Missing TRX {name} element")
+    return child
+
+
 def _report(report: Path, assembly: Path, start: datetime, end: datetime) -> tuple[dict, bool]:
     trx = ET.parse(report).getroot()
     if trx.tag != _TRX + "TestRun":
         raise ValueError("Expected a VSTest TRX TestRun")
-    times = trx.find(_TRX + "Times")
-    if times is None:
-        raise ValueError("Missing TRX run times")
+    times = _required_child(trx, "Times")
     first = datetime.fromisoformat(times.get("start", ""))
     last = datetime.fromisoformat(times.get("finish", ""))
     if first.tzinfo is None or last.tzinfo is None or not start <= first <= last <= end:
         raise ValueError("TRX times fall outside this test invocation")
     definitions = {}
-    for definition in trx.findall(f"{_TRX}TestDefinitions/{_TRX}UnitTest"):
+    for definition in _required_child(trx, "TestDefinitions"):
         test_id = definition.get("id")
-        method = definition.find(_TRX + "TestMethod")
-        source = Path(method.get("codeBase", "")) if method is not None else Path()
-        if not test_id or test_id in definitions or not source.is_absolute() or source.resolve() != assembly:
+        method = _required_child(definition, "TestMethod")
+        source = Path(method.get("codeBase", ""))
+        if (definition.tag != _TRX + "UnitTest" or not test_id or test_id in definitions
+                or not source.is_absolute() or source.resolve() != assembly):
             raise ValueError("TRX test definitions do not identify the expected project/framework assembly")
-        definitions[test_id] = source
-    results = trx.find(_TRX + "Results")
-    summary = trx.find(_TRX + "ResultSummary")
-    counters = summary.find(_TRX + "Counters") if summary is not None else None
-    if results is None or counters is None or not len(results):
-        raise ValueError("Missing TRX results or counters")
-    executions = set()
+        declared_execution = _optional_child(definition, "Execution")
+        if declared_execution is not None and not declared_execution.get("id"):
+            raise ValueError("Missing TRX test definition execution ID")
+        definitions[test_id] = declared_execution.get("id") if declared_execution is not None else None
+    results = _required_child(trx, "Results")
+    summary = _required_child(trx, "ResultSummary")
+    counters = _required_child(summary, "Counters")
+    executions = {}
     outcomes = Counter()
     for row in results:
         execution = row.get("executionId")
         outcome = row.get("outcome")
+        test_id = row.get("testId")
         if (row.tag != _TRX + "UnitTestResult" or row.find(_TRX + "InnerResults") is not None
-                or row.get("testId") not in definitions or not execution or execution in executions
+                or test_id not in definitions or not execution or execution in executions
                 or outcome not in {"Passed", "Failed", "NotExecuted"}):
             raise ValueError("Unsupported, duplicated or unattributable TRX result")
-        executions.add(execution)
+        executions[execution] = test_id
         outcomes[outcome] += 1
+    for test_id, declared_execution in definitions.items():
+        if declared_execution is not None and executions.get(declared_execution) != test_id:
+            raise ValueError("TRX test definition execution ID disagrees with observed results")
+    entries = _optional_child(trx, "TestEntries")
+    if entries is not None:
+        entry_executions = {}
+        for entry in entries:
+            execution = entry.get("executionId")
+            if (entry.tag != _TRX + "TestEntry" or len(entry) or not execution
+                    or execution in entry_executions):
+                raise ValueError("Invalid or duplicate TRX test entry")
+            entry_executions[execution] = entry.get("testId")
+        if entry_executions != executions:
+            raise ValueError("TRX test entries disagree with observed test and execution IDs")
     passed, failed, skipped = (outcomes[k] for k in ("Passed", "Failed", "NotExecuted"))
     for key, expected in {"total": len(executions), "executed": passed + failed,
                           "passed": passed, "failed": failed}.items():

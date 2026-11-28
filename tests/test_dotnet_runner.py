@@ -3,6 +3,7 @@
 
 """One .NET gate must prove the selected suite, even inside a polyglot run."""
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -56,6 +57,90 @@ def trx(assembly, outcomes, date=None):
         "total": str(len(outcomes)), "passed": str(passed), "failed": str(failed),
         "executed": str(passed + failed)})
     return root
+
+
+def declared_trx(assembly):
+    doc = trx(assembly, ["Passed", "Passed"])
+    entries = ET.SubElement(doc, "TestEntries")
+    for definition, result in zip(doc.find("TestDefinitions"), doc.find("Results"), strict=True):
+        ET.SubElement(definition, "Execution", {"id": result.get("executionId")})
+        ET.SubElement(entries, "TestEntry", {"executionId": result.get("executionId"),
+                                              "testId": result.get("testId")})
+    return doc
+
+
+def parse_trx(doc, assembly, tmp_path):
+    report = tmp_path / "test.trx"
+    ET.ElementTree(doc).write(report)
+    now = datetime.now(timezone.utc)
+    return dotnet._report(report, assembly, now - timedelta(minutes=1), now)
+
+
+@pytest.mark.parametrize("path", ["Times", "Results", "ResultSummary", "ResultSummary/Counters",
+                                  "TestDefinitions", "TestDefinitions/UnitTest/TestMethod"])
+@pytest.mark.parametrize("change", ["missing", "duplicate"])
+def test_trx_requires_exactly_one_section(module, tmp_path, path, change):
+    _, _, assembly, _ = module
+    doc = declared_trx(assembly)
+    parent_path, _, name = path.rpartition("/")
+    parent = doc.find(parent_path) if parent_path else doc
+    element = parent.find(name)
+    if change == "missing":
+        parent.remove(element)
+    else:
+        duplicate = deepcopy(element)
+        if name == "Results":
+            duplicate[0].set("outcome", "Failed")
+        if name == "ResultSummary":
+            duplicate.set("outcome", "Failed")
+        if name == "Counters":
+            duplicate.set("failed", "1")
+        parent.append(duplicate)
+    with pytest.raises(ValueError, match=f"TRX {name}"):
+        parse_trx(doc, assembly, tmp_path)
+
+
+@pytest.mark.parametrize("change", ["extra-entry", "missing-entry", "entry-id", "entry-test", "nested-entry",
+                                    "duplicate-entries", "definition-id", "missing-id",
+                                    "duplicate-execution"])
+def test_optional_trx_execution_bindings_must_agree(module, tmp_path, change):
+    _, _, assembly, _ = module
+    doc = declared_trx(assembly)
+    entries = doc.find("TestEntries")
+    definition = doc.find("TestDefinitions/UnitTest")
+    if change == "extra-entry":
+        entries.append(deepcopy(entries[0]))
+    elif change == "missing-entry":
+        entries.remove(entries[0])
+    elif change == "entry-id":
+        entries[0].set("executionId", "different-execution")
+    elif change == "entry-test":
+        entries[0].set("testId", entries[1].get("testId"))
+    elif change == "nested-entry":
+        entries[0].append(deepcopy(entries[1]))
+    elif change == "duplicate-entries":
+        doc.append(deepcopy(entries))
+    elif change == "definition-id":
+        definition.find("Execution").set("id", entries[1].get("executionId"))
+    elif change == "missing-id":
+        definition.find("Execution").attrib.clear()
+    else:
+        definition.append(deepcopy(definition.find("Execution")))
+    with pytest.raises(ValueError):
+        parse_trx(doc, assembly, tmp_path)
+
+
+@pytest.mark.parametrize("shared_definition", [False, True])
+def test_two_flat_data_rows_have_separate_executions(module, tmp_path, shared_definition):
+    _, _, assembly, _ = module
+    doc = declared_trx(assembly)
+    if shared_definition:
+        definitions = doc.find("TestDefinitions")
+        definitions.remove(definitions[1])
+        doc.find("Results")[1].set("testId", definitions[0].get("id"))
+        doc.find("TestEntries")[1].set("testId", definitions[0].get("id"))
+    counts, clean = parse_trx(doc, assembly, tmp_path)
+    assert clean and counts["tests_passed"] == 2
 
 
 @pytest.mark.parametrize("role", ["verify", "dev_verify"])
