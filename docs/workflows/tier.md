@@ -43,6 +43,70 @@ count never authorizes simultaneous writes to a shared checkout. See the
 records accepted by the current plan and lineage contract. Nested source
 repositories must be initialized before creating the worktree.
 
+## Building Python, Rust and C# products together
+
+Use the canonical language ID `dotnet` for C# on modern .NET. The
+following excerpt of a product Spec builds an SDK solution and verifies
+one named C# test project on .NET 10, alongside Python and Rust. Merge
+the fields into the product's existing project context and constraints.
+
+```yaml
+project_context:
+  runners:
+    build: crucible.common.runners.polyglot
+    verify: crucible.common.runners.polyglot
+  runner_parameters:
+    per_language:
+      python:
+        project_subdir: simulation
+      rust:
+        project_subdir: motion
+      dotnet:
+        project_subdir: services
+        project: Warehouse.sln
+        test_project: Orders.Tests/Orders.Tests.csproj
+        target_framework: net10.0
+constraints:
+  - kind: languages
+    languages: [python, rust, dotnet]
+```
+
+Each path is relative to the selected checkout or, for the .NET project
+files, its `project_subdir`. The build accepts an SDK project, `.sln` or
+`.slnx` solution. Install the SDK selected by the repository's
+`global.json`, the target framework or targeting pack and the project's
+VSTest-compatible test adapter. Verification uses MSBuild 17.8 or later
+to identify the selected test assembly. Python's bundled verifier uses
+`uv run pytest` by default. Keep the Python product's source and its
+`pyproject.toml` in Git, and commit `uv.lock` when the product uses a
+locked environment. Rust uses Cargo. Provision these in the
+environment that runs the workflow. [SDK selection](https://learn.microsoft.com/en-us/dotnet/core/tools/global-json)
+· [VSTest](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-test-vstest)
+· [MSBuild property evaluation](https://learn.microsoft.com/en-us/visualstudio/msbuild/evaluate-items-and-properties)
+
+For a slice that changes only the C# service, set the planned directive's
+`blast_radius.languages` to `[dotnet]`. The dispatcher honors declared
+order and stops on the first failure. Verify each test project and target
+framework that the product claims, using a separate slice selection for
+each. The .NET test runner expects the project's Debug output to be inside
+the project directory and identifiable by the target framework. A fresh
+VSTest TRX report must contain flat test-result rows identifying the
+tests that executed against that assembly. Microsoft.Testing.Platform
+and nested result formats require a separately qualified adapter. A
+missing report, no tests, all tests skipped, a failing test, or a compiler
+error leaves verification unsuccessful.
+
+Read the language-specific counters when a product requires a given test
+population. In particular, Cargo can exit successfully for a crate with
+zero tests. A cross-language service contract needs a test that exercises
+the boundary.
+
+The bundled .NET runner does not attest benchmark performance or generate
+exact per-finding C# assurance evidence. A tier or handoff requiring that
+evidence must report the unsupported capability. Use a separate authorized
+review of the C# artifact where the product accepts it. [Build and
+review lifecycle](README.md)
+
 ## Options
 
 `uv run crucible tier --help` reports accepted values, defaults, mutual

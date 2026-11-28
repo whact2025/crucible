@@ -1439,6 +1439,29 @@ def _invoke_tier_breach_child(
     return breach_rc, breach_error
 
 
+def _tier_breach_language(spec, tier, extra_parameters, *, diff_files=()) -> str:
+    """Use the same canonical tier selection at preflight and execution."""
+    parameters = extra_parameters or {}
+    metadata = parameters.get("deepswe_metadata")
+    if not isinstance(metadata, dict):
+        metadata = parameters.get("swebench_metadata")
+    return breach_workflow._breach_language_for_run(
+        metadata if isinstance(metadata, dict) else None,
+        spec,
+        directives=tuple(item.directive for item in tier.slices),
+        diff_files=diff_files,
+    )
+
+
+def _tier_rust_selection(spec, tier, extra_parameters):
+    binding = None
+    if tier is not None and _authoring_container_id(extra_parameters) is None:
+        binding = breach_workflow.scope_execution_binding(
+            tuple(item.directive for item in tier.slices), spec,
+        )
+    return breach_workflow._rust_runner_selection(spec, binding[0] if binding else None)
+
+
 def _authoring_container_id(extra_parameters: dict | None) -> str | None:
     """Return the benchmark authoring container id, if configured.
 
@@ -2855,13 +2878,14 @@ def _final_binding_runner_parameters(
     breach_executed: bool,
     breach_test_file: str | None = None,
     breach_attack_ids: tuple[str, ...] = (),
+    tier=None,
 ) -> dict | None:
     """Seal final-gate selection and optional exact breach observations."""
 
     parameters: dict = dict(extra_parameters or {})
     trusted = False
     if breach_executed and breach_language == "rust":
-        selection = breach_workflow._rust_runner_selection(spec)
+        selection = _tier_rust_selection(spec, tier, extra_parameters)
         sealed_selection = breach_workflow._RustRunnerSelection(
             crate=selection.crate,
             features=selection.features,
@@ -2895,29 +2919,13 @@ def _single_tier_execution_binding(
     tier,
     *,
     fallback_slice_id: str,
+    spec=None,
 ) -> tuple[str, ImplementationDirective | None]:
-    """Retain canonical runner routing for one-slice aggregate gates.
-
-    Tier uses synthetic names for cumulative/final lifecycle checkpoints, but
-    those names are not canonical slice IDs. Passing them to
-    ``build_and_verify`` drops the slice language constraint and any
-    ``runner_parameters.per_slice`` overlay. A one-slice tier has one
-    unambiguous execution binding, so deterministic aggregate gates must use
-    that canonical ID and directive. Multi-slice gates retain the conservative
-    Spec-wide aggregate behavior until an explicit aggregate binding exists.
-    """
-
-    if len(tier.slices) != 1:
-        return fallback_slice_id, None
-    canonical_slice = tier.slices[0]
-    # Aggregate acceptance gates always re-run build and verification even
-    # when the implementation slice used ``skip`` or ``build_only`` during
-    # authoring. Preserve every routing field but override that phase-local
-    # suppression for the final proof.
-    gate_directive = canonical_slice.directive
-    if gate_directive.verify_mode in {"skip", "build_only"}:
-        gate_directive = _replace(gate_directive, verify_mode="tests")
-    return canonical_slice.id, gate_directive
+    """Preserve slice-bound runner settings across aggregate tier gates."""
+    binding = breach_workflow.scope_execution_binding(
+        tuple(item.directive for item in tier.slices), spec,
+    )
+    return binding or (fallback_slice_id, None)
 
 
 def _spec_cas_guard(expected_spec, expected_digest: str):
@@ -6010,6 +6018,10 @@ def run_tier(
             )
         try:
             _build_verify.runner_parameters(spec, extra_parameters)
+            if args.breach_policy.enabled and _authoring_container_id(extra_parameters) is None:
+                _single_tier_execution_binding(
+                    tier, spec=spec, fallback_slice_id=args.tier_id,
+                )
         except (TypeError, ValueError) as exc:
             record_handled_terminal(
                 corpus,
@@ -6025,11 +6037,7 @@ def run_tier(
                 extra_parameters.get("deepswe_metadata")
                 if isinstance(extra_parameters, dict) else None
             )
-            boundary_language = breach_workflow._breach_language_for_run(
-                raw_deepswe_metadata
-                if isinstance(raw_deepswe_metadata, dict) else None,
-                spec,
-            )
+            boundary_language = _tier_breach_language(spec, tier, extra_parameters)
             try:
                 breach_gate = (
                     "dev_verify"
@@ -6051,7 +6059,7 @@ def run_tier(
                         "through a DeepSWE dev_verify_command override"
                     )
                 if boundary_language == "rust":
-                    breach_workflow._rust_runner_selection(spec)
+                    _tier_rust_selection(spec, tier, extra_parameters)
                     breach_workflow.validate_breach_rust_parameters(
                         extra_parameters,
                         cwd=cwd,
@@ -6264,6 +6272,10 @@ def _run_tier_workspace_body(
         ) from exc
     try:
         _build_verify.runner_parameters(locked_spec, extra_parameters)
+        if args.breach_policy.enabled and _authoring_container_id(extra_parameters) is None:
+            _single_tier_execution_binding(
+                locked_tier, spec=locked_spec, fallback_slice_id=args.tier_id,
+            )
     except (TypeError, ValueError) as exc:
         raise _TierSetupTerminal(
             str(exc),
@@ -6286,10 +6298,7 @@ def _run_tier_workspace_body(
             extra_parameters.get("deepswe_metadata")
             if isinstance(extra_parameters, dict) else None
         )
-        locked_language = breach_workflow._breach_language_for_run(
-            locked_metadata if isinstance(locked_metadata, dict) else None,
-            locked_spec,
-        )
+        locked_language = _tier_breach_language(locked_spec, locked_tier, extra_parameters)
         try:
             breach_gate = (
                 "dev_verify"
@@ -6311,7 +6320,7 @@ def _run_tier_workspace_body(
                     "through a DeepSWE dev_verify_command override"
                 )
             if locked_language == "rust":
-                breach_workflow._rust_runner_selection(locked_spec)
+                _tier_rust_selection(locked_spec, locked_tier, extra_parameters)
                 breach_workflow.validate_rust_breach_runners(
                     locked_spec,
                     gate=breach_gate,
@@ -8034,17 +8043,7 @@ def _run_tier_locked_body(
         post_breach_review_amended = False
         review_conflict_verdict_ref: ContentHash | None = None
         review_conflict_input_ref: ContentHash | None = None
-        initial_breach_metadata = (
-            (extra_parameters or {}).get("deepswe_metadata")
-            if isinstance(extra_parameters, dict)
-            else None
-        )
-        breach_language = breach_workflow._breach_language_for_run(
-            initial_breach_metadata
-            if isinstance(initial_breach_metadata, dict)
-            else None,
-            cur_spec,
-        )
+        breach_language = _tier_breach_language(cur_spec, tier, extra_parameters)
 
         # Every model-backed mutation gets a durable write-ahead journal.
         # Normal exceptions and cancellation unwind these callbacks in reverse
@@ -12120,21 +12119,16 @@ def _run_tier_locked_body(
                     *slice_.directive.creates_paths,
                 )
             ))
-            breach_metadata = (
-                (extra_parameters or {}).get("deepswe_metadata")
-                if isinstance(extra_parameters, dict) else None
-            )
-            breach_language = breach_workflow._breach_language_for_run(
-                breach_metadata if isinstance(breach_metadata, dict) else None,
-                cur_spec,
-            )
             breach_diff_files = breach_workflow._touched_files_from_diff(
                 union_diff,
                 cwd=cwd,
                 base_treeish=union_base_treeish,
             )
+            breach_language = _tier_breach_language(
+                cur_spec, tier, extra_parameters, diff_files=breach_diff_files,
+            )
             requested_rust_selection = (
-                breach_workflow._rust_runner_selection(cur_spec)
+                _tier_rust_selection(cur_spec, tier, extra_parameters)
                 if breach_language == "rust"
                 else breach_workflow._RustRunnerSelection()
             )
@@ -12297,6 +12291,10 @@ def _run_tier_locked_body(
                     "--authority-file", str(authority_path),
                     "--authority-digest", authority_digest,
                 ])
+            elif not in_container and breach_language != breach_workflow._breach_language_for_run(
+                None, cur_spec,
+            ):
+                breach_argv.extend(["--observation-tier", tier.tier_id])
             breach_parent_journal = (
                 breach_test_journal
                 if (
@@ -15176,6 +15174,7 @@ def _run_tier_locked_body(
                     _single_tier_execution_binding(
                         tier,
                         fallback_slice_id=f"{args.tier_id}__cumulative",
+                        spec=cur_spec if args.breach_policy.enabled and not in_container else None,
                     )
                 )
                 clean_final_outcome = _build_verify.build_and_verify(
@@ -15306,6 +15305,7 @@ def _run_tier_locked_body(
                 cwd=cwd,
                 breach_language=breach_language,
                 breach_executed=breach_test_relative is not None,
+                tier=tier,
                 breach_test_file=breach_test_relative,
                 breach_attack_ids=(
                     admitted_breach_attack_ids
@@ -15366,6 +15366,7 @@ def _run_tier_locked_body(
                     _single_tier_execution_binding(
                         tier,
                         fallback_slice_id=f"{args.tier_id}__final",
+                        spec=cur_spec if args.breach_policy.enabled and not in_container else None,
                     )
                 )
                 final_outcome = _build_verify.build_and_verify(
@@ -15766,6 +15767,7 @@ def _run_tier_locked_body(
                     _single_tier_execution_binding(
                         tier,
                         fallback_slice_id=f"{args.tier_id}__shipping",
+                        spec=cur_spec if args.breach_policy.enabled and not in_container else None,
                     )
                 )
                 shipping_outcome = _build_verify.build_and_verify(
@@ -15786,6 +15788,7 @@ def _run_tier_locked_body(
                         cwd=cwd,
                         breach_language=breach_language,
                         breach_executed=breach_test_relative is not None,
+                        tier=tier,
                     ),
                     gate=bv_gate,
                     writer_epoch_members=_writer_epoch_family(

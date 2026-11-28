@@ -32,6 +32,8 @@ Bundled languages:
   (or ``cargo test -p <crate>`` via ``parameters.crate``).
 - ``crucible.common.runners.lang.cpp`` — ``cmake --build build &&
   ctest --test-dir build`` (configurable build_dir + ctest_args).
+- ``crucible.common.runners.lang.dotnet`` — SDK build and verification of
+  an explicitly selected C# test project and target framework.
 
 Each module also exposes per-language *convention* helpers consumed
 outside the bench-runner subprocess contract:
@@ -89,6 +91,9 @@ def conventions_for(language: str) -> LanguageConventions:
         return _mod  # type: ignore[return-value]
     if canonical in ("cpp", "c++", "cxx"):
         from . import cpp as _mod
+        return _mod  # type: ignore[return-value]
+    if canonical == "dotnet":
+        from . import dotnet as _mod
         return _mod  # type: ignore[return-value]
     raise ValueError(
         f"no language conventions registered for {language!r}; "

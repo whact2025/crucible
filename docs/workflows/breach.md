@@ -69,6 +69,7 @@ exclusions, and the precise invocation scope.
 | `--diff` | Path to a unified diff file to breach-test. |
 | `--diff-base-treeish` | Exact full Git object ID against which the diff was captured. Required for an unbound --diff-hash; a standalone --diff path defaults to the current locked HEAD. |
 | `--diff-hash` | `sha256:<hex>` corpus key for an existing diff artifact (typically Implementation.diff_ref). |
+| `--observation-tier` | Select a tier from the canonical plan for a standalone native diff. Its directives must cover the diff and support the requested observations. A child that carries a scoped authority packet takes its selection from that packet. |
 | `--implementer-read-call-limit` | Maximum consecutive source-tool reads per test-author or Defender invocation without a successful write (default: 96). |
 | `--issue-text` | Original issue / intent text threaded into the Breaker rubric via the ``{spec_intent}`` placeholder. SWE-bench dispatch fills this from the per-instance ``problem_statement`` so the Breaker can attack alternative interpretations of the issue rather than only the diff. |
 | `--judge-rubric` | Rubric name for the Judge phase. Default: ``breach_judge``. |

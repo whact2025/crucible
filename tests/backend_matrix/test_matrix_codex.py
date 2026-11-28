@@ -47,6 +47,7 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
+import http.client
 import json
 import logging
 import os
@@ -2230,11 +2231,14 @@ def test_a_tool_server_that_goes_away_inside_a_call_is_a_call_that_failed() -> N
 
         def serve() -> None:
             connection, _address = listener.accept()
-            with connection:
+            with connection, connection.makefile("rb") as request:
                 connection.settimeout(10.0)
-                received = b""
-                while b"\r\n\r\n" not in received:
-                    received += connection.recv(65536)
+                request.readline()  # HTTP request line
+                headers = http.client.parse_headers(request)
+                length = int(headers["Content-Length"])
+                # Unread POST bytes can reset the connection and erase the intended reply.
+                if len(request.read(length)) != length:
+                    return
                 connection.sendall(reply)
 
         thread = threading.Thread(target=serve, daemon=True)

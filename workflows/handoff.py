@@ -2634,6 +2634,7 @@ def main(argv: list[str] | None = None) -> int:
                         cwd=cwd,
                         diff_bytes=corpus.get_artifact(initial_impl.diff_ref),
                         base_treeish=initial_impl.base_commit,
+                        directive=selected_slice.directive,
                     )
                 transaction_scope = tuple(dict.fromkeys((
                     *directive_scope,
